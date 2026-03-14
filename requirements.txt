@@ -1,0 +1,8 @@
+playwright>=1.40.0
+playwright-stealth>=1.0.6
+pystray>=0.19.4
+Pillow>=10.0.0
+pyyaml>=6.0.1
+watchdog>=3.0.0
+requests>=2.31.0
+win11toast>=0.30.0; sys_platform == "win32"

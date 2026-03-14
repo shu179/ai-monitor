@@ -1,0 +1,14 @@
+2026/03/14-18:38:54.023 39435 Reusing MANIFEST /Users/shuao/Desktop/ai-monitor/user_data/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/03/14-18:38:54.023 39435 Recovering log #7
+2026/03/14-18:38:54.023 39435 Reusing old log /Users/shuao/Desktop/ai-monitor/user_data/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/000007.log 
+2026/03/14-18:38:54.027 39435 Level-0 table #11: started
+2026/03/14-18:38:54.028 39435 Level-0 table #11: 9403 bytes OK
+2026/03/14-18:38:54.030 39435 Delete type=0 #7
+2026/03/14-18:38:54.030 39435 Manual compaction at level-0 from '\x00\x04\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x05\x00\x00\x00' @ 0 : 0; will stop at '\x00\x05\x01\x02\x01$\x00f\x003\x006\x005\x006\x001\x00f\x00f\x00-\x005\x003\x000\x002\x00-\x004\x008\x000\x00a\x00-\x008\x00b\x00e\x008\x00-\x00a\x009\x001\x001\x00a\x00d\x004\x003\x004\x002\x007\x005' @ 432 : 1
+2026/03/14-18:38:54.030 39435 Compacting 1@0 + 1@1 files
+2026/03/14-18:38:54.031 39435 Generated table #12@0: 86 keys, 7093 bytes
+2026/03/14-18:38:54.031 39435 Compacted 1@0 + 1@1 files => 7093 bytes
+2026/03/14-18:38:54.032 39435 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/03/14-18:38:54.032 39435 Delete type=2 #11
+2026/03/14-18:38:54.033 39435 Manual compaction at level-0 from '\x00\x05\x01\x02\x01$\x00f\x003\x006\x005\x006\x001\x00f\x00f\x00-\x005\x003\x000\x002\x00-\x004\x008\x000\x00a\x00-\x008\x00b\x00e\x008\x00-\x00a\x009\x001\x001\x00a\x00d\x004\x003\x004\x002\x007\x005' @ 432 : 1 .. '\x00\x05\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/03/14-18:39:46.180 39438 Manual compaction at level-0 from '\x00\x06\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x07\x00\x00\x00' @ 0 : 0; will stop at (end)
