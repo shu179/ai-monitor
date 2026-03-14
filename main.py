@@ -14,7 +14,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from core import load_config, SmartScheduler, WeComNotifier
 from ui.tray import TrayApp
-from platforms import DoubaoPlatform
+from platforms import (
+    DoubaoPlatform, DeepSeekPlatform, KimiPlatform,
+    YuanbaoPlatform, TongyiPlatform, WenxinPlatform
+)
 
 
 def cleanup_chrome_processes():
@@ -50,11 +53,22 @@ def run_task(task: dict, notifier: WeComNotifier) -> tuple:
     # 创建平台实例
     user_data_dir = f"./auth/{platform_name}"
 
-    if platform_name == 'doubao':
-        platform = DoubaoPlatform(user_data_dir)
-    else:
+    # 平台映射
+    platform_map = {
+        'doubao': DoubaoPlatform,
+        'deepseek': DeepSeekPlatform,
+        'kimi': KimiPlatform,
+        'yuanbao': YuanbaoPlatform,
+        'tongyi': TongyiPlatform,
+        'wenxin': WenxinPlatform,
+    }
+
+    platform_class = platform_map.get(platform_name)
+    if not platform_class:
         print(f"[Main] 不支持的平台: {platform_name}")
         return 99, None
+
+    platform = platform_class(user_data_dir)
 
     try:
         with platform:
