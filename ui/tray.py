@@ -64,7 +64,7 @@ class TrayApp:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "⚙️ 编辑配置",
+                "⚙️ 任务配置管理",
                 self.open_config
             ),
             pystray.MenuItem(
@@ -176,23 +176,18 @@ class TrayApp:
         print(f"[Tray] 执行任务: {task.get('name', task.get('platform'))}")
 
     def open_config(self):
-        """打开配置文件"""
-        config_path = Path("config.yaml").absolute()
+        """打开任务配置管理器"""
+        from .config_manager import ConfigManagerWindow
 
-        if not config_path.exists():
-            messagebox.showerror("错误", f"配置文件不存在: {config_path}")
-            return
+        # 在新线程中打开配置窗口，避免阻塞托盘
+        import threading
+        def open_window():
+            app = ConfigManagerWindow("config.yaml")
+            app.run()
 
-        # 尝试用系统默认编辑器打开
-        try:
-            if sys.platform == 'win32':
-                os.startfile(config_path)
-            elif sys.platform == 'darwin':
-                os.system(f'open "{config_path}"')
-            else:
-                os.system(f'xdg-open "{config_path}"')
-        except Exception as e:
-            messagebox.showerror("错误", f"打开配置文件失败: {e}")
+        thread = threading.Thread(target=open_window)
+        thread.daemon = True
+        thread.start()
 
     def view_logs(self):
         """查看日志"""
