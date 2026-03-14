@@ -13,16 +13,26 @@ scheduler:
   # 随机偏移 ±20%
   random_jitter: 0.2
 
-# ==================== 通知配置 ====================
-notification:
-  # 企业微信机器人 Webhook 地址
-  webhook_url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY_HERE"
+# ==================== 机器人配置 ====================
+# 可以配置多个企业微信机器人，每个任务可以指定使用哪个
+wechat_bots:
+  default:
+    name: "默认群"
+    webhook_url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY_HERE"
 
-  # 同排名冷却时间（分钟），避免重复轰炸
-  cooldown_minutes: 30
+  # 可以添加更多机器人，比如：
+  # sales_group:
+  #   name: "销售部"
+  #   webhook_url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=XXX"
+  #
+  # tech_group:
+  #   name: "技术部"
+  #   webhook_url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YYY"
 
-  # 发送间隔（秒），避免触发频率限制
-  send_interval: 2
+# 默认通知设置
+default_notification:
+  cooldown_minutes: 30   # 同排名冷却时间
+  send_interval: 2       # 发送间隔（秒）
 
 # ==================== 平台配置 ====================
 platforms:
@@ -51,22 +61,40 @@ platforms:
     user_data_dir: "./auth/wenxin"
 
 # ==================== 监控任务配置 ====================
+# 每个任务可以独立配置：
+# - 使用哪个机器人 (wechat_bot)
+# - 运行时间 (weekdays)
+# - 是否启用 (enabled)
+#
 # weekdays: 0=周一, 1=周二, ..., 6=周日
+
 tasks:
+  # 示例1：即搜AI监控 → 发送到默认群
   - name: "豆包-即搜AI"
     platform: doubao
     keyword: "武汉geo优化公司"
     brand: "即搜AI"
     enabled: true
-    weekdays: [0, 1, 2, 3, 4]  # 周一到周五
+    weekdays: [0, 1, 2, 3, 4]
+    wechat_bot: default  # 指定使用哪个机器人
 
-  # 示例：DeepSeek监控
+  # 示例2：DeepSeek监控 → 发送到技术群（如果有配置）
   # - name: "DeepSeek-DeepSeek"
   #   platform: deepseek
   #   keyword: "AI写作工具"
   #   brand: "DeepSeek"
-  #   enabled: false
+  #   enabled: true
   #   weekdays: [0, 1, 2, 3, 4, 5, 6]
+  #   wechat_bot: tech_group  # 发送到技术部群
+
+  # 示例3：可以添加更多任务，随时增删改
+  # - name: "Kimi-品牌监控"
+  #   platform: kimi
+  #   keyword: "AI助手"
+  #   brand: "Kimi"
+  #   enabled: true
+  #   weekdays: [1, 3, 5]  # 只在周2/4/6运行
+  #   wechat_bot: sales_group
 
 # ==================== 截图配置 ====================
 screenshot:
