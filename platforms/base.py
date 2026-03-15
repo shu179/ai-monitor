@@ -30,7 +30,7 @@ class BasePlatform(ABC):
     def start(self) -> "BasePlatform":
         """启动浏览器（复用 doubao.json 的 persistent context 模式）"""
         from playwright.sync_api import sync_playwright
-        from playwright_stealth import stealth_sync
+        from playwright_stealth import stealth
 
         # 确保用户数据目录存在
         if not os.path.exists(self.user_data_dir):
@@ -51,7 +51,7 @@ class BasePlatform(ABC):
         )
 
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-        stealth_sync(self.page)
+        stealth(self.page)
 
         # 访问目标页面
         self.page.goto(self.target_url)
