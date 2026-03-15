@@ -443,16 +443,17 @@ class ConfigManagerWindow:
             ttk.Label(row, text=run_info, width=20).pack(side=tk.LEFT)
 
             # 操作按钮
+            from functools import partial
             ttk.Button(
                 row,
                 text="编辑",
-                command=lambda idx=i: self.edit_task(idx)
+                command=partial(self.edit_task, i)
             ).pack(side=tk.RIGHT, padx=2)
 
             ttk.Button(
                 row,
                 text="删除",
-                command=lambda idx=i: self.delete_task(idx)
+                command=partial(self.delete_task, i)
             ).pack(side=tk.RIGHT, padx=2)
 
         self.tasks_frame.update_idletasks()

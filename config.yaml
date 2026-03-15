@@ -43,6 +43,20 @@ tasks:
   - 3
   - 4
   wechat_bot: default
+- name: '1'
+  platform: doubao
+  keyword: 武汉GEO优化公司
+  brand: 即搜AI
+  webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=1dec6872-9bb7-4058-9dc2-44f86953ace3
+  weekdays:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  enabled: true
+  schedule:
+  - '15:00'
 screenshot:
   format: jpg
   quality: 85
