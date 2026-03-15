@@ -145,28 +145,41 @@ class TaskConfigDialog:
             command=self.toggle_schedule_mode
         ).pack(side=tk.LEFT, padx=5)
 
-        # 定点时间设置
-        self.schedule_frame = ttk.LabelFrame(frame, text="每天运行时间（可多选）", padding="10")
+        # 定点时间设置 - 滚动选择器
+        self.schedule_frame = ttk.LabelFrame(frame, text="每天运行时间", padding="10")
         self.schedule_frame.pack(fill=tk.X, pady=(0, 15))
 
-        self.time_vars = []
-        current_schedule = task.get('schedule', ['09:00', '14:00']) if task else ['09:00', '14:00']
+        # 解析现有时间
+        current_schedule = task.get('schedule', ['09:00']) if task else ['09:00']
+        current_time = current_schedule[0] if current_schedule else '09:00'
+        current_hour, current_min = current_time.split(':')
 
-        # 预设时间点
-        preset_times = ['08:00', '09:00', '10:00', '11:00', '12:00',
-                       '13:00', '14:00', '15:00', '16:00', '17:00', '18:00']
+        time_select_frame = ttk.Frame(self.schedule_frame)
+        time_select_frame.pack(fill=tk.X, pady=5)
 
-        time_grid = ttk.Frame(self.schedule_frame)
-        time_grid.pack(fill=tk.X)
+        # 小时选择 0-23
+        ttk.Label(time_select_frame, text="小时:").pack(side=tk.LEFT, padx=(0, 5))
+        self.hour_var = tk.StringVar(value=current_hour)
+        hour_spin = tk.Spinbox(
+            time_select_frame,
+            from_=0,
+            to=23,
+            width=5,
+            format="%02.0f",
+            textvariable=self.hour_var
+        )
+        hour_spin.pack(side=tk.LEFT, padx=(0, 15))
 
-        for i, time_str in enumerate(preset_times):
-            var = tk.BooleanVar(value=time_str in current_schedule)
-            self.time_vars.append((time_str, var))
-            ttk.Checkbutton(
-                time_grid,
-                text=time_str,
-                variable=var
-            ).grid(row=i // 4, column=i % 4, sticky=tk.W, padx=10, pady=2)
+        # 分钟选择 00,10,20,30,40,50
+        ttk.Label(time_select_frame, text="分钟:").pack(side=tk.LEFT, padx=(0, 5))
+        self.min_var = tk.StringVar(value=current_min)
+        min_spin = tk.Spinbox(
+            time_select_frame,
+            values=('00', '10', '20', '30', '40', '50'),
+            width=5,
+            textvariable=self.min_var
+        )
+        min_spin.pack(side=tk.LEFT)
 
         # 间隔设置
         self.interval_frame = ttk.LabelFrame(frame, text="运行间隔", padding="10")
@@ -205,6 +218,12 @@ class TaskConfigDialog:
         # 按钮
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Button(
+            btn_frame,
+            text="🚀 立即运行测试",
+            command=self.run_now
+        ).pack(side=tk.LEFT, padx=5)
 
         ttk.Button(
             btn_frame,
@@ -252,11 +271,9 @@ class TaskConfigDialog:
 
         # 构建调度配置
         if self.schedule_mode.get() == 'schedule':
-            schedule_times = [time_str for time_str, var in self.time_vars if var.get()]
-            if not schedule_times:
-                messagebox.showerror("错误", "请至少选择一个运行时间")
-                return
-            schedule_config = {'schedule': schedule_times}
+            hour = self.hour_var.get().zfill(2)
+            minute = self.min_var.get().zfill(2)
+            schedule_config = {'schedule': [f"{hour}:{minute}"]}
         else:
             schedule_config = {'interval': self.interval_var.get()}
 
@@ -272,6 +289,53 @@ class TaskConfigDialog:
         }
 
         self.dialog.destroy()
+
+    def run_now(self):
+        """立即运行测试"""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+
+        # 构建临时任务配置
+        task = {
+            'name': self.name_var.get().strip() or '测试任务',
+            'platform': self.platform_var.get(),
+            'keyword': self.keyword_var.get().strip(),
+            'brand': self.brand_var.get().strip(),
+            'webhook_url': self.webhook_var.get().strip(),
+            'weekdays': [0, 1, 2, 3, 4, 5, 6],
+            'enabled': True
+        }
+
+        if not task['keyword'] or not task['brand']:
+            messagebox.showerror("错误", "请输入关键词和品牌")
+            return
+
+        # 在新线程中运行测试
+        import threading
+        def do_run():
+            try:
+                from main import run_task
+                print(f"\n{'='*50}")
+                print(f"开始测试运行: {task['name']}")
+                print(f"{'='*50}")
+
+                rank, screenshot = run_task(task, {'cooldown_minutes': 0, 'send_interval': 0})
+
+                print(f"\n测试结果: 排名 {rank}")
+                if screenshot:
+                    print(f"截图: {screenshot}")
+
+                # 显示结果
+                if rank <= 3:
+                    messagebox.showinfo("测试成功", f"品牌进入前3！\n排名: 第{rank}名")
+                else:
+                    messagebox.showinfo("测试完成", f"排名: 第{rank}名\n未进入前3")
+
+            except Exception as e:
+                messagebox.showerror("运行失败", f"错误: {e}")
+
+        threading.Thread(target=do_run, daemon=True).start()
+        messagebox.showinfo("提示", "测试任务正在后台运行，请查看终端输出")
 
 
 class ConfigManagerWindow:
