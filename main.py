@@ -40,14 +40,13 @@ def cleanup_chrome_processes():
         print(f"[Cleanup] 清理进程时出错: {e}")
 
 
-def run_task(task: dict, notifiers: dict, default_notify_config: dict) -> tuple:
+def run_task(task: dict, default_notify_config: dict) -> tuple:
     """
     执行单个监控任务
-    每个任务可以指定使用哪个机器人
+    每个任务有自己的webhook_url
 
     参数:
         task: 任务配置
-        notifiers: 机器人字典 {name: WeComNotifier}
         default_notify_config: 默认通知配置
 
     返回: (rank, screenshot_path)
@@ -56,12 +55,18 @@ def run_task(task: dict, notifiers: dict, default_notify_config: dict) -> tuple:
     keyword = task['keyword']
     brand = task['brand']
 
-    # 获取任务指定的机器人
-    bot_name = task.get('wechat_bot', 'default')
-    notifier = notifiers.get(bot_name)
+    # 获取任务的webhook
+    webhook_url = task.get('webhook_url', '')
+    notifier = None
 
-    if not notifier:
-        print(f"[Main] 警告: 任务 '{task.get('name')}' 指定的机器人 '{bot_name}' 不存在")
+    if webhook_url and webhook_url != 'YOUR_KEY_HERE':
+        notifier = WeComNotifier(
+            webhook_url=webhook_url,
+            cooldown_minutes=default_notify_config.get('cooldown_minutes', 30),
+            send_interval=default_notify_config.get('send_interval', 2)
+        )
+    else:
+        print(f"[Main] 警告: 任务 '{task.get('name')}' 未配置有效的Webhook")
 
     # 创建平台实例
     user_data_dir = f"./auth/{platform_name}"
@@ -104,42 +109,6 @@ def run_task(task: dict, notifiers: dict, default_notify_config: dict) -> tuple:
         return 99, None
 
 
-def create_notifiers(config: dict) -> dict:
-    """
-    根据配置创建多个企业微信通知器
-
-    返回: {bot_name: WeComNotifier}
-    """
-    notifiers = {}
-
-    # 获取默认通知配置
-    default_notify = config.get('default_notification', {})
-
-    # 获取机器人配置
-    bots_config = config.get('wechat_bots', {})
-
-    if not bots_config:
-        print("[Main] 警告: 未配置任何企业微信机器人")
-        return notifiers
-
-    for bot_name, bot_config in bots_config.items():
-        webhook_url = bot_config.get('webhook_url', '')
-
-        if not webhook_url or webhook_url == 'YOUR_KEY_HERE':
-            print(f"[Main] 警告: 机器人 '{bot_name}' 未配置有效的Webhook")
-            continue
-
-        notifier = WeComNotifier(
-            webhook_url=webhook_url,
-            cooldown_minutes=default_notify.get('cooldown_minutes', 30),
-            send_interval=default_notify.get('send_interval', 2)
-        )
-        notifiers[bot_name] = notifier
-        print(f"[Main] 已加载机器人: {bot_name} ({bot_config.get('name', '')})")
-
-    return notifiers
-
-
 def main():
     """主函数"""
     print("=" * 50)
@@ -165,18 +134,16 @@ def main():
     scheduler_config = config.get('scheduler', {})
     scheduler = SmartScheduler(scheduler_config)
 
-    # 创建多个企业微信通知器（支持多群）
-    notifiers = create_notifiers(config)
 
     # 获取默认通知配置
     default_notify_config = config.get('default_notification', {})
 
     # 4. 创建托盘应用
-    app = TrayApp(scheduler, notifiers.get('default'), config)
+    app = TrayApp(scheduler, None, config)
 
     # 绑定任务执行函数
     def execute_task(task):
-        rank, screenshot = run_task(task, notifiers, default_notify_config)
+        rank, screenshot = run_task(task, default_notify_config)
         # 更新托盘显示
         app.update_result(task['platform'], task['brand'], rank)
 

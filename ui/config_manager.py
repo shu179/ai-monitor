@@ -18,7 +18,7 @@ class TaskConfigDialog:
 
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("添加任务组" if task is None else "编辑任务组")
-        self.dialog.geometry("500x700")
+        self.dialog.geometry("550x700")
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
@@ -68,24 +68,10 @@ class TaskConfigDialog:
         self.brand_var = tk.StringVar(value=task.get('brand', '') if task else '')
         ttk.Entry(frame, textvariable=self.brand_var, width=50).pack(fill=tk.X, pady=(0, 15))
 
-        # 选择企业微信机器人
-        ttk.Label(frame, text="发送到哪个群:").pack(anchor=tk.W, pady=(0, 5))
-        self.bot_var = tk.StringVar(value=task.get('wechat_bot', 'default') if task else 'default')
-
-        bot_frame = ttk.Frame(frame)
-        bot_frame.pack(fill=tk.X, pady=(0, 15))
-
-        if self.bots:
-            for bot_id, bot_config in self.bots.items():
-                bot_name = bot_config.get('name', bot_id)
-                ttk.Radiobutton(
-                    bot_frame,
-                    text=bot_name,
-                    variable=self.bot_var,
-                    value=bot_id
-                ).pack(anchor=tk.W)
-        else:
-            ttk.Label(bot_frame, text="未配置机器人，请先配置wechat_bots").pack(anchor=tk.W)
+        # 企业微信Webhook
+        ttk.Label(frame, text="企业微信机器人Webhook:").pack(anchor=tk.W, pady=(0, 5))
+        self.webhook_var = tk.StringVar(value=task.get('webhook_url', '') if task else '')
+        ttk.Entry(frame, textvariable=self.webhook_var, width=50).pack(fill=tk.X, pady=(0, 15))
 
         # 运行星期
         ttk.Label(frame, text="运行时间:").pack(anchor=tk.W, pady=(0, 5))
@@ -249,7 +235,7 @@ class TaskConfigDialog:
             'platform': self.platform_var.get(),
             'keyword': keyword,
             'brand': brand,
-            'wechat_bot': self.bot_var.get(),
+            ''webhook_url': self.webhook_var.get().strip(),
             'weekdays': weekdays,
             'enabled': self.enabled_var.get(),
             **schedule_config
@@ -328,7 +314,7 @@ class ConfigManagerWindow:
         ttk.Label(headers, text="平台", width=10).pack(side=tk.LEFT)
         ttk.Label(headers, text="关键词", width=15).pack(side=tk.LEFT)
         ttk.Label(headers, text="品牌", width=12).pack(side=tk.LEFT)
-        ttk.Label(headers, text="发送到", width=12).pack(side=tk.LEFT)
+        ttk.Label(headers, text="Webhook", width=18).pack(side=tk.LEFT)
         ttk.Label(headers, text="运行时间", width=15).pack(side=tk.LEFT)
 
         ttk.Separator(list_frame, orient=tk.HORIZONTAL).pack(fill=tk.X)
@@ -404,10 +390,10 @@ class ConfigManagerWindow:
             # 品牌
             ttk.Label(row, text=task.get('brand', ''), width=12).pack(side=tk.LEFT)
 
-            # 机器人
-            bot_id = task.get('wechat_bot', 'default')
-            bot_name = bots.get(bot_id, {}).get('name', bot_id)
-            ttk.Label(row, text=bot_name, width=12).pack(side=tk.LEFT)
+            # Webhook（只显示前10个字符）
+            webhook = task.get('webhook_url', '')
+            webhook_short = webhook[:15] + '...' if len(webhook) > 15 else webhook
+            ttk.Label(row, text=webhook_short, width=18).pack(side=tk.LEFT)
 
             # 运行时间（星期 + 时间点）
             weekdays = task.get('weekdays', [])
