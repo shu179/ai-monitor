@@ -99,7 +99,9 @@ class TaskConfigDialog:
             menu.add_command(label="粘贴", command=lambda: self.webhook_entry.event_generate("<<Paste>>"))
             menu.post(event.x_root, event.y_root)
 
+        # 绑定右键 (Windows/Linux: Button-3, Mac: Button-2)
         self.webhook_entry.bind("<Button-3>", show_context_menu)
+        self.webhook_entry.bind("<Button-2>", show_context_menu)
 
         # 运行星期
         ttk.Label(frame, text="运行时间:").pack(anchor=tk.W, pady=(0, 5))
@@ -458,9 +460,7 @@ class ConfigManagerWindow:
 
     def add_task(self):
         """添加新任务"""
-        bots = self.config.get('wechat_bots', {})
-
-        dialog = TaskConfigDialog(self.root, bots=bots)
+        dialog = TaskConfigDialog(self.root)
         self.root.wait_window(dialog.dialog)
 
         if dialog.result:
@@ -475,9 +475,7 @@ class ConfigManagerWindow:
         if index >= len(tasks):
             return
 
-        bots = self.config.get('wechat_bots', {})
-
-        dialog = TaskConfigDialog(self.root, task=tasks[index], bots=bots)
+        dialog = TaskConfigDialog(self.root, task=tasks[index])
         self.root.wait_window(dialog.dialog)
 
         if dialog.result:
