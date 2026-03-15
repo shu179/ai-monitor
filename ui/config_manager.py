@@ -442,14 +442,13 @@ class ConfigManagerWindow:
 
             ttk.Label(row, text=run_info, width=20).pack(side=tk.LEFT)
 
-            # 操作按钮
+            # 整行点击编辑
             from functools import partial
-            ttk.Button(
-                row,
-                text="编辑",
-                command=partial(self.edit_task, i)
-            ).pack(side=tk.RIGHT, padx=2)
+            for widget in row.winfo_children():
+                widget.bind("<Button-1>", lambda e, idx=i: self.edit_task(idx))
+            row.bind("<Button-1>", lambda e, idx=i: self.edit_task(idx))
 
+            # 操作按钮
             ttk.Button(
                 row,
                 text="删除",
