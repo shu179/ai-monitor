@@ -18,16 +18,35 @@ class TaskConfigDialog:
 
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("添加任务组" if task is None else "编辑任务组")
-        self.dialog.geometry("550x700")
+        self.dialog.geometry("550x600")
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
         self.create_form(task)
 
     def create_form(self, task):
-        """创建表单"""
-        frame = ttk.Frame(self.dialog, padding="20")
-        frame.pack(fill=tk.BOTH, expand=True)
+        """创建表单（带滚动条）"""
+        # 创建Canvas和滚动条
+        canvas = tk.Canvas(self.dialog)
+        scrollbar = ttk.Scrollbar(self.dialog, orient="vertical", command=canvas.yview)
+        frame = ttk.Frame(canvas, padding="20")
+
+        frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # 鼠标滚轮支持
+        def on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        canvas.bind("<MouseWheel>", on_mousewheel)
+        frame.bind("<MouseWheel>", on_mousewheel)
 
         # 任务名称
         ttk.Label(frame, text="任务名称:").pack(anchor=tk.W, pady=(0, 5))
@@ -68,10 +87,19 @@ class TaskConfigDialog:
         self.brand_var = tk.StringVar(value=task.get('brand', '') if task else '')
         ttk.Entry(frame, textvariable=self.brand_var, width=50).pack(fill=tk.X, pady=(0, 15))
 
-        # 企业微信Webhook
+        # 企业微信Webhook（带右键菜单）
         ttk.Label(frame, text="企业微信机器人Webhook:").pack(anchor=tk.W, pady=(0, 5))
         self.webhook_var = tk.StringVar(value=task.get('webhook_url', '') if task else '')
-        ttk.Entry(frame, textvariable=self.webhook_var, width=50).pack(fill=tk.X, pady=(0, 15))
+        self.webhook_entry = ttk.Entry(frame, textvariable=self.webhook_var, width=50)
+        self.webhook_entry.pack(fill=tk.X, pady=(0, 15))
+
+        # 右键菜单
+        def show_context_menu(event):
+            menu = tk.Menu(self.dialog, tearoff=0)
+            menu.add_command(label="粘贴", command=lambda: self.webhook_entry.event_generate("<<Paste>>"))
+            menu.post(event.x_root, event.y_root)
+
+        self.webhook_entry.bind("<Button-3>", show_context_menu)
 
         # 运行星期
         ttk.Label(frame, text="运行时间:").pack(anchor=tk.W, pady=(0, 5))
@@ -235,7 +263,7 @@ class TaskConfigDialog:
             'platform': self.platform_var.get(),
             'keyword': keyword,
             'brand': brand,
-            ''webhook_url': self.webhook_var.get().strip(),
+            'webhook_url': self.webhook_var.get().strip(),
             'weekdays': weekdays,
             'enabled': self.enabled_var.get(),
             **schedule_config

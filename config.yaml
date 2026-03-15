@@ -2,7 +2,7 @@ scheduler:
   interval: 300
   night_mode: true
   night_start: '23:00'
-  night_end: '07:00'
+  night_end: 07:00
   random_jitter: 0.2
 wechat_bots:
   default:
