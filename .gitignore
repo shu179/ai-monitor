@@ -10,7 +10,7 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+/lib/
 lib64/
 parts/
 sdist/
@@ -28,17 +28,38 @@ env/
 # 敏感配置（包含真实webhook等）
 config.local.yaml
 .env
+doubao.json
+doubao_auth.json
+doubao_profile*/
 
 # 运行时数据
-auth/*/            # 登录状态
-screenshots/       # 截图文件
-logs/              # 日志文件
-user_data*/        # 浏览器数据
-temp_profile*/     # 临时浏览器配置
+# 登录状态
+auth/*/
+*_auth.json
+*browser_state.json
+# 截图文件
+screenshots/
+# 日志文件
+logs/
+# 生成的报告/导出文件
+reports/
+exports/
+# 本地应用数据
+.app_data*/
+# 浏览器数据
+user_data*/
+# 临时浏览器配置
+temp_profile*/
+temp_test_detection/
+
+# 前端依赖
+node_modules/
+web-ui/node_modules/
 
 # IDE
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 *~

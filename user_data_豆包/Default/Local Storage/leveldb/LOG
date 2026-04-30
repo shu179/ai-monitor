@@ -1,5 +1,0 @@
-2026/03/14-18:47:27.177 3af15 Creating DB /Users/shuao/Desktop/ai-monitor/user_data_豆包/Default/Local Storage/leveldb since it was missing.
-2026/03/14-18:47:27.182 3af15 Reusing MANIFEST /Users/shuao/Desktop/ai-monitor/user_data_豆包/Default/Local Storage/leveldb/MANIFEST-000001
-2026/03/14-18:48:10.998 3b4d9 Level-0 table #5: started
-2026/03/14-18:48:11.003 3b4d9 Level-0 table #5: 321569 bytes OK
-2026/03/14-18:48:11.005 3b4d9 Delete type=0 #3

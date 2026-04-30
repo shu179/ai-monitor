@@ -1,8 +1,0 @@
-2026/03/14-18:36:37.653 38662 Reusing MANIFEST /Users/shuao/Desktop/ai-monitor/user_data/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/MANIFEST-000001
-2026/03/14-18:36:37.653 38662 Recovering log #4
-2026/03/14-18:36:37.653 38662 Reusing old log /Users/shuao/Desktop/ai-monitor/user_data/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/000004.log 
-2026/03/14-18:36:37.661 38661 Level-0 table #8: started
-2026/03/14-18:36:37.662 38661 Level-0 table #8: 1633 bytes OK
-2026/03/14-18:36:37.667 38661 Delete type=0 #4
-2026/03/14-18:36:37.667 38661 Manual compaction at level-0 from '\x00\x02\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x03\x00\x00\x00' @ 0 : 0; will stop at (end)
-2026/03/14-18:38:02.443 38674 Manual compaction at level-0 from '\x00\x03\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x04\x00\x00\x00' @ 0 : 0; will stop at (end)
