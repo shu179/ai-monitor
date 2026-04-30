@@ -1,0 +1,111 @@
+:root {
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "kern" 1, "liga" 1, "clig" 1, "calt" 1;
+}
+
+html,
+body,
+button,
+input,
+textarea,
+select {
+  font-family: var(--font-sans);
+}
+
+h1,
+h2,
+.app-display-heading {
+  font-family: var(--font-sans);
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 1.02;
+  color: var(--brand-navy);
+}
+
+.app-subtle-copy {
+  color: #5d6c88;
+  letter-spacing: -0.01em;
+}
+
+.app-english-display {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  line-height: 0.98;
+  color: var(--brand-navy);
+}
+
+.app-wordmark-heading {
+  font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, "Source Han Serif SC", "Noto Serif SC", "Songti SC", "STSong", "Source Serif 4", serif !important;
+  font-weight: 700;
+  font-synthesis: weight;
+  letter-spacing: -0.02em;
+  line-height: 1.04;
+  color: var(--brand-navy);
+}
+
+.app-canvas {
+  background: #fcfdff;
+}
+
+.app-frost-card {
+  background: rgba(255, 255, 255, 0.86);
+  border: 1px solid rgba(var(--brand-cyan-rgb), 0.16);
+  box-shadow:
+    0 16px 40px -26px rgba(var(--brand-navy-rgb), 0.24),
+    0 2px 8px rgba(var(--brand-cyan-rgb), 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(10px);
+}
+
+.app-chip {
+  background: rgba(255, 255, 255, 0.84);
+  border: 1px solid rgba(var(--brand-cyan-rgb), 0.14);
+  box-shadow:
+    0 8px 20px -18px rgba(var(--brand-navy-rgb), 0.24),
+    0 2px 6px rgba(var(--brand-cyan-rgb), 0.08);
+}
+
+.app-divider {
+  border-color: rgba(var(--brand-cyan-rgb), 0.16);
+}
+
+@keyframes loading-brand-dot-2-reveal {
+  0%,
+  33.32% {
+    opacity: 0;
+  }
+
+  33.33%,
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes loading-brand-dot-3-reveal {
+  0%,
+  66.65% {
+    opacity: 0;
+  }
+
+  66.66%,
+  100% {
+    opacity: 1;
+  }
+}
+
+.loading-brand-dot-2,
+.loading-brand-dot-3 {
+  opacity: 0;
+}
+
+.loading-brand-dot-2 {
+  animation: loading-brand-dot-2-reveal 3s steps(1, end) infinite;
+}
+
+.loading-brand-dot-3 {
+  animation: loading-brand-dot-3-reveal 3s steps(1, end) infinite;
+}

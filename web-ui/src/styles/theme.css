@@ -1,0 +1,104 @@
+@import "tailwindcss";
+
+:root {
+  --brand-navy: #173A43;
+  --brand-navy-rgb: 23, 58, 67;
+  --brand-cyan: #14C7F3;
+  --brand-cyan-rgb: 20, 199, 243;
+  --brand-cyan-soft: #D9F7FE;
+}
+
+@theme {
+  --color-blue-50: #F1FCFF;
+  --color-blue-100: #D9F7FE;
+  --color-blue-200: #B8F0FB;
+  --color-blue-300: #82E5F8;
+  --color-blue-400: #47D6F5;
+  --color-blue-500: #14C7F3;
+  --color-blue-600: #16A6C8;
+  --color-blue-700: #16798C;
+  --color-blue-800: #185762;
+  --color-blue-900: #173A43;
+  --color-blue-950: #0D2227;
+
+  --color-primary-50: #F1FCFF;
+  --color-primary-100: #D9F7FE;
+  --color-primary-200: #B8F0FB;
+  --color-primary-300: #82E5F8;
+  --color-primary-400: #47D6F5;
+  --color-primary-500: #14C7F3;
+  --color-primary-600: #16A6C8;
+  --color-primary-700: #16798C;
+  --color-primary-800: #185762;
+  --color-primary-900: #173A43;
+  --color-primary-950: #0D2227;
+  
+  --font-sans: "SF Pro Text", "SF Pro Display", "Segoe UI Variable", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-display: Georgia, "Times New Roman", "Noto Serif SC", "Source Han Serif SC", "Songti SC", SimSun, serif;
+
+  --scrollbar-thumb: rgba(148, 163, 184, 0.28);
+  --scrollbar-thumb-hover: rgba(100, 116, 139, 0.5);
+  --scrollbar-track: rgba(15, 23, 42, 0.04);
+  --scrollbar-track-hover: rgba(15, 23, 42, 0.08);
+}
+
+@layer utilities {
+  .custom-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: transparent transparent;
+    scrollbar-gutter: stable;
+  }
+
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: transparent transparent;
+    scrollbar-gutter: stable;
+    margin-inline-end: -28px;
+    padding-inline-end: 28px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar,
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 7px;
+    height: 7px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-track,
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+    border-radius: 999px;
+    margin-block: 8px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb,
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: transparent;
+    border: 1px solid transparent;
+    background-clip: padding-box;
+    border-radius: 999px;
+    min-height: 44px;
+    box-shadow: none;
+  }
+
+  .custom-scrollbar:hover,
+  .scrollbar-thin:hover {
+    scrollbar-color: var(--scrollbar-thumb-hover) transparent;
+  }
+
+  .custom-scrollbar:hover::-webkit-scrollbar-track,
+  .scrollbar-thin:hover::-webkit-scrollbar-track {
+    background: linear-gradient(180deg, rgba(255,255,255,0.12), rgba(226,232,240,0.14));
+  }
+
+  .custom-scrollbar:hover::-webkit-scrollbar-thumb,
+  .scrollbar-thin:hover::-webkit-scrollbar-thumb,
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover,
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, rgba(100,116,139,0.54), rgba(71,85,105,0.4));
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-corner,
+  .scrollbar-thin::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+}
