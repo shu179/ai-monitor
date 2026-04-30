@@ -1,0 +1,39 @@
+{
+  "app_name": "Surfaced",
+  "channels": {
+    "stable": {
+      "version": "2026.04.20",
+      "channel": "stable",
+      "published_at": "2026-04-20T10:00:00+08:00",
+      "notes": "1. 修复平台会话池的稳定性问题。\n2. 优化元宝与文心输入提交流程。\n3. 补充升级基础设施。",
+      "download_page_url": "https://example.com/surfaced/releases",
+      "packages": {
+        "darwin-arm64": {
+          "url": "https://example.com/surfaced/Surfaced-macos-arm64.zip",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "windows-x64": {
+          "url": "https://example.com/surfaced/Surfaced-windows-x64.zip",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    },
+    "beta": {
+      "version": "2026.04.22",
+      "channel": "beta",
+      "published_at": "2026-04-22T20:30:00+08:00",
+      "notes": "Beta 预览版，用于提前验证新平台调度策略。",
+      "download_page_url": "https://example.com/surfaced/beta",
+      "packages": {
+        "darwin-arm64": {
+          "url": "https://example.com/surfaced/Surfaced-beta-macos-arm64.zip",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "windows-x64": {
+          "url": "https://example.com/surfaced/Surfaced-beta-windows-x64.zip",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    }
+  }
+}

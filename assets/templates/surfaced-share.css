@@ -1,0 +1,274 @@
+/* Surfaced - Share Template Styles */
+:root {
+  --bg-color: #fafafa;
+  --text-dark: #0f172a;
+  --text-body: #475569;
+  --text-light: #94a3b8;
+  --cyan: #0ea5e9;
+  --cyan-muted: rgba(14, 165, 233, 0.15);
+  
+  --bubble-ai-bg: #ffffff;
+  --bubble-ai-border: rgba(226, 232, 240, 0.8);
+  --bubble-user-bg: #0f172a;
+  --bubble-user-text: #f8fafc;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 80px 20px 60px;
+  background-color: var(--bg-color);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Source Han Sans CN', 'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  min-height: 100vh;
+  position: relative;
+  overflow-x: hidden;
+}
+
+.bg-glow {
+  position: fixed;
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: -1;
+}
+
+  .top-glow {
+  top: -10%;
+  left: -10%;
+  width: 40vw;
+  height: 40vw;
+  background: rgba(14, 165, 233, 0.08);
+  filter: blur(120px);
+}
+
+.bottom-glow {
+  bottom: -10%;
+  right: -5%;
+  width: 50vw;
+  height: 50vw;
+  background: rgba(96, 165, 250, 0.04);
+  filter: blur(150px);
+}
+
+.share-card {
+  width: 100%;
+  max-width: 760px;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(226, 232, 240, 0.6);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border-radius: 32px;
+  padding: 64px 48px 48px;
+  box-shadow: 0 30px 60px -15px rgba(0, 0, 0, 0.05), 0 0 0 1px rgba(255,255,255,0.5) inset;
+  display: flex;
+  flex-direction: column;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  padding-bottom: 24px;
+  margin-bottom: 40px;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.6);
+}
+
+.header-meta {
+  font-family: 'Inter', sans-serif;
+  font-size: 12px;
+  color: #94a3b8;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.logo {
+  font-family: 'Newsreader', serif;
+  font-size: 32px;
+  font-weight: 400;
+  color: var(--text-dark);
+  letter-spacing: -0.02em;
+}
+
+.logo .cyan {
+  color: var(--cyan);
+}
+
+.chat-area {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  margin-bottom: 40px;
+}
+
+.message {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.message.user {
+  flex-direction: row-reverse;
+}
+
+.avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.user-avatar {
+  background: var(--bg-color);
+  color: var(--text-dark);
+  border: 1px solid var(--bubble-ai-border);
+}
+
+.ai-avatar {
+  background: #f8fafc;
+  border: 1px solid var(--bubble-ai-border);
+}
+
+.bubble {
+  max-width: 80%;
+  padding: 12px 20px;
+  font-size: 15px;
+  line-height: 1.6;
+  border-radius: 20px;
+}
+
+.user-bubble {
+  background: var(--bubble-user-bg);
+  color: var(--bubble-user-text);
+  box-shadow: 0 10px 15px -3px rgba(15, 23, 42, 0.1);
+}
+
+.ai-text {
+  flex: 1;
+  max-width: 604px;
+  font-size: 15px;
+  line-height: 1.75;
+  letter-spacing: 0.01em;
+  color: #1e293b;
+}
+
+.answer-body h1,
+.answer-body h2,
+.answer-body h3,
+.answer-body h4,
+.answer-body h5,
+.answer-body h6 {
+  margin: 1.05em 0 0.55em;
+  color: var(--text-dark);
+  line-height: 1.35;
+  letter-spacing: -0.02em;
+}
+
+.answer-body h1 { font-size: 30px; }
+.answer-body h2 { font-size: 24px; }
+.answer-body h3 { font-size: 20px; }
+.answer-body h4 { font-size: 18px; }
+.answer-body h5,
+.answer-body h6 { font-size: 16px; }
+
+.answer-body > h1:first-child,
+.answer-body > h2:first-child,
+.answer-body > h3:first-child,
+.answer-body > h4:first-child,
+.answer-body > h5:first-child,
+.answer-body > h6:first-child {
+  line-height: 1.18;
+  margin-top: -0.12em !important;
+}
+
+.ai-text p { margin: 0 0 16px 0; }
+.ai-text p:last-child { margin-bottom: 0; }
+.ai-text ul, .ai-text ol { margin: 0 0 16px 0; padding-left: 1.35em; }
+.ai-text li { margin-bottom: 10px; }
+.ai-text li > p { margin: 0; }
+.ai-text li > p + p { margin-top: 8px; }
+.ai-text li::marker { color: var(--text-dark); }
+.ai-text strong { color: var(--text-dark); font-weight: 600; }
+.term-highlight { background-color: rgba(14, 165, 233, 0.1); color: #0284c7; padding: 2px 6px; border-radius: 6px; font-weight: 500; font-size: 0.95em; }
+.ai-text code { font-family: 'JetBrains Mono', monospace; font-size: 13px; background: rgba(15, 23, 42, 0.05); padding: 2px 6px; border-radius: 4px; }
+.ai-text pre { background: rgba(15, 23, 42, 0.03); border: 1px solid rgba(226, 232, 240, 0.8); border-radius: 8px; padding: 16px; overflow-x: auto; margin-bottom: 16px; }
+.ai-text pre code { background: transparent; padding: 0; }
+.ai-text blockquote { border-left: 3px solid var(--cyan); padding-left: 16px; margin: 0 0 16px 0; color: var(--text-light); }
+.ai-text table { width: 100%; border-collapse: collapse; margin-bottom: 16px; font-size: 14px; }
+.ai-text th, .ai-text td { border-bottom: 1px solid rgba(226, 232, 240, 0.8); padding: 8px 12px; text-align: left; }
+.ai-text th { font-weight: 600; color: var(--text-dark); }
+.answer-block {
+  margin: 0;
+}
+.answer-block > :first-child {
+  margin-top: 0 !important;
+}
+.answer-block > :last-child {
+  margin-bottom: 0 !important;
+}
+.answer-body img,
+.answer-body picture,
+.answer-body figure,
+.answer-body figure img {
+  display: none !important;
+}
+
+.footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 32px;
+  border-top: 1px solid rgba(226, 232, 240, 0.6);
+}
+
+.time {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--text-light);
+  letter-spacing: 0.05em;
+}
+
+.brand-text {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-light);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+@media (max-width: 640px) {
+  .share-card { padding: 24px; }
+  .bubble { padding: 12px 16px; max-width: 90%; }
+  .footer { flex-direction: column; gap: 16px; align-items: flex-start; }
+}
+
+html {
+  background-color: var(--bg-color);
+}
+
+body {
+  isolation: isolate;
+}
+
+.bg-glow {
+  z-index: 0;
+}
+
+.share-card {
+  position: relative;
+  z-index: 1;
+}

@@ -1,0 +1,78 @@
+from pathlib import Path
+import tempfile
+import unittest
+
+import main
+from core.task_results import (
+    build_execution_report,
+    count_task_keywords,
+    count_task_queries,
+    finalize_execution_report,
+    make_query_result_key,
+    result_has_usable_screenshot,
+)
+
+
+class TaskResultsTests(unittest.TestCase):
+    def test_main_compatibility_exports_point_to_task_result_helpers(self):
+        self.assertIs(main._count_task_queries, count_task_queries)
+        self.assertIs(main._build_execution_report, build_execution_report)
+        self.assertIs(main._finalize_execution_report, finalize_execution_report)
+
+    def test_counts_only_executable_keywords_and_queries(self):
+        keywords = [
+            {"keyword": "词1", "brand": "品牌A", "platforms": ["doubao", "kimi"]},
+            {"keyword": "词1", "brand": "品牌A", "platforms": ["tongyi"]},
+            {"keyword": "", "brand": "品牌A", "platforms": ["doubao"]},
+            {"keyword": "词2", "brand": "", "platforms": []},
+            {"keyword": "词3", "brand": "", "platforms": ["doubao"]},
+        ]
+
+        self.assertEqual(count_task_queries(keywords, "默认品牌"), 4)
+        self.assertEqual(count_task_keywords(keywords, "默认品牌"), 2)
+
+    def test_execution_report_and_notification_finalization_preserve_status_rules(self):
+        task = {"task_id": "task-a", "name": "品牌A"}
+        report = build_execution_report(
+            task,
+            [
+                {"keyword": "词1", "platform": "doubao", "brand": "品牌A", "rank": 1, "mode": "browser"},
+                {
+                    "keyword": "词2",
+                    "platform": "kimi",
+                    "brand": "品牌A",
+                    "rank": 99,
+                    "mode": "browser",
+                    "error_message": "未配置 api_key",
+                },
+            ],
+            1.234,
+        )
+
+        self.assertEqual(report["round_status"], "partial")
+        self.assertEqual(report["failure_kind"], "structural")
+        self.assertEqual(report["successful_brands"], ["品牌A"])
+        self.assertEqual(report["failed_query_details"][0]["failure_type"], "structural_error")
+
+        finalized = finalize_execution_report(
+            {"round_status": "success", "failure_kind": ""},
+            {"success": False, "error_message": "企业微信发送失败"},
+        )
+        self.assertEqual(finalized["task_status"], "failed")
+        self.assertEqual(finalized["task_failure_kind"], "notification")
+
+    def test_query_key_normalizes_platform_and_screenshot_requires_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            screenshot = Path(tmpdir) / "hit.jpg"
+            screenshot.write_bytes(b"fake-image")
+
+            self.assertEqual(
+                make_query_result_key(" 词 ", "豆包", " 品牌 "),
+                ("词", "doubao", "品牌"),
+            )
+            self.assertTrue(result_has_usable_screenshot({"screenshot": str(screenshot)}))
+            self.assertFalse(result_has_usable_screenshot({"screenshot": str(screenshot) + ".missing"}))
+
+
+if __name__ == "__main__":
+    unittest.main()

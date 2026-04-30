@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Surfaced - Shared Conversation</title>
+  <style>
+{style_block}
+  </style>
+</head>
+<body>
+  <div class="bg-glow top-glow"></div>
+  <div class="bg-glow bottom-glow"></div>
+
+  <div class="share-card">
+    <header class="header">
+      <div class="logo">Surfaced<span class="cyan">.</span></div>
+      <div class="header-meta">THREAD SNAPSHOT</div>
+    </header>
+
+    <main class="chat-area">
+      {keyword_section}
+
+      <div class="message ai">
+        <div class="avatar ai-avatar">
+          {logo_html}
+        </div>
+        <div class="ai-text answer-body">
+          {html_body}
+        </div>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div class="time">{timestamp}</div>
+      <div class="brand-text">AI MONITORING</div>
+    </footer>
+  </div>
+</body>
+</html>
