@@ -303,11 +303,16 @@ def _build_dashboard_trend(tasks: list[dict[str, Any]], range_key: str) -> dict[
 
 def _build_dashboard_media_stats_monthly(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
     today = date.today()
-    first_day = today.replace(day=1)
-    total_days = (today - first_day).days + 1
-    day_list = [first_day + timedelta(days=offset) for offset in range(total_days)]
+    window_days = 30
+    first_day = today - timedelta(days=window_days - 1)
+    day_list = [first_day + timedelta(days=offset) for offset in range(window_days)]
     stats_by_day = {
-        current_day.isoformat(): {"name": f"{current_day.day}日", "auth": 0, "self": 0}
+        current_day.isoformat(): {
+            "date": current_day.isoformat(),
+            "name": f"{current_day.month}/{current_day.day}",
+            "auth": 0,
+            "self": 0,
+        }
         for current_day in day_list
     }
 

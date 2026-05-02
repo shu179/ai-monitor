@@ -198,6 +198,8 @@ def record(
             legacy_records = _load(_task_file(task_name))
             _compute_rates_locked(task_name, legacy_records)
 
+    return entry
+
 
 def get_records(
     task_name: str = "",
@@ -229,6 +231,28 @@ def get_records(
 
     records.sort(key=lambda item: str(item.get("ts") or ""))
     return records
+
+
+def get_records_file_signature(
+    task_name: str = "",
+    *,
+    task_id: str = "",
+    include_legacy: bool = True,
+) -> tuple[tuple[str, int, int], ...]:
+    """Return a cheap source signature for the files read by get_records()."""
+    task_name = str(task_name or "").strip()
+    task_id = str(task_id or "").strip()
+    signatures: list[tuple[str, int, int]] = []
+    for key in _history_read_targets(task_id=task_id, task_name=task_name, include_legacy=include_legacy):
+        path = _task_file(key)
+        try:
+            stat = path.stat()
+            signatures.append((str(path), int(stat.st_mtime_ns), int(stat.st_size)))
+        except FileNotFoundError:
+            signatures.append((str(path), 0, 0))
+        except Exception:
+            signatures.append((str(path), -1, -1))
+    return tuple(signatures)
 
 
 def extract_success_record_screenshot_paths(record: dict) -> list[str]:

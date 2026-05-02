@@ -697,6 +697,7 @@ class RecognitionTextMatchingTests(unittest.TestCase):
                     ],
                 }
                 manager = ClipboardRecognitionManager(lambda: config)
+                manager.set_active_capture_platform("doubao")
 
                 result = manager._mark_referenced_articles_from_text(
                     "引用链接：https://example.com/a/123?utm_campaign=abc",
@@ -711,7 +712,12 @@ class RecognitionTextMatchingTests(unittest.TestCase):
 
         self.assertEqual(result["matched_count"], 1)
         self.assertEqual(articles[0].get("referenced_tasks"), ["品牌A任务"])
-        self.assertIn("品牌A任务", articles[0].get("reference_hits", {}))
+        hit = articles[0].get("reference_hits", {}).get("品牌A任务")
+        self.assertIsInstance(hit, dict)
+        self.assertEqual(hit.get("count"), 1)
+        self.assertEqual(hit.get("source"), "unit_test")
+        self.assertEqual(hit.get("events")[0].get("platform"), "doubao")
+        self.assertEqual(hit.get("events")[0].get("source"), "unit_test")
 
 
 if __name__ == "__main__":

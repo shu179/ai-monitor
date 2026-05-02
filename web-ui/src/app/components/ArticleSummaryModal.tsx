@@ -3,8 +3,8 @@ import { createPortal } from "react-dom";
 import { X, Download, Calendar, Landmark, Zap, ArrowUpRight, RefreshCw, Trash2, Pencil, Upload, Check, Undo2 } from "lucide-react";
 import { Bar, BarChart, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer } from "recharts";
 import { ConfirmModal } from "./ConfirmModal";
-import type { ArticleSnapshot } from "../lib/backend";
-import { ARTICLE_DATA_CHANGED_EVENT, confirmArticleTableImport, deleteArticle, exportTaskArticlesToWecom, fetchArticles, fetchPendingArticleTableImports, fetchSettings, importArticlesFromFile, runAccountArticleCrawl, undoArticleTableImport, updateArticle, updateArticleMediaType } from "../lib/backend";
+import type { ArticleReferenceRankingDailyPoint, ArticleReferenceRankingItem, ArticleReferenceRankingPlatform, ArticleReferenceRankingResponse, ArticleSnapshot } from "../lib/backend";
+import { ARTICLE_DATA_CHANGED_EVENT, confirmArticleTableImport, deleteArticle, exportTaskArticlesToWecom, fetchArticles, fetchPendingArticleTableImports, fetchSettings, fetchTaskArticleReferenceRanking, importArticlesFromFile, runAccountArticleCrawl, undoArticleTableImport, updateArticle, updateArticleMediaType } from "../lib/backend";
 import type { ArticleEditValue } from "./ArticleEditModal";
 import { ArticleEditModal } from "./ArticleEditModal";
 import { getMediaBranding } from "../lib/mediaBranding";
@@ -17,6 +17,14 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "./ui/context-menu";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 
 type Article = {
   id: string;
@@ -160,6 +168,70 @@ function formatArticleExportKeywords(article: Article) {
     .map((name) => String(name || "").trim())
     .filter(Boolean);
   return labels.length ? labels : ["未识别关键词"];
+}
+
+function formatRankingDate(value: string) {
+  const raw = String(value || "").trim();
+  return raw ? raw.slice(0, 10) : "--";
+}
+
+function formatRankingPlatformLabel(platform: ArticleReferenceRankingPlatform) {
+  return `${platform.label || platform.id}`;
+}
+
+function formatRankingPlatformNames(platforms: ArticleReferenceRankingPlatform[]) {
+  if (!platforms.length) {
+    return "未记录平台";
+  }
+  return platforms
+    .map((platform) => formatRankingPlatformLabel(platform))
+    .filter(Boolean)
+    .join("、");
+}
+
+function downloadRankingCsv(
+  fileBaseName: string,
+  items: ArticleReferenceRankingItem[],
+  dateRange: { start: string; end: string },
+  platformFilterLabel: string,
+) {
+  const headers = [
+    "排名",
+    "标题",
+    "来源",
+    "链接",
+    "平台",
+    "首次引用",
+    "最近引用",
+    "引用范围开始",
+    "引用范围结束",
+    "平台筛选",
+  ];
+  const rows = [
+    headers,
+    ...items.map((item) => [
+      String(item.rank || ""),
+      item.article.title,
+      item.article.source,
+      item.article.url,
+      formatRankingPlatformNames(item.platforms),
+      formatRankingDate(item.first_referenced_at),
+      formatRankingDate(item.last_referenced_at),
+      dateRange.start || "全部",
+      dateRange.end || "全部",
+      platformFilterLabel,
+    ]),
+  ];
+  const csv = `\ufeff${rows.map((row) => row.map((cell) => escapeCsvCell(cell)).join(",")).join("\n")}`;
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${fileBaseName}.csv`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function downloadArticlesCsv(
@@ -352,28 +424,42 @@ export function ArticleSummaryModal({
   scope = "task",
   onClose,
 }: ArticleSummaryModalProps) {
+  const isAllScope = scope === "all";
+  const canShowRanking = Boolean(taskId) && !isAllScope;
   const [filterType, setFilterType] = useState<"all" | "media" | "self-media">("all");
   const [dateRange, setDateRange] = useState({ start: "", end: "" });
+  const [viewMode, setViewMode] = useState<"detail" | "ranking">("detail");
+  const [platformFilter, setPlatformFilter] = useState("all");
   const [showExportConfirm, setShowExportConfirm] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [isCrawling, setIsCrawling] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [isLoadingArticles, setIsLoadingArticles] = useState(true);
+  const [isLoadingRanking, setIsLoadingRanking] = useState(false);
   const [pendingImportAction, setPendingImportAction] = useState<"confirm" | "undo" | null>(null);
   const [exportNotice, setExportNotice] = useState<ExportNotice | null>(null);
   const [pendingArticleImport, setPendingArticleImport] = useState<PendingArticleImport | null>(null);
   const [articles, setArticles] = useState<Article[]>([]);
+  const [rankingData, setRankingData] = useState<ArticleReferenceRankingResponse | null>(null);
   const [visibleArticleCount, setVisibleArticleCount] = useState(ARTICLE_INITIAL_RENDER_COUNT);
+  const [visibleRankingCount, setVisibleRankingCount] = useState(ARTICLE_INITIAL_RENDER_COUNT);
   const [editingArticle, setEditingArticle] = useState<Article | null>(null);
   const [articleEditSaving, setArticleEditSaving] = useState(false);
   const [articleExportShowKeywordCategory, setArticleExportShowKeywordCategory] = useState(false);
   const [articleExportShowSelfMediaAccount, setArticleExportShowSelfMediaAccount] = useState(true);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const articleListRef = useRef<HTMLDivElement | null>(null);
+  const platformFilterMenuRef = useRef<HTMLDivElement | null>(null);
+  const [isPlatformFilterMenuOpen, setIsPlatformFilterMenuOpen] = useState(false);
+  const [rankingSinglePlatformId, setRankingSinglePlatformId] = useState("");
 
-  const isAllScope = scope === "all";
+  const isRankingMode = canShowRanking && viewMode === "ranking";
   const modalTitle = isAllScope ? "全部文章" : brandName;
-  const exportFileBaseName = isAllScope ? "全部文章汇总" : `${brandName}-文章汇总`;
+  const exportFileBaseName = isAllScope
+    ? "全部文章汇总"
+    : isRankingMode
+      ? `${brandName}-引用排名`
+      : `${brandName}-文章汇总`;
 
   useEffect(() => {
     if (!exportNotice) {
@@ -382,6 +468,32 @@ export function ArticleSummaryModal({
     const timer = window.setTimeout(() => setExportNotice(null), 2600);
     return () => window.clearTimeout(timer);
   }, [exportNotice]);
+
+  useEffect(() => {
+    if (!canShowRanking && viewMode === "ranking") {
+      setViewMode("detail");
+    }
+  }, [canShowRanking, viewMode]);
+
+  useEffect(() => {
+    if (!isRankingMode) {
+      setIsPlatformFilterMenuOpen(false);
+    }
+  }, [isRankingMode]);
+
+  useEffect(() => {
+    if (!isPlatformFilterMenuOpen) {
+      return;
+    }
+    if (platformFilter === "all") {
+      setIsPlatformFilterMenuOpen(false);
+    }
+  }, [isPlatformFilterMenuOpen, platformFilter]);
+
+  useEffect(() => {
+    setPlatformFilter("all");
+    setRankingData(null);
+  }, [taskId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -434,6 +546,35 @@ export function ArticleSummaryModal({
   }, [articleExportShowKeywordCategory, taskName]);
 
   useEffect(() => {
+    if (!canShowRanking || !isRankingMode || !taskId) {
+      return;
+    }
+    let cancelled = false;
+    const loadRanking = async () => {
+      setIsLoadingRanking(true);
+      try {
+        const result = await fetchTaskArticleReferenceRanking(taskId, {
+          platform: platformFilter,
+          date_from: dateRange.start,
+          date_to: dateRange.end,
+        });
+        if (cancelled) {
+          return;
+        }
+        setRankingData(result);
+      } finally {
+        if (!cancelled) {
+          setIsLoadingRanking(false);
+        }
+      }
+    };
+    void loadRanking();
+    return () => {
+      cancelled = true;
+    };
+  }, [canShowRanking, dateRange.end, dateRange.start, isRankingMode, platformFilter, taskId]);
+
+  useEffect(() => {
     if (!isAllScope) {
       return;
     }
@@ -475,7 +616,7 @@ export function ArticleSummaryModal({
   useEffect(() => {
     setVisibleArticleCount(ARTICLE_INITIAL_RENDER_COUNT);
     articleListRef.current?.scrollTo({ top: 0 });
-  }, [articles, dateRange.end, dateRange.start, filterType]);
+  }, [articles, dateRange.end, dateRange.start, filterType, isRankingMode]);
 
   const visibleArticles = useMemo(
     () => filteredArticles.slice(0, visibleArticleCount),
@@ -507,15 +648,123 @@ export function ArticleSummaryModal({
       filteredArticles.length,
     ));
   }, [filteredArticles.length]);
+
+  const rankingItems = useMemo(() => rankingData?.items || [], [rankingData]);
+  const rankingDailyPoints = useMemo(() => rankingData?.daily_points || [], [rankingData]);
+  const rankingAvailablePlatforms = useMemo(() => rankingData?.available_platforms || [], [rankingData]);
+  const hasMultipleRankingPlatforms = rankingAvailablePlatforms.length > 1;
+  const visibleRankingItems = useMemo(
+    () => rankingItems.slice(0, visibleRankingCount),
+    [rankingItems, visibleRankingCount],
+  );
+  const hasMoreVisibleRanking = visibleRankingItems.length < rankingItems.length;
+  const loadMoreVisibleRanking = useCallback(() => {
+    setVisibleRankingCount((current) => Math.min(
+      current + ARTICLE_RENDER_BATCH_SIZE,
+      rankingItems.length,
+    ));
+  }, [rankingItems.length]);
   const handleArticleListScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
+    const target = event.currentTarget;
+    if (isRankingMode) {
+      if (!hasMoreVisibleRanking) {
+        return;
+      }
+      if (target.scrollHeight - target.scrollTop - target.clientHeight < 260) {
+        loadMoreVisibleRanking();
+      }
+      return;
+    }
     if (!hasMoreVisibleArticles) {
       return;
     }
-    const target = event.currentTarget;
     if (target.scrollHeight - target.scrollTop - target.clientHeight < 260) {
       loadMoreVisibleArticles();
     }
-  }, [hasMoreVisibleArticles, loadMoreVisibleArticles]);
+  }, [hasMoreVisibleArticles, hasMoreVisibleRanking, isRankingMode, loadMoreVisibleArticles, loadMoreVisibleRanking]);
+
+  const rankingTotalEvents = useMemo(
+    () => rankingItems.reduce((sum, item) => sum + (item.effective_event_count || 0), 0),
+    [rankingItems],
+  );
+  const rankingCrossArticleCount = useMemo(
+    () => rankingItems.filter((item) => (item.platform_count || 0) >= 2).length,
+    [rankingItems],
+  );
+  const rankingActiveDays = useMemo(() => {
+    const days = new Set<string>();
+    for (const point of rankingDailyPoints) {
+      if ((point.event_count || 0) > 0) {
+        days.add(point.date);
+      }
+    }
+    return days.size;
+  }, [rankingDailyPoints]);
+  const rankingSelectedPlatformLabel = useMemo(() => {
+    if (platformFilter === "all") {
+      return "全部平台";
+    }
+    if (platformFilter === "cross") {
+      return "跨平台";
+    }
+    return rankingAvailablePlatforms.find((platform) => platform.id === platformFilter)?.label || platformFilter;
+  }, [platformFilter, rankingAvailablePlatforms]);
+  const rankingDisplayedPlatform = useMemo(() => {
+    const displayId = platformFilter !== "all" && platformFilter !== "cross"
+      ? platformFilter
+      : rankingSinglePlatformId;
+    return rankingAvailablePlatforms.find((platform) => platform.id === displayId) || rankingAvailablePlatforms[0] || null;
+  }, [platformFilter, rankingAvailablePlatforms, rankingSinglePlatformId]);
+
+  useEffect(() => {
+    if (!hasMultipleRankingPlatforms) {
+      setIsPlatformFilterMenuOpen(false);
+    }
+  }, [hasMultipleRankingPlatforms]);
+
+  useEffect(() => {
+    if (!rankingAvailablePlatforms.length) {
+      setRankingSinglePlatformId("");
+      return;
+    }
+    setRankingSinglePlatformId((current) => {
+      if (current && rankingAvailablePlatforms.some((platform) => platform.id === current)) {
+        return current;
+      }
+      return rankingAvailablePlatforms[0].id;
+    });
+    if (rankingAvailablePlatforms.length === 1 && platformFilter !== rankingAvailablePlatforms[0].id) {
+      setPlatformFilter(rankingAvailablePlatforms[0].id);
+    }
+  }, [platformFilter, rankingAvailablePlatforms]);
+
+  useEffect(() => {
+    if (!isPlatformFilterMenuOpen) {
+      return;
+    }
+    const handlePointerDown = (event: MouseEvent) => {
+      if (platformFilterMenuRef.current && !platformFilterMenuRef.current.contains(event.target as Node)) {
+        setIsPlatformFilterMenuOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsPlatformFilterMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isPlatformFilterMenuOpen]);
+  useEffect(() => {
+    setVisibleRankingCount(ARTICLE_INITIAL_RENDER_COUNT);
+    if (isRankingMode) {
+      articleListRef.current?.scrollTo({ top: 0 });
+    }
+  }, [dateRange.end, dateRange.start, isRankingMode, platformFilter, rankingData]);
 
   const selfMediaCount = useMemo(
     () => filteredArticles.filter((article) => article.type === "self-media").length,
@@ -530,8 +779,31 @@ export function ArticleSummaryModal({
     : filterType === "self-media"
       ? `${selfMediaCount} 篇自媒体`
       : `${mediaCount} 篇权威媒体 / ${selfMediaCount} 篇自媒体`;
+  const currentExportCount = isRankingMode ? rankingItems.length : filteredArticles.length;
 
   const exportArticles = async () => {
+    if (isRankingMode) {
+      if (!rankingItems.length) {
+        return;
+      }
+      setIsExporting(true);
+      try {
+        downloadRankingCsv(exportFileBaseName, rankingItems, dateRange, rankingSelectedPlatformLabel);
+        setExportNotice({
+          tone: "success",
+          message: `已导出 ${rankingItems.length} 条引用排名`,
+        });
+      } catch (error) {
+        setExportNotice({
+          tone: "error",
+          message: error instanceof Error ? error.message : "导出失败",
+        });
+      } finally {
+        setIsExporting(false);
+      }
+      return;
+    }
+
     if (!filteredArticles.length) {
       return;
     }
@@ -785,11 +1057,11 @@ export function ArticleSummaryModal({
               ) : null}
               <button
                 onClick={() => setShowExportConfirm(true)}
-                disabled={!filteredArticles.length || isExporting}
+                disabled={!currentExportCount || isExporting}
                 className={HEADER_ACTION_CLASS}
               >
                 <Upload className="w-3.5 h-3.5" />
-                {isExporting ? "导出中..." : "导出当前数据"}
+                {isExporting ? "导出中..." : isRankingMode ? "导出当前排名" : "导出当前数据"}
               </button>
               <span className="hidden text-gray-200 sm:inline">/</span>
               <button
@@ -872,160 +1144,430 @@ export function ArticleSummaryModal({
 
           <div className="min-h-0 min-w-0 flex-1 overflow-hidden bg-white">
             <div className="grid h-full min-h-0 min-w-0 grid-cols-1 overflow-hidden lg:grid-cols-[284px_minmax(0,1fr)]">
-              <aside className="flex min-h-0 min-w-0 flex-col px-4 py-5 sm:px-6">
+              <aside className="flex min-h-0 min-w-0 flex-col px-4 py-5 sm:px-6 lg:border-r lg:border-gray-200/70">
                 <section className="flex min-h-0 flex-1 flex-col">
                   <div className="mb-5 flex items-center gap-2.5">
                     <div className="h-5 w-1.5 rounded-full bg-[var(--brand-navy)]" />
-                    <h3 className="text-[16px] font-black tracking-[0.08em] text-gray-900">数据洞察</h3>
+                    <h3 className="text-[16px] font-black tracking-[0.08em] text-gray-900">
+                      {isRankingMode ? "引用趋势" : "数据洞察"}
+                    </h3>
                   </div>
 
-                  <div className="mb-4 flex flex-wrap items-start justify-between gap-3 sm:gap-4">
-                    <div>
-                      <div className="text-[12px] font-black tracking-[0.16em] text-gray-400">发布趋势</div>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-3 pt-0.5 sm:gap-4">
-                      <button
-                        onClick={() => setFilterType(filterType === "media" ? "all" : "media")}
-                        className={`${FILTER_ACTION_BASE_CLASS} ${filterType === "media" ? FILTER_ACTION_ACTIVE_CLASS : FILTER_ACTION_IDLE_CLASS}`}
-                      >
-                        <Landmark className="w-3.5 h-3.5" /> 权威媒体
-                      </button>
-                      <span className="w-px h-2.5 bg-gray-200"></span>
-                      <button
-                        onClick={() => setFilterType(filterType === "self-media" ? "all" : "self-media")}
-                        className={`${FILTER_ACTION_BASE_CLASS} ${filterType === "self-media" ? FILTER_ACTION_ACTIVE_CLASS : FILTER_ACTION_IDLE_CLASS}`}
-                      >
-                        <Zap className="w-3.5 h-3.5" /> 自媒体
-                      </button>
-                    </div>
-                  </div>
+                  {isRankingMode ? (
+                    <>
+                      <div className="mb-4 flex flex-wrap items-start justify-between gap-3 sm:gap-4">
+                        <div>
+                          <div className="text-[12px] font-black tracking-[0.16em] text-gray-400">引用平台</div>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                          {hasMultipleRankingPlatforms ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => setPlatformFilter("all")}
+                                className={`${FILTER_ACTION_BASE_CLASS} ${platformFilter === "all" ? FILTER_ACTION_ACTIVE_CLASS : FILTER_ACTION_IDLE_CLASS}`}
+                              >
+                                全部平台
+                              </button>
+                              <span className="w-px h-2.5 bg-gray-200"></span>
+                              <button
+                                type="button"
+                                onClick={() => setPlatformFilter(platformFilter === "cross" ? "all" : "cross")}
+                                className={`${FILTER_ACTION_BASE_CLASS} ${platformFilter === "cross" ? FILTER_ACTION_ACTIVE_CLASS : FILTER_ACTION_IDLE_CLASS}`}
+                              >
+                                跨平台
+                              </button>
+                              <span className="w-px h-2.5 bg-gray-200"></span>
+                            </>
+                          ) : null}
+                          <div ref={platformFilterMenuRef} className="relative shrink-0">
+                            {hasMultipleRankingPlatforms ? (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (platformFilter !== "all") {
+                                    setIsPlatformFilterMenuOpen((current) => !current);
+                                  }
+                                }}
+                                disabled={platformFilter === "all"}
+                                className={`${FILTER_ACTION_BASE_CLASS} ${
+                                  platformFilter === "all" ? FILTER_ACTION_IDLE_CLASS : FILTER_ACTION_ACTIVE_CLASS
+                                }`}
+                                aria-haspopup="menu"
+                                aria-expanded={platformFilter !== "all" && isPlatformFilterMenuOpen}
+                              >
+                                {rankingDisplayedPlatform?.label || "单平台"}
+                                {rankingDisplayedPlatform ? (
+                                  <span className="ml-0.5 text-[10px] font-bold tabular-nums text-gray-300">
+                                    {rankingDisplayedPlatform.event_count || 0}
+                                  </span>
+                                ) : null}
+                              </button>
+                            ) : (
+                              <span className={`${FILTER_ACTION_BASE_CLASS} ${FILTER_ACTION_ACTIVE_CLASS}`}>
+                                {rankingDisplayedPlatform?.label || "单平台"}
+                                {rankingDisplayedPlatform ? (
+                                  <span className="ml-0.5 text-[10px] font-bold tabular-nums text-gray-300">
+                                    {rankingDisplayedPlatform.event_count || 0}
+                                  </span>
+                                ) : null}
+                              </span>
+                            )}
 
-                  <BrandMediaChart
-                    brandName={modalTitle}
-                    filterType={filterType}
-                    articles={filteredArticles}
-                    dateRange={dateRange}
-                    className="flex min-h-0 flex-1 flex-col"
-                    chartHeight={158}
-                  />
-
-                  <div className="mt-3 border-b border-gray-200 pb-2.5 transition-colors focus-within:border-[var(--brand-navy)]">
-                    <div className="flex items-center gap-3">
-                      <div className="shrink-0 text-[10px] font-bold tracking-[0.16em] text-gray-400 uppercase">
-                        时间范围
+                            {hasMultipleRankingPlatforms && platformFilter !== "all" && isPlatformFilterMenuOpen ? (
+                              <div className={`${ARTICLE_MENU_CONTENT_CLASS} absolute right-0 top-full z-30 mt-2`}>
+                                <div className={ARTICLE_MENU_LABEL_CLASS}>
+                                  切换平台
+                                </div>
+                                {rankingAvailablePlatforms.map((platform) => {
+                                  const isSelected = rankingDisplayedPlatform?.id === platform.id;
+                                  return (
+                                    <button
+                                      key={platform.id}
+                                      type="button"
+                                      onClick={() => {
+                                        setRankingSinglePlatformId(platform.id);
+                                        setPlatformFilter(platform.id);
+                                        setIsPlatformFilterMenuOpen(false);
+                                      }}
+                                      title={platform.id}
+                                      className={`${ARTICLE_MENU_ACTION_CLASS} flex w-full items-center justify-between`}
+                                    >
+                                      <span className={`min-w-0 truncate ${isSelected ? "text-[var(--brand-navy)]" : "text-gray-700"}`}>
+                                        {platform.label || platform.id}
+                                      </span>
+                                      <span className="shrink-0 text-[10px] font-bold tabular-nums text-gray-300">
+                                        {platform.event_count || 0}
+                                      </span>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
                       </div>
-                      <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5">
-                        <DatePickerField
-                          value={dateRange.start}
-                          onChange={(value) => setDateRange({ ...dateRange, start: value })}
-                          fromYear={2020}
-                          toYear={new Date().getFullYear() + 1}
-                          placeholder="开始"
-                          variant="compact"
-                          icon={<Calendar className="w-3 h-3 text-gray-300 shrink-0" />}
-                          className="min-w-0 flex-1"
-                          triggerClassName="h-7 w-full justify-end !border-0 !rounded-none !bg-transparent !px-0 !py-0 text-[12px] font-bold tracking-wide !shadow-none hover:!bg-transparent hover:!shadow-none focus:!border-0 focus:!ring-0"
-                          contentClassName="shadow-[0_12px_30px_-26px_rgba(15,23,42,0.24)]"
-                          showTodayShortcut={false}
-                          surface="plain"
-                        />
-                        <span className="shrink-0 text-[11px] font-bold text-gray-300">—</span>
-                        <DatePickerField
-                          value={dateRange.end}
-                          onChange={(value) => setDateRange({ ...dateRange, end: value })}
-                          fromYear={2020}
-                          toYear={new Date().getFullYear() + 1}
-                          placeholder="结束"
-                          variant="compact"
-                          icon={<Calendar className="w-3 h-3 text-gray-300 shrink-0" />}
-                          className="min-w-0 flex-1"
-                          triggerClassName="h-7 w-full justify-end !border-0 !rounded-none !bg-transparent !px-0 !py-0 text-[12px] font-bold tracking-wide !shadow-none hover:!bg-transparent hover:!shadow-none focus:!border-0 focus:!ring-0"
-                          contentClassName="shadow-[0_12px_30px_-26px_rgba(15,23,42,0.24)]"
-                          showTodayShortcut={false}
-                          surface="plain"
-                        />
+
+                      <div className="mb-4 grid grid-cols-2 gap-3">
+                        <div className="border-b border-gray-100 pb-2">
+                          <div className="text-[9px] font-bold tracking-[0.14em] text-gray-400">被引文章数</div>
+                          <div className="mt-1 text-[18px] font-black leading-none text-gray-900 tabular-nums">
+                            {rankingItems.length}
+                          </div>
+                        </div>
+                        <div className="border-b border-gray-100 pb-2">
+                          <div className="text-[9px] font-bold tracking-[0.14em] text-gray-400">总引用事件</div>
+                          <div className="mt-1 text-[18px] font-black leading-none text-gray-900 tabular-nums">
+                            {rankingTotalEvents}
+                          </div>
+                        </div>
+                        <div className="border-b border-gray-100 pb-2">
+                          <div className="text-[9px] font-bold tracking-[0.14em] text-gray-400">跨平台文章数</div>
+                          <div className="mt-1 text-[18px] font-black leading-none text-gray-900 tabular-nums">
+                            {rankingCrossArticleCount}
+                          </div>
+                        </div>
+                        <div className="border-b border-gray-100 pb-2">
+                          <div className="text-[9px] font-bold tracking-[0.14em] text-gray-400">活跃天数</div>
+                          <div className="mt-1 text-[18px] font-black leading-none text-gray-900 tabular-nums">
+                            {rankingActiveDays}
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                  </div>
+
+                      <ReferenceTrendChart
+                        items={rankingItems}
+                        dailyPoints={rankingDailyPoints}
+                        loading={isLoadingRanking}
+                        className="flex min-h-0 flex-1 flex-col"
+                        chartHeight={158}
+                      />
+
+                      <div className="mt-3 border-b border-gray-200 pb-2.5 transition-colors focus-within:border-[var(--brand-cyan)]">
+                        <div className="flex items-center gap-3">
+                          <div className="shrink-0 text-[10px] font-bold tracking-[0.16em] text-gray-400 uppercase">
+                            引用发生日
+                          </div>
+                          <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5">
+                            <DatePickerField
+                              value={dateRange.start}
+                              onChange={(value) => setDateRange({ ...dateRange, start: value })}
+                              fromYear={2020}
+                              toYear={new Date().getFullYear() + 1}
+                              placeholder="开始"
+                              variant="compact"
+                              icon={<Calendar className="w-3 h-3 text-gray-300 shrink-0" />}
+                              className="min-w-0 flex-1"
+                              triggerClassName="h-7 w-full justify-end !border-0 !rounded-none !bg-transparent !px-0 !py-0 text-[12px] font-bold tracking-wide !shadow-none hover:!bg-transparent hover:!shadow-none focus:!border-0 focus:!ring-0"
+                              contentClassName="shadow-[0_12px_30px_-26px_rgba(15,23,42,0.24)]"
+                              showTodayShortcut={false}
+                              surface="plain"
+                            />
+                            <span className="shrink-0 text-[11px] font-bold text-gray-300">—</span>
+                            <DatePickerField
+                              value={dateRange.end}
+                              onChange={(value) => setDateRange({ ...dateRange, end: value })}
+                              fromYear={2020}
+                              toYear={new Date().getFullYear() + 1}
+                              placeholder="结束"
+                              variant="compact"
+                              icon={<Calendar className="w-3 h-3 text-gray-300 shrink-0" />}
+                              className="min-w-0 flex-1"
+                              triggerClassName="h-7 w-full justify-end !border-0 !rounded-none !bg-transparent !px-0 !py-0 text-[12px] font-bold tracking-wide !shadow-none hover:!bg-transparent hover:!shadow-none focus:!border-0 focus:!ring-0"
+                              contentClassName="shadow-[0_12px_30px_-26px_rgba(15,23,42,0.24)]"
+                              showTodayShortcut={false}
+                              surface="plain"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="mb-4 flex flex-wrap items-start justify-between gap-3 sm:gap-4">
+                        <div>
+                          <div className="text-[12px] font-black tracking-[0.16em] text-gray-400">发布趋势</div>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-3 pt-0.5 sm:gap-4">
+                          <button
+                            onClick={() => setFilterType(filterType === "media" ? "all" : "media")}
+                            className={`${FILTER_ACTION_BASE_CLASS} ${filterType === "media" ? FILTER_ACTION_ACTIVE_CLASS : FILTER_ACTION_IDLE_CLASS}`}
+                          >
+                            <Landmark className="w-3.5 h-3.5" /> 权威媒体
+                          </button>
+                          <span className="w-px h-2.5 bg-gray-200"></span>
+                          <button
+                            onClick={() => setFilterType(filterType === "self-media" ? "all" : "self-media")}
+                            className={`${FILTER_ACTION_BASE_CLASS} ${filterType === "self-media" ? FILTER_ACTION_ACTIVE_CLASS : FILTER_ACTION_IDLE_CLASS}`}
+                          >
+                            <Zap className="w-3.5 h-3.5" /> 自媒体
+                          </button>
+                        </div>
+                      </div>
+
+                      <BrandMediaChart
+                        brandName={modalTitle}
+                        filterType={filterType}
+                        articles={filteredArticles}
+                        dateRange={dateRange}
+                        className="flex min-h-0 flex-1 flex-col"
+                        chartHeight={158}
+                      />
+
+                      <div className="mt-3 border-b border-gray-200 pb-2.5 transition-colors focus-within:border-[var(--brand-navy)]">
+                        <div className="flex items-center gap-3">
+                          <div className="shrink-0 text-[10px] font-bold tracking-[0.16em] text-gray-400 uppercase">
+                            时间范围
+                          </div>
+                          <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5">
+                            <DatePickerField
+                              value={dateRange.start}
+                              onChange={(value) => setDateRange({ ...dateRange, start: value })}
+                              fromYear={2020}
+                              toYear={new Date().getFullYear() + 1}
+                              placeholder="开始"
+                              variant="compact"
+                              icon={<Calendar className="w-3 h-3 text-gray-300 shrink-0" />}
+                              className="min-w-0 flex-1"
+                              triggerClassName="h-7 w-full justify-end !border-0 !rounded-none !bg-transparent !px-0 !py-0 text-[12px] font-bold tracking-wide !shadow-none hover:!bg-transparent hover:!shadow-none focus:!border-0 focus:!ring-0"
+                              contentClassName="shadow-[0_12px_30px_-26px_rgba(15,23,42,0.24)]"
+                              showTodayShortcut={false}
+                              surface="plain"
+                            />
+                            <span className="shrink-0 text-[11px] font-bold text-gray-300">—</span>
+                            <DatePickerField
+                              value={dateRange.end}
+                              onChange={(value) => setDateRange({ ...dateRange, end: value })}
+                              fromYear={2020}
+                              toYear={new Date().getFullYear() + 1}
+                              placeholder="结束"
+                              variant="compact"
+                              icon={<Calendar className="w-3 h-3 text-gray-300 shrink-0" />}
+                              className="min-w-0 flex-1"
+                              triggerClassName="h-7 w-full justify-end !border-0 !rounded-none !bg-transparent !px-0 !py-0 text-[12px] font-bold tracking-wide !shadow-none hover:!bg-transparent hover:!shadow-none focus:!border-0 focus:!ring-0"
+                              contentClassName="shadow-[0_12px_30px_-26px_rgba(15,23,42,0.24)]"
+                              showTodayShortcut={false}
+                              surface="plain"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </>
+                  )}
                 </section>
               </aside>
 
               <section className="flex min-h-0 min-w-0 flex-col bg-white">
-                <div className="border-b border-gray-200/70 px-4 py-4 sm:pl-6 sm:pr-8">
-                  <div className="flex flex-wrap items-start justify-between gap-3 sm:gap-4">
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-baseline gap-2">
-                        <span className="text-[12px] font-bold tracking-[0.16em] uppercase text-gray-400">文章明细</span>
-                        <span className="text-[12px] font-semibold text-gray-700">{detailSummaryText}</span>
-                      </div>
-                    </div>
-                    <div className="shrink-0 text-[11px] font-bold text-gray-500">
-                      共 {allGroupedArticleCount} 组时间层
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid min-w-0 shrink-0 grid-cols-[minmax(112px,150px)_minmax(0,1fr)_auto] gap-3 px-4 py-2 text-[10px] font-bold tracking-[0.16em] text-gray-400 uppercase sm:grid-cols-[minmax(140px,180px)_minmax(0,1fr)_100px] sm:gap-4 sm:pl-6 sm:pr-8">
-                  <div className="min-w-0">媒体 / 来源</div>
-                  <div>文章标题</div>
-                  <div className="w-[76px] text-right sm:w-[100px]">发布时间</div>
-                </div>
-
-                <div
-                  ref={articleListRef}
-                  onScroll={handleArticleListScroll}
-                  className="min-w-0 flex-1 overflow-y-auto px-4 pb-3 custom-scrollbar bg-white sm:pl-6 sm:pr-8"
-                >
-                  {isLoadingArticles && !visibleGroupedArticles.length ? (
-                    <div className="flex h-full min-h-[240px] items-center justify-center border border-dashed border-gray-200 bg-gray-50/40 text-[13px] font-medium text-gray-400">
-                      正在加载文章记录...
-                    </div>
-                  ) : visibleGroupedArticles.length > 0 ? (
-                    <div className="flex flex-col">
-                      {visibleGroupedArticles.map((group) => (
-                        <div key={group.date || group.label} className="flex flex-col">
-                          <div className="sticky top-0 z-10 flex items-center justify-between bg-white/95 py-2 backdrop-blur-sm">
-                            <span className="text-[11px] font-bold tracking-[0.16em] uppercase text-gray-500">
-                              {group.label}
-                            </span>
-                            <span className="text-[11px] font-bold text-gray-400">
-                              {group.count} 篇
-                            </span>
-                          </div>
-                          <div className="flex flex-col">
-                            {group.items.map((article) => (
-                              <ArticleRow
-                                key={article.id}
-                                article={article}
-                                onTypeClick={(type) => setFilterType(filterType === type ? "all" : type)}
-                                onSetMediaType={(mediaType) => {
-                                  void handleArticleMediaTypeChange(article.id, mediaType);
-                                }}
-                                onEdit={() => setEditingArticle(article)}
-                                onClear={() => {
-                                  void handleArticleRemove(article.id);
-                                }}
-                              />
-                            ))}
+                {isRankingMode ? (
+                  <>
+                    <div className="border-b border-gray-200/70 px-4 py-4 sm:pl-6 sm:pr-8">
+                      <div className="flex flex-wrap items-start justify-between gap-3 sm:gap-4">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-baseline gap-1.5 text-[12px] font-bold tracking-[0.16em] uppercase">
+                            <button
+                              type="button"
+                              onClick={() => setViewMode("detail")}
+                              className={`transition-colors ${
+                                canShowRanking ? "text-gray-300 hover:text-gray-500 cursor-pointer" : "text-gray-300 cursor-default"
+                              }`}
+                              disabled={!canShowRanking}
+                              aria-label="切换到文章明细"
+                            >
+                              文章明细
+                            </button>
+                            <span className="font-normal text-gray-200" aria-hidden="true">/</span>
+                            <span className="text-gray-700">引用排名</span>
                           </div>
                         </div>
-                      ))}
-                      {hasMoreVisibleArticles ? (
-                        <button
-                          type="button"
-                          onClick={loadMoreVisibleArticles}
-                          className="mt-3 inline-flex h-9 items-center justify-center border border-gray-200 bg-white text-[12px] font-bold text-gray-500 transition-colors hover:border-gray-300 hover:text-gray-900"
-                        >
-                          继续加载 {Math.min(ARTICLE_RENDER_BATCH_SIZE, filteredArticles.length - visibleArticles.length)} 篇
-                        </button>
-                      ) : null}
+                        <div className="shrink-0 text-[11px] font-bold text-gray-500">
+                          共 {rankingItems.length} 篇 · {rankingCrossArticleCount} 篇跨平台
+                        </div>
+                      </div>
                     </div>
-                  ) : (
-                    <div className="flex h-full min-h-[240px] items-center justify-center border border-dashed border-gray-200 bg-gray-50/40 text-[13px] font-medium text-gray-400">
-                      当前筛选下暂无文章记录
+
+                    <div className="grid min-w-0 shrink-0 grid-cols-[32px_minmax(0,1fr)_104px_74px] gap-2 px-4 py-2 text-[10px] font-bold tracking-[0.16em] text-gray-400 uppercase sm:grid-cols-[40px_minmax(0,1fr)_132px_90px] sm:gap-3 sm:pl-6 sm:pr-8">
+                      <div className="min-w-0">排名</div>
+                      <div>文章标题</div>
+                      <div className="text-center">平台</div>
+                      <div className="w-full text-right">最近引用</div>
                     </div>
-                  )}
-                </div>
+
+                    <div
+                      ref={articleListRef}
+                      onScroll={handleArticleListScroll}
+                      className="min-w-0 flex-1 overflow-y-auto px-4 pb-3 custom-scrollbar bg-white sm:pl-6 sm:pr-8"
+                    >
+                      {isLoadingRanking && !visibleRankingItems.length ? (
+                        <div className="flex h-full min-h-[240px] items-center justify-center border border-dashed border-gray-200 bg-gray-50/40 text-[13px] font-medium text-gray-400">
+                          正在计算引用排名...
+                        </div>
+                      ) : visibleRankingItems.length > 0 ? (
+                        <div className="flex flex-col -mr-[10px]">
+                          {visibleRankingItems.map((item) => (
+                            <RankingRow
+                              key={item.article.id || `${item.rank}-${item.article.url}`}
+                              item={item}
+                              onOpen={() => {
+                                if (!item.article.url) {
+                                  return;
+                                }
+                                const normalized = /^https?:\/\//i.test(item.article.url) ? item.article.url : `https://${item.article.url}`;
+                                window.open(normalized, "_blank", "noopener,noreferrer");
+                              }}
+                            />
+                          ))}
+                          {hasMoreVisibleRanking ? (
+                            <button
+                              type="button"
+                              onClick={loadMoreVisibleRanking}
+                              className="mt-3 inline-flex h-9 items-center justify-center border border-gray-200 bg-white text-[12px] font-bold text-gray-500 transition-colors hover:border-gray-300 hover:text-gray-900"
+                            >
+                              继续加载 {Math.min(ARTICLE_RENDER_BATCH_SIZE, rankingItems.length - visibleRankingItems.length)} 条
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <div className="flex h-full min-h-[240px] items-center justify-center border border-dashed border-gray-200 bg-gray-50/40 text-[13px] font-medium text-gray-400">
+                          当前筛选下暂无引用排名
+                        </div>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="border-b border-gray-200/70 px-4 py-4 sm:pl-6 sm:pr-8">
+                      <div className="flex flex-wrap items-center justify-between gap-3 sm:flex-nowrap sm:gap-4">
+                        <div className="min-w-0 flex items-baseline gap-1.5 text-[12px] font-bold tracking-[0.16em] uppercase">
+                          <span className="text-gray-700">文章明细</span>
+                          {canShowRanking ? (
+                            <>
+                              <span className="font-normal text-gray-200" aria-hidden="true">/</span>
+                              <button
+                                type="button"
+                                onClick={() => setViewMode("ranking")}
+                                className="text-gray-300 transition-colors hover:text-gray-500 cursor-pointer"
+                                aria-label="切换到引用排名"
+                              >
+                                引用排名
+                              </button>
+                            </>
+                          ) : null}
+                        </div>
+                        <div className="flex min-w-0 flex-1 items-center justify-end gap-2.5">
+                          <span className="min-w-0 truncate text-[11px] font-bold text-gray-500">
+                            {detailSummaryText}
+                          </span>
+                          <span className="h-4 w-px shrink-0 bg-gray-200" aria-hidden="true" />
+                          <span className="shrink-0 text-[11px] font-bold text-gray-500">
+                            共 {allGroupedArticleCount} 组时间层
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid min-w-0 shrink-0 grid-cols-[minmax(112px,150px)_minmax(0,1fr)_auto] gap-3 px-4 py-2 text-[10px] font-bold tracking-[0.16em] text-gray-400 uppercase sm:grid-cols-[minmax(140px,180px)_minmax(0,1fr)_100px] sm:gap-4 sm:pl-6 sm:pr-8">
+                      <div className="min-w-0">媒体 / 来源</div>
+                      <div>文章标题</div>
+                      <div className="w-[76px] text-right sm:w-[100px]">发布时间</div>
+                    </div>
+
+                    <div
+                      ref={articleListRef}
+                      onScroll={handleArticleListScroll}
+                      className="min-w-0 flex-1 overflow-y-auto px-4 pb-3 custom-scrollbar bg-white sm:pl-6 sm:pr-8"
+                    >
+                      {isLoadingArticles && !visibleGroupedArticles.length ? (
+                        <div className="flex h-full min-h-[240px] items-center justify-center border border-dashed border-gray-200 bg-gray-50/40 text-[13px] font-medium text-gray-400">
+                          正在加载文章记录...
+                        </div>
+                      ) : visibleGroupedArticles.length > 0 ? (
+                        <div className="flex flex-col">
+                          {visibleGroupedArticles.map((group) => (
+                            <div key={group.date || group.label} className="flex flex-col">
+                              <div className="sticky top-0 z-10 flex items-center justify-between bg-white/95 py-2 backdrop-blur-sm">
+                                <span className="text-[11px] font-bold tracking-[0.16em] uppercase text-gray-500">
+                                  {group.label}
+                                </span>
+                                <span className="text-[11px] font-bold text-gray-400">
+                                  {group.count} 篇
+                                </span>
+                              </div>
+                              <div className="flex flex-col">
+                                {group.items.map((article) => (
+                                  <ArticleRow
+                                    key={article.id}
+                                    article={article}
+                                    onTypeClick={(type) => setFilterType(filterType === type ? "all" : type)}
+                                    onSetMediaType={(mediaType) => {
+                                      void handleArticleMediaTypeChange(article.id, mediaType);
+                                    }}
+                                    onEdit={() => setEditingArticle(article)}
+                                    onClear={() => {
+                                      void handleArticleRemove(article.id);
+                                    }}
+                                  />
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                          {hasMoreVisibleArticles ? (
+                            <button
+                              type="button"
+                              onClick={loadMoreVisibleArticles}
+                              className="mt-3 inline-flex h-9 items-center justify-center border border-gray-200 bg-white text-[12px] font-bold text-gray-500 transition-colors hover:border-gray-300 hover:text-gray-900"
+                            >
+                              继续加载 {Math.min(ARTICLE_RENDER_BATCH_SIZE, filteredArticles.length - visibleArticles.length)} 篇
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <div className="flex h-full min-h-[240px] items-center justify-center border border-dashed border-gray-200 bg-gray-50/40 text-[13px] font-medium text-gray-400">
+                          当前筛选下暂无文章记录
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
               </section>
             </div>
           </div>
@@ -1036,13 +1578,21 @@ export function ArticleSummaryModal({
         isOpen={showExportConfirm}
         onClose={() => setShowExportConfirm(false)}
         onConfirm={() => { void exportArticles(); }}
-        title={isAllScope ? "确认导出当前筛选文章？" : "确认发送当前筛选文章到企业微信？"}
-        message={
-          isAllScope
-            ? `将导出当前筛选的 ${filteredArticles.length} 篇文章记录。筛选范围：${dateRange.start || "全部开始日期"} 至 ${dateRange.end || "全部结束日期"}。`
-            : `将生成 Excel 表格，并通过当前品牌任务配置的 webhook 发送 ${filteredArticles.length} 篇文章记录。筛选范围：${dateRange.start || "全部开始日期"} 至 ${dateRange.end || "全部结束日期"}。`
+        title={
+          isRankingMode
+            ? "确认导出当前引用排名？"
+            : isAllScope
+              ? "确认导出当前筛选文章？"
+              : "确认发送当前筛选文章到企业微信？"
         }
-        confirmText={isExporting ? "处理中..." : isAllScope ? "确认导出" : "确认发送"}
+        message={
+          isRankingMode
+            ? `将导出当前筛选的 ${rankingItems.length} 条引用排名。平台筛选：${rankingSelectedPlatformLabel}。引用发生日范围：${dateRange.start || "全部开始日期"} 至 ${dateRange.end || "全部结束日期"}。`
+            : isAllScope
+              ? `将导出当前筛选的 ${filteredArticles.length} 篇文章记录。筛选范围：${dateRange.start || "全部开始日期"} 至 ${dateRange.end || "全部结束日期"}。`
+              : `将生成 Excel 表格，并通过当前品牌任务配置的 webhook 发送 ${filteredArticles.length} 篇文章记录。筛选范围：${dateRange.start || "全部开始日期"} 至 ${dateRange.end || "全部结束日期"}。`
+        }
+        confirmText={isExporting ? "处理中..." : isRankingMode ? "确认导出" : isAllScope ? "确认导出" : "确认发送"}
         type="primary"
       />
       <ArticleEditModal
@@ -1207,6 +1757,233 @@ function ArticleRow({
         </ContextMenuItem>
       </ContextMenuContent>
     </ContextMenu>
+  );
+}
+
+function RankingRow({
+  item,
+  onOpen,
+}: {
+  item: ArticleReferenceRankingItem;
+  onOpen?: () => void;
+}) {
+  const platforms = item.platforms || [];
+  const visiblePlatforms = platforms.slice(0, 3);
+  const hiddenPlatformCount = Math.max(0, platforms.length - visiblePlatforms.length);
+  const hasPlatforms = visiblePlatforms.length > 0;
+  return (
+    <div
+      className="grid w-full min-w-0 grid-cols-[32px_minmax(0,1fr)_104px_74px] items-start gap-2 border-t border-gray-100 py-3 transition-colors group cursor-pointer first:border-t-0 hover:bg-gray-50/55 sm:grid-cols-[40px_minmax(0,1fr)_132px_90px] sm:gap-3"
+      onClick={() => {
+        onOpen?.();
+      }}
+      title={item.article.url ? "左键打开文章链接" : "暂无链接"}
+    >
+      <div className="flex items-start pt-0.5">
+        <span className="text-[12px] font-black leading-none tracking-tight text-gray-400 tabular-nums">
+          {item.rank}
+        </span>
+      </div>
+
+      <div className="flex min-w-0 flex-col gap-0.5">
+        <div className="min-w-0 truncate text-[13px] font-bold leading-tight text-gray-900 transition-colors group-hover:text-blue-600">
+          {item.article.title}
+        </div>
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className="min-w-0 truncate text-[10px] font-medium text-gray-500">
+            {item.article.source}
+          </span>
+          <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[9px] font-bold leading-none tracking-wider ${
+            item.article.type === "media"
+              ? "border-sky-100 bg-sky-50 text-sky-600"
+              : "border-cyan-100 bg-cyan-50 text-cyan-600"
+          }`}>
+            {item.article.type === "media" ? "权威" : "自媒体"}
+          </span>
+        </div>
+      </div>
+
+      <div className="flex w-[104px] min-w-0 justify-center justify-self-center pt-0.5 sm:w-[132px]">
+        {hasPlatforms ? (
+          <div className="flex min-w-0 flex-wrap items-center justify-center gap-1">
+            {visiblePlatforms.map((platform) => (
+              <span
+                key={`${item.article.id}-${platform.id}`}
+                title={platform.id}
+                className="inline-flex max-w-full items-center rounded border border-gray-200 bg-gray-50 px-1.5 py-0.5 text-[9px] font-bold leading-none tracking-wider text-gray-500"
+              >
+                <span className="truncate">{platform.label}</span>
+              </span>
+            ))}
+            {hiddenPlatformCount > 0 ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label={`查看全部 ${platforms.length} 个平台`}
+                    title={platforms.map((platform) => `${platform.label} (${platform.id})`).join(" · ")}
+                    onClick={(event) => event.stopPropagation()}
+                    className="inline-flex items-center rounded border border-gray-200 bg-white px-1.5 py-0.5 text-[9px] font-bold leading-none tracking-wider text-gray-400 transition-colors hover:border-gray-300 hover:text-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-200"
+                  >
+                    +{hiddenPlatformCount}
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  align="end"
+                  sideOffset={6}
+                  className="z-[80] w-[152px] rounded-[12px] border-gray-200/90 bg-white p-1 shadow-[0_14px_30px_rgba(15,23,42,0.12)]"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <DropdownMenuLabel className="px-2 py-1 text-[9px] font-bold tracking-[0.16em] text-gray-400">
+                    全部平台
+                  </DropdownMenuLabel>
+                  <DropdownMenuSeparator className="my-1 bg-gray-100" />
+                  {platforms.map((platform) => (
+                    <DropdownMenuItem
+                      key={`${item.article.id}-${platform.id}-menu`}
+                      title={platform.id}
+                      className="h-7 rounded-[8px] px-2 text-[11px] font-semibold text-gray-600 focus:bg-gray-50 focus:text-gray-900"
+                    >
+                      <span className="min-w-0 truncate">{formatRankingPlatformLabel(platform)}</span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : null}
+          </div>
+        ) : (
+          <span
+            title="仅保留了已引用标记，未记录具体平台"
+            className="inline-flex items-center rounded border border-gray-200 bg-white px-1.5 py-0.5 text-[9px] font-bold leading-none tracking-wider text-gray-400"
+          >
+            未记录平台
+          </span>
+        )}
+      </div>
+
+      <div className="flex w-[74px] justify-end justify-self-end pt-0.5 text-right text-[11px] font-medium text-gray-500 tabular-nums sm:w-[90px]">
+        {formatRankingDate(item.last_referenced_at)}
+      </div>
+    </div>
+  );
+}
+
+function ReferenceTrendChart({
+  items,
+  dailyPoints,
+  loading,
+  className,
+  chartHeight = 140,
+}: {
+  items: ArticleReferenceRankingItem[];
+  dailyPoints: ArticleReferenceRankingDailyPoint[];
+  loading?: boolean;
+  className?: string;
+  chartHeight?: number;
+}) {
+  const chartData = useMemo(
+    () => dailyPoints.map((point) => ({
+      name: point.date.replace(/-/g, "/"),
+      value: point.article_count,
+      eventCount: point.event_count,
+      rawCount: point.raw_count,
+    })),
+    [dailyPoints],
+  );
+  const total = useMemo(
+    () => chartData.reduce((sum, item) => sum + (item.value || 0), 0),
+    [chartData],
+  );
+  const values = chartData.map((item) => Number(item.value || 0));
+  const nonZeroValues = values.filter((value) => value > 0);
+  const peak = nonZeroValues.length ? Math.max(...nonZeroValues) : 0;
+  const avg = nonZeroValues.length ? Math.round(total / nonZeroValues.length) : 0;
+
+  return (
+    <div className={className || "px-6 py-5 border-b border-gray-100 shrink-0 bg-white"}>
+      <div className="grid grid-cols-3 gap-3 border-b border-gray-100 pb-3">
+        <div>
+          <div className="text-[9px] font-bold tracking-[0.14em] text-gray-400">当前</div>
+          <div className="mt-1 flex items-end gap-0.5">
+            <span className="text-[24px] font-black leading-none tracking-[-0.04em] text-gray-900 tabular-nums">
+              {items.length.toLocaleString()}
+            </span>
+            <span className="mb-0.5 text-[11px] font-bold text-gray-500">篇</span>
+          </div>
+          <div className="mt-1 text-[10px] font-medium text-gray-400">
+            日累计 {total.toLocaleString()} 次
+          </div>
+        </div>
+        <div className="border-l border-gray-100 pl-3">
+          <div className="text-[9px] font-bold tracking-[0.14em] text-gray-400">峰值</div>
+          <div className="mt-1 text-[18px] font-black leading-none text-gray-900">
+            {peak}
+            <span className="ml-0.5 text-[11px] font-bold text-gray-500">篇</span>
+          </div>
+        </div>
+        <div className="border-l border-gray-100 pl-3">
+          <div className="text-[9px] font-bold tracking-[0.14em] text-gray-400">均值</div>
+          <div className="mt-1 text-[18px] font-black leading-none text-gray-900">
+            {avg}
+            <span className="ml-0.5 text-[11px] font-bold text-gray-500">篇</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-3 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-1.5 text-[10px] font-bold text-gray-400">
+          <span>按日被引用文章数</span>
+          <ArrowUpRight className="h-3 w-3" />
+          <span>{chartData.length} 个时间点</span>
+        </div>
+        <div className="flex items-center gap-3 text-[10px] font-bold text-gray-500">
+          <div className="flex items-center gap-1.5">
+            <div className="h-1.5 w-1.5 rounded-[2px] bg-[var(--brand-cyan)]"></div>
+            文章数
+          </div>
+        </div>
+      </div>
+
+      <div className="w-full min-h-0 flex-1 -ml-3.5 -mr-1 pb-1" style={{ minHeight: `${chartHeight}px` }}>
+        {loading && !chartData.length ? (
+          <div className="flex h-full min-h-[140px] items-center justify-center text-[13px] font-medium text-gray-400">
+            正在加载引用数据...
+          </div>
+        ) : chartData.length > 0 ? (
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={chartData} margin={{ top: 14, right: 10, left: -12, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f3f4f6" />
+              <XAxis
+                dataKey="name"
+                axisLine={false}
+                tickLine={false}
+                tick={{ fontSize: 10, fill: "#9ca3af" }}
+                interval={0}
+                angle={-38}
+                textAnchor="end"
+                dy={7}
+                height={44}
+              />
+              <YAxis
+                axisLine={false}
+                tickLine={false}
+                tick={{ fontSize: 10, fill: "#9ca3af" }}
+                dx={-5}
+              />
+              <RechartsTooltip
+                cursor={{ fill: "#f8fafc" }}
+                contentStyle={{ borderRadius: "8px", border: "none", boxShadow: "0 4px 12px rgba(0,0,0,0.05)", fontSize: "11px" }}
+              />
+              <Bar dataKey="value" name="被引文章数" fill="var(--brand-cyan)" radius={[4, 4, 0, 0]} maxBarSize={18} isAnimationActive={false} />
+            </BarChart>
+          </ResponsiveContainer>
+        ) : (
+          <div className="flex h-full min-h-[140px] items-center justify-center text-[13px] font-medium text-gray-400">
+            当前筛选下暂无引用数据
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 

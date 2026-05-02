@@ -330,15 +330,19 @@ class DashboardHelperTests(unittest.TestCase):
         self.assertEqual(stats[1]["auth"], 0)
         self.assertEqual(stats[1]["self"], 2)
 
-    def test_monthly_media_stats_uses_current_month(self) -> None:
+    def test_monthly_media_stats_uses_recent_30_day_window(self) -> None:
         today = date.today()
         stats = _build_dashboard_media_stats_monthly([
+            {"ts": (today - timedelta(days=30)).isoformat(), "media_type": "self"},
+            {"ts": (today - timedelta(days=29)).isoformat(), "media_type": "authority"},
             {"ts": today.isoformat(), "media_type": "authority"},
             {"ts": today.isoformat(), "media_type": "self"},
         ])
 
-        self.assertGreaterEqual(len(stats), 1)
-        self.assertEqual(stats[-1]["auth"], 1)
+        self.assertEqual(len(stats), 30)
+        self.assertEqual(stats[0]["date"], (today - timedelta(days=29)).isoformat())
+        self.assertEqual(stats[0]["auth"], 1)
+        self.assertEqual(stats[0]["self"], 0)
         self.assertEqual(stats[-1]["self"], 1)
 
 

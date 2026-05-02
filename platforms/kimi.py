@@ -55,8 +55,11 @@ class KimiPlatform(BasePlatform):
     def start_new_chat(self) -> None:
         """Kimi 的新对话图标本身不可直接点击，改点最近的可点击父节点。"""
         self._disable_landing_video_pointer_intercept()
+        clicked = False
+        last_error = "未找到可用的新对话按钮"
         try:
             self._raise_if_stop_requested()
+            before = self._conversation_snapshot()
             clicked = self.page.evaluate("""() => {
                 const icon = document.querySelector("svg[name='AddConversation']");
                 if (!icon) return false;
@@ -75,16 +78,31 @@ class KimiPlatform(BasePlatform):
                 }
                 return true;
             }""")
+            if clicked:
+                if self._wait_and_confirm_new_chat(before, sleep_seconds=random.uniform(0.8, 1.4)):
+                    print(f"[{self.name}] 已开启新对话")
+                    return
+                clicked = False
+                last_error = "已点击图标，但未确认切换到新会话"
             if not clicked:
                 btn = self.page.locator(self.new_chat_selector).first
                 btn.scroll_into_view_if_needed(timeout=3000)
                 self._click_locator(btn, timeout_ms=5000, force=True)
-            self._cooperative_sleep(random.uniform(0.8, 1.4))
-            self._wait_for_page_selector(self.input_selector, timeout_ms=10000)
-            print(f"[{self.name}] 已开启新对话")
+                if self._wait_and_confirm_new_chat(before, sleep_seconds=random.uniform(0.8, 1.4)):
+                    print(f"[{self.name}] 已开启新对话")
+                    return
+                clicked = False
+                last_error = "已点击按钮，但未确认切换到新会话"
         except Exception as e:
             self._reraise_stop_requested(e)
-            print(f"[{self.name}] 开启新对话失败，继续: {e}")
+            last_error = str(e) or last_error
+        if not clicked and self._attempt_learned_selector_heal("new_chat_selector", label="新对话"):
+            print(f"[{self.name}] 已通过 learned selector 开启新对话")
+            return
+        if not clicked and self._attempt_selector_agent_heal("new_chat_selector", label="新对话"):
+            print(f"[{self.name}] 已通过 selector_agent 开启新对话")
+            return
+        print(f"[{self.name}] 开启新对话失败，继续: {last_error}")
 
     def type_like_human(self, text: str) -> None:
         self._disable_landing_video_pointer_intercept()

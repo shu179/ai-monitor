@@ -1,8 +1,8 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
-import { Settings2, Save, RefreshCw, CalendarDays, Clock, X, Edit2, ChevronDown, Upload, Download, Send, ListFilter, RotateCcw } from "lucide-react";
+import { Settings2, Save, RefreshCw, CalendarDays, Clock, X, Edit2, ChevronDown, Upload, Download, Send, ListFilter, RotateCcw, Wrench } from "lucide-react";
 import { ImageWithFallback } from "./figma/ImageWithFallback";
 import { ConfirmModal } from "./ConfirmModal";
-import { browserAuthAction, checkAppUpdate, fetchAccountCrawlExclusions, fetchBrowserAuth, fetchLocalModelStatus, fetchLocalUpdatePlan, fetchPlatformKeys, fetchSettings, pickDirectory, prepareAppUpdate, prepareLocalModel, readSettingsCache, restoreAccountCrawlExclusions, savePlatformConfig, saveSettings, saveProfile, startLocalUpdate, refreshContextSnapshots, testLocalModel, testSchedulerNotificationWebhook, type AppUpdateStatusSnapshot, type BrowserAuthPlatformSnapshot, type ExcludedArticleLinkSnapshot, type LocalModelStatus, type PlatformKeyInfo } from "../lib/backend";
+import { browserAuthAction, checkAppUpdate, diagnoseSelectorHeal, diagnoseSelectorPauseState, fetchAccountCrawlExclusions, fetchBrowserAuth, fetchLocalModelStatus, fetchLocalUpdatePlan, fetchPlatformKeys, fetchSettings, pickDirectory, prepareAppUpdate, prepareLocalModel, readSettingsCache, restoreAccountCrawlExclusions, savePlatformConfig, saveSettings, saveProfile, startLocalUpdate, refreshContextSnapshots, testLocalModel, testSchedulerNotificationWebhook, type AppUpdateStatusSnapshot, type BrowserAuthPlatformSnapshot, type ExcludedArticleLinkSnapshot, type LocalModelStatus, type PlatformKeyInfo, type SelectorAgentSettingsSnapshot, type SelectorHealFieldResult, type SelectorPauseStateResponse } from "../lib/backend";
 import { notifySaveSuccess } from "../lib/saveToast";
 import { DatePickerField } from "./ui/date-picker-field";
 
@@ -305,8 +305,8 @@ const BROWSER_AUTOMATION_CONFIGS: Record<(typeof BROWSER_AUTOMATION_PLATFORM_IDS
     ]),
   },
   deepseek: {
-    summary: "新对话与深度思考",
-    note: "DeepSeek 的深度思考更接近单按钮切换，selector 配不到时仍会继续走文案识别兜底；下方也可以按平台单独覆盖语言、时区、代理等运行参数。",
+    summary: "新对话、深度思考与暂停态",
+    note: "DeepSeek 的暂停态用于判断回答仍在生成；下方也可以按平台单独覆盖语言、时区、代理等运行参数。",
     fields: withBrowserRuntimeFields([
       {
         key: "new_chat_selector",
@@ -317,6 +317,11 @@ const BROWSER_AUTOMATION_CONFIGS: Record<(typeof BROWSER_AUTOMATION_PLATFORM_IDS
         key: "deep_think_selector",
         label: "深度思考 Selector :",
         placeholder: "button:has-text('深度思考')",
+      },
+      {
+        key: "generation_pause_selector",
+        label: "暂停态 Selector :",
+        placeholder: 'path[d^="M2 4.88"]',
       },
     ]),
   },
@@ -332,8 +337,8 @@ const BROWSER_AUTOMATION_CONFIGS: Record<(typeof BROWSER_AUTOMATION_PLATFORM_IDS
     ]),
   },
   yuanbao: {
-    summary: "新对话、深度思考与联网搜索",
-    note: "元宝的联网搜索通常要先命中外层状态容器，再点内部主操作区，所以两个 selector 分开配更稳；下方也可以按平台单独覆盖语言、时区、代理等运行参数。",
+    summary: "新对话与深度思考",
+    note: "元宝现已默认联网搜索，这里只保留新对话与深度思考相关 selector；下方也可以按平台单独覆盖语言、时区、代理等运行参数。",
     fields: withBrowserRuntimeFields([
       {
         key: "new_chat_selector",
@@ -344,16 +349,6 @@ const BROWSER_AUTOMATION_CONFIGS: Record<(typeof BROWSER_AUTOMATION_PLATFORM_IDS
         key: "deep_think_selector",
         label: "深度思考 Selector :",
         placeholder: "button:has-text('深度思考')",
-      },
-      {
-        key: "web_search_container_selector",
-        label: "联网搜索容器 Selector :",
-        placeholder: ".yb-internet-search-btn",
-      },
-      {
-        key: "web_search_trigger_selector",
-        label: "联网搜索点击区 Selector :",
-        placeholder: ".yb-internet-search-btn .index_v2_mainSection__SNIvs",
       },
     ]),
   },
@@ -408,6 +403,7 @@ const BROWSER_SELECTOR_DEFAULTS: Partial<Record<BrowserAutomationPlatformId, Rec
     ...BROWSER_AUTOMATION_RUNTIME_DEFAULTS,
     new_chat_selector: "button:has(path[d^='M8 0.599609'])",
     deep_think_selector: "button:has-text('深度思考'), div:has-text('深度思考'), span:has-text('深度思考')",
+    generation_pause_selector: 'path[d^="M2 4.88"], path[d^="M2 4.87988"], path[d^="M2 4.8"]',
   },
   kimi: {
     ...BROWSER_AUTOMATION_RUNTIME_DEFAULTS,
@@ -417,8 +413,6 @@ const BROWSER_SELECTOR_DEFAULTS: Partial<Record<BrowserAutomationPlatformId, Rec
     ...BROWSER_AUTOMATION_RUNTIME_DEFAULTS,
     new_chat_selector: ".yb-icon.icon-yb-ic_newchat_20",
     deep_think_selector: "button:has-text('Deep thinking'), div:has-text('Deep thinking'), span:has-text('Deep thinking'), button:has-text('深度思考'), div:has-text('深度思考')",
-    web_search_container_selector: ".yb-internet-search-btn",
-    web_search_trigger_selector: ".yb-internet-search-btn .index_v2_mainSection__SNIvs",
   },
   tongyi: {
     ...BROWSER_AUTOMATION_RUNTIME_DEFAULTS,
@@ -935,6 +929,10 @@ export function SettingsContent({
   const [smartVisionPlatform, setSmartVisionPlatform] = useState("");
   const [smartVisionModel, setSmartVisionModel] = useState("");
 
+  const [selectorAgentEnabled, setSelectorAgentEnabled] = useState(false);
+  const [selectorAgentPlatform, setSelectorAgentPlatform] = useState("");
+  const [selectorAgentModel, setSelectorAgentModel] = useState("");
+
   const [ocrPlatform, setOcrPlatform] = useState("");
   const [ocrModel, setOcrModel] = useState("");
   const [recognitionMode, setRecognitionMode] = useState("screenshot");
@@ -971,6 +969,12 @@ export function SettingsContent({
   const [browserAuthPlatforms, setBrowserAuthPlatforms] = useState<Record<string, BrowserAuthPlatformSnapshot>>({});
   const [browserAuthPendingKey, setBrowserAuthPendingKey] = useState("");
   const [browserAuthMessages, setBrowserAuthMessages] = useState<Record<string, string>>({});
+  const [selectorHealResult, setSelectorHealResult] = useState<SelectorHealFieldResult | null>(null);
+  const [selectorHealMessage, setSelectorHealMessage] = useState("");
+  const [selectorHealDiagnosing, setSelectorHealDiagnosing] = useState(false);
+  const [selectorPauseStateResult, setSelectorPauseStateResult] = useState<SelectorPauseStateResponse | null>(null);
+  const [selectorPauseStateMessage, setSelectorPauseStateMessage] = useState("");
+  const [selectorPauseStateDiagnosing, setSelectorPauseStateDiagnosing] = useState(false);
 
   const handleAddSearchModel = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && newSearchModel.trim()) {
@@ -1240,6 +1244,13 @@ export function SettingsContent({
         if (typeof smartVision.enabled === "boolean") setSmartVisionEnabled(smartVision.enabled);
         if (smartVision.platform) setSmartVisionPlatform(String(smartVision.platform));
         if (smartVision.model) setSmartVisionModel(String(smartVision.model));
+      }
+
+      const selectorAgent = data.selector_agent as SelectorAgentSettingsSnapshot | Record<string, unknown> | undefined;
+      if (selectorAgent) {
+        if (typeof selectorAgent.enabled === "boolean") setSelectorAgentEnabled(selectorAgent.enabled);
+        if (selectorAgent.platform) setSelectorAgentPlatform(String(selectorAgent.platform));
+        if (selectorAgent.model) setSelectorAgentModel(String(selectorAgent.model));
       }
 
       // recognition -> ocrPlatform, ocrModel
@@ -1519,6 +1530,10 @@ export function SettingsContent({
     () => buildPlatformOptions(platformKeys, { visionOnly: true, currentPlatform: smartVisionPlatform, currentModel: smartVisionModel }),
     [platformKeys, smartVisionPlatform, smartVisionModel],
   );
+  const selectorAgentPlatforms = useMemo(
+    () => buildPlatformOptions(platformKeys, { currentPlatform: selectorAgentPlatform, currentModel: selectorAgentModel }),
+    [platformKeys, selectorAgentPlatform, selectorAgentModel],
+  );
   const recognitionVisionPlatforms = useMemo(
     () => buildPlatformOptions(platformKeys, { visionOnly: true, currentPlatform: ocrPlatform, currentModel: ocrModel }),
     [platformKeys, ocrPlatform, ocrModel],
@@ -1568,6 +1583,21 @@ export function SettingsContent({
       setOcrModel(current.models[0] || "");
     }
   }, [recognitionVisionPlatforms, ocrPlatform, ocrModel]);
+
+  useEffect(() => {
+    if (!selectorAgentPlatform && selectorAgentPlatforms[0]) {
+      setSelectorAgentPlatform(selectorAgentPlatforms[0].id);
+      setSelectorAgentModel(selectorAgentPlatforms[0].models[0] || "");
+      return;
+    }
+    const current = selectorAgentPlatforms.find((item) => item.id === selectorAgentPlatform);
+    if (!current && selectorAgentPlatforms[0]) {
+      setSelectorAgentPlatform(selectorAgentPlatforms[0].id);
+      setSelectorAgentModel(selectorAgentPlatforms[0].models[0] || "");
+    } else if (current && !current.models.includes(selectorAgentModel)) {
+      setSelectorAgentModel(current.models[0] || "");
+    }
+  }, [selectorAgentPlatforms, selectorAgentPlatform, selectorAgentModel]);
 
   const buildSchedulerSettingsPayload = useCallback(() => {
     const weekly_times: Record<string, string | null> = {};
@@ -1660,6 +1690,14 @@ export function SettingsContent({
       smart: buildQueryExecutionPayload({ smart: queryExecutionSettings.smart } as Record<string, QueryExecutionModeSettings>).smart,
     },
   }), [queryExecutionSettings, smartModel, smartPlatform, smartVisionEnabled, smartVisionModel, smartVisionPlatform]);
+
+  const buildSelectorAgentSettingsPayload = useCallback(() => ({
+    selector_agent: {
+      enabled: selectorAgentEnabled,
+      platform: selectorAgentPlatform.trim(),
+      model: selectorAgentModel.trim(),
+    },
+  }), [selectorAgentEnabled, selectorAgentModel, selectorAgentPlatform]);
 
   const buildSearchSettingsPayload = useCallback(() => ({
     search: {
@@ -1769,6 +1807,7 @@ export function SettingsContent({
     recognition: JSON.stringify(buildRecognitionSettingsPayload()),
     api_mode: JSON.stringify(buildApiModePayload()),
     smart: JSON.stringify(buildSmartModeSettingsPayload()),
+    selector_agent: JSON.stringify(buildSelectorAgentSettingsPayload()),
     search: JSON.stringify(buildSearchSettingsPayload()),
     local_model: JSON.stringify(buildLocalModelSettingsPayload()),
     context: JSON.stringify(buildContextSnapshotSettingsPayload()),
@@ -1787,6 +1826,7 @@ export function SettingsContent({
     buildScreenshotTemplatePayload,
     buildSearchSettingsPayload,
     buildSmartModeSettingsPayload,
+    buildSelectorAgentSettingsPayload,
   ]);
 
   useEffect(() => {
@@ -1840,6 +1880,103 @@ export function SettingsContent({
     }
   }, [applyBrowserAuthPayload, onSaveSuccess]);
 
+  const syncSavedBrowserSelector = useCallback((platformId: string, field: string, selector: string) => {
+    setBrowserSelectors((previousSelectors) => {
+      const nextSelectors = {
+        ...previousSelectors,
+        [platformId]: {
+          ...(previousSelectors[platformId] || BROWSER_SELECTOR_DEFAULTS[platformId as BrowserAutomationPlatformId] || {}),
+          [field]: selector,
+        },
+      };
+      lastSavedSettingsRef.current = {
+        ...lastSavedSettingsRef.current,
+        browser: JSON.stringify({
+          screenshot: {
+            browser_answer_mode: browserAnswerMode,
+          },
+          query_execution: {
+            browser: buildQueryExecutionPayload({ browser: queryExecutionSettings.browser } as Record<string, QueryExecutionModeSettings>).browser,
+          },
+          browser_automation: Object.fromEntries(
+            Object.entries(buildBrowserAutomationPayload(nextSelectors)),
+          ),
+        }),
+      };
+      return nextSelectors;
+    });
+  }, [browserAnswerMode, queryExecutionSettings.browser]);
+
+  const handleDiagnoseDeepSeekNewChatSelector = useCallback(async () => {
+    if (selectorHealDiagnosing || selectorPauseStateDiagnosing) {
+      return;
+    }
+    setSelectorHealDiagnosing(true);
+    setSelectorHealMessage("");
+    setSelectorHealResult(null);
+    try {
+      const result = await diagnoseSelectorHeal({
+        platform: "deepseek",
+        fields: ["new_chat_selector"],
+        verify: true,
+        auto_apply: true,
+      });
+      const fieldResult = result.results?.[0] || null;
+      if (fieldResult) {
+        setSelectorHealResult(fieldResult);
+      }
+      if (!result.ok) {
+        setSelectorHealMessage(result.blocking_reason || result.message || "诊断失败");
+        return;
+      }
+      const selector = String(fieldResult?.selector || fieldResult?.verified_selector || "").trim();
+      if (selector && fieldResult?.saved) {
+        syncSavedBrowserSelector("deepseek", "new_chat_selector", selector);
+      }
+      setSelectorHealMessage(
+        fieldResult?.save_error
+          ? fieldResult.save_error
+          : fieldResult?.saved
+          ? "已找到并自动保存 selector"
+          : fieldResult?.verify_status === "passed"
+            ? "已找到通过验证的 selector，等待自动保存"
+            : "诊断完成，未找到可直接保存的 selector",
+      );
+      if (fieldResult?.saved) {
+        notifySaveSuccess(onSaveSuccess, "DeepSeek 新对话 selector 已保存");
+      }
+    } finally {
+      setSelectorHealDiagnosing(false);
+    }
+  }, [onSaveSuccess, selectorHealDiagnosing, selectorPauseStateDiagnosing, syncSavedBrowserSelector]);
+
+  const handleDiagnoseDeepSeekPauseState = useCallback(async () => {
+    if (selectorPauseStateDiagnosing || selectorHealDiagnosing) {
+      return;
+    }
+    setSelectorPauseStateDiagnosing(true);
+    setSelectorPauseStateMessage("");
+    setSelectorPauseStateResult(null);
+    try {
+      const result = await diagnoseSelectorPauseState({ platform: "deepseek" });
+      setSelectorPauseStateResult(result);
+      if (!result.ok) {
+        setSelectorPauseStateMessage(result.blocking_reason || result.message || "暂停态诊断失败");
+        return;
+      }
+      const selector = String(result.selector || result.verified_selector || result.summary?.suggested_selector || "").trim();
+      if (selector && result.saved) {
+        syncSavedBrowserSelector("deepseek", "generation_pause_selector", selector);
+      }
+      setSelectorPauseStateMessage(result.save_error || result.message || (result.saved ? "已抓到并保存 DeepSeek 暂停态 selector" : "已抓到 DeepSeek 生成中的暂停态表达"));
+      if (result.saved) {
+        notifySaveSuccess(onSaveSuccess, "DeepSeek 暂停态 selector 已保存");
+      }
+    } finally {
+      setSelectorPauseStateDiagnosing(false);
+    }
+  }, [onSaveSuccess, selectorHealDiagnosing, selectorPauseStateDiagnosing, syncSavedBrowserSelector]);
+
   const handleSaveSettings = useCallback(async () => {
     if (savingScope) {
       return;
@@ -1873,6 +2010,9 @@ export function SettingsContent({
     }
     if (changedSections.includes("smart")) {
       Object.assign(mergedSettingsPayload, buildSmartModeSettingsPayload());
+    }
+    if (changedSections.includes("selector_agent")) {
+      Object.assign(mergedSettingsPayload, buildSelectorAgentSettingsPayload());
     }
     if (changedSections.includes("search")) {
       Object.assign(mergedSettingsPayload, buildSearchSettingsPayload());
@@ -1935,6 +2075,7 @@ export function SettingsContent({
     buildScreenshotTemplatePayload,
     buildSearchSettingsPayload,
     buildSmartModeSettingsPayload,
+    buildSelectorAgentSettingsPayload,
     captureCurrentSettingsSnapshot,
     onSaveSuccess,
     savingScope,
@@ -2300,6 +2441,10 @@ export function SettingsContent({
   const smartVisionModelOptions = withCurrentModel(
     visionPlatforms.find((p) => p.id === smartVisionPlatform)?.models || [],
     smartVisionModel,
+  );
+  const selectorAgentModelOptions = withCurrentModel(
+    selectorAgentPlatforms.find((p) => p.id === selectorAgentPlatform)?.models || [],
+    selectorAgentModel,
   );
   const ocrModelOptions = withCurrentModel(
     recognitionVisionPlatforms.find((p) => p.id === ocrPlatform)?.models || [],
@@ -2769,16 +2914,66 @@ export function SettingsContent({
                       <div className="grid grid-cols-1 md:grid-cols-[150px_minmax(0,1fr)] gap-4 border-t border-gray-200/80 pt-4 pb-4">
                         <div className="hidden md:block" />
                         <div className="space-y-4">
-                          {basicFields.map((field) => (
-                            <ControlledTextInput
-                              key={`${platformId}-${field.key}`}
-                              label={field.label}
-                              value={browserSelectors[platformId]?.[field.key] || ""}
-                              onChange={(value) => updateBrowserSelector(platformId, field.key, value)}
-                              placeholder={field.placeholder}
-                              type={field.inputType}
-                            />
-                          ))}
+                          {basicFields.map((field) => {
+                            const newChatHealEnabled = platformId === "deepseek" && field.key === "new_chat_selector";
+                            const pauseStateHealEnabled = platformId === "deepseek" && field.key === "generation_pause_selector";
+                            const selectorHealEnabled = newChatHealEnabled || pauseStateHealEnabled;
+                            return (
+                              <div key={`${platformId}-${field.key}`} className="space-y-2">
+                                <div className={selectorHealEnabled ? "grid grid-cols-[minmax(0,1fr)_auto] items-end gap-3" : ""}>
+                                  <ControlledTextInput
+                                    label={field.label}
+                                    value={browserSelectors[platformId]?.[field.key] || ""}
+                                    onChange={(value) => updateBrowserSelector(platformId, field.key, value)}
+                                    placeholder={field.placeholder}
+                                    type={field.inputType}
+                                  />
+                                  {selectorHealEnabled ? (
+                                    <div className="flex h-9 items-center gap-3">
+                                      {newChatHealEnabled ? (
+                                        <button
+                                          type="button"
+                                          onClick={handleDiagnoseDeepSeekNewChatSelector}
+                                          disabled={selectorHealDiagnosing || selectorPauseStateDiagnosing}
+                                          className="inline-flex items-center gap-1.5 border-b border-gray-300 px-0 text-[12px] font-bold text-gray-700 transition-colors hover:border-gray-900 hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-50"
+                                        >
+                                          <Wrench className={`h-3.5 w-3.5 ${selectorHealDiagnosing ? "animate-spin" : ""}`} />
+                                          {selectorHealDiagnosing ? "抓取中" : "自动抓取"}
+                                        </button>
+                                      ) : null}
+                                      {pauseStateHealEnabled ? (
+                                        <button
+                                          type="button"
+                                          onClick={handleDiagnoseDeepSeekPauseState}
+                                          aria-label="诊断 DeepSeek 暂停态 selector"
+                                          title="诊断 DeepSeek 暂停态 selector"
+                                          disabled={selectorPauseStateDiagnosing || selectorHealDiagnosing}
+                                          className="inline-flex items-center gap-1.5 border-b border-gray-300 px-0 text-[12px] font-bold text-gray-700 transition-colors hover:border-gray-900 hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-50"
+                                        >
+                                          <Wrench className={`h-3.5 w-3.5 ${selectorPauseStateDiagnosing ? "animate-spin" : ""}`} />
+                                          {selectorPauseStateDiagnosing ? "诊断中" : "诊断"}
+                                        </button>
+                                      ) : null}
+                                    </div>
+                                  ) : null}
+                                </div>
+                                {newChatHealEnabled ? (
+                                  <div className="space-y-2">
+                                    <SelectorHealResultPanel
+                                      result={selectorHealResult}
+                                      message={selectorHealMessage}
+                                    />
+                                  </div>
+                                ) : null}
+                                {pauseStateHealEnabled ? (
+                                  <SelectorPauseStatePanel
+                                    result={selectorPauseStateResult}
+                                    message={selectorPauseStateMessage}
+                                  />
+                                ) : null}
+                              </div>
+                            );
+                          })}
                           {advancedFields.length > 0 && (
                             <div className="border-t border-dashed border-gray-200/80 pt-1">
                               <button
@@ -3320,7 +3515,52 @@ export function SettingsContent({
             </div>
           </Section>
 
-          {/* Section 5: Search Plugin */}
+          <Section title="Selector Agent">
+            <p className="text-[12px] text-gray-500 mb-4 leading-relaxed">
+              这里单独配置浏览器自动抓取用的大模型，不占用智能模式或识别模式的账号。后续 selector 自动诊断、抽取和写回都会优先读这组配置。
+            </p>
+
+            <div className="space-y-3 mb-6">
+              <CheckboxRow
+                checked={selectorAgentEnabled}
+                onChange={setSelectorAgentEnabled}
+                label="启用 selector agent 自动抓取"
+                subtext="关闭后只保留配置，不参与自动诊断或自动写入。"
+              />
+            </div>
+
+            {selectorAgentPlatforms.length === 0 ? (
+              <div className="text-[12px] text-gray-500 border-l-2 border-gray-200 pl-3 py-1">
+                当前没有可用的平台模型，请先在 API 配置里补充至少一个可调用的模型。
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
+                  <SelectInput
+                    label="AI 平台 :"
+                    value={selectorAgentPlatform}
+                    onChange={(val) => {
+                      setSelectorAgentPlatform(val);
+                      const platform = selectorAgentPlatforms.find((item) => item.id === val);
+                      if (platform) setSelectorAgentModel(platform.models[0] || "");
+                    }}
+                    options={selectorAgentPlatforms.map((item) => ({ value: item.id, label: item.name }))}
+                  />
+                  <SelectInput
+                    label="调用模型 :"
+                    value={selectorAgentModel}
+                    onChange={setSelectorAgentModel}
+                    options={selectorAgentModelOptions.map((model) => ({ value: model, label: model }))}
+                  />
+                </div>
+                <p className="text-[11px] text-gray-400 leading-relaxed border-l-2 border-gray-200 pl-3">
+                  这组配置只负责 selector 诊断和自动抓取时的模型选择，和智能模式、识别模式彼此独立。
+                </p>
+              </div>
+            )}
+          </Section>
+
+          {/* Section 6: Search Plugin */}
           <Section title="搜搜与联网配置">
             <p className="text-[12px] text-gray-500 mb-4 leading-relaxed">
               联网搜索桥接优先走 Tavily；此外，还可配置搜搜模式支持调用的大模型列表。
@@ -3363,7 +3603,7 @@ export function SettingsContent({
             </div>
           </Section>
 
-          {/* Section 6: Decoration Template */}
+          {/* Section 7: Decoration Template */}
           <Section title="页面原始截图装饰模板">
             <p className="text-[12px] text-gray-500 mb-4 leading-relaxed">
               这里只作用于“页面原始截图”。DOM 文本生成会固定走 Surfaced 模版，不会套用这里的旧装饰样式。
@@ -4027,6 +4267,124 @@ function ControlledTextInput({
         placeholder={placeholder}
         className="w-full bg-transparent border-0 border-b border-gray-200 rounded-none text-[12px] px-0 py-2 outline-none focus:border-gray-900 transition-colors text-gray-800"
       />
+    </div>
+  );
+}
+
+function SelectorHealResultPanel({
+  result,
+  message,
+}: {
+  result: SelectorHealFieldResult | null,
+  message: string,
+}) {
+  const candidates = (result?.candidates || []).slice(0, 3);
+  if (!result && !message) {
+    return null;
+  }
+  const currentStatus = String(result?.current_status || "").trim();
+  const currentStatusLabel = result?.saved
+    ? "已修复并保存"
+    : currentStatus === "healthy"
+      ? "当前 selector 正常"
+      : currentStatus === "missing"
+        ? "当前 selector 失效"
+        : currentStatus
+          ? `当前状态：${currentStatus}`
+          : "";
+  const selectorAgentLabel = result?.selector_agent_used
+    ? `模型辅助：${result.selector_agent_platform || "unknown"}${result.selector_agent_model ? ` / ${result.selector_agent_model}` : ""}${result.selector_agent_confidence ? `（${Math.round(result.selector_agent_confidence * 100)}%）` : ""}`
+    : result?.selector_agent_error
+      ? `模型辅助失败：${result.selector_agent_error}`
+      : result?.selector_agent_reason
+        ? `模型辅助跳过：${result.selector_agent_reason}`
+      : "";
+  const verifiedSelector = String(
+    result?.selector
+    || result?.verified_selector
+    || candidates.find((candidate) => Boolean(candidate.verified))?.selector
+    || "",
+  ).trim();
+  return (
+    <div className="border-l-2 border-gray-200 pl-3 text-[11px] text-gray-500">
+      {message ? (
+        <div className="mb-2 leading-relaxed text-gray-600">{message}</div>
+      ) : null}
+      {result ? (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            {currentStatusLabel ? (
+              <span className="font-bold text-gray-700">{currentStatusLabel}</span>
+            ) : null}
+            <span className="text-gray-400">风险：{result.field_risk_level || "unknown"}</span>
+            <span className={result.saved ? "text-emerald-700" : result.save_error ? "text-rose-700" : result.verify_status === "passed" ? "text-emerald-700" : "text-gray-400"}>
+              {result.saved ? "已自动保存" : result.save_error ? "保存失败" : result.verify_status === "passed" ? "已验证待保存" : "仅诊断"}
+            </span>
+            {selectorAgentLabel ? (
+              <span className={result.selector_agent_used ? "text-sky-700" : "text-amber-700"}>{selectorAgentLabel}</span>
+            ) : null}
+          </div>
+          {verifiedSelector ? (
+            <div className="border-t border-gray-100 pt-2">
+              <div className="min-w-0">
+                <div className="mb-1 font-bold text-gray-700">已验证 selector</div>
+                <code className="break-all rounded bg-gray-50 px-1.5 py-0.5 text-[11px] text-gray-800">{verifiedSelector}</code>
+              </div>
+            </div>
+          ) : null}
+          {!verifiedSelector && candidates.length > 0 ? (
+            <div className="border-t border-gray-100 pt-2 leading-relaxed text-amber-700">
+              已找到候选，但没有通过点击验证。
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function SelectorPauseStatePanel({
+  result,
+  message,
+}: {
+  result: SelectorPauseStateResponse | null,
+  message: string,
+}) {
+  if (!result && !message) {
+    return null;
+  }
+  const selector = String(result?.verified_selector || result?.summary?.suggested_selector || "").trim();
+  const sampleCount = Number(result?.summary?.sample_count || 0);
+  const generatingSampleCount = Number(result?.summary?.generating_sample_count || 0);
+  const topPrefix = String(result?.summary?.top_path_prefixes?.[0]?.[0] || "").trim();
+  return (
+    <div className="border-l-2 border-blue-200 pl-3 text-[11px] text-gray-500">
+      {message ? (
+        <div className={`mb-2 leading-relaxed ${result?.ok ? "text-blue-700" : "text-amber-700"}`}>{message}</div>
+      ) : null}
+      {result ? (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={result.ok ? "font-bold text-blue-700" : "font-bold text-amber-700"}>
+              {result.ok ? (result.saved ? "暂停态已确认并保存" : "暂停态已确认") : "暂停态未确认"}
+            </span>
+            {sampleCount > 0 ? <span className="text-gray-400">采样 {sampleCount} 次</span> : null}
+            {generatingSampleCount > 0 ? <span className="text-gray-400">生成态 {generatingSampleCount} 次</span> : null}
+          </div>
+          {selector ? (
+            <div className="border-t border-gray-100 pt-2">
+              <div className="mb-1 font-bold text-gray-700">暂停态表达</div>
+              <code className="break-all rounded bg-gray-50 px-1.5 py-0.5 text-[11px] text-gray-800">{selector}</code>
+            </div>
+          ) : null}
+          {topPrefix ? (
+            <div className="border-t border-gray-100 pt-2">
+              <div className="mb-1 font-bold text-gray-700">SVG path 前缀</div>
+              <code className="break-all rounded bg-gray-50 px-1.5 py-0.5 text-[11px] text-gray-800">{topPrefix}</code>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

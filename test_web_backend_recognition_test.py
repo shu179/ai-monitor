@@ -143,6 +143,32 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
         self.assertTrue(runtime._recognition_manager.started)
         self.assertTrue(runtime._recognition_manager.get_runtime_status()["running"])
 
+    def test_selector_heal_runtime_safety_blocks_when_monitoring_runs(self):
+        runtime = AppRuntime()
+        runtime._scheduler = Mock()
+        runtime._scheduler.get_status.return_value = {"running": True}
+        runtime._scheduler.get_running_tasks.return_value = {}
+
+        result = runtime._selector_heal_runtime_safety()
+
+        self.assertFalse(result["runtime_safe"])
+        self.assertIn("正式抓取", result["blocking_reason"])
+        self.assertTrue(result["checks"]["monitoring_running"])
+
+    def test_selector_heal_runtime_safety_blocks_while_scheduler_is_draining(self):
+        runtime = AppRuntime()
+        runtime._scheduler = Mock()
+        runtime._scheduler.get_status.return_value = {"running": False}
+        runtime._scheduler.get_running_tasks.return_value = {"品牌任务 [抓取模式]": 2.5}
+
+        result = runtime._selector_heal_runtime_safety()
+
+        self.assertFalse(result["runtime_safe"])
+        self.assertIn("暂停收尾", result["blocking_reason"])
+        self.assertFalse(result["checks"]["monitoring_running"])
+        self.assertTrue(result["checks"]["scheduler_draining"])
+        self.assertEqual(result["checks"]["scheduler_running_tasks"], {"品牌任务 [抓取模式]": 2.5})
+
     def test_running_base_recognition_manager_does_not_block_recognition_test(self):
         runtime = AppRuntime()
         runtime._recognition_manager = FakeRecognitionManager(running=True)

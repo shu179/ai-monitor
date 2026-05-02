@@ -30,6 +30,7 @@ from core.browser_processes import (
     terminate_browser_profile_processes,
 )
 from core.browser_runtime import resolve_system_browser_executable
+from core.selector_cache import get_learned_selector, set_learned_selector
 from core.time_utils import local_now
 
 
@@ -248,6 +249,157 @@ class BasePlatform(ABC):
         if last_error:
             raise last_error
         raise TimeoutError(f"等待元素超时: {selector}")
+
+    def _conversation_snapshot(self) -> dict:
+        """Generic conversation snapshot for runtime selector verification."""
+        try:
+            return self.page.evaluate(
+                """({resultSel, inputSel, thinkSel}) => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const answers = [];
+                    if (resultSel) {
+                        let nodes = [];
+                        try { nodes = Array.from(document.querySelectorAll(resultSel)); } catch (_) { nodes = []; }
+                        for (const node of nodes) {
+                            if (!node) continue;
+                            if (thinkSel) {
+                                try {
+                                    if (node.closest(thinkSel)) continue;
+                                } catch (_) {}
+                            }
+                            const text = normalize(node.innerText || node.textContent);
+                            if (text) answers.push(text);
+                        }
+                    }
+                    let input = null;
+                    if (inputSel) {
+                        try { input = document.querySelector(inputSel); } catch (_) { input = null; }
+                    }
+                    return {
+                        answerCount: answers.length,
+                        answerLength: answers.join('\\n').length,
+                        inputValue: input ? normalize(input.value || input.innerText || input.textContent) : '',
+                        path: String(location.pathname || ''),
+                        href: String(location.href || ''),
+                    };
+                }""",
+                {
+                    "resultSel": self.result_selector or "",
+                    "inputSel": self.input_selector or "",
+                    "thinkSel": self.think_content_selector or "",
+                },
+            )
+        except Exception:
+            return {"answerCount": 0, "answerLength": 0, "inputValue": "", "path": "", "href": ""}
+
+    def _new_chat_transition_ready(self, before: dict, current: dict) -> bool:
+        """Check whether a click really moved the browser into a fresh chat state.
+
+        Draft text can legitimately remain in the composer on some platforms,
+        so this check intentionally ignores input contents and instead relies on
+        session/path and message-history changes.
+        """
+        baseline_count = int((before or {}).get("answerCount") or 0)
+        baseline_length = int((before or {}).get("answerLength") or 0)
+        baseline_path = str((before or {}).get("path") or "").strip()
+        baseline_href = str((before or {}).get("href") or "").strip()
+
+        current_count = int((current or {}).get("answerCount") or 0)
+        current_length = int((current or {}).get("answerLength") or 0)
+        current_path = str((current or {}).get("path") or "").strip()
+        current_href = str((current or {}).get("href") or "").strip()
+
+        if baseline_path and current_path and current_path != baseline_path and current_count == 0:
+            return True
+        if baseline_href and current_href and current_href != baseline_href and current_count == 0:
+            return True
+        if baseline_count <= 0 and baseline_length <= 0:
+            return current_count == 0 and current_length <= 0
+        if current_count == 0:
+            return True
+        if baseline_count > 0 and current_count < baseline_count:
+            return True
+        if baseline_length > 0 and current_length <= min(20, max(0, baseline_length // 5)):
+            return True
+        return False
+
+    def _wait_until_new_chat_ready(self, before: dict, timeout: float = 6.0) -> bool:
+        """Generic confirmation that a new-chat click really moved to a new session."""
+        deadline = time.time() + max(1.0, float(timeout or 0))
+        while time.time() < deadline:
+            self._raise_if_stop_requested()
+            current = self._conversation_snapshot()
+            if self._new_chat_transition_ready(before, current):
+                return True
+            self._cooperative_sleep(0.25)
+        return False
+
+    def _wait_and_confirm_new_chat(
+        self,
+        before: dict,
+        *,
+        sleep_seconds: float = 1.0,
+        timeout_ms: int = 10000,
+    ) -> bool:
+        """Wait for the input to settle, then confirm the browser state changed."""
+        self._cooperative_sleep(max(0.0, float(sleep_seconds or 0.0)))
+        self._wait_for_page_selector(self.input_selector, timeout_ms=timeout_ms)
+        return self._wait_until_new_chat_ready(before)
+
+    def _attempt_selector_agent_heal(self, field_name: str, *, label: str = "") -> bool:
+        """Ask the configured model to repair one selector, then verify by clicking."""
+        try:
+            from core.selector_heal.runtime import attempt_runtime_selector_heal
+
+            result = attempt_runtime_selector_heal(self, field_name, label=label)
+            if bool(result.get("ok")):
+                selector = str(result.get("selector") or "").strip()
+                saved = "并已保存" if result.get("saved") else "但保存失败"
+                if selector:
+                    print(f"[{self.name}] selector_agent 已验证 {label or field_name}: {selector}，{saved}")
+                return True
+            message = str(result.get("message") or "").strip()
+            if message and not result.get("skipped"):
+                print(f"[{self.name}] selector_agent 未完成 {label or field_name} 自愈: {message}")
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            print(f"[{self.name}] selector_agent 自愈异常: {exc}")
+        return False
+
+    def _attempt_learned_selector_heal(self, field_name: str, *, label: str = "") -> bool:
+        """Try the learned selector cache before falling back to the model."""
+        selector = self._get_learned_selector(field_name)
+        if not selector:
+            return False
+        try:
+            self._raise_if_stop_requested()
+            before = self._conversation_snapshot()
+            btn = self.page.locator(selector).first
+            self._wait_for_locator(btn, timeout_ms=5000)
+            self._click_locator(btn, timeout_ms=5000)
+            if not self._wait_and_confirm_new_chat(before, sleep_seconds=random.uniform(0.5, 1.0)):
+                return False
+            self._remember_learned_selector(field_name, selector, source="cache_verified", note=f"{label or field_name} 点击验证通过")
+            if label:
+                print(f"[{self.name}] 已通过 learned selector 开启{label}")
+            else:
+                print(f"[{self.name}] 已通过 learned selector 开启 {field_name}")
+            return True
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return False
+
+    def _get_learned_selector(self, field_name: str) -> str:
+        try:
+            return get_learned_selector(self.user_data_dir, field_name)
+        except Exception:
+            return ""
+
+    def _remember_learned_selector(self, field_name: str, selector: str, *, source: str = "vision", note: str = "") -> None:
+        try:
+            set_learned_selector(self.user_data_dir, field_name, selector, source=source, note=note)
+        except Exception:
+            pass
 
     def _wait_for_locator(self, locator, timeout_ms: int) -> None:
         deadline = time.time() + max(0.1, timeout_ms / 1000.0)
@@ -755,19 +907,27 @@ class BasePlatform(ABC):
             raise
 
     def start_new_chat(self) -> None:
-        """点击新建对话按钮，等待输入框就绪"""
+        """点击新建对话按钮，等待新会话状态就绪。"""
+        before = self._conversation_snapshot()
         if not self.new_chat_selector:
+            if not self._attempt_selector_agent_heal("new_chat_selector", label="新对话"):
+                return
+            print(f"[{self.name}] 已通过 selector_agent 开启新对话")
             return
         try:
             self._raise_if_stop_requested()
             btn = self.page.locator(self.new_chat_selector).first
             self._wait_for_locator(btn, timeout_ms=5000)
             self._click_locator(btn, timeout_ms=5000)
-            self._cooperative_sleep(random.uniform(1.0, 2.0))
-            self._wait_for_page_selector(self.input_selector, timeout_ms=10000)
-            print(f"[{self.name}] 已开启新对话")
+            if self._wait_and_confirm_new_chat(before, sleep_seconds=random.uniform(1.0, 2.0)):
+                print(f"[{self.name}] 已开启新对话")
+                return
+            raise RuntimeError("已点击新对话，但未确认进入新会话")
         except Exception as e:
             self._reraise_stop_requested(e)
+            if self._attempt_selector_agent_heal("new_chat_selector", label="新对话"):
+                print(f"[{self.name}] 已通过 selector_agent 开启新对话")
+                return
             print(f"[{self.name}] 开启新对话失败，继续: {e}")
 
     def _browser_locale(self) -> str:
@@ -4316,8 +4476,6 @@ class BasePlatform(ABC):
                 self.start_new_chat()
                 if deep_think:
                     self.enable_deep_think()
-                if hasattr(self, 'enable_web_search'):
-                    self.enable_web_search()
                 baseline_answer_text = self._get_answer_text()
                 self._active_baseline_answer_text = baseline_answer_text or ""
 

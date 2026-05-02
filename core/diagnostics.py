@@ -108,6 +108,8 @@ def clear_resolved_events() -> int:
 
 def _default_suggestion(category: str, message: str) -> str:
     text = f"{category} {message}".lower()
+    if "selector_miss" in text or "selector" in text or "选择器" in text:
+        return "检查平台页面是否改版；可在抓取模式设置中重新检测对应 selector，确认候选后再应用。"
     if "webhook" in text or "企业微信" in text:
         return "检查企业微信 webhook 是否可用，以及当前任务是否配置了有效 webhook。"
     if "登录" in text or "captcha" in text or "验证" in text:

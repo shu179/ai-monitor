@@ -6,6 +6,7 @@ DeepSeek 平台适配器
 import time
 import random
 from typing import Tuple, Optional
+from core.selector_heal.dom_probe import click_interactive_candidate
 from .base import BasePlatform, InterruptionDetected
 
 
@@ -19,6 +20,7 @@ class DeepSeekPlatform(BasePlatform):
     chat_container_selector = ".ds-virtual-list"
     think_content_selector = ".ds-think-content"
     deep_think_selector = "button:has-text('深度思考'), div:has-text('深度思考'), span:has-text('深度思考')"
+    generation_pause_selector = 'path[d^="M2 4.88"], path[d^="M2 4.87988"], path[d^="M2 4.8"]'
     prefer_last_result_block = True
     use_automation_control_flag = False
     use_automation_user_agent = False
@@ -87,21 +89,10 @@ class DeepSeekPlatform(BasePlatform):
     def _click_new_chat_via_dom(self) -> bool:
         try:
             self._raise_if_stop_requested()
-            return bool(self.page.evaluate("""(primarySelector) => {
-                const clickNode = (node) => {
-                    if (!node) return false;
-                    try { node.scrollIntoView({block: 'center', inline: 'center'}); } catch (_) {}
-                    for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
-                        try {
-                            node.dispatchEvent(new MouseEvent(eventName, {bubbles: true, cancelable: true, view: window}));
-                        } catch (_) {}
-                    }
-                    try { node.click(); } catch (_) {}
-                    return true;
-                };
-
-                const directSelectors = [
-                    primarySelector,
+            return click_interactive_candidate(
+                self.page,
+                primary_selector=self.new_chat_selector,
+                direct_selectors=[
                     "button[aria-label*='新建']",
                     "button[aria-label*='新对话']",
                     "button[title*='新建']",
@@ -110,33 +101,10 @@ class DeepSeekPlatform(BasePlatform):
                     "[class*='new-chat']",
                     "[class*='newChat']",
                     "[class*='newConversation']",
-                ].filter(Boolean);
-
-                for (const selector of directSelectors) {
-                    const node = document.querySelector(selector);
-                    if (clickNode(node)) return true;
-                }
-
-                const candidates = Array.from(document.querySelectorAll('button, a[role="button"], div[role="button"], [tabindex="0"]'));
-                const keywords = ['新建', '新对话', 'new chat', 'newchat', 'new conversation', 'chat'];
-                for (const node of candidates) {
-                    const text = String(node.innerText || node.textContent || '').trim().toLowerCase();
-                    const label = String(node.getAttribute('aria-label') || node.getAttribute('title') || '').trim().toLowerCase();
-                    const marker = `${text} ${label}`;
-                    if (!marker) continue;
-                    if (keywords.some((keyword) => marker.includes(keyword))) {
-                        if (clickNode(node)) return true;
-                    }
-                }
-
-                for (const node of document.querySelectorAll('button')) {
-                    if (node.querySelector('path[d^="M8 0"], path[d^="M8 0.599609"]')) {
-                        if (clickNode(node)) return true;
-                    }
-                }
-
-                return false;
-            }""", self.new_chat_selector))
+                ],
+                text_keywords=["新建", "新对话", "new chat", "newchat", "new conversation", "chat"],
+                icon_selectors=['path[d^="M8 0"], path[d^="M8 0.599609"]'],
+            )
         except Exception as e:
             self._reraise_stop_requested(e)
             return False
@@ -153,30 +121,7 @@ class DeepSeekPlatform(BasePlatform):
             return False
 
     def _wait_until_new_chat_ready(self, before: dict, timeout: float = 6.0) -> bool:
-        deadline = time.time() + max(timeout, 1.0)
-        baseline_count = int((before or {}).get("answerCount") or 0)
-        baseline_length = int((before or {}).get("answerLength") or 0)
-        baseline_path = str((before or {}).get("path") or "").strip()
-        while time.time() < deadline:
-            self._raise_if_stop_requested()
-            current = self._conversation_snapshot()
-            current_count = int(current.get("answerCount") or 0)
-            current_length = int(current.get("answerLength") or 0)
-            input_value = str(current.get("inputValue") or "").strip()
-            current_path = str(current.get("path") or "").strip()
-            if input_value:
-                self._cooperative_sleep(0.3)
-                continue
-            if baseline_path and current_path and current_path != baseline_path and current_count == 0:
-                return True
-            if baseline_count <= 0 and baseline_length <= 0:
-                return True
-            if current_count == 0:
-                return True
-            if current_length <= min(20, max(0, baseline_length // 5)):
-                return True
-            self._cooperative_sleep(0.3)
-        return False
+        return super()._wait_until_new_chat_ready(before, timeout=timeout)
 
     def start_new_chat(self) -> None:
         """DeepSeek新建对话：SVG selector不稳定，优先用JS查找新建按钮"""
@@ -188,6 +133,8 @@ class DeepSeekPlatform(BasePlatform):
                 ("locator", lambda: self._click_new_chat_button(force=False)),
                 ("locator_force", lambda: self._click_new_chat_button(force=True)),
                 ("dom", self._click_new_chat_via_dom),
+                ("learned", lambda: self._attempt_learned_selector_heal("new_chat_selector", label="新对话")),
+                ("selector_agent", lambda: self._attempt_selector_agent_heal("new_chat_selector", label="新对话")),
                 ("goto_home", self._open_fresh_chat_fallback),
             ]
             last_error = "未找到可用的新对话按钮"
@@ -239,7 +186,7 @@ class DeepSeekPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             snapshot = self.page.evaluate(
-                """({inputSel, resultSel, thinkSel}) => {
+                """({inputSel, resultSel, thinkSel, pauseSel}) => {
                     const normalize = (value) => String(value || '').trim();
                     const isVisible = (el) => {
                         if (!el) return false;
@@ -249,11 +196,12 @@ class DeepSeekPlatform(BasePlatform):
                             style.display !== 'none' &&
                             style.visibility !== 'hidden' &&
                             style.opacity !== '0' &&
+                            style.pointerEvents !== 'none' &&
                             rect.width > 0 &&
                             rect.height > 0
                         );
                     };
-                    const controls = Array.from(document.querySelectorAll('button, [role="button"], div[role="button"], a[role="button"]'));
+                    const controls = Array.from(document.querySelectorAll('button, [role="button"], div[role="button"], a[role="button"], [tabindex="0"]'));
                     const collectSignals = (el) => [
                         el.getAttribute('aria-label'),
                         el.getAttribute('title'),
@@ -262,40 +210,128 @@ class DeepSeekPlatform(BasePlatform):
                         el.textContent,
                         el.className,
                     ].filter(Boolean).join(' ');
+                    const controlFor = (el) => (
+                        el?.closest?.('button, [role="button"], div[role="button"], a[role="button"], [tabindex="0"]')
+                        || el
+                    );
+                    const escapeAttr = (value) => String(value || '').replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"');
+                    const selectorHintsFor = (el) => {
+                        const hints = [];
+                        if (!el) return hints;
+                        const tag = String(el.tagName || '').toLowerCase() || '*';
+                        const aria = normalize(el.getAttribute?.('aria-label'));
+                        const title = normalize(el.getAttribute?.('title'));
+                        const testId = normalize(el.getAttribute?.('data-testid'));
+                        const text = normalize(el.innerText || el.textContent);
+                        if (aria) hints.push(`${tag}[aria-label="${escapeAttr(aria)}"]`);
+                        if (aria.includes('停止')) hints.push(`${tag}[aria-label*="停止"]`);
+                        if (/stop/i.test(aria)) hints.push(`${tag}[aria-label*="stop" i]`);
+                        if (title) hints.push(`${tag}[title="${escapeAttr(title)}"]`);
+                        if (title.includes('停止')) hints.push(`${tag}[title*="停止"]`);
+                        if (testId) hints.push(`${tag}[data-testid="${escapeAttr(testId)}"]`);
+                        if (text && text.length <= 20) hints.push(`text="${escapeAttr(text)}"`);
+                        const cls = String(el.className || '');
+                        if (cls.includes('ds-icon-button')) hints.push(`${tag}[class*="ds-icon-button"]`);
+                        return Array.from(new Set(hints)).slice(0, 8);
+                    };
                     const visibleControls = controls.filter((el) => isVisible(el));
-                    const stopSignalPattern = /停止回答|停止生成|停止|stop generating|stop response|stop/i;
+                    const stopSignalPattern = /停止回答|停止生成|暂停生成|暂停|停止|stop generating|stop response|stop/i;
                     const sendSignalPattern = /发送消息|发送|send message|send/i;
 
-                    const stopPathSelectors = [
+                    const configuredStopSelectors = String(pauseSel || '')
+                        .split(',')
+                        .map((item) => item.trim())
+                        .filter(Boolean);
+                    const stopPathSelectors = Array.from(new Set([
+                        ...configuredStopSelectors,
                         'path[d^="M2 4.88"]',
                         'path[d^="M2 4.87988"]',
                         'path[d^="M2 4.8"]',
-                    ];
+                    ]));
                     const stopPathMarkers = [
                         '11.12V4.88Z',
                         '12.3199 2 11.12V4.88Z',
                     ];
                     const stopPathSet = new Set();
+                    const configuredStopControlSet = new Set();
+                    const addConfiguredStopNode = (node) => {
+                        if (!node) return;
+                        const tag = String(node.tagName || '').toLowerCase();
+                        if (tag === 'path') {
+                            stopPathSet.add(node);
+                            return;
+                        }
+                        const control = controlFor(node);
+                        if (control && isVisible(control)) {
+                            configuredStopControlSet.add(control);
+                        }
+                        try {
+                            for (const path of node.querySelectorAll('svg path, path')) {
+                                stopPathSet.add(path);
+                            }
+                        } catch (_) {}
+                    };
                     for (const selector of stopPathSelectors) {
                         try {
                             for (const node of document.querySelectorAll(selector)) {
-                                stopPathSet.add(node);
+                                addConfiguredStopNode(node);
                             }
                         } catch (_) {}
                     }
                     for (const node of document.querySelectorAll('svg path')) {
                         const d = String(node.getAttribute('d') || '');
                         if (!d) continue;
-                        if (stopPathMarkers.some((marker) => d.includes(marker))) {
+                        if (
+                            d.startsWith('M2 4.88') ||
+                            d.startsWith('M2 4.87988') ||
+                            d.startsWith('M2 4.8') ||
+                            stopPathMarkers.some((marker) => d.includes(marker))
+                        ) {
                             stopPathSet.add(node);
                         }
                     }
-                    const stopPathCount = stopPathSet.size;
+                    const stopPathDetails = Array.from(stopPathSet).map((path) => {
+                        const d = String(path.getAttribute('d') || '');
+                        const prefix = d.slice(0, 64);
+                        const control = controlFor(path);
+                        const tag = String(control?.tagName || '').toLowerCase() || '*';
+                        return {
+                            dPrefix: prefix,
+                            selector: `path[d^="${escapeAttr(prefix)}"]`,
+                            controlSelector: `${tag}:has(path[d^="${escapeAttr(prefix)}"])`,
+                            controlTag: tag,
+                            controlRole: String(control?.getAttribute?.('role') || ''),
+                            controlText: normalize(control?.innerText || control?.textContent),
+                            controlAriaLabel: normalize(control?.getAttribute?.('aria-label')),
+                            controlTitle: normalize(control?.getAttribute?.('title')),
+                            controlClassName: String(control?.className || ''),
+                            selectorHints: [
+                                `path[d^="${escapeAttr(prefix)}"]`,
+                                `${tag}:has(path[d^="${escapeAttr(prefix)}"])`,
+                                ...selectorHintsFor(control),
+                            ],
+                        };
+                    });
+                    const stopPathCount = stopPathDetails.length;
 
-                    const stopVisibleCount = visibleControls.filter((el) => {
+                    const textStopControls = visibleControls.filter((el) => {
                         const signals = collectSignals(el);
                         return stopSignalPattern.test(String(signals || ''));
-                    }).length;
+                    });
+                    const stopControlDetails = Array.from(new Set([
+                        ...Array.from(configuredStopControlSet),
+                        ...textStopControls,
+                    ])).map((el) => ({
+                        tag: String(el.tagName || '').toLowerCase(),
+                        role: String(el.getAttribute('role') || ''),
+                        text: normalize(el.innerText || el.textContent),
+                        ariaLabel: normalize(el.getAttribute('aria-label')),
+                        title: normalize(el.getAttribute('title')),
+                        testId: normalize(el.getAttribute('data-testid')),
+                        className: String(el.className || ''),
+                        selectorHints: selectorHintsFor(el),
+                    }));
+                    const stopVisibleCount = stopControlDetails.length;
                     const sendVisibleCount = visibleControls.filter((el) => {
                         if (el.disabled) return false;
                         const signals = collectSignals(el);
@@ -321,12 +357,19 @@ class DeepSeekPlatform(BasePlatform):
                         input_length: inputText.length,
                         answer_count: answers.length,
                         answer_length: answers.join('\\n').length,
+                        stop_controls: stopControlDetails.slice(0, 8),
+                        stop_paths: stopPathDetails.slice(0, 8),
+                        stop_selector_hints: Array.from(new Set([
+                            ...stopPathDetails.flatMap((item) => item.selectorHints || []),
+                            ...stopControlDetails.flatMap((item) => item.selectorHints || []),
+                        ])).slice(0, 12),
                     };
                 }""",
                 {
                     "inputSel": self.input_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
+                    "pauseSel": self.generation_pause_selector or "",
                 },
             ) or {}
             stop_visible_count = int(snapshot.get("stop_visible_count", 0) or 0)
@@ -346,6 +389,9 @@ class DeepSeekPlatform(BasePlatform):
                 "input_length": input_length,
                 "answer_count": answer_count,
                 "answer_length": answer_length,
+                "stop_controls": list(snapshot.get("stop_controls") or []),
+                "stop_paths": list(snapshot.get("stop_paths") or []),
+                "stop_selector_hints": list(snapshot.get("stop_selector_hints") or []),
             }
         except Exception as e:
             self._reraise_stop_requested(e)

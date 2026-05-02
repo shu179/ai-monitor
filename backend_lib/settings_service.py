@@ -84,15 +84,27 @@ class SettingsService:
         )
         search_cfg["tavily_api_key"] = self._mask_secret(search_cfg.get("tavily_api_key", ""))
         cloud_sync_cfg["api_token"] = self._mask_secret(cloud_sync_cfg.get("api_token", ""))
+        ai_assistant_cfg = dict(config.get("ai_assistant", {}) or {})
+        selector_agent_cfg = dict(config.get("selector_agent", {}) or {})
+        selector_agent_cfg["enabled"] = bool(selector_agent_cfg.get("enabled", False))
+        selector_agent_platform = str(selector_agent_cfg.get("platform", "") or "").strip()
+        if not selector_agent_platform:
+            selector_agent_platform = str(ai_assistant_cfg.get("platform", "") or "").strip()
+        selector_agent_model = str(selector_agent_cfg.get("model", "") or "").strip()
+        if not selector_agent_model:
+            selector_agent_model = str(ai_assistant_cfg.get("model", "") or "").strip()
+        selector_agent_cfg["platform"] = selector_agent_platform
+        selector_agent_cfg["model"] = selector_agent_model
         version_info = get_version_payload()
         return {
             "version": version_info,
             "scheduler": scheduler_cfg,
-            "ai_assistant": config.get("ai_assistant", {}),
+            "ai_assistant": ai_assistant_cfg,
             "local_model": config.get("local_model", {}),
             "local_model_status": get_local_model_manager().get_status(),
             "recognition": config.get("recognition", {}),
             "smart_vision": config.get("smart_vision", {}),
+            "selector_agent": selector_agent_cfg,
             "cloud_sync": cloud_sync_cfg,
             "query_execution": query_execution_cfg,
             "browser_automation": config.get("browser_automation", {}),

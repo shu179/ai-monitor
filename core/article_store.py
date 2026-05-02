@@ -8,6 +8,7 @@
 - 提供关键词→任务组匹配、文章数统计等查询接口
 """
 
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from difflib import SequenceMatcher
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from .app_paths import resolve_app_path
+from .history import normalize_platform_id
 
 ARTICLES_FILE = resolve_app_path("logs/articles.json")
 DOMAIN_OVERRIDES_FILE = resolve_app_path("logs/domain_overrides.json")
@@ -751,6 +753,175 @@ def _classify_media_name_hint(media_name: str) -> str:
     return ""
 
 
+def _coerce_non_negative_int(value, default: int = 0) -> int:
+    try:
+        parsed = int(value or 0)
+    except Exception:
+        parsed = default
+    return max(0, parsed)
+
+
+def _max_timestamp_text(left: str, right: str) -> str:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if not left_text:
+        return right_text
+    if not right_text:
+        return left_text
+    return right_text if right_text > left_text else left_text
+
+
+def _make_reference_event_id(
+    *,
+    explicit_event_id: str = "",
+    record_id: str = "",
+    task_name: str = "",
+    article_url: str = "",
+    platform: str = "",
+    referenced_at: str = "",
+    source: str = "",
+) -> str:
+    event_id = str(explicit_event_id or "").strip()
+    if event_id:
+        return event_id
+
+    record_text = str(record_id or "").strip()
+    if record_text:
+        payload = {
+            "record_id": record_text,
+            "task_name": str(task_name or "").strip(),
+            "article_url": normalize_article_url(article_url),
+            "platform": normalize_platform_id(platform),
+            "referenced_at": str(referenced_at or "").strip(),
+            "source": str(source or "").strip(),
+        }
+        digest = hashlib.sha1(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:20]
+        return f"reference:{digest}"
+
+    return uuid.uuid4().hex
+
+
+def _normalize_reference_event(
+    event: dict,
+    *,
+    task_name: str = "",
+    article_url: str = "",
+    default_source: str = "",
+    default_platform: str = "",
+    default_referenced_at: str = "",
+) -> dict | None:
+    if not isinstance(event, dict):
+        return None
+
+    normalized: dict = {}
+    event_id = str(event.get("event_id") or event.get("id") or "").strip()
+    if event_id:
+        normalized["event_id"] = event_id
+
+    record_id = str(event.get("record_id") or event.get("history_record_id") or "").strip()
+    if record_id:
+        normalized["record_id"] = record_id
+
+    referenced_at = str(
+        event.get("referenced_at")
+        or event.get("last_referenced_at")
+        or default_referenced_at
+        or ""
+    ).strip()
+    if referenced_at:
+        normalized["referenced_at"] = referenced_at
+
+    platform = normalize_platform_id(str(event.get("platform") or default_platform or "").strip())
+    if not platform:
+        raw_platforms = event.get("platforms")
+        if isinstance(raw_platforms, list):
+            for raw_platform in raw_platforms:
+                platform = normalize_platform_id(str(raw_platform or "").strip())
+                if platform:
+                    break
+    if platform:
+        normalized["platform"] = platform
+
+    source = str(event.get("source") or default_source or "").strip()
+    if source:
+        normalized["source"] = source
+
+    event_task_name = str(event.get("task_name") or task_name or "").strip()
+    if event_task_name:
+        normalized["task_name"] = event_task_name
+
+    normalized_url = normalize_article_url(str(event.get("article_url") or event.get("url") or article_url or "").strip())
+    if normalized_url:
+        normalized["article_url"] = normalized_url
+
+    return normalized or None
+
+
+def _normalize_reference_hit(
+    hit: dict,
+    *,
+    task_name: str = "",
+    article_url: str = "",
+) -> tuple[dict, bool]:
+    if not isinstance(hit, dict):
+        return {}, True
+
+    normalized = dict(hit)
+    before = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+
+    count = _coerce_non_negative_int(normalized.get("count", 0))
+    normalized["count"] = count
+
+    source = str(normalized.get("source") or "").strip()
+    if source:
+        normalized["source"] = source
+    else:
+        normalized.pop("source", None)
+
+    last_referenced_at = str(normalized.get("last_referenced_at") or "").strip()
+    if last_referenced_at:
+        normalized["last_referenced_at"] = last_referenced_at
+    else:
+        normalized.pop("last_referenced_at", None)
+
+    raw_events = normalized.get("events")
+    if isinstance(raw_events, list):
+        cleaned_events = []
+        seen_event_ids: set[str] = set()
+        latest_time = last_referenced_at
+        for raw_event in raw_events:
+            event = _normalize_reference_event(
+                raw_event,
+                task_name=task_name,
+                article_url=article_url,
+                default_source=source,
+            )
+            if not event:
+                continue
+            event_id = str(event.get("event_id") or "").strip()
+            if event_id and event_id in seen_event_ids:
+                continue
+            if event_id:
+                seen_event_ids.add(event_id)
+            latest_time = _max_timestamp_text(latest_time, str(event.get("referenced_at") or ""))
+            cleaned_events.append(event)
+
+        if cleaned_events:
+            normalized["events"] = cleaned_events
+            normalized["count"] = max(count, len(cleaned_events))
+            if latest_time:
+                normalized["last_referenced_at"] = latest_time
+        else:
+            normalized.pop("events", None)
+    else:
+        normalized.pop("events", None)
+
+    after = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+    return normalized, after != before
+
+
 def _normalize_article_entry(entry: dict) -> tuple[dict, bool]:
     """为旧记录补齐媒体名，避免前端继续显示域名。"""
     normalized = dict(entry)
@@ -878,12 +1049,20 @@ def _normalize_article_entry(entry: dict) -> tuple[dict, bool]:
     if not isinstance(reference_hits, dict):
         normalized["reference_hits"] = {}
         changed = True
-    elif excluded_task_set:
-        cleaned_reference_hits = {
-            str(task_name or "").strip(): hit
-            for task_name, hit in reference_hits.items()
-            if str(task_name or "").strip() and str(task_name or "").strip() not in excluded_task_set
-        }
+    else:
+        cleaned_reference_hits = {}
+        for task_name, hit in reference_hits.items():
+            task_text = str(task_name or "").strip()
+            if not task_text or task_text in excluded_task_set:
+                continue
+            normalized_hit, hit_changed = _normalize_reference_hit(
+                hit,
+                task_name=task_text,
+                article_url=normalized.get("url", ""),
+            )
+            if normalized_hit:
+                cleaned_reference_hits[task_text] = normalized_hit
+            changed = changed or hit_changed
         if cleaned_reference_hits != reference_hits:
             normalized["reference_hits"] = cleaned_reference_hits
             changed = True
@@ -1565,6 +1744,18 @@ def get_articles() -> list:
     return _sort_articles_for_display(articles)
 
 
+def get_articles_file_signature() -> tuple[str, int, int]:
+    """Return a cheap source signature for the article store file."""
+    path = ARTICLES_FILE
+    try:
+        stat = path.stat()
+        return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    except FileNotFoundError:
+        return (str(path), 0, 0)
+    except Exception:
+        return (str(path), -1, -1)
+
+
 def export_article_store_bundle() -> dict:
     """导出文章存储及站点记忆数据。"""
     with _lock:
@@ -1859,6 +2050,9 @@ def mark_articles_referenced_by_urls(
     *,
     source: str = "recognition",
     referenced_at: str = "",
+    platform: str = "",
+    event_id: str = "",
+    record_id: str = "",
 ) -> dict:
     """
     将已录入文章标记为“已引用”。
@@ -1890,6 +2084,7 @@ def mark_articles_referenced_by_urls(
     url_set = set(normalized_urls)
     reference_source = str(source or "recognition").strip() or "recognition"
     reference_time = str(referenced_at or "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    normalized_platform = normalize_platform_id(platform)
 
     matched_articles = []
     updated_count = 0
@@ -1933,14 +2128,49 @@ def mark_articles_referenced_by_urls(
                 if task_name not in referenced_tasks:
                     referenced_tasks.append(task_name)
                 hit = dict(reference_hits.get(task_name) or {})
+                normalized_hit, _ = _normalize_reference_hit(
+                    hit,
+                    task_name=task_name,
+                    article_url=article_url,
+                )
+                hit = normalized_hit or {}
+                events = list(hit.get("events") or [])
+                explicit_event_id = _make_reference_event_id(
+                    explicit_event_id=event_id,
+                    record_id=record_id,
+                    task_name=task_name,
+                    article_url=article_url,
+                    platform=normalized_platform,
+                    referenced_at=reference_time,
+                    source=reference_source,
+                )
+                added_event = False
+                if not any(str(item.get("event_id") or "").strip() == explicit_event_id for item in events if isinstance(item, dict)):
+                    event_payload = {
+                        "event_id": explicit_event_id,
+                        "referenced_at": reference_time,
+                        "source": reference_source,
+                        "article_url": article_url,
+                        "task_name": task_name,
+                    }
+                    if normalized_platform:
+                        event_payload["platform"] = normalized_platform
+                    if record_id:
+                        event_payload["record_id"] = str(record_id or "").strip()
+                    events.append(event_payload)
+                    added_event = True
+
                 try:
                     count = int(hit.get("count", 0) or 0)
                 except Exception:
                     count = 0
+                if added_event:
+                    count += 1
                 hit.update({
-                    "last_referenced_at": reference_time,
+                    "last_referenced_at": _max_timestamp_text(str(hit.get("last_referenced_at") or ""), reference_time) if added_event else str(hit.get("last_referenced_at") or "").strip(),
                     "source": reference_source,
-                    "count": count + 1,
+                    "count": max(count, 0),
+                    "events": events,
                 })
                 reference_hits[task_name] = hit
 

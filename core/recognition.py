@@ -1979,36 +1979,11 @@ class ClipboardRecognitionManager:
             return False
 
     def _extract_reference_urls_from_text(self, text: str) -> list[str]:
-        raw = str(text or "")
-        if not raw:
-            return []
-
-        urls: list[str] = []
-        patterns = (
-            r"(https?://[^\s<>'\"）)\]】]+)",
-            r"((?:www\.)[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:/[^\s<>'\"）)\]】]*)?)",
-        )
         try:
-            from core.article_fetcher import _unwrap_known_redirect_url
+            from core.reference_urls import extract_reference_urls_from_text
         except Exception:
-            _unwrap_known_redirect_url = None
-
-        for pattern in patterns:
-            for match in re.finditer(pattern, raw, re.IGNORECASE):
-                candidate = str(match.group(1) or "").strip()
-                candidate = candidate.rstrip("，。；：!！?？)）]】>,\"'")
-                if not candidate:
-                    continue
-                if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", candidate):
-                    candidate = f"https://{candidate}"
-                if _unwrap_known_redirect_url is not None:
-                    try:
-                        candidate = _unwrap_known_redirect_url(candidate)
-                    except Exception:
-                        pass
-                if candidate and candidate not in urls:
-                    urls.append(candidate)
-        return urls
+            return []
+        return extract_reference_urls_from_text(text)
 
     def _get_reference_task_names(self, tasks: list[dict]) -> list[str]:
         guide_items = self._build_keyword_guide_items(tasks)
@@ -2033,6 +2008,7 @@ class ClipboardRecognitionManager:
         *,
         tasks: list[dict] | None = None,
         source: str = "recognition",
+        platform: str = "",
     ) -> dict:
         urls = self._extract_reference_urls_from_text(text)
         if not urls:
@@ -2050,6 +2026,7 @@ class ClipboardRecognitionManager:
                 task_names,
                 urls,
                 source=source,
+                platform=platform or self._get_active_capture_platform(),
             )
         except Exception as exc:
             print(f"[Recognition] 引用链接匹配失败: {exc}")
@@ -2090,6 +2067,7 @@ class ClipboardRecognitionManager:
             text,
             tasks=self._get_enabled_tasks(),
             source="recognition_clipboard_url",
+            platform=self._get_active_capture_platform(),
         )
 
     def _collect_text_mode_candidate_brands(self) -> list[str]:
@@ -2249,6 +2227,7 @@ class ClipboardRecognitionManager:
             text,
             tasks=active_tasks,
             source="recognition_dom_text",
+            platform=self._get_active_capture_platform(),
         )
 
         # 【关键优化】先进行文本品牌识别，再决定是否渲染

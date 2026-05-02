@@ -31,33 +31,12 @@ class YuanbaoPlatform(BasePlatform):
     )
     prefer_last_result_block = True
     deep_think_selector = "button:has-text('Deep thinking'), div:has-text('Deep thinking'), span:has-text('Deep thinking'), button:has-text('深度思考'), div:has-text('深度思考')"
-    web_search_container_selector = ".yb-internet-search-btn"
-    web_search_trigger_selector = ".yb-internet-search-btn .index_v2_mainSection__SNIvs"
     _overlay_detection_enabled = False
-
-    def enable_web_search(self) -> bool:
-        """确保联网搜索已开启（检测 active class，未开则点击）"""
-        try:
-            self._raise_if_stop_requested()
-            btn = self.page.locator(self.web_search_container_selector).first
-            self._wait_for_locator(btn, timeout_ms=3000)
-            cls = btn.get_attribute("class") or ""
-            if "index_v2_active__" in cls:
-                print(f"[{self.name}] 联网搜索已开启")
-                return True
-            self._click_locator(self.page.locator(self.web_search_trigger_selector).first, timeout_ms=3000)
-            self._cooperative_sleep(0.5)
-            cls = self.page.locator(self.web_search_container_selector).first.get_attribute("class") or ""
-            activated = "index_v2_active__" in cls
-            print(f"[{self.name}] 联网搜索{'已开启' if activated else '开启失败'}")
-            return activated
-        except Exception as e:
-            self._reraise_stop_requested(e)
-            print(f"[{self.name}] 联网搜索按钮未找到: {e}")
-            return False
 
     def start_new_chat(self) -> None:
         """元宝新建对话：span被nav遮挡，用JS直接触发点击"""
+        before = self._conversation_snapshot()
+        last_error = "未找到可用的新对话入口"
         try:
             self._raise_if_stop_requested()
             clicked = False
@@ -76,16 +55,31 @@ class YuanbaoPlatform(BasePlatform):
                         return true;
                     }""", self.new_chat_selector)
             if not clicked:
-                self.page.evaluate("""() => {
+                clicked = bool(self.page.evaluate("""() => {
                     const span = document.querySelector('.yb-icon.icon-yb-ic_newchat_20');
-                    if (span) span.click();
-                }""")
-            self._cooperative_sleep(random.uniform(1.0, 2.0))
-            self._wait_for_page_selector(self.input_selector, timeout_ms=10000)
-            print(f"[{self.name}] 已开启新对话")
+                    if (!span) return false;
+                    span.click();
+                    return true;
+                }"""))
+            if clicked and self._wait_and_confirm_new_chat(before, sleep_seconds=random.uniform(1.0, 2.0)):
+                print(f"[{self.name}] 已开启新对话")
+                return
+            if clicked:
+                last_error = "已点击新对话入口，但未确认切换到新会话"
+                clicked = False
+            if not clicked and self._attempt_learned_selector_heal("new_chat_selector", label="新对话"):
+                print(f"[{self.name}] 已通过 learned selector 开启新对话")
+                return
+            if not clicked and self._attempt_selector_agent_heal("new_chat_selector", label="新对话"):
+                print(f"[{self.name}] 已通过 selector_agent 开启新对话")
+                return
+            if self._open_fresh_chat_fallback():
+                print(f"[{self.name}] 新对话按钮不可用，已回到首页")
+                return
+            raise RuntimeError(last_error)
         except Exception as e:
             self._reraise_stop_requested(e)
-            print(f"[{self.name}] 开启新对话失败，继续: {e}")
+            print(f"[{self.name}] 开启新对话失败，继续: {last_error or e}")
 
     def _scroll_brand_into_view(self, brand: str) -> None:
         """元宝先滚到容器底部（最新回答在底部），再定位品牌词。"""

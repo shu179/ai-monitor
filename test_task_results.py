@@ -10,6 +10,7 @@ from core.task_results import (
     finalize_execution_report,
     make_query_result_key,
     result_has_usable_screenshot,
+    record_result_history,
 )
 
 
@@ -72,6 +73,37 @@ class TaskResultsTests(unittest.TestCase):
             )
             self.assertTrue(result_has_usable_screenshot({"screenshot": str(screenshot)}))
             self.assertFalse(result_has_usable_screenshot({"screenshot": str(screenshot) + ".missing"}))
+
+    def test_record_result_history_persists_body_references_and_supports_task_id_lookup(self):
+        from core import history
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_history_dir = history.HISTORY_DIR
+            history.HISTORY_DIR = Path(tmpdir) / "logs" / "history"
+            try:
+                record_result_history(
+                    "品牌A",
+                    {
+                        "platform": "doubao",
+                        "keyword": "关键词A",
+                        "brand": "品牌A",
+                        "rank": 1,
+                        "mode": "browser",
+                        "references": [{"url": "https://example.com/a"}],
+                        "body_references": [{"url": "https://example.com/b"}],
+                    },
+                    task_id="task-a",
+                )
+
+                records = history.get_records("品牌A", task_id="task-a")
+                self.assertEqual(len(records), 1)
+                extra = records[0].get("extra") or {}
+                self.assertEqual([item["url"] for item in extra.get("references") or []], ["https://example.com/a"])
+                self.assertEqual([item["url"] for item in extra.get("body_references") or []], ["https://example.com/b"])
+                self.assertEqual(extra.get("body_reference_count"), 1)
+                self.assertEqual(extra.get("total_reference_count"), 2)
+            finally:
+                history.HISTORY_DIR = original_history_dir
 
 
 if __name__ == "__main__":

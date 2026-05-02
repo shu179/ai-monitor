@@ -255,7 +255,31 @@ def record_result_history(task_name: str, result: dict, *, execution_source: str
     if execution_source == 'manual_test' and result.get('rank', 99) == 99:
         return
 
-    history_record(
+    references = result.get('references', [])
+    if not isinstance(references, list):
+        references = []
+    body_references = result.get('body_references', [])
+    if not isinstance(body_references, list):
+        body_references = []
+
+    previous_index_signature = None
+    build_reference_index_source_signature = None
+    update_reference_index_with_records = None
+    try:
+        from core.article_reference_index import (
+            build_reference_index_source_signature as _build_reference_index_source_signature,
+            update_reference_index_with_records as _update_reference_index_with_records,
+        )
+
+        previous_index_signature = _build_reference_index_source_signature(task_name, task_id)
+        build_reference_index_source_signature = _build_reference_index_source_signature
+        update_reference_index_with_records = _update_reference_index_with_records
+    except Exception:
+        previous_index_signature = None
+        build_reference_index_source_signature = None
+        update_reference_index_with_records = None
+
+    written_entry = history_record(
         task_name,
         result.get('platform', ''),
         result.get('keyword', ''),
@@ -274,11 +298,26 @@ def record_result_history(task_name: str, result: dict, *, execution_source: str
             'recovered_manually': result.get('recovered_manually', False),
             'execution_source': execution_source,
             'extra': {
-                'references': result.get('references', []),
-                'reference_count': len(result.get('references', [])),
+                'references': references,
+                'body_references': body_references,
+                'reference_count': len(references),
+                'body_reference_count': len(body_references),
+                'total_reference_count': len(references) + len(body_references),
             },
         },
     )
+    if isinstance(written_entry, dict) and build_reference_index_source_signature and update_reference_index_with_records:
+        try:
+            current_index_signature = build_reference_index_source_signature(task_name, task_id)
+            update_reference_index_with_records(
+                task_name,
+                task_id,
+                [written_entry],
+                previous_source_signature=previous_index_signature,
+                current_source_signature=current_index_signature,
+            )
+        except Exception:
+            pass
 
 
 STRUCTURAL_ERROR_PATTERNS = (

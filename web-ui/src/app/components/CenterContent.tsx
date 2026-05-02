@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Zap, Eye, Code2, Cpu, ArrowUpRight, Map, Globe } from "lucide-react";
 import { ChartArea } from "./Charts";
 import { OcrFloatingWindow } from "./OcrFloatingWindow";
@@ -45,6 +45,47 @@ const DASHBOARD_TEAL = "#1E7F95";
 const DASHBOARD_CYAN = "#2FB8E6";
 const DASHBOARD_CYAN_LIGHT = "#74D2EE";
 const DASHBOARD_CYAN_SOFT = "#CBEFF9";
+const MEDIA_STAT_WEEKDAY_LABELS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+const FALLBACK_MEDIA_STATS = [
+  { name: '1月', auth: 400, self: 240 },
+  { name: '2月', auth: 300, self: 139 },
+  { name: '3月', auth: 200, self: 980 },
+  { name: '4月', auth: 278, self: 390 },
+  { name: '5月', auth: 189, self: 480 },
+  { name: '6月', auth: 239, self: 380 },
+];
+
+function parseMediaStatDate(dateText?: string) {
+  const [yearText, monthText, dayText] = String(dateText || "").split("-");
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) {
+    return null;
+  }
+  return new Date(year, month - 1, day);
+}
+
+function formatMediaStatAxisLabel(
+  item: DashboardSnapshot["mediaStats"][number],
+  index: number,
+  total: number,
+) {
+  const parsedDate = parseMediaStatDate(item.date);
+  if (!parsedDate) {
+    return item.label || item.name;
+  }
+
+  const position = index + 1;
+  const lastWeekStart = Math.max(total - 7, 7);
+  if (position <= 7) {
+    return `${parsedDate.getDate()}日`;
+  }
+  if (position > lastWeekStart) {
+    return `${parsedDate.getMonth() + 1}/${parsedDate.getDate()}`;
+  }
+  return MEDIA_STAT_WEEKDAY_LABELS[parsedDate.getDay()] || item.name;
+}
 
 const INDUSTRY_CHART_COLORS = [
   DASHBOARD_DEEP,
@@ -451,18 +492,19 @@ function IndustryPieChart({ data }: { data?: { name: string; value: number }[] }
   );
 }
 
-function MediaBarChart({ data }: { data?: { name: string; auth: number; self: number }[] }) {
+function MediaBarChart({ data }: { data?: DashboardSnapshot["mediaStats"] }) {
   const [filter, setFilter] = useState<'all' | 'auth' | 'self'>('all');
-  const chartData = data && data.length ? data : [
-    { name: '1月', auth: 400, self: 240 },
-    { name: '2月', auth: 300, self: 139 },
-    { name: '3月', auth: 200, self: 980 },
-    { name: '4月', auth: 278, self: 390 },
-    { name: '5月', auth: 189, self: 480 },
-    { name: '6月', auth: 239, self: 380 },
-  ];
-  const hasAnyData = chartData.some((item) => item.auth > 0 || item.self > 0);
-  const displayData = hasAnyData ? chartData.filter((item) => item.auth > 0 || item.self > 0) : chartData;
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const chartData = data && data.length ? data : FALLBACK_MEDIA_STATS;
+  const displayData = chartData;
+  const chartMinWidth = Math.max(600, displayData.length * 38 + 56);
+  const labeledData = useMemo(
+    () => displayData.map((item, index) => ({
+      ...item,
+      label: formatMediaStatAxisLabel(item, index, displayData.length),
+    })),
+    [displayData],
+  );
   const rawMaxValue = displayData.reduce((max, item) => {
     const currentValue =
       filter === 'auth' ? item.auth :
@@ -479,6 +521,17 @@ function MediaBarChart({ data }: { data?: { name: string; auth: number; self: nu
   if (yTicks[yTicks.length - 1] !== yAxisMax) {
     yTicks.push(yAxisMax);
   }
+
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      container.scrollLeft = Math.max(0, container.scrollWidth - container.clientWidth - 20);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [displayData, filter, chartMinWidth]);
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -503,39 +556,53 @@ function MediaBarChart({ data }: { data?: { name: string; auth: number; self: nu
         </div>
       </div>
 
-      <div className="h-[168px] w-full -ml-3">
-        <ResponsiveContainer width="100%" height={168}>
-          <BarChart data={displayData} margin={{ top: 10, right: 10, left: -10, bottom: 0 }} barCategoryGap="22%">
-            <CartesianGrid key="grid" strokeDasharray="3 3" vertical={false} stroke="#f3f4f6" />
-            <XAxis 
-              key="xaxis"
-              dataKey="name" 
-              axisLine={false} 
-              tickLine={false} 
-              tick={{ fontSize: 10, fill: '#9ca3af' }} 
-              minTickGap={8}
-              interval="preserveStartEnd"
-              dy={5}
-            />
-            <YAxis 
-              key="yaxis"
-              axisLine={false} 
-              tickLine={false} 
-              allowDecimals={false}
-              domain={[0, yAxisMax]}
-              ticks={yTicks}
-              tick={{ fontSize: 10, fill: '#9ca3af' }} 
-              dx={-5}
-            />
-            <RechartsTooltip 
-              key="tooltip"
-              cursor={{ fill: '#f8fafc' }}
-              contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.05)', fontSize: '11px' }}
-            />
-            <Bar key="bar-auth" hide={filter !== 'all' && filter !== 'auth'} dataKey="auth" name="权威媒体" fill={DASHBOARD_DEEP} radius={[4, 4, 0, 0]} maxBarSize={24} />
-            <Bar key="bar-self" hide={filter !== 'all' && filter !== 'self'} dataKey="self" name="自媒体" fill={DASHBOARD_CYAN} radius={[4, 4, 0, 0]} maxBarSize={24} />
-          </BarChart>
-        </ResponsiveContainer>
+      <div className="w-full -ml-3 overflow-hidden">
+        <div className="flex w-full">
+          <div className="w-[40px] shrink-0">
+            <div className="flex h-[144px] flex-col justify-between pt-[10px] pr-2 pb-0 text-right text-[10px] font-medium leading-none text-gray-400">
+              {[...yTicks].reverse().map((tick, index) => (
+                <div key={`${tick}-${index}`} className="tabular-nums">
+                  {tick}
+                </div>
+              ))}
+            </div>
+            <div className="h-[24px]" />
+          </div>
+
+          <div ref={scrollContainerRef} className="flex-1 overflow-x-auto overflow-y-hidden custom-scrollbar">
+            <div className="h-full" style={{ minWidth: chartMinWidth }}>
+              <div className="h-[144px]">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={displayData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }} barCategoryGap="10%" barGap={2}>
+                    <CartesianGrid key="grid" strokeDasharray="3 3" vertical={false} stroke="#f3f4f6" />
+                    <XAxis
+                      key="xaxis"
+                      dataKey="name"
+                      hide
+                    />
+                    <RechartsTooltip
+                      key="tooltip"
+                      cursor={{ fill: '#f8fafc' }}
+                      contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.05)', fontSize: '11px' }}
+                    />
+                    <Bar key="bar-auth" hide={filter !== 'all' && filter !== 'auth'} dataKey="auth" name="权威媒体" fill={DASHBOARD_DEEP} radius={[4, 4, 0, 0]} maxBarSize={22} />
+                    <Bar key="bar-self" hide={filter !== 'all' && filter !== 'self'} dataKey="self" name="自媒体" fill={DASHBOARD_CYAN} radius={[4, 4, 0, 0]} maxBarSize={22} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div
+                className="grid h-[24px] items-start pr-[10px]"
+                style={{ gridTemplateColumns: `repeat(${displayData.length || 1}, minmax(0, 1fr))` }}
+              >
+                {labeledData.map((item, index) => (
+                  <div key={`${item.label || item.name}-${index}`} className="pt-1 text-center text-[10px] leading-none font-medium text-gray-400">
+                    {item.label || item.name}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );

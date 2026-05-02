@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import core.daily_task_state as dts
 import main
+from platforms.base import SchedulerStopRequested
 
 
 class _FakePlatform:
@@ -20,6 +21,7 @@ class _FakePlatform:
         self.last_references = []
         self.last_body_references = []
         self.last_run_recovered_manually = False
+        self.stop_checker = None
 
     def start(self):
         return self
@@ -29,6 +31,9 @@ class _FakePlatform:
 
     def search(self, keyword: str, brand: str) -> tuple[int, str]:
         self._calls.append(self.platform_name)
+        if callable(self.stop_checker) and self.stop_checker():
+            self.last_error = "定时任务已关闭，当前浏览器查询已终止"
+            raise SchedulerStopRequested(self.last_error)
         screenshot_path = self._screenshot_dir / f"{keyword}_{self.platform_name}.jpg"
         screenshot_path.write_bytes(b"fake-image")
         self.last_answer_text = f"{brand} mention on {self.platform_name}"
@@ -69,8 +74,10 @@ class RunTaskGroupPlatformExecutionTests(unittest.TestCase):
         }
 
     def _create_platform(self, platform_name: str, *, config=None, inspect=False, stop_checker=None):
-        del config, inspect, stop_checker
-        return _FakePlatform(platform_name, self._screenshot_dir, self.calls)
+        del config, inspect
+        platform = _FakePlatform(platform_name, self._screenshot_dir, self.calls)
+        platform.stop_checker = stop_checker
+        return platform
 
     def test_runs_all_selected_platforms_in_same_round(self) -> None:
         task = self._task()
@@ -126,6 +133,30 @@ class RunTaskGroupPlatformExecutionTests(unittest.TestCase):
         self.assertEqual([item["platform"] for item in results], ["deepseek"])
         self.assertEqual(report["attempted_queries"], 1)
         self.assertEqual(report["success_queries"], 1)
+
+    def test_stop_checker_cancels_browser_round_without_recording_failed_query(self) -> None:
+        task = self._task()
+
+        with patch("main.create_browser_platform", side_effect=self._create_platform):
+            with patch("main._load_today_success_only_query_results", return_value={}):
+                with patch("main._record_result_history", return_value=None):
+                    with patch(
+                        "main._send_task_notifications",
+                        return_value={"attempted": False, "success": False, "found_results": 0, "error_message": ""},
+                    ):
+                        results, report = main.run_task_group(
+                            task,
+                            {},
+                            {"detection_mode": "browser"},
+                            return_report=True,
+                            stop_checker=lambda: True,
+                        )
+
+        self.assertEqual(results, [])
+        self.assertEqual(self.calls, [])
+        self.assertTrue(report["_scheduler_cancelled"])
+        self.assertEqual(report["task_failure_kind"], "cancelled")
+        self.assertEqual(report["task_status"], "pending")
 
 
 if __name__ == "__main__":

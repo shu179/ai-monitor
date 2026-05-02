@@ -71,6 +71,7 @@ from backend_lib.article_service import (
     _runtime_article_import_batches,
     _save_article_import_batches_file,
 )
+from backend_lib.article_reference_service import ArticleReferenceService
 from backend_lib.config_provider import RuntimeConfigProvider
 from backend_lib.dashboard import (
     _build_dashboard_failed_tasks as _build_dashboard_failed_tasks_impl,
@@ -108,6 +109,7 @@ from backend_lib.keyword_import import (
     _split_keyword_import_candidates,
 )
 from backend_lib.settings_service import SettingsService, _screenshot_theme_to_api
+from backend_lib.selector_heal_service import SelectorHealService
 from backend_lib.snapshot_fragments import (
     _build_snapshot_assistant,
     _build_snapshot_branding,
@@ -154,6 +156,7 @@ from core.browser_processes import (
 )
 from core.browser_platform_factory import (
     BROWSER_PLATFORM_IDS,
+    create_browser_platform,
     get_browser_platform_class,
     normalize_browser_platform_name,
 )
@@ -391,6 +394,7 @@ _BROWSER_AUTOMATION_MANAGED_FIELDS = {
         *_BROWSER_AUTOMATION_RUNTIME_MANAGED_FIELDS,
         "new_chat_selector",
         "deep_think_selector",
+        "generation_pause_selector",
     },
     "kimi": {
         *_BROWSER_AUTOMATION_RUNTIME_MANAGED_FIELDS,
@@ -400,8 +404,6 @@ _BROWSER_AUTOMATION_MANAGED_FIELDS = {
         *_BROWSER_AUTOMATION_RUNTIME_MANAGED_FIELDS,
         "new_chat_selector",
         "deep_think_selector",
-        "web_search_container_selector",
-        "web_search_trigger_selector",
     },
     "tongyi": {
         *_BROWSER_AUTOMATION_RUNTIME_MANAGED_FIELDS,
@@ -1676,12 +1678,26 @@ class AppRuntime:
             lock=self._lock,
             import_batch_store=self.article_import_batch_store,
         )
+        self.article_reference_service = ArticleReferenceService(
+            config_provider=self.config_provider,
+            synced_articles_loader=self._get_synced_articles,
+        )
         self.settings_service = SettingsService(
             context_snapshot_loader=self._ensure_context_snapshots,
             browser_auth_loader=self.get_browser_auth,
             public_profile_builder=self.get_public_profile,
             cloud_sync_status_getter=lambda: self._cloud_sync_manager.get_status(),
             secret_masker=_mask_secret,
+        )
+        self.selector_heal_service = SelectorHealService(
+            config_loader=self.load_config,
+            platform_factory=create_browser_platform,
+            selector_config_writer=self._write_selector_heal_config,
+            platform_session_closer=lambda platform, reason: self._close_runtime_platform_for_auth(
+                platform,
+                reason=reason,
+            ),
+            runtime_safety_checker=self._selector_heal_runtime_safety,
         )
         self._test_run_cancel_events: dict[str, threading.Event] = {}
         self._test_failure_notices: dict[str, dict[str, Any]] = {}
@@ -1751,6 +1767,10 @@ class AppRuntime:
     def _invalidate_article_cache(self) -> None:
         with self._article_cache_lock:
             self._synced_articles_cache = None
+        try:
+            self.article_reference_service.invalidate_cache()
+        except Exception:
+            pass
 
     @staticmethod
     def _article_store_version_key() -> tuple[str, int, int]:
@@ -4388,6 +4408,21 @@ return changedCount
             months.append({"name": label, "value": auth + self_, "auth": auth, "self": self_})
         return {"months": months}
 
+    def get_task_article_reference_ranking(
+        self,
+        task_id: str,
+        *,
+        platform: str = "all",
+        date_from: str = "",
+        date_to: str = "",
+    ) -> dict:
+        return self.article_reference_service.get_task_article_reference_ranking(
+            task_id,
+            platform=platform,
+            date_from=date_from,
+            date_to=date_to,
+        )
+
     def create_task(self, payload: dict) -> dict:
         """创建新任务。"""
         with self._lock:
@@ -5787,6 +5822,119 @@ return changedCount
         """返回当前设置。"""
         return self.settings_service.get_settings()
 
+    def diagnose_selector_heal(self, payload: dict) -> dict:
+        """Run a read-only selector diagnosis."""
+        return self.selector_heal_service.diagnose(payload)
+
+    def apply_selector_heal(self, payload: dict) -> dict:
+        """Apply a verified selector candidate."""
+        return self.selector_heal_service.apply(payload)
+
+    def diagnose_selector_pause_state(self, payload: dict) -> dict:
+        """Probe the in-generation pause/stop state used by browser crawling."""
+        return self.selector_heal_service.diagnose_pause_state(payload)
+
+    def _selector_heal_runtime_safety(self) -> dict[str, Any]:
+        checks: dict[str, Any] = {}
+        blockers: list[str] = []
+
+        monitoring_running = self._is_monitoring_running()
+        checks["monitoring_running"] = monitoring_running
+        if monitoring_running:
+            blockers.append("正式抓取任务正在运行，请先暂停抓取后再应用 selector。")
+
+        scheduler_draining = False
+        scheduler_running_tasks: dict[str, Any] = {}
+        if self._scheduler is not None:
+            try:
+                scheduler_running_tasks = dict(self._scheduler.get_running_tasks() or {})
+            except Exception:
+                scheduler_running_tasks = {}
+            scheduler_draining = bool(scheduler_running_tasks)
+        checks["scheduler_draining"] = scheduler_draining
+        checks["scheduler_running_tasks"] = scheduler_running_tasks
+        if scheduler_draining:
+            blockers.append("抓取任务正在暂停收尾，请等待当前浏览器动作完全结束后再应用 selector。")
+
+        worker_running = bool(self._worker and self._worker.is_alive())
+        checks["manual_run_running"] = worker_running
+        if worker_running:
+            blockers.append("手动执行任务正在运行，请等待结束后再应用 selector。")
+
+        with self._test_run_lock:
+            active_test_runs = [
+                run_id
+                for run_id, state in self._test_runs.items()
+                if str((state or {}).get("status") or "").strip() in {"queued", "running"}
+            ]
+        checks["active_test_runs"] = active_test_runs
+        if active_test_runs:
+            blockers.append("当前有测试任务正在运行，请等待结束后再应用 selector。")
+
+        recognition_test_running = False
+        manager = self._recognition_test_manager
+        if manager is not None and hasattr(manager, "get_runtime_status"):
+            try:
+                recognition_test_running = bool((manager.get_runtime_status() or {}).get("running"))
+            except Exception:
+                recognition_test_running = True
+        checks["recognition_test_running"] = recognition_test_running
+        if recognition_test_running:
+            blockers.append("识别测试正在运行，请先停止识别测试后再应用 selector。")
+
+        active_batches = self._active_batch_test_ids()
+        checks["active_batch_tests"] = active_batches
+        if active_batches:
+            blockers.append("批量测试正在运行，请等待结束或取消后再应用 selector。")
+
+        blocking_reason = blockers[0] if blockers else ""
+        return {
+            "runtime_safe": not blockers,
+            "blocking_reason": blocking_reason,
+            "checks": checks,
+        }
+
+    @staticmethod
+    def _active_batch_test_ids(*, stale_after_seconds: float = 6 * 60 * 60) -> list[str]:
+        batch_dir = resolve_app_path("user_data/batch_tests")
+        if not batch_dir.exists():
+            return []
+        active: list[str] = []
+        now_ts = time.time()
+        for path in batch_dir.glob("*.json"):
+            if path.name.endswith("_report.json"):
+                continue
+            try:
+                stat = path.stat()
+                if now_ts - stat.st_mtime > stale_after_seconds:
+                    continue
+                with open(path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle) or {}
+            except Exception:
+                continue
+            status = str((payload or {}).get("status") or "").strip().lower()
+            if status in {"pending", "running"}:
+                batch_id = str((payload or {}).get("batch_id") or path.stem).strip()
+                if batch_id:
+                    active.append(batch_id)
+        return active
+
+    def _write_selector_heal_config(self, platform: str, field: str, selector: str) -> str:
+        with self._lock:
+            config = self.load_config()
+            browser_cfg = config.get("browser_automation")
+            if not isinstance(browser_cfg, dict):
+                browser_cfg = {}
+                config["browser_automation"] = browser_cfg
+            platform_cfg = browser_cfg.get(platform)
+            if not isinstance(platform_cfg, dict):
+                platform_cfg = {}
+                browser_cfg[platform] = platform_cfg
+            previous_selector = str(platform_cfg.get(field) or "").strip()
+            platform_cfg[field] = selector
+            self.save_config(config)
+            return previous_selector
+
     def save_settings(self, payload: dict) -> dict:
         """保存设置到 config.yaml。"""
         with self._lock:
@@ -5851,7 +5999,7 @@ return changedCount
 
             allowed_sections = [
                 "scheduler", "ai_assistant", "local_model", "recognition",
-                "search", "smart_vision", "profile", "cloud_sync",
+                "search", "smart_vision", "selector_agent", "profile", "cloud_sync",
                 "default_notification",
                 "context_snapshots",
                 "query_execution",
@@ -5882,7 +6030,7 @@ return changedCount
                     config.get("browser_automation", {}) or {},
                     normalized_payload["browser_automation"],
                 )
-            for section in ("ai_assistant", "recognition", "smart_vision"):
+            for section in ("ai_assistant", "recognition", "smart_vision", "selector_agent"):
                 section_cfg = config.get(section, {}) or {}
                 if isinstance(section_cfg, dict) and section_cfg.get("platform"):
                     section_cfg["platform"] = _normalize_platform_id(str(section_cfg.get("platform", "") or "").strip())
@@ -7424,6 +7572,22 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             task_id = path[len("/api/tasks/"):-len("/monthly-stats")]
             _json_response(self, self.runtime.get_task_monthly_stats(task_id))
             return True
+        if path.startswith("/api/tasks/") and path.endswith("/article-reference-ranking"):
+            qs = parse_qs(parsed.query)
+            task_id = path[len("/api/tasks/"):-len("/article-reference-ranking")]
+            platform = (qs.get("platform", ["all"])[0] or "all").strip()
+            date_from = (qs.get("date_from", [""])[0] or "").strip()
+            date_to = (qs.get("date_to", [""])[0] or "").strip()
+            _json_response(
+                self,
+                self.runtime.get_task_article_reference_ranking(
+                    task_id,
+                    platform=platform,
+                    date_from=date_from,
+                    date_to=date_to,
+                ),
+            )
+            return True
         if path.startswith("/api/tasks/") and path.endswith("/trend"):
             qs = parse_qs(parsed.query)
             range_key = (qs.get("range", ["week"])[0] or "week").strip()
@@ -7489,6 +7653,18 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/actions/run-all":
             _json_response(self, self.runtime.trigger_run_all())
+            return
+        if path == "/api/selector-heal/diagnose":
+            payload = self._read_json()
+            _json_response(self, self.runtime.diagnose_selector_heal(payload))
+            return
+        if path == "/api/selector-heal/apply":
+            payload = self._read_json()
+            _json_response(self, self.runtime.apply_selector_heal(payload))
+            return
+        if path == "/api/selector-heal/pause-state":
+            payload = self._read_json()
+            _json_response(self, self.runtime.diagnose_selector_pause_state(payload))
             return
         exact_method_name = POST_JSON_RUNTIME_METHODS.get(path)
         if exact_method_name:

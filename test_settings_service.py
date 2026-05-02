@@ -34,6 +34,7 @@ def test_settings_service_projects_masked_settings(monkeypatch):
             },
         },
         "article_export": {"show_keyword_category": True, "show_selfmedia_account": False},
+        "selector_agent": {"enabled": True, "platform": "deepseek", "model": "deepseek-chat"},
     }
 
     service = SettingsService(
@@ -61,9 +62,37 @@ def test_settings_service_projects_masked_settings(monkeypatch):
         "show_keyword_category": True,
         "show_selfmedia_account": False,
     }
+    assert result["selector_agent"] == {"enabled": True, "platform": "deepseek", "model": "deepseek-chat"}
     assert result["query_execution"]["browser"]["strategy"] == "platform_serial"
     assert result["query_execution"]["browser"]["session_pool_dispatch"] == "platform_batch"
     assert result["screenshot_template"]["title"] == "标题"
     assert result["screenshot_template"]["show_time"] is False
     assert result["screenshot_template"]["background_start"] == "#111111"
     assert result["screenshot"]["browser_answer_mode"] == "dom"
+
+
+def test_settings_service_provides_selector_agent_fallback_from_ai_assistant(monkeypatch):
+    monkeypatch.setattr(settings_module, "get_version_payload", lambda: {"version": "test"})
+    monkeypatch.setattr(settings_module, "get_local_model_manager", lambda: _FakeLocalModelManager())
+    monkeypatch.setattr(settings_module, "build_update_status", lambda config, include_check=False: {"ok": True})
+    monkeypatch.setattr(settings_module, "get_app_update_settings", lambda config: {"channel": "stable"})
+
+    config = {
+        "ai_assistant": {"platform": "deepseek", "model": "deepseek-chat"},
+    }
+
+    service = SettingsService(
+        context_snapshot_loader=lambda: (config, {}),
+        browser_auth_loader=lambda: {"platforms": {}},
+        public_profile_builder=lambda current_config: {"name": "AI 运营"},
+        cloud_sync_status_getter=lambda: {"connected": False},
+        secret_masker=lambda value: value if str(value or "").startswith("MASK(") else (f"MASK({value})" if value else ""),
+    )
+
+    result = service.get_settings()
+
+    assert result["selector_agent"] == {
+        "enabled": False,
+        "platform": "deepseek",
+        "model": "deepseek-chat",
+    }

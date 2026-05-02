@@ -1,53 +1,30 @@
+detection_mode: browser
 scheduler:
-  interval: 300
-  night_mode: true
-  night_start: '23:00'
-  night_end: 07:00
-  random_jitter: 0.2
-wechat_bots:
-  default:
-    name: 默认群
-    webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY_HERE
-default_notification:
-  cooldown_minutes: 30
-  send_interval: 2
-platforms:
-  doubao:
-    enabled: true
-    user_data_dir: ./auth/doubao
-  deepseek:
-    enabled: false
-    user_data_dir: ./auth/deepseek
-  kimi:
-    enabled: false
-    user_data_dir: ./auth/kimi
-  yuanbao:
-    enabled: false
-    user_data_dir: ./auth/yuanbao
-  tongyi:
-    enabled: false
-    user_data_dir: ./auth/tongyi
-  wenxin:
-    enabled: false
-    user_data_dir: ./auth/wenxin
+  weekly_times:
+    '0': null
+    '1': null
+    '2': null
+    '3': null
+    '4': null
+    '5': null
+    '6': null
+  auto_continue_after_default_failure: false
+  notification_webhook_url: ''
 tasks:
-- name: 豆包-即搜AI
-  platform: doubao
-  keyword: 武汉geo优化公司
-  brand: 即搜AI
-  enabled: true
-  weekdays:
-  - 0
-  - 1
-  - 2
-  - 3
-  - 4
-  wechat_bot: default
-- name: '1'
-  platform: doubao
-  keyword: 武汉GEO优化公司
-  brand: 即搜AI
-  webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=1dec6872-9bb7-4058-9dc2-44f86953ace3
+- name: 即搜AI
+  industry_tags:
+  - 科技互联网
+  region_tags:
+  - 湖北
+  keywords:
+  - keyword: 武汉GEO优化公司
+    brand: 即搜AI
+    platforms:
+    - doubao
+    mode: browser
+    deep_think:
+      doubao: true
+  webhook_url: ''
   weekdays:
   - 0
   - 1
@@ -55,12 +32,199 @@ tasks:
   - 3
   - 4
   enabled: true
-  schedule:
-  - '15:00'
+  inspect: false
+  recognition_enabled: false
+  recognition_brands: ''
+  recognition_batch_size: 2
+  task_id: legacy_2fc71313da15
+  optimization_start_date: ''
+  optimization_end_date: ''
+  brand: 即搜AI
+- name: 智源本珍
+  brand: 智源本珍
+  webhook_url: ''
+  recognition_brands: ''
+  optimization_start_date: ''
+  optimization_end_date: ''
+  enabled: true
+  inspect: false
+  recognition_enabled: false
+  weekdays:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  industry_tags:
+  - 食品
+  region_tags: []
+  keywords:
+  - keyword: 牛肉品牌推荐
+    brand: 智源本珍
+    platforms:
+    - doubao
+    mode: browser
+    deep_think:
+      doubao: true
+  task_id: legacy_f81af072565a
+  recognition_batch_size: 1
+platforms:
+  local_model:
+    api_key: ''
+    api_model: gemma4:e2b
+    model_options:
+    - gemma4:e2b
+  kimi:
+    api_key: ''
+  doubao:
+    api_key: ''
+    api_model: doubao-seed-2-0-pro-260215
+    model_options:
+    - doubao-seed-2-0-pro-260215
+  deepseek:
+    api_key: ''
+  ark_deepseek:
+    api_key: ''
+  tongyi:
+    api_key: ''
+  wenxin:
+    api_key: ''
+  yuanbao:
+    api_key: ''
+    api_model: DeepSeek-V3-0324
+    model_options:
+    - DeepSeek-V3-0324
+  chatgpt:
+    api_key: ''
+  claude:
+    api_key: ''
+  gemini:
+    api_key: ''
+  perplexity:
+    api_key: ''
+local_model:
+  default_model: gemma4:e2b
+  auto_start: true
+  auto_pull: true
+  auto_prepare_on_launch: true
+  seed_bundled_models_on_launch: true
+  base_url: http://127.0.0.1:11434
+  bundled_binary_relative_path: third_party/ollama/ollama
+  bundled_models_relative_path: third_party/ollama-models
+  runtime_binary_path: ollama/runtime/ollama
+  runtime_models_dir: ollama/models
+quick_todos: []
+profile:
+  name: shu
+  role: 资深 AI 运营
+  avatar: user_data/profile/avatar.jpg
+  birthday: '2003-08-21'
+  hire_date: '2025-09-08'
+ai_assistant:
+  platform: doubao
+  model: doubao-seed-2-0-pro-260215
+recognition:
+  safe_mode_ocr_enabled: true
+  ai_fallback_enabled: false
+  platform: doubao
+  model: doubao-seed-2-0-pro-260215
+  dom_render_mode: true
+  dom_render_default_platform: ''
+  dom_render_min_length: 500
+  dom_render_max_length: 5000
+screenshot_template:
+  enabled: true
+  title: '{platform}'
+  subtitle: '{brand}'
+  footer: MONITOR SNAPSHOT
+  show_time: true
+  show_footer: true
+  show_highlight: true
+  accent_color: '#14C7F3'
+  background_start: '#FCFDFF'
+  background_end: '#F7FAFF'
+  header_start: '#173A43'
+  header_end: '#14C7F3'
+  outer_padding: 28
+  header_height: 152
+  radius: 28
+  image_radius: 22
+search:
+  provider: tavily
+  tavily_api_key: ''
+  model_pool:
+  - sonar-pro
+  - sonar
+smart_vision:
+  enabled: false
+  platform: doubao
+  model: doubao-seed-2-0-pro-260215
+selector_agent:
+  enabled: false
+  platform: doubao
+  model: doubao-seed-2-0-pro-260215
+browser_automation:
+  doubao:
+    new_chat_selector: div[data-testid='create_conversation_button']
+    deep_think_menu_trigger_selector: div[data-testid="deep-thinking-action-button"],
+      button:has(div[data-testid="deep-thinking-action-button"])
+    deep_think_think_selector: div[data-testid="deep-thinking-action-item-1"], [role="menuitem"]:has-text("思考")
+    deep_think_quick_selector: '[role="menuitem"]:has-text("快速")'
+  deepseek:
+    new_chat_selector: button:has(path[d^='M8 0.599609'])
+    deep_think_selector: button:has-text('深度思考'), div:has-text('深度思考'), span:has-text('深度思考')
+  kimi:
+    new_chat_selector: button:has(svg[name='AddConversation']), [role='button']:has(svg[name='AddConversation']),
+      svg[name='AddConversation']
+  yuanbao:
+    new_chat_selector: .yb-icon.icon-yb-ic_newchat_20
+    deep_think_selector: button:has-text('Deep thinking'), div:has-text('Deep thinking'),
+      span:has-text('Deep thinking'), button:has-text('深度思考'), div:has-text('深度思考')
+  tongyi:
+    new_chat_selector: button:has-text("新建对话"), button[aria-label="新建对话"], button[class*="newChat"],
+      button[class*="new-chat"]
+    deep_think_selector: button[aria-label="深度思考"], button:has-text("深度思考")
+  wenxin:
+    new_chat_selector: img[alt="New Session Btn"]
+    deep_think_menu_selector: '[class*="inputToolbarLeft"] [class*="item__"]'
+    deep_think_enable_item_selector: '[class*="dtModeItem__"]'
 screenshot:
-  format: jpg
-  quality: 85
-  max_width: 1920
-  auto_cleanup: true
-  keep_days: 7
-  max_size_mb: 500
+  decoration:
+    enabled: true
+    title: '{platform}'
+    subtitle: '{brand}'
+    footer: MONITOR SNAPSHOT
+    show_timestamp: true
+    show_footer: true
+    draw_highlight_boxes: true
+    accent_color: '#14C7F3'
+    background:
+      start: '#FCFDFF'
+      end: '#F7FAFF'
+    card:
+      surface: '#FFFFFF'
+      border: '#D7E3F4'
+      shadow: '#10213A26'
+    header:
+      start: '#173A43'
+      end: '#14C7F3'
+    text:
+      header_primary: '#F8FBFF'
+      header_secondary: '#D8E4FF'
+      body_primary: '#0F172A'
+      body_secondary: '#5B6B84'
+      chip_text: '#0F172A'
+      footer: '#6B7A90'
+    chip:
+      fill: '#FFFFFF'
+      border: '#D6E0F5'
+    layout:
+      outer_padding: 28
+      inner_padding: 18
+      header_height: 152
+      radius: 28
+      image_radius: 22
+      shadow_blur: 18
+      shadow_offset_y: 10

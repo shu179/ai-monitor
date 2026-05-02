@@ -64,6 +64,8 @@ export type DashboardSnapshot = {
     name: string;
     auth: number;
     self: number;
+    date?: string;
+    label?: string;
   }>;
 };
 
@@ -158,6 +160,156 @@ export type ArticleSnapshot = {
   referenced?: boolean;
   referencedTasks?: string[];
   lastReferencedAt?: string;
+};
+
+export type ArticleReferenceRankingPlatform = {
+  id: string;
+  label: string;
+  configured: boolean;
+  raw_count: number;
+  event_count: number;
+};
+
+export type ArticleReferenceRankingDailyPoint = {
+  date: string;
+  article_count: number;
+  event_count: number;
+  raw_count: number;
+};
+
+export type ArticleReferenceRankingItem = {
+  rank: number;
+  score: number;
+  article: {
+    id: string;
+    title: string;
+    url: string;
+    source: string;
+    type: "media" | "self-media";
+  };
+  raw_ref_count: number;
+  effective_event_count: number;
+  weighted_mention_count: number;
+  active_days: number;
+  span_days: number;
+  platform_count: number;
+  platforms: ArticleReferenceRankingPlatform[];
+  first_referenced_at: string;
+  last_referenced_at: string;
+};
+
+export type ArticleReferenceRankingResponse = {
+  ok?: boolean;
+  algorithm_version: string;
+  computed_at: string;
+  data_coverage: {
+    body_references_since: string;
+    answer_text_fallback: boolean;
+  };
+  available_platforms: ArticleReferenceRankingPlatform[];
+  daily_points: ArticleReferenceRankingDailyPoint[];
+  items: ArticleReferenceRankingItem[];
+  total: number;
+  message?: string;
+};
+
+export type SelectorHealCandidate = {
+  selector: string;
+  score?: number;
+  reason?: string;
+  verified?: boolean;
+  verify_reason?: string;
+  verify_error?: string;
+  text?: string;
+  aria_label?: string;
+  test_id?: string;
+  tag?: string;
+};
+
+export type SelectorHealFieldResult = {
+  ok?: boolean;
+  platform: string;
+  field: string;
+  intent?: string;
+  current_selector?: string;
+  current_status?: string;
+  field_risk_level?: string;
+  apply_allowed?: boolean;
+  verify_status?: string;
+  verified_selector?: string;
+  verify_reason?: string;
+  selector?: string;
+  previous_selector?: string;
+  saved?: boolean;
+  save_error?: string;
+  candidates?: SelectorHealCandidate[];
+  selector_agent_used?: boolean;
+  selector_agent_platform?: string;
+  selector_agent_model?: string;
+  selector_agent_confidence?: number;
+  selector_agent_reason?: string;
+  selector_agent_error?: string;
+  selector_agent_selected_selector?: string;
+  selector_agent_image_used?: boolean;
+  selector_agent_image_supported?: boolean;
+};
+
+export type SelectorHealResponse = {
+  ok: boolean;
+  platform?: string;
+  verify?: boolean;
+  auto_apply?: boolean;
+  vision?: boolean;
+  runtime_safe?: boolean;
+  blocking_reason?: string;
+  message?: string;
+  results?: SelectorHealFieldResult[];
+};
+
+export type SelectorHealApplyResponse = {
+  ok: boolean;
+  platform?: string;
+  field?: string;
+  selector?: string;
+  previous_selector?: string;
+  field_risk_level?: string;
+  apply_allowed?: boolean;
+  runtime_safe?: boolean;
+  blocking_reason?: string;
+  message?: string;
+};
+
+export type SelectorPauseStateResponse = {
+  ok: boolean;
+  platform?: string;
+  field?: string;
+  runtime_safe?: boolean;
+  blocking_reason?: string;
+  message?: string;
+  prompt?: string;
+  verified_selector?: string;
+  selector?: string;
+  previous_selector?: string;
+  saved?: boolean;
+  save_error?: string;
+  log_path?: string;
+  submit_error?: string;
+  summary?: {
+    sample_count?: number;
+    generating_sample_count?: number;
+    saw_pause_state?: boolean;
+    suggested_selector?: string;
+    top_selectors?: Array<[string, number]>;
+    top_path_prefixes?: Array<[string, number]>;
+    first_generating_sample?: Record<string, unknown> | null;
+    last_sample?: Record<string, unknown> | null;
+  };
+};
+
+export type SelectorAgentSettingsSnapshot = {
+  enabled: boolean;
+  platform: string;
+  model: string;
 };
 
 export type ArticleTableImportResult = {
@@ -1551,6 +1703,61 @@ export async function browserAuthAction(
   }
 }
 
+export async function diagnoseSelectorHeal(payload: {
+  platform: string;
+  fields: string[];
+  verify?: boolean;
+  auto_apply?: boolean;
+}): Promise<SelectorHealResponse> {
+  try {
+    const res = await apiFetch("/api/selector-heal/diagnose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return await res.json();
+  } catch {
+    return { ok: false, message: "网络错误", results: [] };
+  }
+}
+
+export async function applySelectorHeal(payload: {
+  platform: string;
+  field: string;
+  candidate_selector: string;
+}): Promise<SelectorHealApplyResponse> {
+  try {
+    const res = await apiFetch("/api/selector-heal/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (data?.ok) {
+      invalidateSettingsCache();
+      void fetchSettings({ force: true });
+    }
+    return data;
+  } catch {
+    return { ok: false, message: "网络错误" };
+  }
+}
+
+export async function diagnoseSelectorPauseState(payload: {
+  platform: string;
+}): Promise<SelectorPauseStateResponse> {
+  try {
+    const res = await apiFetch("/api/selector-heal/pause-state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return await res.json();
+  } catch {
+    return { ok: false, message: "网络错误" };
+  }
+}
+
 export async function fetchLocalModelStatus(): Promise<{ ok: boolean; local_model?: LocalModelStatus; message?: string }> {
   try {
     const res = await apiFetch("/api/local-model/status", {
@@ -1798,6 +2005,52 @@ export async function fetchTaskMonthlyStats(taskId: string): Promise<{ months: {
     return await res.json();
   } catch {
     return { months: [] };
+  }
+}
+
+export async function fetchTaskArticleReferenceRanking(
+  taskId: string,
+  params?: { platform?: string; date_from?: string; date_to?: string },
+): Promise<ArticleReferenceRankingResponse> {
+  try {
+    const qs = new URLSearchParams();
+    if (params?.platform) qs.set("platform", params.platform);
+    if (params?.date_from) qs.set("date_from", params.date_from);
+    if (params?.date_to) qs.set("date_to", params.date_to);
+    const url = `/api/tasks/${taskId}/article-reference-ranking${qs.toString() ? `?${qs.toString()}` : ""}`;
+    const res = await apiFetch(url, { cache: "no-store" });
+    if (!res.ok) {
+      return {
+        ok: false,
+        algorithm_version: "article_ref_weight_v1",
+        computed_at: "",
+        data_coverage: {
+          body_references_since: "",
+          answer_text_fallback: true,
+        },
+        available_platforms: [],
+        daily_points: [],
+        items: [],
+        total: 0,
+        message: "获取引用排名失败",
+      };
+    }
+    return await res.json();
+  } catch {
+    return {
+      ok: false,
+      algorithm_version: "article_ref_weight_v1",
+      computed_at: "",
+      data_coverage: {
+        body_references_since: "",
+        answer_text_fallback: true,
+      },
+      available_platforms: [],
+      daily_points: [],
+      items: [],
+      total: 0,
+      message: "网络错误",
+    };
   }
 }
 

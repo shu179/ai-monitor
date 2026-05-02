@@ -173,15 +173,6 @@ class DoubaoPlatform(BasePlatform):
             self._reraise_stop_requested(e)
         return None
 
-    def _wait_for_input_empty(self, timeout: float = 4.0) -> bool:
-        deadline = time.time() + max(1.0, timeout)
-        while time.time() < deadline:
-            self._raise_if_stop_requested()
-            if not self._normalize_compact_text(self._read_input_value()):
-                return True
-            self._cooperative_sleep(0.15)
-        return False
-
     def _wait_for_submit_started(self, before_input: str, timeout: float = 8.0) -> bool:
         keyword = str(getattr(self, "_last_prompt_text", "") or "")
         keyword_compact = self._normalize_compact_text(keyword)
@@ -568,30 +559,7 @@ class DoubaoPlatform(BasePlatform):
             return False
 
     def _wait_until_new_chat_ready(self, before: dict, timeout: float = 6.0) -> bool:
-        deadline = time.time() + max(1.0, timeout)
-        baseline_count = int((before or {}).get("answerCount") or 0)
-        baseline_length = int((before or {}).get("answerLength") or 0)
-        baseline_href = str((before or {}).get("href") or "").strip()
-        while time.time() < deadline:
-            self._raise_if_stop_requested()
-            current = self._conversation_snapshot()
-            current_count = int(current.get("answerCount") or 0)
-            current_length = int(current.get("answerLength") or 0)
-            current_input = str(current.get("inputValue") or "").strip()
-            current_href = str(current.get("href") or "").strip()
-            if current_input:
-                self._cooperative_sleep(0.25)
-                continue
-            if baseline_href and current_href and current_href != baseline_href and current_count == 0:
-                return True
-            if baseline_count <= 0 and baseline_length <= 0:
-                return True
-            if current_count == 0:
-                return True
-            if current_length <= min(20, max(0, baseline_length // 5)):
-                return True
-            self._cooperative_sleep(0.25)
-        return False
+        return super()._wait_until_new_chat_ready(before, timeout=timeout)
 
     def start_new_chat(self) -> None:
         """仅通过固定 selector 开启新对话，不再做 DOM 猜测。"""
@@ -600,17 +568,22 @@ class DoubaoPlatform(BasePlatform):
             self._disable_captcha_pointer_intercept()
             self.check_for_interruption(check_input_visible=False)
             before = self._conversation_snapshot()
+            last_error = "豆包新对话入口不可用"
             if self._click_selector(self.new_chat_selector, "新对话", timeout_ms=3000):
-                self._cooperative_sleep(random.uniform(0.5, 1.0))
-                self._wait_for_page_selector(self.input_selector, timeout_ms=8000)
-                self._wait_for_input_empty(timeout=2.0)
-                self._wait_until_new_chat_ready(before, timeout=4.0)
-                print(f"[{self.name}] 已开启新对话")
+                if self._wait_and_confirm_new_chat(before, sleep_seconds=random.uniform(0.5, 1.0), timeout_ms=8000):
+                    print(f"[{self.name}] 已开启新对话")
+                    return
+                last_error = "已点击新对话按钮，但未确认切换到新会话"
+            if self._attempt_learned_selector_heal("new_chat_selector", label="新对话"):
+                print(f"[{self.name}] 已通过 learned selector 开启新对话")
+                return
+            if self._attempt_selector_agent_heal("new_chat_selector", label="新对话"):
+                print(f"[{self.name}] 已通过 selector_agent 开启新对话")
                 return
             if self._open_fresh_chat_fallback():
                 print(f"[{self.name}] 新对话按钮不可用，已回到首页")
                 return
-            raise RuntimeError("豆包新对话入口不可用")
+            raise RuntimeError(last_error)
         except InterruptionDetected:
             raise
         except Exception as e:

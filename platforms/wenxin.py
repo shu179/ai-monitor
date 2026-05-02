@@ -217,18 +217,34 @@ class WenxinPlatform(BasePlatform):
             self._wait_for_human_resolution(
                 "文心一言检测到登录弹窗（扫码登录），请扫码登录后点击「确定」继续。"
             )
+        before = self._conversation_snapshot()
+        last_error = "未找到可用的新会话按钮"
         if not self.new_chat_selector:
+            if self._attempt_learned_selector_heal("new_chat_selector", label="新会话"):
+                print(f"[{self.name}] 已通过 learned selector 开启新会话")
+                return
+            if self._attempt_selector_agent_heal("new_chat_selector", label="新会话"):
+                print(f"[{self.name}] 已通过 selector_agent 开启新会话")
+                return
             return
         try:
             btn = self.page.locator(self.new_chat_selector).first
             self._wait_for_locator(btn, timeout_ms=5000)
             self._click_locator(btn, timeout_ms=5000)
-            self._cooperative_sleep(1.5)
-            self._wait_for_page_selector(self.input_selector, timeout_ms=10000)
-            print(f"[{self.name}] 已开启新对话")
+            if self._wait_and_confirm_new_chat(before, sleep_seconds=1.5):
+                print(f"[{self.name}] 已开启新对话")
+                return
+            last_error = "已点击新会话按钮，但未确认切换到新会话"
         except Exception as e:
             self._reraise_stop_requested(e)
-            print(f"[{self.name}] 开启新对话失败，继续: {e}")
+            last_error = str(e) or last_error
+        if self._attempt_learned_selector_heal("new_chat_selector", label="新会话"):
+            print(f"[{self.name}] 已通过 learned selector 开启新会话")
+            return
+        if self._attempt_selector_agent_heal("new_chat_selector", label="新会话"):
+            print(f"[{self.name}] 已通过 selector_agent 开启新会话")
+            return
+        print(f"[{self.name}] 开启新对话失败，继续: {last_error}")
 
     def type_like_human(self, text: str) -> None:
         """文心使用 Slate 编辑器，必须走真实键盘输入，不能直接改 DOM。"""

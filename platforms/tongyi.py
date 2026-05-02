@@ -558,7 +558,15 @@ class TongyiPlatform(BasePlatform):
 
     def start_new_chat(self) -> None:
         """新版通义的新建入口就是左侧文本按钮。"""
+        before = self._conversation_snapshot()
+        last_error = "未找到可用的新建对话按钮"
         if not self.new_chat_selector:
+            if self._attempt_learned_selector_heal("new_chat_selector", label="新建对话"):
+                print(f"[{self.name}] 已通过 learned selector 开启新对话")
+                return
+            if self._attempt_selector_agent_heal("new_chat_selector", label="新建对话"):
+                print(f"[{self.name}] 已通过 selector_agent 开启新对话")
+                return
             return
         try:
             self._raise_if_stop_requested()
@@ -578,12 +586,20 @@ class TongyiPlatform(BasePlatform):
                 }""")
                 if not clicked:
                     raise
-            self._cooperative_sleep(1.0)
-            self._wait_for_page_selector(self.input_selector, timeout_ms=10000)
-            print(f"[{self.name}] 已开启新对话")
+            if self._wait_and_confirm_new_chat(before, sleep_seconds=1.0):
+                print(f"[{self.name}] 已开启新对话")
+                return
+            last_error = "已点击新建对话按钮，但未确认切换到新会话"
         except Exception as e:
             self._reraise_stop_requested(e)
-            print(f"[{self.name}] 开启新对话失败，继续: {e}")
+            last_error = str(e) or last_error
+        if self._attempt_learned_selector_heal("new_chat_selector", label="新建对话"):
+            print(f"[{self.name}] 已通过 learned selector 开启新对话")
+            return
+        if self._attempt_selector_agent_heal("new_chat_selector", label="新建对话"):
+            print(f"[{self.name}] 已通过 selector_agent 开启新对话")
+            return
+        print(f"[{self.name}] 开启新对话失败，继续: {last_error}")
 
     def enable_deep_think(self) -> bool:
         try:
