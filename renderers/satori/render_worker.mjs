@@ -745,8 +745,87 @@ function collectTableRows(tokens, start, end) {
   return rows;
 }
 
+const TABLE_FONT_SIZE = 14;
+const TABLE_LINE_HEIGHT = 1.55;
+const TABLE_CELL_PADDING_X = 24;
+const TABLE_CELL_PADDING_Y = 16;
+const TABLE_MIN_ROW_HEIGHT = 42;
+
+function isCjkChar(ch) {
+  return /[\u2E80-\u9FFF\uF900-\uFAFF\u3000-\u303F\uFF00-\uFFEF]/.test(ch);
+}
+
+function textWidth(text, fontSize) {
+  let width = 0;
+  for (const ch of String(text || "")) {
+    width += charWidth(ch, fontSize);
+  }
+  return width;
+}
+
+function unbreakableTextWidth(text, fontSize) {
+  let longest = 0;
+  let latinRun = 0;
+  const flushRun = () => {
+    longest = Math.max(longest, latinRun);
+    latinRun = 0;
+  };
+
+  for (const ch of String(text || "")) {
+    if (isCjkChar(ch)) {
+      flushRun();
+      longest = Math.max(longest, charWidth(ch, fontSize));
+    } else if (/[\s、，。；：！？（）()[\]{}<>《》「」『』,.;:!?/\\|+\-=]+/.test(ch)) {
+      flushRun();
+    } else {
+      latinRun += charWidth(ch, fontSize);
+    }
+  }
+  flushRun();
+  return longest;
+}
+
+function tableColumnWidths(rows, width = ANSWER_WIDTH) {
+  const columnCount = Math.max(1, ...rows.map((row) => row.cells.length));
+  const minWidths = Array(columnCount).fill(0);
+  const preferredWidths = Array(columnCount).fill(0);
+
+  for (const row of rows) {
+    for (let index = 0; index < columnCount; index += 1) {
+      const cell = row.cells[index];
+      const text = inlineText(cell?.children);
+      const headerSafety = cell?.header ? 20 : 0;
+      const minContent = unbreakableTextWidth(text, TABLE_FONT_SIZE) + TABLE_CELL_PADDING_X + headerSafety;
+      const preferredContent = textWidth(text, TABLE_FONT_SIZE) + TABLE_CELL_PADDING_X + headerSafety;
+      minWidths[index] = Math.max(minWidths[index], Math.ceil(minContent));
+      preferredWidths[index] = Math.max(preferredWidths[index], Math.ceil(preferredContent));
+    }
+  }
+
+  const minimumColumnWidth = columnCount >= 6 ? 48 : 58;
+  for (let index = 0; index < columnCount; index += 1) {
+    minWidths[index] = Math.max(minimumColumnWidth, minWidths[index]);
+    preferredWidths[index] = Math.max(minWidths[index], preferredWidths[index]);
+  }
+
+  const minTotal = minWidths.reduce((sum, item) => sum + item, 0);
+  if (minTotal >= width) {
+    return minWidths.map((item) => Math.max(1, (item / minTotal) * width));
+  }
+
+  const preferredTotal = preferredWidths.reduce((sum, item) => sum + item, 0);
+  if (preferredTotal <= width) {
+    const remaining = width - preferredTotal;
+    return preferredWidths.map((item) => item + remaining / columnCount);
+  }
+
+  const remaining = width - minTotal;
+  return minWidths.map((minWidth, index) => minWidth + remaining * (preferredWidths[index] / preferredTotal));
+}
+
 function renderTable(tokens, start, end, pattern, keyPrefix) {
   const rows = collectTableRows(tokens, start, end);
+  const columnWidths = tableColumnWidths(rows, ANSWER_WIDTH);
 
   return h(
     "div",
@@ -756,7 +835,6 @@ function renderTable(tokens, start, end, pattern, keyPrefix) {
         display: "flex",
         flexDirection: "column",
         width: "100%",
-        borderTop: "1px solid rgba(226, 232, 240, 0.8)",
         marginBottom: 16,
       },
     },
@@ -769,7 +847,6 @@ function renderTable(tokens, start, end, pattern, keyPrefix) {
             display: "flex",
             flexDirection: "row",
             borderBottom: "1px solid rgba(226, 232, 240, 0.8)",
-            backgroundColor: row.header ? "rgba(248, 250, 252, 0.8)" : "transparent",
           },
         },
         row.cells.map((cell, cellIndex) =>
@@ -780,12 +857,14 @@ function renderTable(tokens, start, end, pattern, keyPrefix) {
               style: {
                 display: "flex",
                 flexWrap: "wrap",
-                flex: 1,
+                width: columnWidths[cellIndex],
+                flexGrow: 0,
+                flexShrink: 0,
                 minWidth: 0,
-                padding: "8px 10px",
+                padding: "8px 12px",
                 ...baseTextStyle({
-                  fontSize: 14,
-                  lineHeight: 1.55,
+                  fontSize: TABLE_FONT_SIZE,
+                  lineHeight: TABLE_LINE_HEIGHT,
                   color: cell.header ? TEXT_DARK : TEXT_BODY,
                   fontWeight: cell.header ? 600 : 400,
                 }),
@@ -803,21 +882,17 @@ function estimateTableHeight(tokens, start, end, width) {
   const rows = collectTableRows(tokens, start, end);
   if (!rows.length) return 0;
 
-  const fontSize = 14;
-  const lineHeight = 1.55;
-  const cellPaddingX = 20;
-  const cellPaddingY = 16;
-  const minRowHeight = 42;
+  const columnWidths = tableColumnWidths(rows, width);
   let height = 0;
 
   for (const row of rows) {
-    const columnCount = Math.max(1, row.cells.length);
-    const cellWidth = Math.max(24, width / columnCount - cellPaddingX);
-    let rowHeight = minRowHeight;
-    for (const cell of row.cells) {
+    let rowHeight = TABLE_MIN_ROW_HEIGHT;
+    for (let cellIndex = 0; cellIndex < row.cells.length; cellIndex += 1) {
+      const cell = row.cells[cellIndex];
+      const cellWidth = Math.max(24, (columnWidths[cellIndex] || width / row.cells.length) - TABLE_CELL_PADDING_X);
       const text = inlineText(cell.children);
-      const lines = estimateLines(text, cellWidth, fontSize);
-      rowHeight = Math.max(rowHeight, lines * fontSize * lineHeight + cellPaddingY);
+      const lines = estimateLines(text, cellWidth, TABLE_FONT_SIZE);
+      rowHeight = Math.max(rowHeight, lines * TABLE_FONT_SIZE * TABLE_LINE_HEIGHT + TABLE_CELL_PADDING_Y);
     }
     height += rowHeight;
   }
@@ -1004,7 +1079,7 @@ function buildTree(payload, answerContent, height) {
       style: {
         width: WIDTH,
         height,
-        backgroundColor: BG,
+        backgroundColor: "transparent",
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
@@ -1203,7 +1278,6 @@ async function rasterizeSvg(svg, scale) {
     return await sharp(Buffer.from(svg), { density: BASE_DENSITY * scale }).png().toBuffer();
   } catch (sharpError) {
     const resvg = new Resvg(svg, {
-      background: BG,
       fitTo: {
         mode: "width",
         value: Math.round(WIDTH * scale),

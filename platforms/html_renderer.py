@@ -54,7 +54,7 @@ _SATORI_DEFAULT_SCALE = 2.0
 _SATORI_JPEG_QUALITY = 92
 _SATORI_TEMPLATE_WIDTH = 900
 _SATORI_TEMPLATE_MIN_VIEWPORT_HEIGHT = 800
-_SATORI_TEMPLATE_BOTTOM_PADDING = 30
+_SATORI_TEMPLATE_BOTTOM_PADDING = 28
 
 _DEFAULT_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><style>{style_block}</style></head><body>
@@ -385,19 +385,22 @@ def _should_use_satori_renderer() -> bool:
 
 def _convert_satori_png_to_jpeg(png_path: Path, output_path: Path) -> None:
     with Image.open(png_path) as img:
+        min_height = round(max(1, img.width) / _SATORI_TEMPLATE_WIDTH * _SATORI_TEMPLATE_MIN_VIEWPORT_HEIGHT)
+        bottom_padding = round(max(1, img.width) / _SATORI_TEMPLATE_WIDTH * _SATORI_TEMPLATE_BOTTOM_PADDING)
         if img.mode in ("RGBA", "LA"):
             rgba = img.convert("RGBA")
-            background = Image.new("RGBA", rgba.size, (250, 250, 250, 255))
+            rgba = _trim_bottom_transparent(rgba, padding=bottom_padding, min_height=min_height)
+            background = _build_satori_template_background(rgba.size)
             background.alpha_composite(rgba)
             rgb = background.convert("RGB")
         elif img.mode == "P":
             rgb = img.convert("RGB")
+            rgb = _trim_bottom_background(rgb, background=(250, 250, 250), tolerance=4, padding=bottom_padding, min_height=min_height)
+            rgb = _apply_satori_template_background_effects(rgb)
         else:
             rgb = img.convert("RGB")
-        min_height = round(max(1, rgb.width) / _SATORI_TEMPLATE_WIDTH * _SATORI_TEMPLATE_MIN_VIEWPORT_HEIGHT)
-        bottom_padding = round(max(1, rgb.width) / _SATORI_TEMPLATE_WIDTH * _SATORI_TEMPLATE_BOTTOM_PADDING)
-        rgb = _trim_bottom_background(rgb, background=(250, 250, 250), tolerance=4, padding=bottom_padding, min_height=min_height)
-        rgb = _apply_satori_template_background_effects(rgb)
+            rgb = _trim_bottom_background(rgb, background=(250, 250, 250), tolerance=4, padding=bottom_padding, min_height=min_height)
+            rgb = _apply_satori_template_background_effects(rgb)
         rgb.save(output_path, format="JPEG", quality=_SATORI_JPEG_QUALITY, subsampling=0, optimize=True)
 
 
@@ -450,8 +453,73 @@ def _trim_bottom_background(
     return img
 
 
+def _trim_bottom_transparent(
+    img: Image.Image,
+    *,
+    padding: int,
+    min_height: int = 0,
+    alpha_tolerance: int = 2,
+) -> Image.Image:
+    """按透明前景裁掉预估高度，避免背景光晕影响长图底部裁剪。"""
+    rgba = img.convert("RGBA")
+    width, height = rgba.size
+    if width <= 0 or height <= 0:
+        return rgba
+
+    sample_step = max(1, width // 180)
+    alpha = rgba.getchannel("A")
+    last_content_y = height - 1
+    for y in range(height - 1, -1, -1):
+        has_content = False
+        for x in range(0, width, sample_step):
+            if alpha.getpixel((x, y)) > alpha_tolerance:
+                has_content = True
+                break
+        if has_content:
+            last_content_y = y
+            break
+
+    crop_bottom = min(height, max(last_content_y + max(0, padding), int(min_height or 0)))
+    if crop_bottom < height:
+        return rgba.crop((0, 0, width, crop_bottom))
+    return rgba
+
+
+def _build_satori_template_background(size: tuple[int, int]) -> Image.Image:
+    """按原 surfaced-share.css 重建 body 背景和 fixed 光晕。"""
+    width, height = size
+    background = Image.new("RGBA", (width, height), (250, 250, 250, 255))
+    if width <= 0 or height <= 0:
+        return background
+
+    scale = max(0.1, width / _SATORI_TEMPLATE_WIDTH)
+    viewport_width = width
+    viewport_height = round(_SATORI_TEMPLATE_MIN_VIEWPORT_HEIGHT * scale)
+
+    top_diameter = round(viewport_width * 0.4)
+    _alpha_composite_glow(
+        background,
+        left=round(viewport_width * -0.1),
+        top=round(viewport_height * -0.1),
+        diameter=top_diameter,
+        blur=round(120 * scale),
+        color=(14, 165, 233, round(255 * 0.08)),
+    )
+
+    bottom_diameter = round(viewport_width * 0.5)
+    _alpha_composite_glow(
+        background,
+        left=round(viewport_width - viewport_width * -0.05 - bottom_diameter),
+        top=round(viewport_height - viewport_height * -0.1 - bottom_diameter),
+        diameter=bottom_diameter,
+        blur=round(150 * scale),
+        color=(96, 165, 250, round(255 * 0.04)),
+    )
+    return background
+
+
 def _apply_satori_template_background_effects(img: Image.Image) -> Image.Image:
-    """补回浏览器模板里的轻微蓝色背景光晕，避开 Satori 长图渐变慢路径。"""
+    """兼容非透明 Satori 输出：在已扁平图片上补一点模板光晕。"""
     try:
         scale = max(0.1, img.width / _SATORI_TEMPLATE_WIDTH)
         canvas = img.convert("RGBA")
