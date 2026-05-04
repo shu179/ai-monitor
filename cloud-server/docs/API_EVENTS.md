@@ -47,6 +47,13 @@ Authorization: Bearer <access_token>
 
 不要上传截图路径或截图文件。
 
+上传后可用以下接口验证：
+
+```http
+GET /api/v1/tasks/{task_id}/run-records?limit=50
+Authorization: Bearer <access_token>
+```
+
 ## article_reference_event
 
 ```json
@@ -70,4 +77,3 @@ Authorization: Bearer <access_token>
 - `classification_job`
 - `weather_upsert`
 - `client_snapshot_ack`
-

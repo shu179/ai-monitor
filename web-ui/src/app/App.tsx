@@ -3,7 +3,14 @@ import { X } from "lucide-react";
 import { Sidebar } from "./components/Sidebar";
 import { RightSidebar } from "./components/RightSidebar";
 import { SaveSuccessToast } from "./components/SaveSuccessToast";
-import { LoginScreen, type LoginPayload } from "./components/LoginScreen";
+import {
+  LoginScreen,
+  type LoginPayload,
+  type RegisterPayload,
+  type RequestPasswordResetPayload,
+  type ResetPasswordPayload,
+  type VerifyEmailPayload,
+} from "./components/LoginScreen";
 import { SAVE_SUCCESS_TOAST_EVENT } from "./lib/saveToast";
 import {
   ARTICLE_DATA_CHANGED_EVENT,
@@ -12,18 +19,27 @@ import {
   areArticlesEqual,
   areTodosEqual,
   fetchBootstrap,
+  fetchCloudStatus,
   invalidateBootstrapCache,
+  loginCloud,
+  logoutCloud,
+  registerCloudAdmin,
+  requestCloudPasswordReset,
+  resendCloudEmailCode,
+  resetCloudPassword,
   readTodoCache,
+  verifyCloudEmail,
   warmBootstrapCache,
   warmSettingsCache,
   warmTasksFullCache,
   writeTodoCache,
   setMonitoringEnabled,
   type BootstrapPayload,
+  type CloudStatusSnapshot,
 } from "./lib/backend";
 
-const AUTH_STORAGE_KEY = "surfaced-web-ui-authenticated";
 const LOGIN_IDENTITY_STORAGE_KEY = "surfaced-web-ui-login-identity";
+const DEFAULT_CLOUD_BASE_URL = "https://api.surfacedlab.com";
 const LOGIN_MODAL_WIDTH = 332;
 const LOGIN_MODAL_HEIGHT = 430;
 
@@ -65,17 +81,6 @@ function PageLoadingFallback() {
       正在加载页面…
     </main>
   );
-}
-
-function readStoredAuthState() {
-  if (typeof window === "undefined") {
-    return true;
-  }
-  const value = window.localStorage.getItem(AUTH_STORAGE_KEY);
-  if (value === null) {
-    return true;
-  }
-  return value === "true";
 }
 
 function readStoredLoginIdentity() {
@@ -122,7 +127,9 @@ export default function App() {
     visible: false,
     message: "保存成功",
   });
-  const [isAuthenticated, setIsAuthenticated] = useState(() => readStoredAuthState());
+  const [isAuthChecked, setIsAuthChecked] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState<CloudStatusSnapshot | null>(null);
   const [loginIdentity, setLoginIdentity] = useState(() => readStoredLoginIdentity());
   const [isLoginModalOpen, setIsLoginModalOpen] = useState(false);
   const [loginModalPosition, setLoginModalPosition] = useState({ x: 0, y: 0 });
@@ -136,6 +143,17 @@ export default function App() {
   })();
   const residentOcrWindowEnabled = Boolean(bootstrap.config?.recognition?.floating_window_resident_enabled);
   const showResidentOcrWindow = residentOcrWindowEnabled && !recognitionTestWindow.open;
+
+  const applyCloudAuthStatus = useCallback((status?: CloudStatusSnapshot | null) => {
+    const nextStatus = status || null;
+    const loggedIn = Boolean(nextStatus?.loggedIn);
+    setCloudStatus(nextStatus);
+    setIsAuthenticated(loggedIn);
+    if (!loggedIn) {
+      setActiveTab("看板");
+      setIsLoginModalOpen(false);
+    }
+  }, []);
 
   const refreshBootstrap = useCallback(async (options?: { force?: boolean }) => {
     if (options?.force) {
@@ -157,6 +175,41 @@ export default function App() {
     }));
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    fetchCloudStatus().then((result) => {
+      if (cancelled) {
+        return;
+      }
+      applyCloudAuthStatus(result.cloud);
+      setIsAuthChecked(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [applyCloudAuthStatus]);
+
+  useEffect(() => {
+    if (!isAuthChecked) {
+      return;
+    }
+    let cancelled = false;
+    const refreshCloudAuth = async () => {
+      const result = await fetchCloudStatus();
+      if (cancelled) {
+        return;
+      }
+      applyCloudAuthStatus(result.cloud);
+    };
+    const timer = window.setInterval(refreshCloudAuth, isAuthenticated ? 5000 : 30000);
+    window.addEventListener("focus", refreshCloudAuth);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshCloudAuth);
+    };
+  }, [applyCloudAuthStatus, isAuthChecked, isAuthenticated]);
+
   const handleTabChange = useCallback((tab: string) => {
     preloadPageByTab[tab]?.();
     if (tab === "品牌") {
@@ -176,6 +229,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!isAuthenticated) {
+      return;
+    }
     const preload = () => {
       void loadBrandsContent();
       warmTasksFullCache();
@@ -192,9 +248,12 @@ export default function App() {
     }
     const timer = window.setTimeout(preload, 400);
     return () => window.clearTimeout(timer);
-  }, []);
+  }, [isAuthenticated]);
 
   useEffect(() => {
+    if (!isAuthenticated) {
+      return;
+    }
     let cancelled = false;
     refreshBootstrap().then(() => {
       if (cancelled) {
@@ -207,12 +266,18 @@ export default function App() {
   }, [isAuthenticated, refreshBootstrap]);
 
   useEffect(() => {
+    if (!isAuthenticated) {
+      return;
+    }
     if (activeTab === "搜搜" || activeTab === "API配置" || activeTab === "发稿") {
       refreshBootstrap({ force: true });
     }
   }, [activeTab, isAuthenticated, refreshBootstrap]);
 
   useEffect(() => {
+    if (!isAuthenticated) {
+      return;
+    }
     const intervalMs = activeTab === "看板" || activeTab === "品牌" ? 5000 : 30000;
     const syncTimer = window.setInterval(() => {
       void refreshBootstrap();
@@ -221,6 +286,9 @@ export default function App() {
   }, [activeTab, isAuthenticated, refreshBootstrap]);
 
   useEffect(() => {
+    if (!isAuthenticated) {
+      return;
+    }
     const handleTaskDataChanged = () => {
       void refreshBootstrap({ force: true });
     };
@@ -328,42 +396,117 @@ export default function App() {
     void refreshBootstrap({ force: true });
   }, [refreshBootstrap]);
 
-  const centerLoginModal = useCallback(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    setLoginModalPosition({
-      x: Math.max(24, Math.round((window.innerWidth - LOGIN_MODAL_WIDTH) / 2)),
-      y: Math.max(24, Math.round((window.innerHeight - LOGIN_MODAL_HEIGHT) / 2)),
-    });
-  }, []);
-
   const handleOpenAccountSettings = useCallback(() => {
     if (!isAuthenticated) {
-      centerLoginModal();
-      setIsLoginModalOpen(true);
       return;
     }
     setActiveTab("账号");
-  }, [centerLoginModal, isAuthenticated]);
+  }, [isAuthenticated]);
 
-  const handleLogout = useCallback(() => {
+  const handleLogout = useCallback(async () => {
+    try {
+      await logoutCloud();
+    } catch {
+      // Local auth state is still cleared even if the cloud logout request fails.
+    }
+    applyCloudAuthStatus(null);
     setIsAuthenticated(false);
     setActiveTab("看板");
     setIsLoginModalOpen(false);
-    window.localStorage.setItem(AUTH_STORAGE_KEY, "false");
-  }, []);
+  }, [applyCloudAuthStatus]);
 
   const handleLogin = useCallback(async (payload: LoginPayload) => {
-    const nextIdentity = payload.method === "email" ? payload.email.trim() : payload.account.trim();
+    const nextIdentity = payload.username.trim();
+    const result = await loginCloud({
+      baseUrl: payload.baseUrl.trim() || DEFAULT_CLOUD_BASE_URL,
+      username: nextIdentity,
+      password: payload.password,
+    });
+    if (!result.ok || !result.cloud?.loggedIn) {
+      throw new Error(result.message || "云端登录失败");
+    }
     setLoginIdentity(nextIdentity);
-    setIsAuthenticated(true);
+    applyCloudAuthStatus(result.cloud);
     setIsLoginModalOpen(false);
     setActiveTab("看板");
-    window.localStorage.setItem(AUTH_STORAGE_KEY, "true");
     window.localStorage.setItem(LOGIN_IDENTITY_STORAGE_KEY, nextIdentity);
     await refreshBootstrap({ force: true });
-  }, [refreshBootstrap]);
+  }, [applyCloudAuthStatus, refreshBootstrap]);
+
+  const handleRegister = useCallback(async (payload: RegisterPayload) => {
+    const email = payload.email.trim();
+    const result = await registerCloudAdmin({
+      baseUrl: payload.baseUrl.trim() || DEFAULT_CLOUD_BASE_URL,
+      email,
+      password: payload.password,
+      displayName: payload.displayName.trim(),
+      workspaceName: payload.workspaceName.trim(),
+    });
+    if (result.ok && result.requiresEmailVerification) {
+      return { requiresEmailVerification: true, email: result.email || email };
+    }
+    if (!result.ok || !result.cloud?.loggedIn) {
+      throw new Error(result.message || "管理员账号注册失败");
+    }
+    setLoginIdentity(email);
+    applyCloudAuthStatus(result.cloud);
+    setIsLoginModalOpen(false);
+    setActiveTab("看板");
+    window.localStorage.setItem(LOGIN_IDENTITY_STORAGE_KEY, email);
+    await refreshBootstrap({ force: true });
+  }, [applyCloudAuthStatus, refreshBootstrap]);
+
+  const handleVerifyEmail = useCallback(async (payload: VerifyEmailPayload) => {
+    const email = payload.email.trim();
+    const result = await verifyCloudEmail({
+      baseUrl: payload.baseUrl.trim() || DEFAULT_CLOUD_BASE_URL,
+      email,
+      code: payload.code.trim(),
+    });
+    if (!result.ok || !result.cloud?.loggedIn) {
+      throw new Error(result.message || "邮箱验证失败");
+    }
+    setLoginIdentity(email);
+    applyCloudAuthStatus(result.cloud);
+    setIsLoginModalOpen(false);
+    setActiveTab("看板");
+    window.localStorage.setItem(LOGIN_IDENTITY_STORAGE_KEY, email);
+    await refreshBootstrap({ force: true });
+  }, [applyCloudAuthStatus, refreshBootstrap]);
+
+  const handleResendEmailCode = useCallback(async (payload: { email: string; baseUrl: string }) => {
+    const result = await resendCloudEmailCode({
+      baseUrl: payload.baseUrl.trim() || DEFAULT_CLOUD_BASE_URL,
+      email: payload.email.trim(),
+    });
+    if (!result.ok) {
+      throw new Error(result.message || "验证码重发失败");
+    }
+  }, []);
+
+  const handleRequestPasswordReset = useCallback(async (payload: RequestPasswordResetPayload) => {
+    const result = await requestCloudPasswordReset({
+      baseUrl: payload.baseUrl.trim() || DEFAULT_CLOUD_BASE_URL,
+      email: payload.email.trim(),
+    });
+    if (!result.ok) {
+      throw new Error(result.message || "找回密码请求失败");
+    }
+  }, []);
+
+  const handleResetPassword = useCallback(async (payload: ResetPasswordPayload) => {
+    const result = await resetCloudPassword({
+      baseUrl: payload.baseUrl.trim() || DEFAULT_CLOUD_BASE_URL,
+      email: payload.email.trim(),
+      code: payload.code.trim(),
+      password: payload.password,
+    });
+    if (!result.ok) {
+      throw new Error(result.message || "密码重置失败");
+    }
+    setLoginIdentity(payload.email.trim());
+    window.localStorage.setItem(LOGIN_IDENTITY_STORAGE_KEY, payload.email.trim());
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -506,6 +649,38 @@ export default function App() {
       background: linear-gradient(to top, #000000 0%, rgba(0,0,0,0.95) 30%, transparent 100%) !important;
     }
   `;
+
+  if (!isAuthChecked) {
+    return (
+      <div
+        className="flex min-h-screen w-full items-center justify-center text-[#173A43]"
+        style={{
+          background:
+            "radial-gradient(circle at 50% 28%, rgba(20,199,243,0.10), transparent 34%), linear-gradient(180deg, #fcfdff 0%, #f7faff 100%)",
+        }}
+      >
+        <div className="flex flex-col items-center gap-5">
+          <div className="text-[42px] font-bold tracking-[-0.04em]">Surfaced</div>
+          <div className="text-[12px] font-semibold tracking-wide text-gray-400">正在检查云端登录状态</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <LoginScreen
+        defaultIdentity={loginIdentity}
+        defaultBaseUrl={cloudStatus?.baseUrl || DEFAULT_CLOUD_BASE_URL}
+        onLogin={handleLogin}
+        onRegister={handleRegister}
+        onVerifyEmail={handleVerifyEmail}
+        onResendEmailCode={handleResendEmailCode}
+        onRequestPasswordReset={handleRequestPasswordReset}
+        onResetPassword={handleResetPassword}
+      />
+    );
+  }
 
   return (
     <>
@@ -651,6 +826,11 @@ export default function App() {
                   variant="panel"
                   defaultIdentity={loginIdentity}
                   onLogin={handleLogin}
+                  onRegister={handleRegister}
+                  onVerifyEmail={handleVerifyEmail}
+                  onResendEmailCode={handleResendEmailCode}
+                  onRequestPasswordReset={handleRequestPasswordReset}
+                  onResetPassword={handleResetPassword}
                 />
               </div>
             </div>

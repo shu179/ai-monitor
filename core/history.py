@@ -15,6 +15,7 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 
 from .app_paths import resolve_app_path
+from .local_account_space import account_scoped_path
 from .time_utils import local_now, local_today, parse_local_date
 
 HISTORY_DIR = resolve_app_path("logs/history")
@@ -231,6 +232,54 @@ def get_records(
 
     records.sort(key=lambda item: str(item.get("ts") or ""))
     return records
+
+
+def import_records(task_name: str, entries: list[dict], *, task_id: str = "") -> int:
+    """Import already-materialized history entries without changing their IDs or timestamps."""
+    _history_dir().mkdir(parents=True, exist_ok=True)
+    task_name = str(task_name or "").strip()
+    task_id = str(task_id or "").strip()
+    normalized_entries: list[dict] = []
+    for raw_entry in entries or []:
+        if not isinstance(raw_entry, dict):
+            continue
+        entry = dict(raw_entry)
+        _normalize_record(entry, task_name=task_name, task_id=task_id)
+        normalized_entries.append(entry)
+    if not normalized_entries:
+        return 0
+
+    imported = 0
+    for key in _history_write_targets(task_id=task_id, task_name=task_name):
+        if not key:
+            continue
+        lock = _get_lock(key)
+        path = _task_file(key)
+        with lock:
+            records = _load(path)
+            seen_keys = {
+                _history_record_dedupe_key(record)
+                for record in records
+                if isinstance(record, dict)
+            }
+            added_for_target = 0
+            for entry in normalized_entries:
+                dedupe_key = _history_record_dedupe_key(entry)
+                if dedupe_key in seen_keys:
+                    continue
+                records.append(dict(entry))
+                seen_keys.add(dedupe_key)
+                added_for_target += 1
+            if not added_for_target:
+                continue
+            records.sort(key=lambda item: str(item.get("ts") or ""))
+            if len(records) > MAX_RECORDS:
+                records = records[-MAX_RECORDS:]
+            _save(path, records)
+            if key == task_name:
+                _compute_rates_locked(task_name, records)
+            imported = max(imported, added_for_target)
+    return imported
 
 
 def get_records_file_signature(
@@ -1433,9 +1482,14 @@ def _safe_name(task_name: str) -> str:
 
 
 def _history_dir() -> Path:
-    if HISTORY_DIR != resolve_app_path("logs/history"):
+    resolved_default = resolve_app_path("logs/history")
+    if HISTORY_DIR != resolved_default:
         return HISTORY_DIR
-    return resolve_app_path("logs/history")
+    return account_scoped_path("logs/history", fallback=resolved_default)
+
+
+def get_history_dir() -> Path:
+    return _history_dir()
 
 
 def _get_lock(task_name: str) -> threading.Lock:

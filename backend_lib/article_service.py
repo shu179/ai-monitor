@@ -26,6 +26,7 @@ from core.article_store import (
     analyze_article_matches,
     confirm_article_import_batch,
     extract_domain,
+    get_articles_file_path,
     get_articles,
     resolve_article_export_keywords,
     resolve_article_source,
@@ -35,6 +36,7 @@ from core.article_store import (
     update_media_type as update_article_media_type,
 )
 from core.daily_task_state import derive_task_id
+from core.local_account_space import account_scoped_path
 from core.time_utils import local_now, local_today, parse_local_date
 
 ARTICLE_IMPORT_EXTENSIONS = {".xlsx", ".xlsm", ".csv"}
@@ -134,7 +136,10 @@ def _article_to_api(
 
 
 def _article_import_batches_path() -> Path:
-    return resolve_app_path("logs/article_import_batches.json")
+    return account_scoped_path(
+        "logs/article_import_batches.json",
+        fallback=resolve_app_path("logs/article_import_batches.json"),
+    )
 
 
 def _normalize_article_import_batch(batch: Any) -> dict[str, Any] | None:
@@ -241,6 +246,10 @@ class ArticleImportBatchStore:
 
     def save(self) -> None:
         _save_article_import_batches_file(self.get_batches())
+
+    def reset(self) -> None:
+        self._batches = {}
+        self._loaded = False
 
 
 def _runtime_article_import_batches(runtime: Any) -> dict[str, dict[str, Any]]:
@@ -533,7 +542,7 @@ class ArticleService:
                         "url": normalized_url or url,
                         "title": updated_article.get("title", ""),
                         "matched_tasks": updated_article.get("matched_tasks", []),
-                        "articles_path": str(resolve_app_path("logs/articles.json")),
+                        "articles_path": str(get_articles_file_path()),
                     },
                 )
                 return {
@@ -570,7 +579,7 @@ class ArticleService:
                     "url": normalized_url or url,
                     "title": article.get("title", ""),
                     "matched_tasks": article.get("matched_tasks", []),
-                    "articles_path": str(resolve_app_path("logs/articles.json")),
+                    "articles_path": str(get_articles_file_path()),
                 },
             )
             return {"ok": True, "article": _article_to_api(article)}

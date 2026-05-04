@@ -139,6 +139,7 @@ from core.account_crawler import (
 )
 from core.article_store import (
     export_article_store_bundle,
+    get_articles_file_path,
     get_excluded_article_urls,
     refresh_article_matches,
     restore_excluded_article_urls,
@@ -165,6 +166,18 @@ from core.browser_platform_factory import (
 )
 from core.browser_runtime import resolve_system_browser_executable
 from core.cloud_sync import CloudSyncManager
+from core.cloud_client import CloudClientError, SurfacedCloudClient
+from core.cloud_outbox import CloudOutbox
+from core.cloud_platform_auto_sync import CloudPlatformAutoSync
+from core.cloud_run_sync import flush_cloud_outbox as flush_cloud_outbox_events
+from core.cloud_session_store import (
+    CloudSessionChangedError,
+    CloudSessionStore,
+    cloud_session_identity,
+    cloud_session_identity_key,
+)
+from core.cloud_task_sync import pull_cloud_tasks_into_config
+from core.local_account_space import current_account_config_path, ensure_current_account_space
 from core.profile_assets import (
     is_profile_avatar_url,
     public_profile_avatar_url,
@@ -215,6 +228,14 @@ from core.scheduler_state import get_entry as get_scheduler_state_entry
 from core.screenshot_tools import get_decoration_theme, get_default_decoration_theme
 from core.sync_service import apply_sync_bundle, build_sync_bundle
 from core.time_utils import local_now, local_today
+from core.task_recycle_bin import (
+    deleted_task_snapshots,
+    mark_task_delete_pending,
+    purge_expired_deleted_tasks,
+    restore_deleted_task as restore_deleted_task_backup,
+    soft_delete_task,
+    upsert_deleted_task_backup,
+)
 from core.task_defaults import compute_recognition_batch_size_from_keywords, get_most_common_task_webhook
 from core.update_launcher import build_update_plan_payload, get_runtime_app_dir, launch_updater
 from core.update_manager import (
@@ -324,8 +345,12 @@ GET_EXACT_RUNTIME_METHODS = {
     "/api/platforms/keys": "get_platform_keys",
     "/api/browser-auth": "get_browser_auth",
     "/api/tasks/full": "get_tasks_full",
+    "/api/tasks/deleted": "get_deleted_tasks",
     "/api/settings": "get_settings",
     "/api/todos": "get_todos",
+    "/api/cloud/status": "get_cloud_status",
+    "/api/cloud/admin/tasks": "list_cloud_admin_tasks",
+    "/api/cloud/admin/users": "list_cloud_admin_users",
     "/api/cloud-sync/status": "get_cloud_sync_status",
     "/api/local-model/status": "get_local_model_status",
     "/api/account-crawling/exclusions": "get_account_crawl_exclusions",
@@ -357,6 +382,7 @@ POST_JSON_RUNTIME_METHODS = {
     "/api/platforms/save": "save_platform_config",
     "/api/browser-auth/action": "browser_auth_action",
     "/api/tasks": "create_task",
+    "/api/tasks/deleted/restore": "restore_deleted_task",
     "/api/brand-draft/parse": "generate_brand_task_draft",
     "/api/todo-draft/parse": "generate_quick_todos_draft",
     "/api/batch-test/start": "start_batch_test",
@@ -364,6 +390,19 @@ POST_JSON_RUNTIME_METHODS = {
     "/api/search/brand-rank": "run_search_brand_rank",
     "/api/settings": "save_settings",
     "/api/todos": "sync_todos",
+    "/api/cloud/login": "login_cloud",
+    "/api/cloud/register-admin": "register_cloud_admin",
+    "/api/cloud/verify-email": "verify_cloud_email",
+    "/api/cloud/resend-email-code": "resend_cloud_email_code",
+    "/api/cloud/password-reset/request": "request_cloud_password_reset",
+    "/api/cloud/password-reset/confirm": "reset_cloud_password",
+    "/api/cloud/logout": "logout_cloud",
+    "/api/cloud/flush-outbox": "flush_cloud_outbox",
+    "/api/cloud/pull-tasks": "pull_cloud_tasks",
+    "/api/cloud/admin/update-task": "update_cloud_admin_task",
+    "/api/cloud/admin/sync-task": "sync_cloud_admin_task",
+    "/api/cloud/admin/delete-task": "delete_cloud_admin_task",
+    "/api/cloud/admin/restore-task": "restore_cloud_admin_task",
     "/api/articles": "import_article",
     "/api/account-crawling/run": "run_account_article_crawl",
     "/api/account-crawling/exclusions/restore": "restore_account_crawl_exclusions",
@@ -1649,7 +1688,8 @@ class AppRuntime:
     """Holds live state used by the frontend."""
 
     def __init__(self) -> None:
-        self.config_path = resolve_app_path("config.yaml")
+        ensure_current_account_space()
+        self.config_path = current_account_config_path()
         self.config_provider = RuntimeConfigProvider(
             self.config_path,
             on_load=lambda config: get_local_model_manager().sync_config(config),
@@ -1707,6 +1747,11 @@ class AppRuntime:
         self._context_snapshot_lock = threading.RLock()
         self._article_cache_lock = threading.RLock()
         self._synced_articles_cache: dict[str, Any] | None = None
+        self._pending_delete_processing_lock = threading.RLock()
+        self._cloud_status_validation_lock = threading.RLock()
+        self._cloud_status_validated_identity = ""
+        self._cloud_status_validated_at = 0.0
+        self._cloud_status_validation_error = ""
         self.task_overview_service = TaskOverviewService(
             config_provider=self.config_provider,
             synced_articles_loader=self._get_synced_articles,
@@ -1757,11 +1802,32 @@ class AppRuntime:
             config_updater=self._save_runtime_config,
             logger=lambda message: print(redact_secret_text(message)),
         )
+        self._cloud_platform_auto_sync = CloudPlatformAutoSync(
+            pull_tasks=lambda: self.pull_cloud_tasks({}),
+            logger=lambda message: print(redact_secret_text(message)),
+        )
+
+    def _activate_current_account_space(self, *, copy_legacy: bool = True) -> None:
+        ensure_current_account_space(copy_legacy=copy_legacy)
+        next_config_path = current_account_config_path()
+        if Path(self.config_path) == next_config_path:
+            return
+        self.config_path = next_config_path
+        self.config_provider.set_path(next_config_path)
+        self.article_import_batch_store.reset()
+        self._last_run = None
+        self._test_runs.clear()
+        self._test_failure_notices.clear()
+        self._query_serial_state = None
+        self._invalidate_tasks_full_cache()
+        self._invalidate_article_cache()
 
     def load_config(self) -> dict:
+        self._activate_current_account_space(copy_legacy=False)
         return self.config_provider.load()
 
     def save_config(self, config: dict[str, Any]) -> Path:
+        self._activate_current_account_space(copy_legacy=False)
         return self.config_provider.save(config)
 
     def _invalidate_tasks_full_cache(self) -> None:
@@ -3204,14 +3270,13 @@ return changedCount
         return dict(notice) if isinstance(notice, dict) else None
 
     def get_debug_paths(self) -> dict[str, Any]:
-        articles_path = resolve_app_path("logs/articles.json")
         return {
             "ok": True,
             "paths": {
                 "appRoot": str(get_app_root()),
                 "dataRoot": str(get_data_root()),
                 "configPath": str(self.config_path),
-                "articlesPath": str(articles_path),
+                "articlesPath": str(get_articles_file_path()),
                 "frontendDist": str(self.frontend_dist),
             },
         }
@@ -3265,6 +3330,587 @@ return changedCount
 
     def get_cloud_sync_status(self) -> dict[str, Any]:
         return {"ok": True, "cloud_sync": self._cloud_sync_manager.get_status()}
+
+    def _validate_cloud_session_if_needed(self, *, force: bool = False) -> None:
+        store = CloudSessionStore()
+        session = store.load()
+        identity_key = cloud_session_identity_key(session)
+        base_url = str(session.get("base_url") or "").strip()
+        access_token = str(session.get("access_token") or "").strip()
+        refresh_token = str(session.get("refresh_token") or "").strip()
+        if not base_url or not access_token or not refresh_token:
+            return
+
+        now_ts = time.time()
+        with self._cloud_status_validation_lock:
+            if (
+                not force
+                and identity_key
+                and identity_key == self._cloud_status_validated_identity
+                and now_ts - self._cloud_status_validated_at < 60.0
+            ):
+                return
+            self._cloud_status_validated_identity = identity_key
+            self._cloud_status_validated_at = now_ts
+
+        identity = cloud_session_identity(session)
+        client = SurfacedCloudClient(base_url, timeout_seconds=3.0)
+        try:
+            client.me(access_token)
+            with self._cloud_status_validation_lock:
+                self._cloud_status_validation_error = ""
+            return
+        except CloudClientError as exc:
+            if exc.status_code != 401:
+                with self._cloud_status_validation_lock:
+                    self._cloud_status_validation_error = str(exc)
+                return
+
+        try:
+            refreshed_session = store.refresh_login_if_current(
+                base_url=base_url,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                refresh=client.refresh,
+                workspace_id=identity["workspace_id"],
+                user_id=identity["user_id"],
+            )
+            refreshed_access_token = str(refreshed_session.get("access_token") or "").strip()
+            if refreshed_access_token:
+                try:
+                    client.me(refreshed_access_token)
+                except CloudClientError as verify_exc:
+                    if verify_exc.status_code == 401:
+                        refreshed_identity = cloud_session_identity(refreshed_session)
+                        store.clear_if_current(
+                            base_url=base_url,
+                            access_token=refreshed_access_token,
+                            refresh_token=str(refreshed_session.get("refresh_token") or "").strip(),
+                            workspace_id=refreshed_identity["workspace_id"],
+                            user_id=refreshed_identity["user_id"],
+                        )
+                        with self._cloud_status_validation_lock:
+                            self._cloud_status_validation_error = str(verify_exc)
+                    else:
+                        with self._cloud_status_validation_lock:
+                            self._cloud_status_validation_error = str(verify_exc)
+                    return
+            with self._cloud_status_validation_lock:
+                self._cloud_status_validation_error = ""
+        except CloudSessionChangedError as exc:
+            with self._cloud_status_validation_lock:
+                self._cloud_status_validation_error = str(exc)
+        except CloudClientError as refresh_exc:
+            if refresh_exc.status_code == 401:
+                store.clear_if_current(
+                    base_url=base_url,
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    workspace_id=identity["workspace_id"],
+                    user_id=identity["user_id"],
+                )
+            with self._cloud_status_validation_lock:
+                self._cloud_status_validation_error = str(refresh_exc)
+
+    def get_cloud_status(self) -> dict[str, Any]:
+        self._validate_cloud_session_if_needed()
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        with self._cloud_status_validation_lock:
+            validation_error = self._cloud_status_validation_error
+        return {
+            "ok": True,
+            "cloud": {
+                "loggedIn": bool(session.get("base_url") and session.get("access_token") and session.get("refresh_token")),
+                "baseUrl": str(session.get("base_url") or ""),
+                "user": {
+                    "id": user.get("id"),
+                    "workspace_id": user.get("workspace_id"),
+                    "username": user.get("username"),
+                    "role": user.get("role"),
+                    "display_name": user.get("display_name"),
+                    "email": user.get("email"),
+                },
+                "savedAt": str(session.get("saved_at") or ""),
+                "localProfile": {
+                    "configPath": str(current_account_config_path()),
+                },
+                "outbox": CloudOutbox().stats(),
+                "autoSync": self._cloud_platform_auto_sync.get_status(),
+                "validationError": validation_error,
+            },
+        }
+
+    def _cloud_request_with_refresh(self, operation) -> tuple[bool, Any, str]:
+        store = CloudSessionStore()
+        session = store.load()
+        base_url = str(session.get("base_url") or "").strip()
+        access_token = str(session.get("access_token") or "").strip()
+        refresh_token = str(session.get("refresh_token") or "").strip()
+        if not base_url or not access_token:
+            return False, None, "未登录云端"
+        initial_identity_key = cloud_session_identity_key(session)
+        identity = cloud_session_identity(session)
+        client = SurfacedCloudClient(base_url)
+        try:
+            payload = operation(client, access_token)
+            if cloud_session_identity_key(store.load()) != initial_identity_key:
+                return False, None, "云端账号已切换，本次操作已中止"
+            return True, payload, ""
+        except CloudClientError as exc:
+            if exc.status_code != 401 or not refresh_token:
+                return False, None, str(exc)
+        try:
+            refreshed_session = store.refresh_login_if_current(
+                base_url=base_url,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                refresh=client.refresh,
+                workspace_id=identity["workspace_id"],
+                user_id=identity["user_id"],
+            )
+        except CloudSessionChangedError as changed_exc:
+            return False, None, str(changed_exc)
+        except CloudClientError as refresh_exc:
+            if refresh_exc.status_code == 401:
+                store.clear_if_current(
+                    base_url=base_url,
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    workspace_id=identity["workspace_id"],
+                    user_id=identity["user_id"],
+                )
+            return False, None, str(refresh_exc)
+        refreshed_access_token = str(refreshed_session.get("access_token") or "").strip()
+        if not refreshed_access_token:
+            return False, None, "未登录云端"
+        try:
+            payload = operation(client, refreshed_access_token)
+            if cloud_session_identity_key(store.load()) != initial_identity_key:
+                return False, None, "云端账号已切换，本次操作已中止"
+            return True, payload, ""
+        except CloudClientError as retry_exc:
+            refreshed_identity = cloud_session_identity(refreshed_session)
+            if retry_exc.status_code == 401:
+                store.clear_if_current(
+                    base_url=base_url,
+                    access_token=refreshed_access_token,
+                    refresh_token=str(refreshed_session.get("refresh_token") or "").strip(),
+                    workspace_id=refreshed_identity["workspace_id"],
+                    user_id=refreshed_identity["user_id"],
+                )
+            return False, None, str(retry_exc)
+
+    def list_cloud_admin_tasks(self) -> dict[str, Any]:
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return {"ok": False, "message": "当前云端账号不是管理员", "tasks": [], "cloud": self.get_cloud_status().get("cloud")}
+        ok, tasks, message = self._cloud_request_with_refresh(lambda client, token: client.list_admin_tasks(token))
+        if not ok:
+            return {"ok": False, "message": message or "云端任务获取失败", "tasks": [], "cloud": self.get_cloud_status().get("cloud")}
+        return {"ok": True, "message": "云端任务已刷新", "tasks": tasks if isinstance(tasks, list) else [], "cloud": self.get_cloud_status().get("cloud")}
+
+    def list_cloud_admin_users(self) -> dict[str, Any]:
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return {"ok": False, "message": "当前云端账号不是管理员", "users": [], "cloud": self.get_cloud_status().get("cloud")}
+        ok, users, message = self._cloud_request_with_refresh(lambda client, token: client.list_admin_users(token))
+        if not ok:
+            return {"ok": False, "message": message or "云端账号获取失败", "users": [], "cloud": self.get_cloud_status().get("cloud")}
+        return {"ok": True, "message": "云端账号已刷新", "users": users if isinstance(users, list) else [], "cloud": self.get_cloud_status().get("cloud")}
+
+    def login_cloud(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        base_url = str(request_payload.get("base_url") or request_payload.get("baseUrl") or "").strip()
+        username = str(request_payload.get("username") or "").strip()
+        password = str(request_payload.get("password") or "")
+        device_id = str(request_payload.get("device_id") or request_payload.get("deviceId") or "").strip()
+        app_version = str(request_payload.get("app_version") or request_payload.get("appVersion") or "").strip()
+        if not base_url or not username or not password:
+            return {"ok": False, "message": "请填写云端地址、用户名和密码", "cloud": self.get_cloud_status().get("cloud")}
+        if not device_id:
+            device_id = f"surfaced-local-{uuid4().hex[:12]}"
+        if not app_version:
+            app_version = str(get_version_payload().get("version") or get_http_server_version() or "local")
+        client = SurfacedCloudClient(base_url)
+        try:
+            token_pair = client.login(
+                username=username,
+                password=password,
+                device_id=device_id,
+                app_version=app_version,
+            )
+        except CloudClientError as exc:
+            return {"ok": False, "message": str(exc), "cloud": self.get_cloud_status().get("cloud")}
+        CloudSessionStore().save_login(base_url=base_url, token_pair=token_pair)
+        self._activate_current_account_space(copy_legacy=True)
+        pull_result = self.pull_cloud_tasks({})
+        message = "云端登录成功"
+        if pull_result.get("ok"):
+            message = str(pull_result.get("message") or message)
+        return {"ok": True, "message": message, "cloud": self.get_cloud_status().get("cloud")}
+
+    def register_cloud_admin(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        base_url = str(request_payload.get("base_url") or request_payload.get("baseUrl") or "").strip()
+        email = str(request_payload.get("email") or request_payload.get("username") or "").strip().lower()
+        password = str(request_payload.get("password") or "")
+        workspace_name = str(request_payload.get("workspace_name") or request_payload.get("workspaceName") or "").strip()
+        display_name = str(request_payload.get("display_name") or request_payload.get("displayName") or "").strip()
+        if not base_url or not email or not password:
+            return {"ok": False, "message": "请填写云端地址、邮箱和密码", "cloud": self.get_cloud_status().get("cloud")}
+        if len(password) < 8:
+            return {"ok": False, "message": "密码至少需要 8 位", "cloud": self.get_cloud_status().get("cloud")}
+        if not workspace_name:
+            workspace_name = display_name or email.split("@", 1)[0] or "Surfaced Workspace"
+        client = SurfacedCloudClient(base_url)
+        try:
+            registered_user = client.register_admin(
+                email=email,
+                password=password,
+                workspace_name=workspace_name,
+                display_name=display_name,
+            )
+        except CloudClientError as exc:
+            return {"ok": False, "message": str(exc), "cloud": self.get_cloud_status().get("cloud")}
+        if not bool((registered_user or {}).get("email_verified")):
+            return {
+                "ok": True,
+                "message": "验证码已发送，请查收邮箱",
+                "requiresEmailVerification": True,
+                "email": email,
+                "cloud": self.get_cloud_status().get("cloud"),
+            }
+        login_result = self.login_cloud({
+            "base_url": base_url,
+            "username": email,
+            "password": password,
+        })
+        if login_result.get("ok"):
+            login_result["message"] = "管理员账号注册成功"
+        return login_result
+
+    def _save_cloud_token_pair(self, *, base_url: str, token_pair: dict[str, Any], message: str) -> dict[str, Any]:
+        CloudSessionStore().save_login(base_url=base_url, token_pair=token_pair)
+        self._activate_current_account_space(copy_legacy=True)
+        pull_result = self.pull_cloud_tasks({})
+        next_message = message
+        if pull_result.get("ok"):
+            next_message = str(pull_result.get("message") or next_message)
+        return {"ok": True, "message": next_message, "cloud": self.get_cloud_status().get("cloud")}
+
+    def verify_cloud_email(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        base_url = str(request_payload.get("base_url") or request_payload.get("baseUrl") or "").strip()
+        email = str(request_payload.get("email") or "").strip().lower()
+        code = str(request_payload.get("code") or "").strip()
+        device_id = str(request_payload.get("device_id") or request_payload.get("deviceId") or "").strip()
+        app_version = str(request_payload.get("app_version") or request_payload.get("appVersion") or "").strip()
+        if not base_url or not email or not code:
+            return {"ok": False, "message": "请填写邮箱验证码", "cloud": self.get_cloud_status().get("cloud")}
+        if not device_id:
+            device_id = f"surfaced-local-{uuid4().hex[:12]}"
+        if not app_version:
+            app_version = str(get_version_payload().get("version") or get_http_server_version() or "local")
+        try:
+            token_pair = SurfacedCloudClient(base_url).verify_email(
+                email=email,
+                code=code,
+                device_id=device_id,
+                app_version=app_version,
+            )
+        except CloudClientError as exc:
+            return {"ok": False, "message": str(exc), "cloud": self.get_cloud_status().get("cloud")}
+        return self._save_cloud_token_pair(base_url=base_url, token_pair=token_pair, message="邮箱验证成功")
+
+    def resend_cloud_email_code(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        base_url = str(request_payload.get("base_url") or request_payload.get("baseUrl") or "").strip()
+        email = str(request_payload.get("email") or "").strip().lower()
+        if not base_url or not email:
+            return {"ok": False, "message": "请填写邮箱", "cloud": self.get_cloud_status().get("cloud")}
+        try:
+            SurfacedCloudClient(base_url).resend_email_verification(email=email)
+        except CloudClientError as exc:
+            return {"ok": False, "message": str(exc), "cloud": self.get_cloud_status().get("cloud")}
+        return {"ok": True, "message": "验证码已重新发送", "cloud": self.get_cloud_status().get("cloud")}
+
+    def request_cloud_password_reset(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        base_url = str(request_payload.get("base_url") or request_payload.get("baseUrl") or "").strip()
+        email = str(request_payload.get("email") or "").strip().lower()
+        if not base_url or not email:
+            return {"ok": False, "message": "请填写管理员邮箱", "cloud": self.get_cloud_status().get("cloud")}
+        try:
+            SurfacedCloudClient(base_url).request_password_reset(email=email)
+        except CloudClientError as exc:
+            return {"ok": False, "message": str(exc), "cloud": self.get_cloud_status().get("cloud")}
+        return {"ok": True, "message": "如果该邮箱已注册，验证码将发送至对应邮箱", "cloud": self.get_cloud_status().get("cloud")}
+
+    def reset_cloud_password(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        base_url = str(request_payload.get("base_url") or request_payload.get("baseUrl") or "").strip()
+        email = str(request_payload.get("email") or "").strip().lower()
+        code = str(request_payload.get("code") or "").strip()
+        password = str(request_payload.get("password") or "")
+        if not base_url or not email or not code or not password:
+            return {"ok": False, "message": "请填写邮箱、验证码和新密码", "cloud": self.get_cloud_status().get("cloud")}
+        if len(password) < 8:
+            return {"ok": False, "message": "密码至少需要 8 位", "cloud": self.get_cloud_status().get("cloud")}
+        try:
+            SurfacedCloudClient(base_url).reset_password(email=email, code=code, password=password)
+        except CloudClientError as exc:
+            return {"ok": False, "message": str(exc), "cloud": self.get_cloud_status().get("cloud")}
+        return {"ok": True, "message": "密码已重置，请使用新密码登录", "cloud": self.get_cloud_status().get("cloud")}
+
+    def logout_cloud(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        del payload
+        store = CloudSessionStore()
+        session = store.load()
+        base_url = str(session.get("base_url") or "").strip()
+        refresh_token = str(session.get("refresh_token") or "").strip()
+        if base_url and refresh_token:
+            try:
+                SurfacedCloudClient(base_url).logout(refresh_token)
+            except CloudClientError:
+                pass
+        store.clear()
+        self._activate_current_account_space(copy_legacy=False)
+        return {"ok": True, "message": "已退出云端", "cloud": self.get_cloud_status().get("cloud")}
+
+    def flush_cloud_outbox(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        limit = _safe_int(request_payload.get("limit", 100), 100)
+        return flush_cloud_outbox_events(limit=limit)
+
+    def pull_cloud_tasks(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        del payload
+        with self._lock:
+            config = self.load_config()
+            result = pull_cloud_tasks_into_config(config)
+            if result.get("ok"):
+                summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+                run_summary = summary.get("run_records") if isinstance(summary.get("run_records"), dict) else {}
+                changed = (
+                    int(summary.get("added") or 0)
+                    + int(summary.get("updated") or 0)
+                    + int(summary.get("revoked") or 0)
+                    + int(summary.get("deleted") or 0)
+                    + int(summary.get("deleted_backups") or 0)
+                    + int(summary.get("deleted_pending") or 0)
+                    + int(run_summary.get("cursor_updates") or 0)
+                )
+                if changed:
+                    self.save_config(config)
+                if changed or int(run_summary.get("imported") or 0):
+                    self._invalidate_tasks_full_cache()
+                    self._invalidate_article_cache()
+        if result.get("ok"):
+            self._refresh_monitoring_runtime()
+            result["cloud"] = self.get_cloud_status().get("cloud")
+        return result
+
+    def update_cloud_admin_task(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return {"ok": False, "message": "当前云端账号不是管理员", "cloud": self.get_cloud_status().get("cloud")}
+        task_id = _safe_int(request_payload.get("task_id") or request_payload.get("taskId"), 0)
+        if task_id <= 0:
+            return {"ok": False, "message": "缺少云端任务 ID", "cloud": self.get_cloud_status().get("cloud")}
+
+        update_payload: dict[str, Any] = {}
+        for key in ("name", "brand", "enabled"):
+            if key in request_payload:
+                update_payload[key] = request_payload.get(key)
+        if "config_json" in request_payload:
+            config_json = request_payload.get("config_json")
+            if not isinstance(config_json, dict):
+                return {"ok": False, "message": "任务配置必须是 JSON 对象", "cloud": self.get_cloud_status().get("cloud")}
+            update_payload["config_json"] = config_json
+        expected_config_version = request_payload.get("expected_config_version") or request_payload.get("expectedConfigVersion")
+        if expected_config_version is not None:
+            update_payload["expected_config_version"] = _safe_int(expected_config_version, 0)
+        if not update_payload:
+            return {"ok": False, "message": "没有可保存的云端任务改动", "cloud": self.get_cloud_status().get("cloud")}
+
+        ok, task, message = self._cloud_request_with_refresh(
+            lambda client, token: client.update_admin_task(token, task_id, update_payload)
+        )
+        if not ok:
+            return {"ok": False, "message": message or "云端任务保存失败", "cloud": self.get_cloud_status().get("cloud")}
+        return {"ok": True, "message": "云端任务已保存", "task": task if isinstance(task, dict) else {}, "cloud": self.get_cloud_status().get("cloud")}
+
+    def sync_cloud_admin_task(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return {"ok": False, "message": "当前云端账号不是管理员", "cloud": self.get_cloud_status().get("cloud")}
+        local_task_id = str(request_payload.get("local_task_id") or request_payload.get("task_id") or "").strip()
+        if not local_task_id:
+            return {"ok": False, "message": "缺少本地任务 ID", "cloud": self.get_cloud_status().get("cloud")}
+        operator_user_id = _safe_int(request_payload.get("operator_user_id") or request_payload.get("operatorUserId"), 0)
+
+        with self._lock:
+            config = self.load_config()
+            tasks = config.get("tasks", []) or []
+            target_index = None
+            for index, task in enumerate(tasks):
+                if str(task.get("task_id") or derive_task_id(task)).strip() == local_task_id:
+                    target_index = index
+                    break
+            if target_index is None:
+                return {"ok": False, "message": f"未找到本地任务 {local_task_id}", "cloud": self.get_cloud_status().get("cloud")}
+            local_task = dict(tasks[target_index])
+
+        existing_cloud_task_id = _safe_int(local_task.get("cloud_task_id") or local_task.get("cloudTaskId"), 0)
+        cloud_config = self._build_cloud_config_from_local_task(local_task)
+        cloud_payload = {
+            "name": str(local_task.get("name") or local_task.get("brand") or local_task_id).strip(),
+            "brand": str(local_task.get("brand") or local_task.get("name") or local_task_id).strip(),
+            "config_json": cloud_config,
+            "enabled": bool(local_task.get("enabled", True)),
+        }
+        if existing_cloud_task_id > 0 and _safe_int(local_task.get("cloud_config_version"), 0) > 0:
+            cloud_payload["expected_config_version"] = _safe_int(local_task.get("cloud_config_version"), 0)
+
+        def operation(client: SurfacedCloudClient, token: str) -> dict[str, Any]:
+            if existing_cloud_task_id > 0:
+                saved = client.update_admin_task(token, existing_cloud_task_id, cloud_payload)
+            else:
+                saved = client.create_admin_task(
+                    token,
+                    {
+                        "task_key": self._cloud_task_key_for_local_task(local_task, local_task_id),
+                        **cloud_payload,
+                    },
+                )
+            saved_task_id = _safe_int(saved.get("id") if isinstance(saved, dict) else 0, existing_cloud_task_id)
+            if operator_user_id > 0 and saved_task_id > 0:
+                client.assign_admin_task_member(
+                    token,
+                    saved_task_id,
+                    user_id=operator_user_id,
+                    access_level="operate",
+                    note="品牌编辑页分配",
+                )
+            elif saved_task_id > 0:
+                client.clear_admin_task_operator(token, saved_task_id)
+            return saved
+
+        ok, saved_task, message = self._cloud_request_with_refresh(operation)
+        if not ok:
+            return {"ok": False, "message": message or "云端任务同步失败", "cloud": self.get_cloud_status().get("cloud")}
+        if not isinstance(saved_task, dict):
+            saved_task = {}
+
+        with self._lock:
+            config = self.load_config()
+            tasks = config.get("tasks", []) or []
+            for index, task in enumerate(tasks):
+                if str(task.get("task_id") or derive_task_id(task)).strip() != local_task_id:
+                    continue
+                task["cloud_task_id"] = _safe_int(saved_task.get("id"), existing_cloud_task_id)
+                task["cloud_task_key"] = str(saved_task.get("task_key") or task.get("cloud_task_key") or "").strip()
+                task["cloud_workspace_id"] = _safe_int(saved_task.get("workspace_id"), _safe_int(task.get("cloud_workspace_id"), 0))
+                task["cloud_config_version"] = _safe_int(saved_task.get("config_version"), _safe_int(task.get("cloud_config_version"), 1))
+                task["cloud_access_level"] = "admin"
+                task["cloud_assigned_operator_user_id"] = operator_user_id
+                if operator_user_id > 0:
+                    task["cloud_assigned_operator_username"] = str(saved_task.get("assigned_operator_username") or task.get("cloud_assigned_operator_username") or "").strip()
+                else:
+                    task["cloud_assigned_operator_username"] = ""
+                task["cloud_synced_at"] = datetime.now().isoformat(timespec="seconds")
+                tasks[index] = task
+                break
+            config["tasks"] = tasks
+            self.save_config(config)
+            self._invalidate_tasks_full_cache()
+            self._invalidate_article_cache()
+        self._refresh_monitoring_runtime(restart_scheduler=False)
+        return {
+            "ok": True,
+            "message": "云端任务已同步",
+            "task": saved_task,
+            "cloud": self.get_cloud_status().get("cloud"),
+        }
+
+    def delete_cloud_admin_task(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return {"ok": False, "message": "当前云端账号不是管理员", "cloud": self.get_cloud_status().get("cloud")}
+        cloud_task_id = _safe_int(request_payload.get("task_id") or request_payload.get("taskId"), 0)
+        if cloud_task_id <= 0:
+            return {"ok": False, "message": "缺少云端任务 ID", "cloud": self.get_cloud_status().get("cloud")}
+        ok, _payload, message = self._cloud_request_with_refresh(
+            lambda client, token: client.delete_admin_task(token, cloud_task_id)
+        )
+        if not ok:
+            return {"ok": False, "message": message or "云端任务删除失败", "cloud": self.get_cloud_status().get("cloud")}
+        return {"ok": True, "message": "云端任务已软删除", "cloud": self.get_cloud_status().get("cloud")}
+
+    def restore_cloud_admin_task(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return {"ok": False, "message": "当前云端账号不是管理员", "cloud": self.get_cloud_status().get("cloud")}
+        cloud_task_id = _safe_int(request_payload.get("task_id") or request_payload.get("taskId"), 0)
+        if cloud_task_id <= 0:
+            return {"ok": False, "message": "缺少云端任务 ID", "cloud": self.get_cloud_status().get("cloud")}
+        ok, task, message = self._cloud_request_with_refresh(
+            lambda client, token: client.restore_admin_task(token, cloud_task_id)
+        )
+        if not ok:
+            return {"ok": False, "message": message or "云端任务恢复失败", "cloud": self.get_cloud_status().get("cloud")}
+        return {
+            "ok": True,
+            "message": "云端任务已恢复",
+            "task": task if isinstance(task, dict) else {},
+            "cloud": self.get_cloud_status().get("cloud"),
+        }
+
+    @staticmethod
+    def _cloud_task_key_for_local_task(task: dict[str, Any], local_task_id: str) -> str:
+        existing = str(task.get("cloud_task_key") or "").strip()
+        if existing:
+            return existing[:128]
+        raw = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(local_task_id or "").strip()).strip("-")
+        return f"local-{raw or uuid4().hex[:12]}"[:128]
+
+    @staticmethod
+    def _build_cloud_config_from_local_task(task: dict[str, Any]) -> dict[str, Any]:
+        local_task_keys = [
+            "industry_tags",
+            "region_tags",
+            "weekdays",
+            "enabled",
+            "inspect",
+            "recognition_enabled",
+            "recognition_brands",
+            "recognition_batch_size",
+            "extract_references_enabled",
+            "fixed_screenshot_enabled",
+            "fixed_screenshot_count",
+            "optimization_start_date",
+            "optimization_end_date",
+            "keywords",
+            "platforms",
+        ]
+        local_task = {key: copy.deepcopy(task.get(key)) for key in local_task_keys if key in task}
+        platforms = list(task.get("platforms") or [])
+        keywords = copy.deepcopy(task.get("keywords") or [])
+        return {
+            "platforms": platforms,
+            "keywords": keywords,
+            "local_task": local_task,
+        }
 
     def get_local_model_status(self) -> dict[str, Any]:
         return {"ok": True, "local_model": get_local_model_manager().get_status()}
@@ -3501,6 +4147,30 @@ return changedCount
             except Exception:
                 pass
 
+    def _on_scheduler_round_complete(self, payload: dict[str, Any]) -> None:
+        if self._scheduler_reporter is not None:
+            try:
+                self._scheduler_reporter.send_mode_summary(payload)
+            except Exception:
+                pass
+        self._process_pending_task_deletions()
+
+    def _on_scheduler_cycle_complete(self, payload: dict[str, Any]) -> None:
+        if self._scheduler_reporter is not None:
+            try:
+                self._scheduler_reporter.send_cycle_summary(payload)
+            except Exception:
+                pass
+        self._process_pending_task_deletions()
+
+    def _on_recognition_round_complete(self, payload: dict[str, Any]) -> None:
+        if self._scheduler_reporter is not None:
+            try:
+                self._scheduler_reporter.send_recognition_round_summary(payload)
+            except Exception:
+                pass
+        self._process_pending_task_deletions()
+
     def start_monitoring(self) -> dict:
         config = self.load_config()
         enabled_tasks = [task for task in (config.get("tasks", []) or []) if task.get("enabled", True)]
@@ -3528,16 +4198,8 @@ return changedCount
             self._execute_scheduled_task,
             self._on_scheduler_status_change,
             on_task_timeout=self._on_scheduler_task_timeout,
-            on_round_complete=(
-                self._scheduler_reporter.send_mode_summary
-                if self._scheduler_reporter is not None
-                else None
-            ),
-            on_cycle_complete=(
-                self._scheduler_reporter.send_cycle_summary
-                if self._scheduler_reporter is not None
-                else None
-            ),
+            on_round_complete=self._on_scheduler_round_complete,
+            on_cycle_complete=self._on_scheduler_cycle_complete,
         )
         set_auto_resume_monitoring(True)
         self._monitoring_status_message = "定时任务已开启"
@@ -3671,12 +4333,14 @@ return changedCount
 
     def restore_monitoring_if_needed(self) -> None:
         self._cloud_sync_manager.start()
+        self._cloud_platform_auto_sync.start()
         self.start_account_crawl_scheduler()
         if should_auto_resume_monitoring():
             self.start_monitoring()
 
     def shutdown(self) -> None:
         self._cloud_sync_manager.stop()
+        self._cloud_platform_auto_sync.stop()
         self.stop_account_crawl_scheduler()
         self._stop_recognition_test_session(restore_previous=False)
         if self._is_monitoring_running():
@@ -3777,9 +4441,7 @@ return changedCount
                     else None
                 ),
                 on_round_complete=(
-                    self._scheduler_reporter.send_recognition_round_summary
-                    if self._scheduler_reporter is not None
-                    else None
+                    self._on_recognition_round_complete
                 ),
             )
         except Exception:
@@ -4056,6 +4718,7 @@ return changedCount
             manager.stop()
 
     def snapshot(self) -> dict:
+        self._process_pending_task_deletions()
         with self._lock:
             return self._snapshot_locked()
 
@@ -4356,7 +5019,7 @@ return changedCount
 
             self.save_config(config)
             self._invalidate_tasks_full_cache()
-        self._refresh_monitoring_runtime()
+        self._refresh_monitoring_runtime(restart_scheduler=False)
 
         # 记录优化周期到 periods 历史
         task_name = str(target_task.get("name") or task_id).strip()
@@ -4578,7 +5241,210 @@ return changedCount
 
     def get_tasks_full(self) -> dict:
         """返回所有任务的完整信息。"""
+        self._process_pending_task_deletions()
         return self.task_overview_service.get_tasks_full()
+
+    def get_deleted_tasks(self) -> dict:
+        self._process_pending_task_deletions()
+        with self._lock:
+            config = self.load_config()
+            changed = purge_expired_deleted_tasks(config)
+            if changed:
+                self.save_config(config)
+            can_restore = self._current_cloud_role() == "admin"
+            items = deleted_task_snapshots(config)
+        return {
+            "ok": True,
+            "tasks": [
+                {
+                    **item,
+                    "can_restore": bool(can_restore),
+                }
+                for item in items
+            ],
+            "retention_days": 3,
+        }
+
+    def restore_deleted_task(self, payload: dict[str, Any] | None = None) -> dict:
+        request_payload = payload if isinstance(payload, dict) else {}
+        if self._current_cloud_role() != "admin":
+            return {"ok": False, "message": "只有管理员账号可以恢复已删除品牌配置"}
+
+        deleted_task_id = str(request_payload.get("deleted_task_id") or request_payload.get("id") or "").strip()
+        brand_name = str(request_payload.get("brand_name") or request_payload.get("brandName") or "").strip()
+        with self._lock:
+            config = self.load_config()
+            changed = purge_expired_deleted_tasks(config)
+            snapshots = deleted_task_snapshots(config)
+            candidate = None
+            for item in snapshots:
+                if deleted_task_id and str(item.get("id") or "").strip() == deleted_task_id:
+                    candidate = item
+                    break
+                if brand_name and str(item.get("brand") or item.get("name") or "").strip() == brand_name:
+                    candidate = item
+                    break
+            if changed:
+                self.save_config(config)
+            if not candidate:
+                return {"ok": False, "message": "未找到可恢复的品牌配置，可能已超过三天保留期"}
+
+        cloud_ok, cloud_message, cloud_task = self._restore_cloud_deleted_task(candidate)
+        if not cloud_ok:
+            return {"ok": False, "message": cloud_message or "云端品牌配置恢复失败"}
+
+        with self._lock:
+            config = self.load_config()
+            result = restore_deleted_task_backup(
+                config,
+                deleted_task_id=deleted_task_id or str(candidate.get("id") or ""),
+                brand_name=brand_name,
+            )
+            if not result.get("ok"):
+                return result
+            restored_task = result.get("task") if isinstance(result.get("task"), dict) else {}
+            if isinstance(cloud_task, dict) and restored_task:
+                restored_task["cloud_task_id"] = _safe_int(cloud_task.get("id"), _safe_int(restored_task.get("cloud_task_id"), 0))
+                restored_task["cloud_task_key"] = str(cloud_task.get("task_key") or restored_task.get("cloud_task_key") or "").strip()
+                restored_task["cloud_config_version"] = _safe_int(
+                    cloud_task.get("config_version"),
+                    _safe_int(restored_task.get("cloud_config_version"), 1),
+                )
+                restored_task["cloud_access_level"] = "admin"
+                if "enabled" in cloud_task:
+                    restored_task["enabled"] = bool(cloud_task.get("enabled"))
+            self.save_config(config)
+            self._invalidate_tasks_full_cache()
+            self._invalidate_article_cache()
+        self._refresh_monitoring_runtime(restart_scheduler=False)
+        return {
+            "ok": True,
+            "message": f"已恢复品牌配置「{restored_task.get('brand') or restored_task.get('name') or brand_name}」",
+            "task_id": restored_task.get("task_id") or derive_task_id(restored_task),
+        }
+
+    def _current_cloud_role(self) -> str:
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        return str(user.get("role") or "").strip()
+
+    def _task_is_formal_running(self, task: dict[str, Any]) -> bool:
+        try:
+            status = get_task_day_status(task)
+            if bool(status.get("formal_running")):
+                return True
+        except Exception:
+            pass
+
+        scheduler = self._scheduler
+        if scheduler is None:
+            return False
+        task_id = str(task.get("task_id") or derive_task_id(task)).strip()
+        task_name = str(task.get("name") or task_id).strip()
+        try:
+            running_ids = set(str(item) for item in (scheduler.get_running_task_ids() or []))
+            if task_id in running_ids or any(item.startswith(f"{task_id}::") for item in running_ids):
+                return True
+        except Exception:
+            pass
+        try:
+            running_tasks = dict(scheduler.get_running_tasks() or {})
+            return any(key == task_name or key.startswith(f"{task_name} [") for key in running_tasks)
+        except Exception:
+            return False
+
+    def _delete_cloud_task_for_local_task(self, task: dict[str, Any]) -> tuple[bool, str]:
+        cloud_task_id = _safe_int(task.get("cloud_task_id") or task.get("cloudTaskId"), 0)
+        if cloud_task_id <= 0:
+            return True, ""
+        if self._current_cloud_role() != "admin":
+            return False, "只有管理员账号可以删除云端品牌任务"
+        try:
+            flush_cloud_outbox_events(limit=10000)
+        except Exception as exc:
+            print(f"[WebBackend] 删除任务前上传云端 outbox 失败，将继续尝试删除: {exc}")
+        ok, _payload, message = self._cloud_request_with_refresh(
+            lambda client, token: client.delete_admin_task(token, cloud_task_id)
+        )
+        if not ok:
+            return False, message or "云端任务删除失败"
+        return True, ""
+
+    def _restore_cloud_deleted_task(self, deleted_task: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        cloud_task_id = _safe_int(deleted_task.get("cloud_task_id"), 0)
+        if cloud_task_id <= 0:
+            return True, "", {}
+        if self._current_cloud_role() != "admin":
+            return False, "只有管理员账号可以恢复云端品牌任务", {}
+        ok, task, message = self._cloud_request_with_refresh(
+            lambda client, token: client.restore_admin_task(token, cloud_task_id)
+        )
+        if not ok:
+            return False, message or "云端任务恢复失败", {}
+        return True, "", task if isinstance(task, dict) else {}
+
+    def _process_pending_task_deletions(self) -> None:
+        if not self._pending_delete_processing_lock.acquire(blocking=False):
+            return
+        try:
+            pending_tasks: list[dict[str, Any]] = []
+            with self._lock:
+                config = self.load_config()
+                changed = purge_expired_deleted_tasks(config)
+                for task in (config.get("tasks") or []):
+                    if isinstance(task, dict) and bool(task.get("delete_pending")) and not self._task_is_formal_running(task):
+                        pending_tasks.append(copy.deepcopy(task))
+                if changed:
+                    self.save_config(config)
+
+            for task in pending_tasks:
+                deleted_any = False
+                task_id = str(task.get("task_id") or derive_task_id(task)).strip()
+                pending_reason = str(task.get("delete_pending_reason") or "").strip()
+                cloud_already_deleted = pending_reason == "cloud_deleted"
+                if cloud_already_deleted:
+                    cloud_ok, cloud_message = True, ""
+                else:
+                    cloud_ok, cloud_message = self._delete_cloud_task_for_local_task(task)
+                with self._lock:
+                    config = self.load_config()
+                    tasks = [item for item in (config.get("tasks") or []) if isinstance(item, dict)]
+                    target = next(
+                        (
+                            item
+                            for item in tasks
+                            if str(item.get("task_id") or derive_task_id(item)).strip() == task_id
+                        ),
+                        None,
+                    )
+                    if not target:
+                        continue
+                    if self._task_is_formal_running(target):
+                        continue
+                    if not cloud_ok:
+                        target["delete_pending_error"] = cloud_message or "云端任务删除失败，稍后会重试"
+                        config["tasks"] = tasks
+                        self.save_config(config)
+                        self._invalidate_tasks_full_cache()
+                        continue
+                    tombstone = soft_delete_task(
+                        config,
+                        task_id,
+                        source="cloud" if cloud_already_deleted else "local",
+                        reason="cloud_deleted_after_formal_run" if cloud_already_deleted else "pending_formal_run_completed",
+                        deleted_at=str(task.get("cloud_deleted_at") or "") if cloud_already_deleted else None,
+                        expires_at=str(task.get("cloud_delete_expires_at") or task.get("delete_pending_expires_at") or "") if cloud_already_deleted else None,
+                    )
+                    if tombstone:
+                        self.save_config(config)
+                        self._invalidate_tasks_full_cache()
+                        self._invalidate_article_cache()
+                        deleted_any = True
+                        print(f"[WebBackend] 已在正式任务结束后软删除品牌任务: {tombstone.get('name') or task_id}")
+                if deleted_any:
+                    self._refresh_monitoring_runtime(restart_scheduler=False)
+        finally:
+            self._pending_delete_processing_lock.release()
 
     def get_task_trend(self, task_id: str, range_key: str) -> dict:
         config = self.load_config()
@@ -4705,19 +5571,80 @@ return changedCount
         return {"ok": True}
 
     def delete_task(self, task_id: str) -> dict:
-        """删除任务。"""
+        """软删除任务，保留三天可恢复备份。"""
+        if self._current_cloud_role() != "admin":
+            return {"ok": False, "message": "只有管理员账号可以删除品牌任务"}
+
+        target_snapshot: dict[str, Any] | None = None
         with self._lock:
             config = self.load_config()
             tasks = config.get("tasks", []) or []
-            new_tasks = [t for t in tasks if (t.get("task_id") or derive_task_id(t)) != task_id]
-            if len(new_tasks) == len(tasks):
+            target = next(
+                (
+                    t
+                    for t in tasks
+                    if isinstance(t, dict) and (t.get("task_id") or derive_task_id(t)) == task_id
+                ),
+                None,
+            )
+            if target is None:
                 return {"ok": False, "message": f"未找到任务 {task_id}"}
-            config["tasks"] = new_tasks
+            if self._task_is_formal_running(target):
+                mark_task_delete_pending(target, reason="formal_running")
+                config["tasks"] = tasks
+                self.save_config(config)
+                self._invalidate_tasks_full_cache()
+                return {
+                    "ok": True,
+                    "pending": True,
+                    "message": "当前正式任务正在运行，已记录删除请求；运行结束并同步数据后会自动软删除。",
+                }
+            target_snapshot = copy.deepcopy(target)
+
+        cloud_ok, cloud_message = self._delete_cloud_task_for_local_task(target_snapshot or {})
+        if not cloud_ok:
+            return {"ok": False, "message": cloud_message or "云端任务删除失败"}
+
+        with self._lock:
+            config = self.load_config()
+            tasks = [item for item in (config.get("tasks") or []) if isinstance(item, dict)]
+            target = next(
+                (
+                    item
+                    for item in tasks
+                    if str(item.get("task_id") or derive_task_id(item)).strip() == task_id
+                ),
+                None,
+            )
+            if target is None:
+                return {"ok": False, "message": f"未找到任务 {task_id}"}
+            if self._task_is_formal_running(target):
+                mark_task_delete_pending(target, reason="formal_running")
+                config["tasks"] = tasks
+                self.save_config(config)
+                self._invalidate_tasks_full_cache()
+                return {
+                    "ok": True,
+                    "pending": True,
+                    "message": "当前正式任务已开始运行，云端已记录删除请求；运行结束并同步数据后会自动软删除。",
+                }
+            tombstone = soft_delete_task(
+                config,
+                task_id,
+                source="local",
+                reason="manual_admin_delete",
+            )
+            if not tombstone:
+                return {"ok": False, "message": f"未找到任务 {task_id}"}
             self.save_config(config)
             self._invalidate_tasks_full_cache()
             self._invalidate_article_cache()
-        self._refresh_monitoring_runtime()
-        return {"ok": True}
+        self._refresh_monitoring_runtime(restart_scheduler=False)
+        return {
+            "ok": True,
+            "message": f"已删除品牌任务「{tombstone.get('name') or task_id}」，备份将保留三天。",
+            "deleted_task": {key: tombstone.get(key) for key in ("id", "task_id", "name", "brand", "deleted_at", "expires_at")},
+        }
 
     def test_run_task(self, task_id: str) -> dict:
         """单任务测试运行（同步，阻塞直到完成）。"""

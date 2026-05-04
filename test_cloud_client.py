@@ -1,0 +1,186 @@
+from __future__ import annotations
+
+import unittest
+
+from core.cloud_client import SurfacedCloudClient, iter_sse_events
+
+
+class FakeResponse:
+    status_code = 200
+    content = b'{"id": 7, "config_version": 4}'
+    text = '{"id": 7, "config_version": 4}'
+
+    def json(self):
+        return {"id": 7, "config_version": 4}
+
+
+class FakeSession:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def request(self, method: str, url: str, **kwargs):
+        self.calls.append({"method": method, "url": url, **kwargs})
+        return FakeResponse()
+
+
+class CloudClientTests(unittest.TestCase):
+    def test_update_admin_task_uses_patch_and_bearer_token(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        result = client.update_admin_task("access-token", 7, {"name": "新任务", "expected_config_version": 3})
+
+        self.assertEqual(result["config_version"], 4)
+        self.assertEqual(session.calls[0]["method"], "PATCH")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/admin/tasks/7")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+        self.assertEqual(session.calls[0]["json"], {"name": "新任务", "expected_config_version": 3})
+
+    def test_register_admin_posts_public_auth_payload(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.register_admin(
+            email="admin@example.com",
+            password="Password123",
+            workspace_name="示例工作区",
+            display_name="管理员",
+        )
+
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/auth/admin/register")
+        self.assertNotIn("Authorization", session.calls[0]["headers"])
+        self.assertEqual(
+            session.calls[0]["json"],
+            {
+                "email": "admin@example.com",
+                "password": "Password123",
+                "workspace_name": "示例工作区",
+                "display_name": "管理员",
+            },
+        )
+
+    def test_verify_email_posts_code_and_device_info(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.verify_email(
+            email="admin@example.com",
+            code="123456",
+            device_id="device-1",
+            app_version="0.1.0",
+        )
+
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/auth/email/verify")
+        self.assertEqual(
+            session.calls[0]["json"],
+            {
+                "email": "admin@example.com",
+                "code": "123456",
+                "device_id": "device-1",
+                "app_version": "0.1.0",
+            },
+        )
+
+    def test_resend_email_verification_posts_email(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.resend_email_verification(email="admin@example.com")
+
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/auth/email/resend")
+        self.assertEqual(session.calls[0]["json"], {"email": "admin@example.com"})
+
+    def test_request_password_reset_posts_email(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.request_password_reset(email="admin@example.com")
+
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/auth/password/reset/request")
+        self.assertEqual(session.calls[0]["json"], {"email": "admin@example.com"})
+
+    def test_reset_password_posts_code_and_new_password(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.reset_password(email="admin@example.com", code="123456", password="NewPassword123")
+
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/auth/password/reset/confirm")
+        self.assertEqual(
+            session.calls[0]["json"],
+            {"email": "admin@example.com", "code": "123456", "password": "NewPassword123"},
+        )
+
+    def test_clear_admin_task_operator_uses_delete(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        result = client.clear_admin_task_operator("access-token", 7)
+
+        self.assertEqual(result["id"], 7)
+        self.assertEqual(session.calls[0]["method"], "DELETE")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/admin/tasks/7/members/operator")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+
+    def test_delete_admin_task_uses_delete(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.delete_admin_task("access-token", 7)
+
+        self.assertEqual(session.calls[0]["method"], "DELETE")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/admin/tasks/7")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+
+    def test_restore_admin_task_posts_restore(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.restore_admin_task("access-token", 7)
+
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/admin/tasks/7/restore")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+
+    def test_list_deleted_tasks_uses_tasks_deleted_endpoint(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.list_deleted_tasks("access-token")
+
+        self.assertEqual(session.calls[0]["method"], "GET")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/tasks/deleted")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+
+    def test_task_run_records_supports_since_id_cursor(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.task_run_records("access-token", 7, limit=6000, since_id=12)
+
+        self.assertEqual(session.calls[0]["method"], "GET")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/tasks/7/run-records")
+        self.assertEqual(session.calls[0]["params"], {"limit": 6000, "since_id": 12})
+
+    def test_iter_sse_events_parses_named_json_event(self):
+        events = list(
+            iter_sse_events(
+                [
+                    "id: 42",
+                    "event: task_changed",
+                    'data: {"task_id":7}',
+                    "",
+                ]
+            )
+        )
+
+        self.assertEqual(events, [{"event": "task_changed", "data": {"task_id": 7}, "id": "42", "raw_data": '{"task_id":7}'}])
+
+
+if __name__ == "__main__":
+    unittest.main()

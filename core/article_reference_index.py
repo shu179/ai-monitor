@@ -15,9 +15,11 @@ from core.article_reference_ranking import (
 )
 from core.article_store import get_articles_file_signature
 from core.history import get_records_file_signature
+from core.local_account_space import account_scoped_path
 from core.time_utils import local_now
 
-INDEX_DIR = resolve_app_path("logs/article_reference_index")
+DEFAULT_INDEX_DIR = resolve_app_path("logs/article_reference_index")
+INDEX_DIR = DEFAULT_INDEX_DIR
 INDEX_FILE_VERSION = 1
 _INDEX_LOCK = threading.RLock()
 
@@ -133,8 +135,16 @@ def _index_storage_key(task_name: str = "", task_id: str = "") -> str:
 
 
 def _index_path(task_name: str = "", task_id: str = "") -> Path:
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    return INDEX_DIR / f"{_index_storage_key(task_name, task_id)}.json"
+    index_dir = _index_dir()
+    index_dir.mkdir(parents=True, exist_ok=True)
+    return index_dir / f"{_index_storage_key(task_name, task_id)}.json"
+
+
+def _index_dir() -> Path:
+    resolved_default = resolve_app_path("logs/article_reference_index")
+    if INDEX_DIR != resolved_default:
+        return INDEX_DIR
+    return account_scoped_path("logs/article_reference_index", fallback=resolved_default)
 
 
 def _load_index_payload(task_name: str, task_id: str) -> dict[str, Any] | None:

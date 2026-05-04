@@ -7,4 +7,5 @@ pydantic-settings>=2.3.4
 PyJWT>=2.8.0
 pytest>=8.2.0
 SQLAlchemy>=2.0.31
+tencentcloud-sdk-python>=3.0.1300
 uvicorn[standard]>=0.30.1

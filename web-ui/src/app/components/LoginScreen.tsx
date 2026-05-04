@@ -1,133 +1,224 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, AtSign, KeyRound, ShieldCheck, UserRound } from "lucide-react";
+import { ArrowRight, ChevronLeft, KeyRound, RotateCcw, UserRound } from "lucide-react";
 import surfacedWordmark from "../../assets/surfaced-wordmark.svg";
-import { PatternLoadingAnimation } from "./PatternLoadingAnimation";
 
-export type LoginPayload =
-  | {
-      method: "email";
-      email: string;
-      code: string;
-    }
-  | {
-      method: "account";
-      account: string;
-      password: string;
-    };
+export type LoginPayload = {
+  username: string;
+  password: string;
+  baseUrl: string;
+};
+
+export type RegisterPayload = {
+  email: string;
+  password: string;
+  displayName: string;
+  workspaceName: string;
+  baseUrl: string;
+};
+
+export type VerifyEmailPayload = {
+  email: string;
+  code: string;
+  baseUrl: string;
+};
+
+export type RequestPasswordResetPayload = {
+  email: string;
+  baseUrl: string;
+};
+
+export type ResetPasswordPayload = {
+  email: string;
+  code: string;
+  password: string;
+  baseUrl: string;
+};
 
 type LoginScreenProps = {
   defaultIdentity?: string;
+  defaultBaseUrl?: string;
   onLogin: (payload: LoginPayload) => void | Promise<void>;
+  onRegister?: (payload: RegisterPayload) => void | Promise<{ requiresEmailVerification?: boolean; email?: string } | void>;
+  onVerifyEmail?: (payload: VerifyEmailPayload) => void | Promise<void>;
+  onResendEmailCode?: (payload: { email: string; baseUrl: string }) => void | Promise<void>;
+  onRequestPasswordReset?: (payload: RequestPasswordResetPayload) => void | Promise<void>;
+  onResetPassword?: (payload: ResetPasswordPayload) => void | Promise<void>;
   variant?: "page" | "panel";
 };
 
-type LoginMethod = "email" | "account";
+const DEFAULT_BASE_URL = "https://api.surfacedlab.com";
 
-function inputClassName() {
-  return "w-full rounded-[22px] border border-gray-200/80 bg-white px-4 py-3.5 text-[14px] font-medium text-gray-900 outline-none transition-all placeholder:text-gray-400 focus:border-blue-200 focus:ring-4 focus:ring-blue-50";
+function pageInputClassName() {
+  return "h-[46px] w-full rounded-[12px] border border-gray-200/80 bg-white/76 px-4 text-center text-[14px] font-semibold text-gray-900 shadow-[0_16px_36px_-32px_rgba(15,23,42,0.32)] outline-none transition-all placeholder:text-gray-400 focus:border-blue-200 focus:bg-white focus:ring-4 focus:ring-blue-50";
 }
 
-function methodTabClassName(active: boolean) {
-  return `inline-flex flex-1 items-center justify-center rounded-[18px] px-3 py-2.5 text-[13px] font-bold tracking-wide transition-all ${
-    active ? "bg-[#111827] text-white shadow-[0_12px_28px_-18px_rgba(15,23,42,0.48)]" : "text-gray-500 hover:text-gray-900"
-  }`;
-}
-
-function compactInputClassName() {
-  return "w-full rounded-[16px] border border-gray-200 bg-white px-3.5 py-3 text-[13px] font-medium text-gray-900 outline-none transition-all placeholder:text-gray-400 focus:border-blue-200 focus:ring-4 focus:ring-blue-50";
-}
-
-function compactMethodTabClassName(active: boolean) {
-  return `inline-flex flex-1 items-center justify-center rounded-[12px] px-2.5 py-2 text-[12px] font-semibold transition-all ${
-    active ? "bg-[#111827] text-white" : "text-gray-500 hover:text-gray-900"
-  }`;
+function panelInputClassName() {
+  return "w-full rounded-[14px] border border-gray-200 bg-white px-3.5 py-3 text-[13px] font-medium text-gray-900 outline-none transition-all placeholder:text-gray-400 focus:border-blue-200 focus:ring-4 focus:ring-blue-50";
 }
 
 export function LoginScreen({
   defaultIdentity,
+  defaultBaseUrl = DEFAULT_BASE_URL,
   onLogin,
+  onRegister,
+  onVerifyEmail,
+  onResendEmailCode,
+  onRequestPasswordReset,
+  onResetPassword,
   variant = "page",
 }: LoginScreenProps) {
   const isPanel = variant === "panel";
-  const [method, setMethod] = useState<LoginMethod>("email");
-  const [email, setEmail] = useState("");
-  const [emailCode, setEmailCode] = useState("");
-  const [account, setAccount] = useState("");
+  const [mode, setMode] = useState<"login" | "register" | "verify" | "forgot" | "reset">("login");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [agree, setAgree] = useState(true);
+  const [displayName, setDisplayName] = useState("");
+  const [verificationCode, setVerificationCode] = useState("");
+  const [pendingVerificationEmail, setPendingVerificationEmail] = useState("");
+  const [pendingResetEmail, setPendingResetEmail] = useState("");
+  const [baseUrl, setBaseUrl] = useState(defaultBaseUrl);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
 
   useEffect(() => {
-    if (!defaultIdentity) {
-      return;
+    if (defaultIdentity) {
+      setUsername(defaultIdentity);
     }
-    if (defaultIdentity.includes("@")) {
-      setMethod("email");
-      setEmail(defaultIdentity);
-      return;
-    }
-    setMethod("account");
-    setAccount(defaultIdentity);
   }, [defaultIdentity]);
 
+  useEffect(() => {
+    setBaseUrl(defaultBaseUrl || DEFAULT_BASE_URL);
+  }, [defaultBaseUrl]);
+
   const canSubmit = useMemo(() => {
-    if (!agree || isSubmitting) {
-      return false;
+    const hasIdentity = username.trim().length > 0;
+    const hasPassword = password.length > 0;
+    const hasBaseUrl = baseUrl.trim().length > 0;
+    const hasRegisterPassword = mode === "login" || password.length >= 8;
+    if (mode === "verify") {
+      return verificationCode.trim().length >= 4 && pendingVerificationEmail && hasBaseUrl && !isSubmitting;
     }
-    if (method === "email") {
-      return email.trim().length > 0 && emailCode.trim().length > 0;
+    if (mode === "forgot") {
+      return hasIdentity && hasBaseUrl && !isSubmitting;
     }
-    return account.trim().length > 0 && password.trim().length > 0;
-  }, [account, agree, email, emailCode, isSubmitting, method, password]);
+    if (mode === "reset") {
+      return verificationCode.trim().length >= 4 && pendingResetEmail && password.length >= 8 && hasBaseUrl && !isSubmitting;
+    }
+    return hasIdentity && hasPassword && hasBaseUrl && hasRegisterPassword && !isSubmitting;
+  }, [baseUrl, isSubmitting, mode, password, pendingResetEmail, pendingVerificationEmail, username, verificationCode]);
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!agree) {
-      setErrorMessage("请先阅读并同意使用说明");
-      return;
-    }
-
-    if (method === "email") {
-      const nextEmail = email.trim();
-      const nextCode = emailCode.trim();
-      if (!nextEmail || !nextCode) {
-        setErrorMessage("请输入邮箱和验证码后再登录");
+    const nextUsername = username.trim();
+    const nextBaseUrl = baseUrl.trim();
+    if (mode === "verify") {
+      if (!pendingVerificationEmail || !verificationCode.trim()) {
+        setErrorMessage("请输入邮箱验证码");
         return;
       }
       setIsSubmitting(true);
       setErrorMessage("");
       try {
-        await onLogin({
-          method: "email",
-          email: nextEmail,
-          code: nextCode,
+        await onVerifyEmail?.({
+          email: pendingVerificationEmail,
+          code: verificationCode.trim(),
+          baseUrl: nextBaseUrl,
         });
-        setEmailCode("");
       } catch (error) {
-        const message = error instanceof Error ? error.message : "登录失败，请稍后再试";
+        const message = error instanceof Error ? error.message : "邮箱验证失败，请稍后再试";
         setErrorMessage(message);
       } finally {
         setIsSubmitting(false);
       }
       return;
     }
-
-    const nextAccount = account.trim();
-    const nextPassword = password.trim();
-    if (!nextAccount || !nextPassword) {
-      setErrorMessage("请输入账号和密码后再登录");
+    if (mode === "forgot") {
+      if (!nextUsername || !nextBaseUrl) {
+        setErrorMessage("请输入管理员邮箱");
+        return;
+      }
+      setIsSubmitting(true);
+      setErrorMessage("");
+      setStatusMessage("");
+      try {
+        await onRequestPasswordReset?.({ email: nextUsername, baseUrl: nextBaseUrl });
+        setPendingResetEmail(nextUsername);
+        setVerificationCode("");
+        setPassword("");
+        setMode("reset");
+        setStatusMessage("如果该邮箱已注册，验证码将发送至对应邮箱");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "找回密码请求失败";
+        setErrorMessage(message);
+      } finally {
+        setIsSubmitting(false);
+      }
+      return;
+    }
+    if (mode === "reset") {
+      if (!pendingResetEmail || !verificationCode.trim() || password.length < 8) {
+        setErrorMessage("请输入验证码和至少 8 位新密码");
+        return;
+      }
+      setIsSubmitting(true);
+      setErrorMessage("");
+      setStatusMessage("");
+      try {
+        await onResetPassword?.({
+          email: pendingResetEmail,
+          code: verificationCode.trim(),
+          password,
+          baseUrl: nextBaseUrl,
+        });
+        setUsername(pendingResetEmail);
+        setPassword("");
+        setVerificationCode("");
+        setPendingResetEmail("");
+        setMode("login");
+        setStatusMessage("密码已重置，请使用新密码登录");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "密码重置失败，请稍后再试";
+        setErrorMessage(message);
+      } finally {
+        setIsSubmitting(false);
+      }
+      return;
+    }
+    if (!nextUsername || !password || !nextBaseUrl) {
+      setErrorMessage("请输入账号和密码");
+      return;
+    }
+    if (mode === "register" && password.length < 8) {
+      setErrorMessage("密码至少需要 8 位");
       return;
     }
 
     setIsSubmitting(true);
     setErrorMessage("");
+    setStatusMessage("");
     try {
-      await onLogin({
-        method: "account",
-        account: nextAccount,
-        password: nextPassword,
-      });
+      if (mode === "register") {
+        const result = await onRegister?.({
+          email: nextUsername,
+          password,
+          displayName: displayName.trim(),
+          workspaceName: displayName.trim() || nextUsername.split("@", 1)[0] || "Surfaced Workspace",
+          baseUrl: nextBaseUrl,
+        });
+        if (result?.requiresEmailVerification) {
+          setPendingVerificationEmail(result.email || nextUsername);
+          setVerificationCode("");
+          setMode("verify");
+          setErrorMessage("");
+          return;
+        }
+      } else {
+        await onLogin({
+          username: nextUsername,
+          password,
+          baseUrl: nextBaseUrl,
+        });
+      }
       setPassword("");
     } catch (error) {
       const message = error instanceof Error ? error.message : "登录失败，请稍后再试";
@@ -136,6 +227,35 @@ export function LoginScreen({
       setIsSubmitting(false);
     }
   };
+
+  const resetToLogin = () => {
+    setMode("login");
+    setErrorMessage("");
+    setStatusMessage("");
+    setVerificationCode("");
+    setPendingVerificationEmail("");
+    setPendingResetEmail("");
+  };
+
+  const enterRegisterMode = () => {
+    setMode("register");
+    setPassword("");
+    setVerificationCode("");
+    setErrorMessage("");
+    setStatusMessage("");
+  };
+
+  const enterForgotMode = () => {
+    setMode("forgot");
+    setPassword("");
+    setVerificationCode("");
+    setErrorMessage("");
+    setStatusMessage("");
+  };
+
+  const primaryButtonLabel = isSubmitting
+    ? (mode === "verify" ? "验证中..." : mode === "register" ? "注册中..." : mode === "forgot" ? "发送中..." : mode === "reset" ? "重置中..." : "登录中...")
+    : (mode === "verify" ? "验证并登录" : mode === "register" ? "注册" : mode === "forgot" ? "发送验证码" : mode === "reset" ? "重置密码" : "登录");
 
   if (isPanel) {
     return (
@@ -147,106 +267,38 @@ export function LoginScreen({
             className="h-auto w-[108px] select-none"
             draggable={false}
           />
-          <span className="text-[11px] font-medium tracking-wide text-gray-400">恢复账号权限</span>
+          <span className="text-[11px] font-medium tracking-wide text-gray-400">云端账号</span>
         </div>
 
-        <div className="mt-4 rounded-[14px] bg-[#f5f7fb] p-1">
-          <div className="flex items-center gap-1">
-            <button type="button" className={compactMethodTabClassName(method === "email")} onClick={() => setMethod("email")}>
-              邮箱登录
-            </button>
-            <button type="button" className={compactMethodTabClassName(method === "account")} onClick={() => setMethod("account")}>
-              账号密码
-            </button>
-          </div>
-        </div>
+        <form className="mt-5 space-y-3" onSubmit={handleSubmit}>
+          <label className="block">
+            <span className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold tracking-wide text-gray-500">
+              <UserRound className="h-3.5 w-3.5 text-blue-600" />
+              账号
+            </span>
+            <input
+              type="text"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              placeholder="管理员邮箱或普通账号"
+              autoComplete="username"
+              className={panelInputClassName()}
+            />
+          </label>
 
-        <form className="mt-4 space-y-3" onSubmit={handleSubmit}>
-          {method === "email" ? (
-            <>
-              <label className="block">
-                <span className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold tracking-wide text-gray-500">
-                  <AtSign className="h-3.5 w-3.5 text-blue-600" />
-                  邮箱
-                </span>
-                <input
-                  type="email"
-                  value={email}
-                  onChange={(event) => setEmail(event.target.value)}
-                  placeholder="请输入邮箱地址"
-                  autoComplete="email"
-                  className={compactInputClassName()}
-                />
-              </label>
-
-              <label className="block">
-                <div className="mb-1.5 flex items-center justify-between gap-3 text-[11px] font-semibold tracking-wide text-gray-500">
-                  <span className="flex items-center gap-1.5">
-                    <KeyRound className="h-3.5 w-3.5 text-blue-600" />
-                    验证码
-                  </span>
-                  <button
-                    type="button"
-                    className="text-[11px] font-semibold text-blue-600 transition-colors hover:text-blue-700"
-                    onClick={() => setErrorMessage("演示模式下未接入真实验证码发送，这里仅保留界面流程。")}
-                  >
-                    发送验证码
-                  </button>
-                </div>
-                <input
-                  type="text"
-                  value={emailCode}
-                  onChange={(event) => setEmailCode(event.target.value)}
-                  placeholder="请输入邮箱验证码"
-                  className={compactInputClassName()}
-                />
-              </label>
-            </>
-          ) : (
-            <>
-              <label className="block">
-                <span className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold tracking-wide text-gray-500">
-                  <UserRound className="h-3.5 w-3.5 text-blue-600" />
-                  账号
-                </span>
-                <input
-                  type="text"
-                  value={account}
-                  onChange={(event) => setAccount(event.target.value)}
-                  placeholder="请输入账号"
-                  autoComplete="username"
-                  className={compactInputClassName()}
-                />
-              </label>
-
-              <label className="block">
-                <span className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold tracking-wide text-gray-500">
-                  <KeyRound className="h-3.5 w-3.5 text-blue-600" />
-                  密码
-                </span>
-                <input
-                  type="password"
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                  placeholder="请输入密码"
-                  autoComplete="current-password"
-                  className={compactInputClassName()}
-                />
-              </label>
-            </>
-          )}
-
-          <label className="flex items-start gap-2 rounded-[14px] border border-gray-100 bg-[#f8fafc] px-3.5 py-3 text-[11px] leading-5 text-gray-500">
-            <button
-              type="button"
-              onClick={() => setAgree((prev) => !prev)}
-              className={`mt-0.5 flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full border text-[10px] transition-colors ${
-                agree ? "border-[#111827] bg-[#111827] text-white" : "border-gray-300 bg-white text-transparent"
-              }`}
-            >
-              <span>✓</span>
-            </button>
-            <span>同意使用说明并恢复账号权限</span>
+          <label className="block">
+            <span className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold tracking-wide text-gray-500">
+              <KeyRound className="h-3.5 w-3.5 text-blue-600" />
+              密码
+            </span>
+            <input
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              placeholder="请输入密码"
+              autoComplete="current-password"
+              className={panelInputClassName()}
+            />
           </label>
 
           {errorMessage ? (
@@ -258,7 +310,7 @@ export function LoginScreen({
           <button
             type="submit"
             disabled={!canSubmit}
-            className="inline-flex w-full items-center justify-center gap-2 rounded-[18px] bg-[#111827] px-4 py-3 text-[14px] font-semibold text-white transition-all hover:bg-[#0f172a] disabled:cursor-not-allowed disabled:bg-gray-300"
+            className="inline-flex w-full items-center justify-center gap-2 rounded-[16px] bg-[#111827] px-4 py-3 text-[14px] font-semibold text-white transition-all hover:bg-[#0f172a] disabled:cursor-not-allowed disabled:bg-gray-300"
           >
             {isSubmitting ? "登录中..." : "登录"}
             <ArrowRight className="h-4 w-4" />
@@ -269,177 +321,175 @@ export function LoginScreen({
   }
 
   return (
-    <div className="app-canvas relative flex min-h-screen w-full items-center justify-center overflow-hidden bg-[#fcfdff] px-8 py-10 text-gray-900">
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(96,165,250,0.12),transparent_34%),radial-gradient(circle_at_bottom_right,rgba(15,23,42,0.08),transparent_24%)]" />
+    <div
+      className="relative flex min-h-screen w-full overflow-hidden bg-[#fcfdff] text-gray-900"
+      style={{
+        background:
+          "radial-gradient(circle at 50% 28%, rgba(20,199,243,0.10), transparent 34%), linear-gradient(180deg, #fcfdff 0%, #f7faff 100%)",
+      }}
+    >
+      <div className="pointer-events-none absolute inset-x-8 top-0 h-px bg-gradient-to-r from-transparent via-blue-200/70 to-transparent" />
 
-      <div className="pointer-events-none absolute inset-0 opacity-70">
-        <div className="absolute left-8 top-8 h-28 w-44 rounded-[26px] bg-white/72 shadow-[0_24px_60px_-42px_rgba(15,23,42,0.26)] blur-[1px]" />
-        <div className="absolute bottom-10 right-10 h-36 w-48 rounded-[30px] bg-white/76 shadow-[0_24px_60px_-42px_rgba(15,23,42,0.26)] blur-[1px]" />
+      <div className="absolute right-5 top-5 z-10 sm:right-8 sm:top-7">
+        {mode === "login" ? (
+          <div className="flex items-center rounded-full border border-gray-200/70 bg-white/68 px-1.5 py-1 text-[11px] font-semibold text-gray-400 shadow-[0_20px_60px_-46px_rgba(15,23,42,0.42)] backdrop-blur-md">
+            <button
+              type="button"
+              className="rounded-full px-3 py-1.5 transition-colors hover:bg-white hover:text-[#173A43]"
+              onClick={enterRegisterMode}
+            >
+              注册管理账号
+            </button>
+            <span className="h-3.5 w-px bg-gray-200/80" />
+            <button
+              type="button"
+              className="rounded-full px-3 py-1.5 transition-colors hover:bg-white hover:text-[#173A43]"
+              onClick={enterForgotMode}
+            >
+              忘记密码
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="inline-flex h-9 items-center gap-1.5 rounded-full border border-gray-200/70 bg-white/68 px-3.5 text-[12px] font-semibold text-gray-500 shadow-[0_20px_60px_-46px_rgba(15,23,42,0.42)] backdrop-blur-md transition-colors hover:bg-white hover:text-[#173A43]"
+            onClick={resetToLogin}
+          >
+            <ChevronLeft className="h-3.5 w-3.5" />
+            返回登录
+          </button>
+        )}
       </div>
 
-      <div className="relative w-full max-w-[540px]">
-        <div className="rounded-[36px] border border-white/80 bg-white/94 px-7 py-8 shadow-[0_45px_140px_-60px_rgba(15,23,42,0.36)] backdrop-blur-xl sm:px-9 sm:py-9">
-          <div className="flex items-start justify-between gap-6">
-            <div>
-              <img
-                src={surfacedWordmark}
-                alt="Surfaced"
-                className="h-auto w-[146px] select-none"
-                draggable={false}
-              />
-              <div className="mt-6 text-[12px] font-semibold uppercase tracking-[0.26em] text-blue-600/80">
-                Account Access
+      <div className="absolute left-1/2 top-[39%] flex w-[min(328px,calc(100vw-40px))] -translate-x-1/2 -translate-y-1/2 flex-col items-center">
+        <div className="flex w-full flex-col items-center">
+          <img
+            src={surfacedWordmark}
+            alt="Surfaced"
+            className="block h-auto w-[248px] translate-x-[3px] select-none"
+            draggable={false}
+          />
+
+          <form className="mt-7 flex w-full flex-col items-center gap-2.5" onSubmit={handleSubmit}>
+            {mode === "verify" || mode === "reset" ? (
+              <div className="mb-1 flex min-h-9 w-full items-center justify-center rounded-full border border-blue-100/80 bg-white/58 px-4 text-center text-[12px] font-semibold text-[#173A43]/80 shadow-[0_14px_38px_-34px_rgba(20,199,243,0.55)] backdrop-blur-sm">
+                {mode === "verify" ? pendingVerificationEmail : pendingResetEmail}
               </div>
-              <h1 className="mt-3 text-[30px] font-black tracking-tight text-gray-900">
-                登录后恢复账号权限
-              </h1>
-              <p className="mt-3 max-w-[34ch] text-[14px] leading-7 text-gray-500">
-                退出后本地活动仍然保留，但账号信息和高级权限会收起。在这里重新登录后，就会恢复到你原来的账号状态。
-              </p>
-            </div>
+            ) : null}
 
-            <div className="flex h-[104px] w-[104px] shrink-0 items-center justify-center rounded-[28px] bg-[linear-gradient(180deg,#f8fbff_0%,#eef4fb_100%)] shadow-[0_24px_60px_-42px_rgba(59,130,246,0.42)]">
-              <PatternLoadingAnimation className="h-[68px] w-[68px]" />
-            </div>
-          </div>
+            {mode === "verify" || mode === "reset" ? null : (
+              <label className="relative block w-full">
+                <UserRound className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  placeholder={mode === "register" || mode === "forgot" ? "管理员邮箱" : "管理员邮箱或普通账号"}
+                  autoComplete="username"
+                  className={`${pageInputClassName()} pl-10 pr-10`}
+                />
+              </label>
+            )}
 
-          <div className="mt-8 rounded-[22px] border border-gray-200/80 bg-[#f8fafc] p-1.5">
-            <div className="flex items-center gap-1.5">
-              <button type="button" className={methodTabClassName(method === "email")} onClick={() => setMethod("email")}>
-                邮箱登录
-              </button>
-              <button type="button" className={methodTabClassName(method === "account")} onClick={() => setMethod("account")}>
-                账号密码登录
-              </button>
-            </div>
-          </div>
+            {mode === "register" ? (
+              <label className="relative block w-full">
+                <UserRound className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                <input
+                  type="text"
+                  value={displayName}
+                  onChange={(event) => setDisplayName(event.target.value)}
+                  placeholder="管理员名称"
+                  autoComplete="name"
+                  className={`${pageInputClassName()} pl-10 pr-10`}
+                />
+              </label>
+            ) : null}
 
-          <form className="mt-6 space-y-4" onSubmit={handleSubmit}>
-            {method === "email" ? (
-              <>
-                <label className="block">
-                  <span className="mb-2 flex items-center gap-2 text-[12px] font-bold tracking-wide text-gray-500">
-                    <AtSign className="h-3.5 w-3.5 text-blue-600" />
-                    邮箱
-                  </span>
-                  <input
-                    type="email"
-                    value={email}
-                    onChange={(event) => setEmail(event.target.value)}
-                    placeholder="请输入邮箱地址"
-                    autoComplete="email"
-                    className={inputClassName()}
-                  />
-                </label>
-
-                <div>
-                  <div className="mb-2 flex items-center justify-between text-[12px] font-bold tracking-wide text-gray-500">
-                    <span className="flex items-center gap-2">
-                      <KeyRound className="h-3.5 w-3.5 text-blue-600" />
-                      邮箱验证码
-                    </span>
-                    <button
-                      type="button"
-                      className="text-[12px] font-semibold text-blue-600 transition-colors hover:text-blue-700"
-                      onClick={() => setErrorMessage("演示模式下未接入真实验证码发送，这里仅保留界面流程。")}
-                    >
-                      发送验证码
-                    </button>
-                  </div>
+            {mode === "forgot" ? null : (
+              <label className="relative block w-full">
+                <KeyRound className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                {mode === "verify" || mode === "reset" ? (
                   <input
                     type="text"
-                    value={emailCode}
-                    onChange={(event) => setEmailCode(event.target.value)}
-                    placeholder="请输入邮箱验证码"
-                    className={inputClassName()}
+                    inputMode="numeric"
+                    value={verificationCode}
+                    onChange={(event) => setVerificationCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                    placeholder="邮箱验证码"
+                    autoComplete="one-time-code"
+                    className={`${pageInputClassName()} pl-10 pr-10`}
                   />
-                </div>
-              </>
-            ) : (
-              <>
-                <label className="block">
-                  <span className="mb-2 flex items-center gap-2 text-[12px] font-bold tracking-wide text-gray-500">
-                    <UserRound className="h-3.5 w-3.5 text-blue-600" />
-                    账号
-                  </span>
-                  <input
-                    type="text"
-                    value={account}
-                    onChange={(event) => setAccount(event.target.value)}
-                    placeholder="请输入账号"
-                    autoComplete="username"
-                    className={inputClassName()}
-                  />
-                </label>
-
-                <label className="block">
-                  <span className="mb-2 flex items-center gap-2 text-[12px] font-bold tracking-wide text-gray-500">
-                    <KeyRound className="h-3.5 w-3.5 text-blue-600" />
-                    密码
-                  </span>
+                ) : (
                   <input
                     type="password"
                     value={password}
                     onChange={(event) => setPassword(event.target.value)}
-                    placeholder="请输入密码"
-                    autoComplete="current-password"
-                    className={inputClassName()}
+                    placeholder={mode === "register" ? "设置密码，至少 8 位" : "密码"}
+                    autoComplete={mode === "register" ? "new-password" : "current-password"}
+                    className={`${pageInputClassName()} pl-10 pr-10`}
                   />
-                </label>
-              </>
+                )}
+              </label>
             )}
 
-            <div className="flex items-center justify-between rounded-[22px] border border-gray-100 bg-[#f8fafc] px-4 py-3 text-[12px] text-gray-500">
-              <label className="inline-flex items-center gap-2 select-none">
-                <button
-                  type="button"
-                  onClick={() => setAgree((prev) => !prev)}
-                  className={`flex h-5 w-5 items-center justify-center rounded-full border transition-colors ${
-                    agree ? "border-[#111827] bg-[#111827] text-white" : "border-gray-300 bg-white text-transparent"
-                  }`}
-                >
-                  <span className="text-[11px]">✓</span>
-                </button>
-                <span>同意使用说明并恢复账号权限</span>
+            {mode === "reset" ? (
+              <label className="relative block w-full">
+                <KeyRound className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  placeholder="新密码，至少 8 位"
+                  autoComplete="new-password"
+                  className={`${pageInputClassName()} pl-10 pr-10`}
+                />
               </label>
-              <div className="flex items-center gap-1.5 font-semibold text-gray-400">
-                <ShieldCheck className="h-3.5 w-3.5 text-blue-600" />
-                访客模式
-              </div>
-            </div>
+            ) : null}
 
             {errorMessage ? (
-              <div className="rounded-[18px] border border-red-100 bg-red-50 px-4 py-3 text-[12px] font-medium text-red-600">
+              <div className="w-full rounded-[12px] border border-red-100 bg-red-50/90 px-3.5 py-2.5 text-center text-[12px] font-medium text-red-600">
                 {errorMessage}
+              </div>
+            ) : null}
+            {statusMessage ? (
+              <div className="w-full rounded-[12px] border border-blue-100 bg-blue-50/90 px-3.5 py-2.5 text-center text-[12px] font-medium text-[#173A43]">
+                {statusMessage}
               </div>
             ) : null}
 
             <button
               type="submit"
               disabled={!canSubmit}
-              className="inline-flex w-full items-center justify-center gap-2 rounded-[26px] bg-[linear-gradient(135deg,#111827_0%,#1f3a5f_100%)] px-5 py-3.5 text-[15px] font-bold text-white transition-all hover:brightness-105 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:brightness-100"
+              className="inline-flex h-[46px] w-full items-center justify-center gap-2 rounded-[12px] border border-gray-200/80 bg-white/76 px-4 text-[14px] font-semibold text-gray-700 shadow-[0_18px_40px_-30px_rgba(23,58,67,0.38)] transition-all hover:border-blue-200 hover:bg-white hover:text-[#173A43] hover:shadow-[0_20px_42px_-30px_rgba(20,199,243,0.45)] disabled:cursor-not-allowed disabled:opacity-45"
             >
-              {isSubmitting ? "登录中..." : "登录"}
+              {primaryButtonLabel}
               <ArrowRight className="h-4 w-4" />
             </button>
           </form>
 
-          <div className="mt-7 grid grid-cols-3 gap-3">
-            <MiniFeature title="本地活动" value="继续可见" />
-            <MiniFeature title="账号信息" value="登录恢复" />
-            <MiniFeature title="入口位置" value="账号页面" />
-          </div>
+          {mode === "verify" ? (
+            <button
+              type="button"
+              className="mt-4 inline-flex items-center gap-1.5 text-[11px] font-semibold text-gray-400 transition-colors hover:text-[#173A43]"
+              onClick={async () => {
+                setErrorMessage("");
+                try {
+                  await onResendEmailCode?.({ email: pendingVerificationEmail, baseUrl });
+                } catch (error) {
+                  const message = error instanceof Error ? error.message : "验证码重发失败";
+                  setErrorMessage(message);
+                }
+              }}
+            >
+              <RotateCcw className="h-3 w-3" />
+              重新发送验证码
+            </button>
+          ) : null}
         </div>
       </div>
-    </div>
-  );
-}
 
-function MiniFeature({ title, value }: { title: string; value: string }) {
-  return (
-    <div className="rounded-[20px] border border-gray-100 bg-[#f8fafc] px-4 py-4">
-      <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-gray-400">{title}</div>
-      <div className="mt-2 text-[14px] font-bold tracking-tight text-gray-900">{value}</div>
+      <div className="absolute bottom-7 left-8 text-[11px] font-bold uppercase tracking-[0.16em] text-gray-400">
+        Surfaced
+      </div>
     </div>
   );
 }

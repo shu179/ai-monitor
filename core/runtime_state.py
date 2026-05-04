@@ -12,6 +12,7 @@ import tempfile
 import threading
 
 from .app_paths import resolve_app_path
+from .local_account_space import account_scoped_path
 from .time_utils import local_now
 
 
@@ -27,8 +28,9 @@ def _default_state() -> dict:
 
 
 def _load_state() -> dict:
+    state_path = _state_path()
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
+        with open(state_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
             state = _default_state()
@@ -42,13 +44,14 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
+    state_path = _state_path()
     try:
-        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(STATE_PATH.parent), suffix=".tmp")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(state_path.parent), suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
-            os.replace(tmp, STATE_PATH)
+            os.replace(tmp, state_path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -57,6 +60,13 @@ def _save_state(state: dict) -> None:
             raise
     except Exception as e:
         print(f"[RuntimeState] 保存状态失败: {e}")
+
+
+def _state_path():
+    resolved_default = resolve_app_path("user_data/runtime_state.json")
+    if STATE_PATH != resolved_default:
+        return STATE_PATH
+    return account_scoped_path("user_data/runtime_state.json", fallback=resolved_default)
 
 
 def get_runtime_state() -> dict:

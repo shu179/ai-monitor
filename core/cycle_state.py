@@ -15,6 +15,7 @@ from copy import deepcopy
 from datetime import date
 
 from .app_paths import resolve_app_path
+from .local_account_space import account_scoped_path
 from .time_utils import local_now, local_today
 
 
@@ -154,8 +155,9 @@ def merge_task_outcome_from_report(
 
 
 def _load_all() -> dict:
+    state_path = _state_path()
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
+        with open(state_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except FileNotFoundError:
@@ -166,13 +168,14 @@ def _load_all() -> dict:
 
 
 def _save_all(data: dict) -> None:
+    state_path = _state_path()
     try:
-        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(STATE_PATH.parent), suffix=".tmp")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(state_path.parent), suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-            os.replace(tmp, STATE_PATH)
+            os.replace(tmp, state_path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -181,6 +184,13 @@ def _save_all(data: dict) -> None:
             raise
     except Exception as e:
         print(f"[CycleState] 保存状态失败: {e}")
+
+
+def _state_path():
+    resolved_default = resolve_app_path("user_data/scheduler_cycle_state.json")
+    if STATE_PATH != resolved_default:
+        return STATE_PATH
+    return account_scoped_path("user_data/scheduler_cycle_state.json", fallback=resolved_default)
 
 
 def _prune(data: dict, keep_days: int = 45) -> dict:

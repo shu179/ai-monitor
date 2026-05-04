@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
-import { X, Plus, Brain, Save, Trash2, Settings2, Check, Map as MapIcon, Globe, ArrowUpRight, Calendar, Download } from "lucide-react";
+import { X, Plus, Brain, Save, Trash2, Settings2, Check, Map as MapIcon, Globe, ArrowUpRight, Calendar, Download, ChevronDown } from "lucide-react";
 import { ChartArea } from "./Charts";
-import { createTask, fetchTaskTrend, generateBrandTaskDraft, importKeywordsFromFile, updateTask, type BrandTaskDraft, type TaskFull, type TrendSnapshot } from "../lib/backend";
+import { createTask, fetchTaskTrend, generateBrandTaskDraft, importKeywordsFromFile, updateTask, type BrandTaskDraft, type CloudUserSnapshot, type DeletedTaskSnapshot, type TaskFull, type TrendSnapshot } from "../lib/backend";
 import { DatePickerField } from "./ui/date-picker-field";
 
 type PlatformState = {
@@ -39,20 +39,36 @@ export function BrandEditModal({
   brandName,
   brand,
   existingTasks = [],
+  deletedTasks = [],
   currentDetectionMode = "smart",
   onClose,
   onSave,
   isNew = false,
   initialInstruction = "",
+  cloudAdminEnabled = false,
+  cloudOperators = [],
+  initialOperatorUserId = 0,
+  onCloudSync,
+  canDelete = false,
+  onDeleteClick,
+  onRestoreDeletedTask,
 }: {
   brandName?: string,
   brand?: TaskFull,
   existingTasks?: TaskFull[],
+  deletedTasks?: DeletedTaskSnapshot[],
   currentDetectionMode?: "browser" | "recognition" | "api" | "smart",
   onClose: () => void,
   onSave?: () => void,
   isNew?: boolean,
   initialInstruction?: string,
+  cloudAdminEnabled?: boolean,
+  cloudOperators?: CloudUserSnapshot[],
+  initialOperatorUserId?: number,
+  onCloudSync?: (localTaskId: string, operatorUserId?: number) => Promise<{ ok: boolean; message?: string }>,
+  canDelete?: boolean,
+  onDeleteClick?: () => void,
+  onRestoreDeletedTask?: (deletedTaskId: string, brandName: string) => Promise<{ ok: boolean; message?: string }>,
 }) {
   const getMostCommonWebhook = (tasks: TaskFull[]) => {
     const counts = new Map<string, number>();
@@ -136,6 +152,10 @@ export function BrandEditModal({
   const [regions, setRegions] = useState(brandRegionTags.join(", ") || (isNew ? "" : ""));
   const [webhook, setWebhook] = useState(brand?.webhook_url ?? (isNew ? defaultWebhook : ""));
   const [webhookEdited, setWebhookEdited] = useState(Boolean(brand?.webhook_url));
+  const [cloudOperatorUserId, setCloudOperatorUserId] = useState(Number(initialOperatorUserId || 0));
+  const [saveNotice, setSaveNotice] = useState<ImportNotice | null>(null);
+  const [ignoredRestoreCandidateId, setIgnoredRestoreCandidateId] = useState("");
+  const [restoringDeletedTask, setRestoringDeletedTask] = useState(false);
 
   // Optimization Time Period
   const [startDate, setStartDate] = useState(brand?.optimization_start_date ?? (isNew ? "" : ""));
@@ -276,6 +296,8 @@ export function BrandEditModal({
   const [isImportingKeywords, setIsImportingKeywords] = useState(false);
   const [keywordImportNotice, setKeywordImportNotice] = useState<ImportNotice | null>(null);
   const keywordFileInputRef = useRef<HTMLInputElement | null>(null);
+  const cloudOperatorDropdownRef = useRef<HTMLDivElement | null>(null);
+  const [cloudOperatorDropdownOpen, setCloudOperatorDropdownOpen] = useState(false);
 
   const clonePlatformStates = (items: PlatformState[]) => items.map((item) => ({ ...item }));
 
@@ -469,6 +491,7 @@ export function BrandEditModal({
   const handleSave = async () => {
     if (saving) return;
     setSaving(true);
+    setSaveNotice(null);
     try {
       const activePlatformNames = globalPlatforms.filter(p => p.active).map(p => p.name);
       const weekdays = days.map((active, idx) => active ? idx : -1).filter(d => d >= 0);
@@ -516,10 +539,27 @@ export function BrandEditModal({
         fixed_screenshot_count: Math.max(1, fixedScreenshotCount || 1),
       };
 
+      let localTaskId = brand?.id || "";
+      let localResult: { ok: boolean; task_id?: string; message?: string };
       if (isNew) {
-        await createTask(taskPayload);
+        localResult = await createTask(taskPayload);
+        localTaskId = localResult.task_id || "";
       } else if (brand?.id) {
-        await updateTask(brand.id, taskPayload);
+        localResult = await updateTask(brand.id, taskPayload);
+      } else {
+        localResult = { ok: false, message: "缺少本地任务 ID" };
+      }
+      if (!localResult.ok) {
+        setSaveNotice({ tone: "error", message: localResult.message || "本地品牌保存失败" });
+        return;
+      }
+
+      if (cloudAdminEnabled && onCloudSync && localTaskId) {
+        const cloudResult = await onCloudSync(localTaskId, cloudOperatorUserId || 0);
+        if (!cloudResult.ok) {
+          setSaveNotice({ tone: "error", message: cloudResult.message || "云端任务同步失败" });
+          return;
+        }
       }
 
       onSave?.();
@@ -552,6 +592,19 @@ export function BrandEditModal({
   const updateKeywordPlatforms = (kwId: string, updatedPlatforms: PlatformState[]) => {
     setKeywords(keywords.map(kw => kw.id === kwId ? { ...kw, platforms: updatedPlatforms } : kw));
   };
+
+  useEffect(() => {
+    if (!cloudOperatorDropdownOpen) {
+      return;
+    }
+    function handlePointerDown(event: MouseEvent) {
+      if (cloudOperatorDropdownRef.current && !cloudOperatorDropdownRef.current.contains(event.target as Node)) {
+        setCloudOperatorDropdownOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [cloudOperatorDropdownOpen]);
 
   const serializePlatforms = (items: PlatformState[]) => JSON.stringify(
     items.map((item) => ({
@@ -592,6 +645,9 @@ export function BrandEditModal({
         fixedScreenshotMode: Boolean(brand?.fixed_screenshot_enabled ?? false),
         fixedScreenshotCount: Number(brand?.fixed_screenshot_count ?? (isNew ? 3 : (brand?.recognition_batch_size ?? 3))),
       }),
+      cloud: JSON.stringify({
+        operatorUserId: Number(initialOperatorUserId || 0),
+      }),
     };
   }, [
     brand,
@@ -603,6 +659,7 @@ export function BrandEditModal({
     initDays,
     initKeywords,
     initPlatforms,
+    initialOperatorUserId,
     isNew,
   ]);
 
@@ -627,16 +684,20 @@ export function BrandEditModal({
       fixedScreenshotMode: Boolean(fixedScreenshotMode),
       fixedScreenshotCount: Number(fixedScreenshotCount || 1),
     });
+    const currentCloud = JSON.stringify({ operatorUserId: Number(cloudOperatorUserId || 0) });
 
     return [
       currentBasic !== initialSerializedState.basic,
       currentSchedule !== initialSerializedState.schedule,
       currentPlatforms !== initialSerializedState.platforms || currentKeywords !== initialSerializedState.keywords,
       currentRuntime !== initialSerializedState.runtime,
+      cloudAdminEnabled && currentCloud !== initialSerializedState.cloud,
     ].filter(Boolean).length;
   }, [
     aliases,
     checkMode,
+    cloudAdminEnabled,
+    cloudOperatorUserId,
     days,
     extractReferencesEnabled,
     fixedScreenshotCount,
@@ -655,8 +716,53 @@ export function BrandEditModal({
   ]);
 
   const hasDirtyChanges = dirtySectionCount > 0;
+  const selectedCloudOperatorLabel = useMemo(() => {
+    if (!cloudOperatorUserId) {
+      return "暂不分配";
+    }
+    const selected = cloudOperators.find((user) => Number(user.id || 0) === Number(cloudOperatorUserId));
+    const label = String(selected?.display_name || selected?.username || `运营账号 ${cloudOperatorUserId}`).trim();
+    return `#${cloudOperatorUserId} · ${label}`;
+  }, [cloudOperatorUserId, cloudOperators]);
+  const restoreCandidate = useMemo(() => {
+    if (!isNew || !name.trim()) {
+      return null;
+    }
+    const target = name.trim().toLocaleLowerCase();
+    return (deletedTasks || []).find((item) => {
+      if (!item?.can_restore) {
+        return false;
+      }
+      if (ignoredRestoreCandidateId && item.id === ignoredRestoreCandidateId) {
+        return false;
+      }
+      const brand = String(item.brand || "").trim().toLocaleLowerCase();
+      const itemName = String(item.name || "").trim().toLocaleLowerCase();
+      return brand === target || itemName === target;
+    }) || null;
+  }, [deletedTasks, ignoredRestoreCandidateId, isNew, name]);
+
+  const handleRestoreDeletedTask = async () => {
+    if (!restoreCandidate || restoringDeletedTask || !onRestoreDeletedTask) {
+      return;
+    }
+    setRestoringDeletedTask(true);
+    try {
+      const result = await onRestoreDeletedTask(restoreCandidate.id, restoreCandidate.brand || restoreCandidate.name || name);
+      if (!result.ok) {
+        setSaveNotice({ tone: "error", message: result.message || "恢复品牌配置失败" });
+        return;
+      }
+      onSave?.();
+      onClose();
+    } finally {
+      setRestoringDeletedTask(false);
+    }
+  };
 
   const inputClass = "w-full border-0 border-b border-gray-200 bg-transparent px-0 py-2.5 text-[12px] text-gray-900 font-medium outline-none transition-colors placeholder:text-gray-400 focus:border-[var(--brand-navy)]";
+  const alignedInputClass = `${inputClass} h-10 py-0 leading-10`;
+  const operatorButtonClass = "flex h-10 w-full items-center justify-between gap-3 border-b border-gray-200 bg-transparent px-0 text-left text-[12px] font-medium text-gray-900 outline-none transition-colors hover:border-gray-300 focus:border-[var(--brand-navy)]";
   const subtleInputClass = "w-full border-0 border-b border-gray-200 bg-transparent px-0 py-2.5 text-[12px] text-gray-900 font-medium outline-none transition-colors placeholder:text-gray-400 focus:border-[var(--brand-navy)]";
   const helperTextClass = "text-[11px] text-gray-400 leading-5";
 
@@ -778,6 +884,39 @@ export function BrandEditModal({
                 </div>
               </section>
             )}
+
+            {restoreCandidate && (
+              <div className="flex flex-col items-start gap-3 border-l-2 border-amber-300 bg-amber-50/55 px-3.5 py-3 animate-in fade-in slide-in-from-top-2 duration-200 md:flex-row md:items-center md:justify-between">
+                <div className="flex min-w-0 flex-col gap-0.5">
+                  <span className="text-[10px] font-bold tracking-[0.18em] uppercase text-amber-700">可恢复配置</span>
+                  <span className="text-[12px] font-medium text-gray-700">
+                    是否恢复「{restoreCandidate.brand || restoreCandidate.name}」品牌配置及数据？
+                  </span>
+                  <span className="text-[11px] font-semibold text-gray-500">
+                    删除时间 {restoreCandidate.deleted_at || "未知"} · 保留至 {restoreCandidate.expires_at || "三天内"}
+                  </span>
+                </div>
+                <div className="flex shrink-0 items-center gap-2 self-end md:self-auto">
+                  <button
+                    type="button"
+                    onClick={() => setIgnoredRestoreCandidateId(restoreCandidate.id)}
+                    disabled={restoringDeletedTask}
+                    className="inline-flex h-7 items-center gap-1.5 px-2 text-[11px] font-bold text-gray-500 transition-colors hover:text-gray-800 disabled:cursor-not-allowed disabled:text-gray-300"
+                  >
+                    无视
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { void handleRestoreDeletedTask(); }}
+                    disabled={restoringDeletedTask}
+                    className="inline-flex h-7 items-center gap-1.5 px-2 text-[11px] font-bold text-gray-700 transition-colors hover:text-emerald-700 disabled:cursor-not-allowed disabled:text-gray-300"
+                  >
+                    <Check className={`w-3.5 h-3.5 ${restoringDeletedTask ? "animate-spin" : ""}`} />
+                    {restoringDeletedTask ? "恢复中..." : "恢复"}
+                  </button>
+                </div>
+              </div>
+            )}
             
             {/* 1. 基本信息 */}
             <section className={`flex flex-col gap-4 ${isNew ? "" : "-mt-1"}`}>
@@ -864,7 +1003,7 @@ export function BrandEditModal({
                   </div>
                 </div>
 
-                <div className="flex flex-col gap-1.5 md:col-span-2">
+                <div className={`flex flex-col gap-1.5 ${cloudAdminEnabled ? "" : "md:col-span-2"}`}>
                   <label className="text-[11px] font-bold text-gray-500 tracking-widest uppercase">企微机器人 Webhook</label>
                   <input 
                     type="text" 
@@ -874,9 +1013,59 @@ export function BrandEditModal({
                       setWebhook(e.target.value);
                     }}
                     placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
-                    className={`${inputClass} font-mono`}
+                    className={`${alignedInputClass} font-mono`}
                   />
                 </div>
+                {cloudAdminEnabled && (
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[11px] font-bold text-gray-500 tracking-widest uppercase">归属运营账号</label>
+                    <div ref={cloudOperatorDropdownRef} className="relative">
+                      <button
+                        type="button"
+                        aria-expanded={cloudOperatorDropdownOpen}
+                        onClick={() => setCloudOperatorDropdownOpen((open) => !open)}
+                        className={operatorButtonClass}
+                      >
+                        <span className="min-w-0 truncate">{selectedCloudOperatorLabel}</span>
+                        <ChevronDown className={`h-4 w-4 shrink-0 text-gray-500 transition-transform ${cloudOperatorDropdownOpen ? "rotate-180" : ""}`} strokeWidth={2.4} />
+                      </button>
+                      {cloudOperatorDropdownOpen && (
+                        <div className="absolute left-0 right-0 top-[calc(100%+6px)] z-50 max-h-56 overflow-y-auto rounded-lg border border-gray-200 bg-white py-1 shadow-[0_16px_36px_-24px_rgba(15,23,42,0.35)]">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setCloudOperatorUserId(0);
+                              setCloudOperatorDropdownOpen(false);
+                            }}
+                            className={`flex w-full items-center justify-between px-3 py-2 text-left text-[12px] font-bold transition-colors hover:bg-gray-50 ${cloudOperatorUserId ? "text-gray-700" : "text-[var(--brand-navy)]"}`}
+                          >
+                            <span>暂不分配</span>
+                            {!cloudOperatorUserId && <Check className="h-3.5 w-3.5" />}
+                          </button>
+                          {cloudOperators.map((user) => {
+                            const id = Number(user.id || 0);
+                            const label = String(user.display_name || user.username || `运营账号 ${id}`).trim();
+                            const selected = Number(cloudOperatorUserId) === id;
+                            return (
+                              <button
+                                key={id}
+                                type="button"
+                                onClick={() => {
+                                  setCloudOperatorUserId(id);
+                                  setCloudOperatorDropdownOpen(false);
+                                }}
+                                className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-[12px] font-bold transition-colors hover:bg-gray-50 ${selected ? "text-[var(--brand-navy)]" : "text-gray-700"}`}
+                              >
+                                <span className="min-w-0 truncate">#{id} · {label}</span>
+                                {selected && <Check className="h-3.5 w-3.5 shrink-0" />}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             </section>
 
@@ -1109,7 +1298,7 @@ export function BrandEditModal({
                     <div className="flex flex-col gap-1.5 animate-in fade-in duration-200 md:flex-row md:items-center md:gap-4">
                       <div className="flex items-center gap-2 shrink-0">
                         <span className="text-[12px] font-medium text-gray-900">固定截图目标张数：</span>
-                      <div className="flex items-center border-b border-gray-200 overflow-hidden h-7 w-[72px]">
+                        <div className="flex items-center border-b border-gray-200 overflow-hidden h-7 w-[72px]">
                           <input
                             type="number"
                             min={1}
@@ -1125,7 +1314,24 @@ export function BrandEditModal({
                       </span>
                     </div>
                   )}
-                </div>
+
+                  {canDelete && !isNew && (
+                    <div className="flex flex-col gap-1.5 border-t border-rose-100 pt-4 md:flex-row md:items-center md:justify-between md:gap-4">
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[12px] font-bold text-rose-600">删除此品牌任务</span>
+                        <span className={helperTextClass}>只保留三天备份；如果正式任务正在运行，会等运行结束并同步数据后再删除。</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={onDeleteClick}
+                        className="inline-flex h-8 shrink-0 items-center gap-1.5 self-start px-0 text-[12px] font-bold text-rose-600 transition-colors hover:text-rose-700 md:self-auto"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                        删除任务
+                      </button>
+                    </div>
+                  )}
+	                </div>
 
               </div>
             </section>
@@ -1137,6 +1343,11 @@ export function BrandEditModal({
 
         {/* Footer */}
         <div className="px-6 py-4 border-t border-gray-100 bg-white flex items-center justify-end gap-3 shrink-0 z-10">
+          {saveNotice && (
+            <div className={`mr-auto text-[12px] font-medium ${saveNotice.tone === "error" ? "text-rose-600" : "text-emerald-600"}`}>
+              {saveNotice.message}
+            </div>
+          )}
           <button 
             type="button"
             onClick={onClose}

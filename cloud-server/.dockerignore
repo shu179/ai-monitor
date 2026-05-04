@@ -1,0 +1,8 @@
+.env
+.venv
+__pycache__/
+*.py[cod]
+.DS_Store
+._*
+**/._*
+surfaced-cloud-server.tar.gz

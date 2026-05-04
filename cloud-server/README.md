@@ -67,6 +67,7 @@ docker compose exec api alembic upgrade head
 ```
 
 生产环境必须把 `.env` 里的 `SURFACED_CLOUD_SECRET_KEY` 和 `POSTGRES_PASSWORD` 改成高强度随机值。
+测试完成后，可以把 `.env` 里的 `SURFACED_CLOUD_DOCS_ENABLED` 改成 `false`，然后重启服务以关闭公网 Swagger 文档。
 
 ## 第一阶段 API
 
@@ -83,8 +84,10 @@ docker compose exec api alembic upgrade head
 - `GET /api/v1/admin/tasks`
 - `POST /api/v1/admin/tasks`
 - `POST /api/v1/admin/tasks/{task_id}/members`
+- `DELETE /api/v1/admin/tasks/{task_id}/members/operator`
 - `POST /api/v1/sync/events`
 - `GET /api/v1/tasks/{task_id}/article-reference-ranking`
+- `GET /api/v1/tasks/{task_id}/run-records`
 - `GET /api/v1/updates/manifest`
 
 ## 后续接入本地端

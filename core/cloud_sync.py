@@ -12,6 +12,7 @@ from typing import Any, Callable
 import requests
 
 from .app_paths import resolve_app_path
+from .local_account_space import account_scoped_path
 from .time_utils import local_now
 
 BundleBuilder = Callable[[bool], dict[str, Any]]
@@ -25,12 +26,16 @@ _LOCAL_SYNC_FILES = (
     "config.yaml",
     "config.local.yaml",
     "logs/articles.json",
+    "logs/article_import_batches.json",
+    "logs/article_reference_index",
     "logs/domain_overrides.json",
     "logs/domain_media_names.json",
     "logs/diagnostics.json",
     "logs/history",
     "user_data/daily_task_status.json",
+    "user_data/runtime_state.json",
     "user_data/scheduler_state.json",
+    "user_data/scheduler_cycle_state.json",
 )
 
 
@@ -114,7 +119,10 @@ class CloudSyncManager:
             pass
 
     def _local_paths(self) -> list:
-        return [resolve_app_path(path) for path in _LOCAL_SYNC_FILES]
+        return [
+            account_scoped_path(path, fallback=resolve_app_path(path))
+            for path in _LOCAL_SYNC_FILES
+        ]
 
     def _capture_local_file_state(self) -> tuple[Any, ...]:
         state = []

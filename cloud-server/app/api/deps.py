@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import InvalidTokenError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -13,22 +14,23 @@ from app.models import User, UserRole
 
 
 DbSession = Annotated[Session, Depends(get_db)]
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def _bearer_token(authorization: str | None) -> str:
-    if not authorization:
+def _bearer_token(credentials: HTTPAuthorizationCredentials | None) -> str:
+    if not credentials:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing authorization header")
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token:
+    token = credentials.credentials
+    if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authorization header")
     return token
 
 
 def get_current_user(
     db: DbSession,
-    authorization: Annotated[str | None, Header()] = None,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
 ) -> User:
-    token = _bearer_token(authorization)
+    token = _bearer_token(credentials)
     try:
         payload = decode_token(token)
     except InvalidTokenError as exc:
@@ -54,4 +56,3 @@ def require_admin(current_user: CurrentUser) -> User:
 
 
 AdminUser = Annotated[User, Depends(require_admin)]
-

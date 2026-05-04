@@ -20,6 +20,25 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     admin_self_register_enabled: bool = True
     email_verification_required: bool = False
+    email_code_ttl_minutes: int = 10
+    email_code_resend_seconds: int = 60
+    email_code_max_attempts: int = 5
+    email_provider: str = "smtp"
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_use_tls: bool = True
+    smtp_timeout_seconds: int = 15
+    tencent_ses_secret_id: str = ""
+    tencent_ses_secret_key: str = ""
+    tencent_ses_region: str = "ap-hongkong"
+    tencent_ses_endpoint: str = "ses.tencentcloudapi.com"
+    tencent_ses_from: str = ""
+    tencent_ses_reply_to: str = ""
+    tencent_ses_template_id: int = 0
+    docs_enabled: bool = True
     public_update_base_url: str = ""
     access_token_minutes: int = 20
     refresh_token_days: int = 30
@@ -33,4 +52,3 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
-

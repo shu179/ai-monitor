@@ -15,9 +15,11 @@ import uuid
 from datetime import datetime
 
 from .app_paths import resolve_app_path
+from .local_account_space import account_scoped_path
 
 
-DIAGNOSTICS_PATH = resolve_app_path("logs/diagnostics.json")
+DEFAULT_DIAGNOSTICS_PATH = resolve_app_path("logs/diagnostics.json")
+DIAGNOSTICS_PATH = DEFAULT_DIAGNOSTICS_PATH
 MAX_EVENTS = 500
 
 _LOCK = threading.Lock()
@@ -36,7 +38,8 @@ def record_event(
     suggestion: str = "",
 ) -> dict:
     """记录一条诊断事件。"""
-    DIAGNOSTICS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics_path = _diagnostics_path()
+    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
     event = {
         "id": uuid.uuid4().hex,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -124,10 +127,11 @@ def _default_suggestion(category: str, message: str) -> str:
 
 
 def _load_events() -> list[dict]:
-    if not DIAGNOSTICS_PATH.exists():
+    diagnostics_path = _diagnostics_path()
+    if not diagnostics_path.exists():
         return []
     try:
-        with open(DIAGNOSTICS_PATH, "r", encoding="utf-8") as f:
+        with open(diagnostics_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, list) else []
     except Exception:
@@ -135,17 +139,29 @@ def _load_events() -> list[dict]:
 
 
 def _save_events(items: list[dict]) -> None:
-    DIAGNOSTICS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics_path = _diagnostics_path()
+    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
-        dir=str(DIAGNOSTICS_PATH.parent), suffix=".tmp"
+        dir=str(diagnostics_path.parent), suffix=".tmp"
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, DIAGNOSTICS_PATH)
+        os.replace(tmp, diagnostics_path)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def _diagnostics_path():
+    resolved_default = resolve_app_path("logs/diagnostics.json")
+    if DIAGNOSTICS_PATH != resolved_default:
+        return DIAGNOSTICS_PATH
+    return account_scoped_path("logs/diagnostics.json", fallback=resolved_default)
+
+
+def get_diagnostics_path():
+    return _diagnostics_path()

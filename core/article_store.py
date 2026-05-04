@@ -21,11 +21,17 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from .app_paths import resolve_app_path
 from .history import normalize_platform_id
+from .local_account_space import account_scoped_path
 
-ARTICLES_FILE = resolve_app_path("logs/articles.json")
-DOMAIN_OVERRIDES_FILE = resolve_app_path("logs/domain_overrides.json")
-DOMAIN_MEDIA_NAMES_FILE = resolve_app_path("logs/domain_media_names.json")
-EXCLUDED_ARTICLE_URLS_FILE = resolve_app_path("logs/excluded_article_urls.json")
+DEFAULT_ARTICLES_FILE = resolve_app_path("logs/articles.json")
+DEFAULT_DOMAIN_OVERRIDES_FILE = resolve_app_path("logs/domain_overrides.json")
+DEFAULT_DOMAIN_MEDIA_NAMES_FILE = resolve_app_path("logs/domain_media_names.json")
+DEFAULT_EXCLUDED_ARTICLE_URLS_FILE = resolve_app_path("logs/excluded_article_urls.json")
+
+ARTICLES_FILE = DEFAULT_ARTICLES_FILE
+DOMAIN_OVERRIDES_FILE = DEFAULT_DOMAIN_OVERRIDES_FILE
+DOMAIN_MEDIA_NAMES_FILE = DEFAULT_DOMAIN_MEDIA_NAMES_FILE
+EXCLUDED_ARTICLE_URLS_FILE = DEFAULT_EXCLUDED_ARTICLE_URLS_FILE
 
 # 权威媒体域名白名单（内置初始值，可通过手动切换覆盖）
 AUTHORITY_DOMAINS: set = {
@@ -250,6 +256,46 @@ _MEDIA_NAME_BY_DOMAIN_SUFFIX: dict[str, str] = {
     "gov.cn": "中国政府网",
     "redhongan.com": "红安网",
 }
+
+
+def _articles_file() -> Path:
+    if ARTICLES_FILE != DEFAULT_ARTICLES_FILE:
+        return ARTICLES_FILE
+    return account_scoped_path("logs/articles.json", fallback=DEFAULT_ARTICLES_FILE)
+
+
+def _domain_overrides_file() -> Path:
+    if DOMAIN_OVERRIDES_FILE != DEFAULT_DOMAIN_OVERRIDES_FILE:
+        return DOMAIN_OVERRIDES_FILE
+    return account_scoped_path("logs/domain_overrides.json", fallback=DEFAULT_DOMAIN_OVERRIDES_FILE)
+
+
+def _domain_media_names_file() -> Path:
+    if DOMAIN_MEDIA_NAMES_FILE != DEFAULT_DOMAIN_MEDIA_NAMES_FILE:
+        return DOMAIN_MEDIA_NAMES_FILE
+    return account_scoped_path("logs/domain_media_names.json", fallback=DEFAULT_DOMAIN_MEDIA_NAMES_FILE)
+
+
+def _excluded_article_urls_file() -> Path:
+    if EXCLUDED_ARTICLE_URLS_FILE != DEFAULT_EXCLUDED_ARTICLE_URLS_FILE:
+        return EXCLUDED_ARTICLE_URLS_FILE
+    return account_scoped_path("logs/excluded_article_urls.json", fallback=DEFAULT_EXCLUDED_ARTICLE_URLS_FILE)
+
+
+def get_articles_file_path() -> Path:
+    return _articles_file()
+
+
+def get_domain_overrides_file_path() -> Path:
+    return _domain_overrides_file()
+
+
+def get_domain_media_names_file_path() -> Path:
+    return _domain_media_names_file()
+
+
+def get_excluded_article_urls_file_path() -> Path:
+    return _excluded_article_urls_file()
 
 _MEDIA_NAME_ALIASES: dict[str, str] = {
     "头条": "今日头条",
@@ -1146,9 +1192,10 @@ def should_auto_save_media_type(url_or_domain: str, media_type: str, media_name:
 # ---------------------------------------------------------------------------
 
 def _load_domain_overrides() -> dict:
+    path = _domain_overrides_file()
     try:
-        if DOMAIN_OVERRIDES_FILE.exists():
-            with open(DOMAIN_OVERRIDES_FILE, "r", encoding="utf-8") as f:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
     except Exception:
@@ -1157,15 +1204,16 @@ def _load_domain_overrides() -> dict:
 
 
 def _save_domain_overrides(overrides: dict) -> None:
+    path = _domain_overrides_file()
     try:
-        DOMAIN_OVERRIDES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(
-            dir=str(DOMAIN_OVERRIDES_FILE.parent), suffix=".tmp"
+            dir=str(path.parent), suffix=".tmp"
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(overrides, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, DOMAIN_OVERRIDES_FILE)
+            os.replace(tmp, path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -1177,9 +1225,10 @@ def _save_domain_overrides(overrides: dict) -> None:
 
 
 def _load_domain_media_names() -> dict:
+    path = _domain_media_names_file()
     try:
-        if DOMAIN_MEDIA_NAMES_FILE.exists():
-            with open(DOMAIN_MEDIA_NAMES_FILE, "r", encoding="utf-8") as f:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
     except Exception:
@@ -1188,15 +1237,16 @@ def _load_domain_media_names() -> dict:
 
 
 def _save_domain_media_names(media_names: dict) -> None:
+    path = _domain_media_names_file()
     try:
-        DOMAIN_MEDIA_NAMES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(
-            dir=str(DOMAIN_MEDIA_NAMES_FILE.parent), suffix=".tmp"
+            dir=str(path.parent), suffix=".tmp"
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(media_names, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, DOMAIN_MEDIA_NAMES_FILE)
+            os.replace(tmp, path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -1324,9 +1374,10 @@ def save_domain_override(domain: str, media_type: str, force: bool = False) -> N
 # ---------------------------------------------------------------------------
 
 def _load_articles() -> list:
+    path = _articles_file()
     try:
-        if ARTICLES_FILE.exists():
-            with open(ARTICLES_FILE, "r", encoding="utf-8") as f:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, list):
                 return []
@@ -1347,15 +1398,16 @@ def _load_articles() -> list:
 
 
 def _save_articles(articles: list) -> None:
+    path = _articles_file()
     try:
-        ARTICLES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(
-            dir=str(ARTICLES_FILE.parent), suffix=".tmp"
+            dir=str(path.parent), suffix=".tmp"
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(articles, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, ARTICLES_FILE)
+            os.replace(tmp, path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -1433,9 +1485,10 @@ def _sort_articles_for_display(articles: list) -> list:
 
 
 def _load_excluded_article_urls() -> dict:
+    path = _excluded_article_urls_file()
     try:
-        if EXCLUDED_ARTICLE_URLS_FILE.exists():
-            with open(EXCLUDED_ARTICLE_URLS_FILE, "r", encoding="utf-8") as f:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
     except Exception:
@@ -1444,15 +1497,16 @@ def _load_excluded_article_urls() -> dict:
 
 
 def _save_excluded_article_urls(excluded_urls: dict) -> None:
+    path = _excluded_article_urls_file()
     try:
-        EXCLUDED_ARTICLE_URLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(
-            dir=str(EXCLUDED_ARTICLE_URLS_FILE.parent), suffix=".tmp"
+            dir=str(path.parent), suffix=".tmp"
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(excluded_urls, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, EXCLUDED_ARTICLE_URLS_FILE)
+            os.replace(tmp, path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -1746,7 +1800,7 @@ def get_articles() -> list:
 
 def get_articles_file_signature() -> tuple[str, int, int]:
     """Return a cheap source signature for the article store file."""
-    path = ARTICLES_FILE
+    path = _articles_file()
     try:
         stat = path.stat()
         return (str(path), int(stat.st_mtime_ns), int(stat.st_size))

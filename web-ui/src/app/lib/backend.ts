@@ -397,6 +397,127 @@ export type AccountCrawlResult = {
   results?: Array<Record<string, unknown>>;
 };
 
+export type CloudUserSnapshot = {
+  id?: number | string | null;
+  workspace_id?: number | string | null;
+  username?: string | null;
+  role?: "admin" | "operator" | "viewer" | string | null;
+  display_name?: string | null;
+  email?: string | null;
+};
+
+export type CloudOutboxStats = {
+  total: number;
+  pending: number;
+  failed: number;
+  sent: number;
+};
+
+export type CloudAutoSyncStatus = {
+  running: boolean;
+  logged_in: boolean;
+  event_stream_connected: boolean;
+  last_event_at: string;
+  last_upload_at: string;
+  last_pull_at: string;
+  last_error: string;
+  last_error_at: string;
+};
+
+export type CloudStatusSnapshot = {
+  loggedIn: boolean;
+  baseUrl: string;
+  user: CloudUserSnapshot;
+  savedAt: string;
+  outbox: CloudOutboxStats;
+  autoSync: CloudAutoSyncStatus;
+};
+
+export type CloudTaskPullSummary = {
+  received: number;
+  deleted_received?: number;
+  added: number;
+  updated: number;
+  unchanged: number;
+  revoked: number;
+  deleted?: number;
+  deleted_backups?: number;
+  deleted_pending?: number;
+  skipped: number;
+  matched_by?: Record<string, number>;
+  task_ids?: number[];
+};
+
+export type CloudActionResponse = {
+  ok: boolean;
+  message?: string;
+  cloud?: CloudStatusSnapshot;
+  summary?: CloudTaskPullSummary;
+  outbox?: CloudOutboxStats;
+  response?: Record<string, unknown>;
+  requiresEmailVerification?: boolean;
+  email?: string;
+};
+
+export type CloudAdminTaskSnapshot = {
+  id: number;
+  workspace_id: number;
+  task_key: string;
+  name: string;
+  brand: string;
+  config_json: Record<string, unknown>;
+  config_version: number;
+  enabled: boolean;
+  deleted_at?: string | null;
+  delete_expires_at?: string | null;
+  created_at: string;
+  assigned_operator_user_id?: number | null;
+  assigned_operator_username?: string | null;
+  assigned_operator_display_name?: string | null;
+};
+
+export type DeletedTaskSnapshot = {
+  id: string;
+  task_id: string;
+  name: string;
+  brand: string;
+  cloud_task_id?: number | string | null;
+  cloud_task_key?: string;
+  source?: string;
+  deleted_at: string;
+  expires_at: string;
+  reason?: string;
+  can_restore?: boolean;
+};
+
+export type DeletedTasksResponse = {
+  ok: boolean;
+  message?: string;
+  tasks: DeletedTaskSnapshot[];
+  retention_days?: number;
+};
+
+export type CloudAdminTasksResponse = {
+  ok: boolean;
+  message?: string;
+  tasks: CloudAdminTaskSnapshot[];
+  cloud?: CloudStatusSnapshot;
+};
+
+export type CloudAdminUsersResponse = {
+  ok: boolean;
+  message?: string;
+  users: CloudUserSnapshot[];
+  cloud?: CloudStatusSnapshot;
+};
+
+export type CloudAdminTaskUpdateResponse = {
+  ok: boolean;
+  message?: string;
+  task?: CloudAdminTaskSnapshot;
+  cloud?: CloudStatusSnapshot;
+};
+
 export const ARTICLE_DATA_CHANGED_EVENT = "article-updated";
 export const TASK_DATA_CHANGED_EVENT = "task-updated";
 
@@ -794,6 +915,13 @@ function readSessionToken() {
   return window.sessionStorage.getItem(SESSION_TOKEN_STORAGE_KEY) || "";
 }
 
+function clearSessionToken() {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.sessionStorage.removeItem(SESSION_TOKEN_STORAGE_KEY);
+}
+
 function shouldAttachSessionToken(input: RequestInfo | URL) {
   const value = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
   if (value.startsWith("/api/")) {
@@ -820,6 +948,25 @@ async function ensureSessionToken() {
   }
 }
 
+async function refreshSessionTokenAfterRejection() {
+  clearSessionToken();
+  try {
+    const response = await window.fetch("/api/bootstrap", {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      return "";
+    }
+    const data = (await response.json()) as Partial<BootstrapPayload>;
+    storeSessionToken(data.session);
+    bootstrapCache = { data: mergeBootstrap(data), updatedAt: Date.now() };
+    return readSessionToken();
+  } catch {
+    return "";
+  }
+}
+
 export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}) {
   if (!shouldAttachSessionToken(input)) {
     return window.fetch(input, init);
@@ -830,7 +977,18 @@ export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {})
   }
   const headers = new Headers(init.headers || {});
   headers.set(SESSION_TOKEN_HEADER, token);
-  return window.fetch(input, { ...init, headers });
+  const response = await window.fetch(input, { ...init, headers });
+  if (response.status !== 401) {
+    return response;
+  }
+
+  const retryToken = await refreshSessionTokenAfterRejection();
+  if (!retryToken || retryToken === token) {
+    return response;
+  }
+  const retryHeaders = new Headers(init.headers || {});
+  retryHeaders.set(SESSION_TOKEN_HEADER, retryToken);
+  return window.fetch(input, { ...init, headers: retryHeaders });
 }
 
 export async function triggerRunAll(): Promise<{ queued: boolean; message: string }> {
@@ -859,6 +1017,449 @@ export async function setMonitoringEnabled(enabled: boolean): Promise<{ ok: bool
   } catch {
     return { ok: false, enabled, message: "切换失败" };
   }
+}
+
+const EMPTY_CLOUD_STATUS: CloudStatusSnapshot = {
+  loggedIn: false,
+  baseUrl: "",
+  user: {},
+  savedAt: "",
+  outbox: { total: 0, pending: 0, failed: 0, sent: 0 },
+  autoSync: {
+    running: false,
+    logged_in: false,
+    event_stream_connected: false,
+    last_event_at: "",
+    last_upload_at: "",
+    last_pull_at: "",
+    last_error: "",
+    last_error_at: "",
+  },
+};
+
+export async function fetchCloudStatus(): Promise<CloudActionResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/status", {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    const data = await response.json();
+    return {
+      ok: Boolean(data?.ok && response.ok),
+      message: String(data?.message || ""),
+      cloud: normalizeCloudStatus(data?.cloud),
+    };
+  } catch {
+    return { ok: false, message: "云端状态获取失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function loginCloud(payload: {
+  baseUrl: string;
+  username: string;
+  password: string;
+}): Promise<CloudActionResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        base_url: payload.baseUrl,
+        username: payload.username,
+        password: payload.password,
+      }),
+    });
+    const data = await response.json();
+    return normalizeCloudActionResponse(data, response.ok);
+  } catch {
+    return { ok: false, message: "云端登录失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function registerCloudAdmin(payload: {
+  baseUrl: string;
+  email: string;
+  password: string;
+  workspaceName?: string;
+  displayName?: string;
+}): Promise<CloudActionResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/register-admin", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        base_url: payload.baseUrl,
+        email: payload.email,
+        password: payload.password,
+        workspace_name: payload.workspaceName || "",
+        display_name: payload.displayName || "",
+      }),
+    });
+    const data = await response.json();
+    return {
+      ...normalizeCloudActionResponse(data, response.ok),
+      requiresEmailVerification: Boolean(data?.requiresEmailVerification),
+      email: String(data?.email || payload.email || ""),
+    };
+  } catch {
+    return { ok: false, message: "管理员账号注册失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function verifyCloudEmail(payload: {
+  baseUrl: string;
+  email: string;
+  code: string;
+}): Promise<CloudActionResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/verify-email", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        base_url: payload.baseUrl,
+        email: payload.email,
+        code: payload.code,
+      }),
+    });
+    const data = await response.json();
+    return normalizeCloudActionResponse(data, response.ok);
+  } catch {
+    return { ok: false, message: "邮箱验证失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function resendCloudEmailCode(payload: {
+  baseUrl: string;
+  email: string;
+}): Promise<CloudActionResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/resend-email-code", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        base_url: payload.baseUrl,
+        email: payload.email,
+      }),
+    });
+    const data = await response.json();
+    return normalizeCloudActionResponse(data, response.ok);
+  } catch {
+    return { ok: false, message: "验证码重发失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function requestCloudPasswordReset(payload: {
+  baseUrl: string;
+  email: string;
+}): Promise<CloudActionResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/password-reset/request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        base_url: payload.baseUrl,
+        email: payload.email,
+      }),
+    });
+    const data = await response.json();
+    return normalizeCloudActionResponse(data, response.ok);
+  } catch {
+    return { ok: false, message: "找回密码请求失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function resetCloudPassword(payload: {
+  baseUrl: string;
+  email: string;
+  code: string;
+  password: string;
+}): Promise<CloudActionResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/password-reset/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        base_url: payload.baseUrl,
+        email: payload.email,
+        code: payload.code,
+        password: payload.password,
+      }),
+    });
+    const data = await response.json();
+    return normalizeCloudActionResponse(data, response.ok);
+  } catch {
+    return { ok: false, message: "密码重置失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function logoutCloud(): Promise<CloudActionResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/logout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await response.json();
+    return normalizeCloudActionResponse(data, response.ok);
+  } catch {
+    return { ok: false, message: "云端退出失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function pullCloudTasks(): Promise<CloudActionResponse> {
+  try {
+    return await mutateTasksFullCache(async () => {
+      const response = await apiFetch("/api/cloud/pull-tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const data = await response.json();
+      return normalizeCloudActionResponse(data, response.ok);
+    });
+  } catch {
+    return { ok: false, message: "云端任务拉取失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function flushCloudOutbox(limit = 100): Promise<CloudActionResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/flush-outbox", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit }),
+    });
+    const data = await response.json();
+    return normalizeCloudActionResponse(data, response.ok);
+  } catch {
+    return { ok: false, message: "云端数据上传失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function fetchCloudAdminTasks(): Promise<CloudAdminTasksResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/admin/tasks", {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    const data = await response.json();
+    const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
+    return {
+      ok: Boolean(source.ok && response.ok),
+      message: String(source.message || ""),
+      tasks: normalizeCloudAdminTasks(source.tasks),
+      cloud: source.cloud ? normalizeCloudStatus(source.cloud) : undefined,
+    };
+  } catch {
+    return { ok: false, message: "云端任务获取失败", tasks: [], cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function fetchCloudAdminUsers(): Promise<CloudAdminUsersResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/admin/users", {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    const data = await response.json();
+    const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
+    return {
+      ok: Boolean(source.ok && response.ok),
+      message: String(source.message || ""),
+      users: Array.isArray(source.users)
+        ? source.users.map((item) => normalizeCloudUser(item)).filter((item): item is CloudUserSnapshot => Boolean(item))
+        : [],
+      cloud: source.cloud ? normalizeCloudStatus(source.cloud) : undefined,
+    };
+  } catch {
+    return { ok: false, message: "云端账号获取失败", users: [], cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function updateCloudAdminTask(payload: {
+  taskId: number;
+  name?: string;
+  brand?: string;
+  enabled?: boolean;
+  configJson?: Record<string, unknown>;
+  expectedConfigVersion?: number;
+}): Promise<CloudAdminTaskUpdateResponse> {
+  try {
+    const body: Record<string, unknown> = { task_id: payload.taskId };
+    if (payload.name !== undefined) body.name = payload.name;
+    if (payload.brand !== undefined) body.brand = payload.brand;
+    if (payload.enabled !== undefined) body.enabled = payload.enabled;
+    if (payload.configJson !== undefined) body.config_json = payload.configJson;
+    if (payload.expectedConfigVersion !== undefined) body.expected_config_version = payload.expectedConfigVersion;
+    const response = await apiFetch("/api/cloud/admin/update-task", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
+    return {
+      ok: Boolean(source.ok && response.ok),
+      message: String(source.message || ""),
+      task: normalizeCloudAdminTask(source.task),
+      cloud: source.cloud ? normalizeCloudStatus(source.cloud) : undefined,
+    };
+  } catch {
+    return { ok: false, message: "云端任务保存失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function syncCloudAdminTask(payload: {
+  localTaskId: string;
+  operatorUserId?: number;
+}): Promise<CloudAdminTaskUpdateResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/admin/sync-task", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        local_task_id: payload.localTaskId,
+        operator_user_id: payload.operatorUserId || 0,
+      }),
+    });
+    const data = await response.json();
+    const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
+    if (source.ok) {
+      invalidateTasksFullCache();
+    }
+    return {
+      ok: Boolean(source.ok && response.ok),
+      message: String(source.message || ""),
+      task: normalizeCloudAdminTask(source.task),
+      cloud: source.cloud ? normalizeCloudStatus(source.cloud) : undefined,
+    };
+  } catch {
+    return { ok: false, message: "云端任务同步失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+function normalizeCloudStatus(value: unknown): CloudStatusSnapshot {
+  const source = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const outboxSource = source.outbox && typeof source.outbox === "object"
+    ? source.outbox as Record<string, unknown>
+    : {};
+  const userSource = source.user && typeof source.user === "object"
+    ? source.user as CloudUserSnapshot
+    : {};
+  const autoSyncSource = source.autoSync && typeof source.autoSync === "object"
+    ? source.autoSync as Record<string, unknown>
+    : {};
+  return {
+    loggedIn: Boolean(source.loggedIn),
+    baseUrl: String(source.baseUrl || ""),
+    user: userSource,
+    savedAt: String(source.savedAt || ""),
+    outbox: {
+      total: Number(outboxSource.total || 0),
+      pending: Number(outboxSource.pending || 0),
+      failed: Number(outboxSource.failed || 0),
+      sent: Number(outboxSource.sent || 0),
+    },
+    autoSync: {
+      running: Boolean(autoSyncSource.running),
+      logged_in: Boolean(autoSyncSource.logged_in),
+      event_stream_connected: Boolean(autoSyncSource.event_stream_connected),
+      last_event_at: String(autoSyncSource.last_event_at || ""),
+      last_upload_at: String(autoSyncSource.last_upload_at || ""),
+      last_pull_at: String(autoSyncSource.last_pull_at || ""),
+      last_error: String(autoSyncSource.last_error || ""),
+      last_error_at: String(autoSyncSource.last_error_at || ""),
+    },
+  };
+}
+
+function normalizeCloudUser(value: unknown): CloudUserSnapshot | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const source = value as Record<string, unknown>;
+  return {
+    id: source.id as number | string | null,
+    workspace_id: source.workspace_id as number | string | null,
+    username: String(source.username || ""),
+    role: source.role as CloudUserSnapshot["role"],
+    display_name: source.display_name ? String(source.display_name) : null,
+    email: source.email ? String(source.email) : null,
+  };
+}
+
+function normalizeCloudAdminTasks(value: unknown): CloudAdminTaskSnapshot[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => normalizeCloudAdminTask(item))
+    .filter((item): item is CloudAdminTaskSnapshot => Boolean(item));
+}
+
+function normalizeCloudAdminTask(value: unknown): CloudAdminTaskSnapshot | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const source = value as Record<string, unknown>;
+  const id = Number(source.id || 0);
+  if (!Number.isFinite(id) || id <= 0) {
+    return undefined;
+  }
+  const configJson = source.config_json && typeof source.config_json === "object" && !Array.isArray(source.config_json)
+    ? source.config_json as Record<string, unknown>
+    : {};
+  return {
+    id,
+    workspace_id: Number(source.workspace_id || 0),
+    task_key: String(source.task_key || ""),
+    name: String(source.name || ""),
+    brand: String(source.brand || ""),
+    config_json: configJson,
+    config_version: Number(source.config_version || 1),
+    enabled: Boolean(source.enabled),
+    created_at: String(source.created_at || ""),
+    assigned_operator_user_id: Number(source.assigned_operator_user_id || 0) || null,
+    assigned_operator_username: String(source.assigned_operator_username || ""),
+    assigned_operator_display_name: String(source.assigned_operator_display_name || ""),
+  };
+}
+
+function normalizeCloudTaskPullSummary(value: unknown): CloudTaskPullSummary | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const source = value as Record<string, unknown>;
+  return {
+    received: Number(source.received || 0),
+    added: Number(source.added || 0),
+    updated: Number(source.updated || 0),
+    unchanged: Number(source.unchanged || 0),
+    revoked: Number(source.revoked || 0),
+    skipped: Number(source.skipped || 0),
+    matched_by: source.matched_by && typeof source.matched_by === "object"
+      ? source.matched_by as Record<string, number>
+      : undefined,
+    task_ids: Array.isArray(source.task_ids)
+      ? source.task_ids.map((item) => Number(item)).filter((item) => Number.isFinite(item))
+      : undefined,
+  };
+}
+
+function normalizeCloudActionResponse(data: unknown, httpOk: boolean): CloudActionResponse {
+  const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
+  const cloud = source.cloud ? normalizeCloudStatus(source.cloud) : undefined;
+  const outbox = source.outbox ? normalizeCloudStatus({ outbox: source.outbox }).outbox : undefined;
+  return {
+    ok: Boolean(source.ok && httpOk),
+    message: String(source.message || ""),
+    cloud,
+    summary: normalizeCloudTaskPullSummary(source.summary),
+    outbox,
+    response: source.response && typeof source.response === "object"
+      ? source.response as Record<string, unknown>
+      : undefined,
+  };
 }
 
 export function mergeBootstrap(data: Partial<BootstrapPayload> | null | undefined): BootstrapPayload {
@@ -1122,6 +1723,16 @@ export type TaskFull = {
   optimization_start_date: string;
   optimization_end_date: string;
   created_at?: string;
+  delete_pending?: boolean;
+  delete_pending_at?: string;
+  delete_pending_expires_at?: string;
+  delete_pending_error?: string;
+  cloud_task_id?: number | string | null;
+  cloud_task_key?: string;
+  cloud_access_level?: string;
+  cloud_config_version?: number | string | null;
+  cloud_assigned_operator_user_id?: number | string | null;
+  cloud_assigned_operator_username?: string;
   total_records: number;
   success_records: number;
   success_rate: number;
@@ -1198,6 +1809,53 @@ export async function fetchTasksFull(options: { force?: boolean } = {}): Promise
   return tasksFullInFlight;
 }
 
+function normalizeDeletedTasks(value: unknown): DeletedTaskSnapshot[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item): DeletedTaskSnapshot | null => {
+      if (!item || typeof item !== "object") return null;
+      const source = item as Record<string, unknown>;
+      const id = String(source.id || source.task_id || "").trim();
+      const taskId = String(source.task_id || "").trim();
+      const name = String(source.name || source.brand || taskId || "").trim();
+      const brand = String(source.brand || source.name || name || "").trim();
+      if (!id || !brand) return null;
+      return {
+        id,
+        task_id: taskId,
+        name,
+        brand,
+        cloud_task_id: source.cloud_task_id as DeletedTaskSnapshot["cloud_task_id"],
+        cloud_task_key: String(source.cloud_task_key || ""),
+        source: String(source.source || ""),
+        deleted_at: String(source.deleted_at || ""),
+        expires_at: String(source.expires_at || ""),
+        reason: String(source.reason || ""),
+        can_restore: Boolean(source.can_restore),
+      };
+    })
+    .filter((item): item is DeletedTaskSnapshot => item !== null);
+}
+
+export async function fetchDeletedTasks(): Promise<DeletedTasksResponse> {
+  try {
+    const res = await apiFetch("/api/tasks/deleted", {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    const data = await res.json();
+    const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
+    return {
+      ok: Boolean(source.ok && res.ok),
+      message: String(source.message || ""),
+      tasks: normalizeDeletedTasks(source.tasks),
+      retention_days: Number(source.retention_days || 3),
+    };
+  } catch {
+    return { ok: false, message: "已删除品牌配置获取失败", tasks: [] };
+  }
+}
+
 async function mutateTasksFullCache<T>(operation: () => Promise<T>): Promise<T> {
   try {
     const result = await operation();
@@ -1270,6 +1928,27 @@ export async function deleteTask(taskId: string): Promise<{ ok: boolean; message
   try {
     return await mutateTasksFullCache(async () => {
       const res = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" });
+      return await res.json();
+    });
+  } catch {
+    return { ok: false, message: "网络错误" };
+  }
+}
+
+export async function restoreDeletedTask(payload: {
+  deletedTaskId?: string;
+  brandName?: string;
+}): Promise<{ ok: boolean; message?: string; task_id?: string }> {
+  try {
+    return await mutateTasksFullCache(async () => {
+      const res = await apiFetch("/api/tasks/deleted/restore", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          deleted_task_id: payload.deletedTaskId || "",
+          brand_name: payload.brandName || "",
+        }),
+      });
       return await res.json();
     });
   } catch {

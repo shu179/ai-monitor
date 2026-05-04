@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urljoin, urlparse, urlsplit, urlunsplit
 from xml.etree import ElementTree
@@ -23,6 +24,7 @@ from xml.etree import ElementTree
 import requests
 
 from core.app_paths import resolve_app_path
+from core.local_account_space import account_scoped_path
 from core.article_store import (
     add_article,
     analyze_article_matches,
@@ -205,9 +207,10 @@ def _article_ts_now() -> str:
 
 
 def _read_state() -> dict[str, Any]:
+    state_path = _state_path()
     try:
-        if ACCOUNT_CRAWL_STATE_FILE.exists():
-            with open(ACCOUNT_CRAWL_STATE_FILE, "r", encoding="utf-8") as handle:
+        if state_path.exists():
+            with open(state_path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
             return data if isinstance(data, dict) else {}
     except Exception:
@@ -216,13 +219,14 @@ def _read_state() -> dict[str, Any]:
 
 
 def _write_state(state: dict[str, Any]) -> None:
+    state_path = _state_path()
     try:
-        ACCOUNT_CRAWL_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(ACCOUNT_CRAWL_STATE_FILE.parent), suffix=".tmp")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(state_path.parent), suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(state, handle, ensure_ascii=False, indent=2)
-            os.replace(tmp, ACCOUNT_CRAWL_STATE_FILE)
+            os.replace(tmp, state_path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -231,6 +235,13 @@ def _write_state(state: dict[str, Any]) -> None:
             raise
     except Exception as exc:
         print(f"[AccountCrawler] 写入状态失败: {exc}")
+
+
+def _state_path() -> Path:
+    resolved_default = resolve_app_path("logs/account_crawl_state.json")
+    if ACCOUNT_CRAWL_STATE_FILE != resolved_default:
+        return ACCOUNT_CRAWL_STATE_FILE
+    return account_scoped_path("logs/account_crawl_state.json", fallback=resolved_default)
 
 
 def _ensure_url_scheme(url: str) -> str:

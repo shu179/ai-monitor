@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .app_paths import resolve_app_path
+from .local_account_space import account_scoped_path
 from .time_utils import local_now, local_today
 
 
@@ -188,7 +189,11 @@ def _state_path() -> Path:
     resolved_default = resolve_app_path("user_data/daily_task_status.json")
     if STATE_PATH != resolved_default:
         return STATE_PATH
-    return resolved_default
+    return account_scoped_path("user_data/daily_task_status.json", fallback=resolved_default)
+
+
+def get_state_path() -> Path:
+    return _state_path()
 
 
 def _make_day_key(task: dict, target_date: date | None = None) -> str:

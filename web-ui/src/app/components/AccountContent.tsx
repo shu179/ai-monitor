@@ -187,7 +187,7 @@ export function AccountContent({
   isAuthenticated?: boolean;
   onSaveSuccess?: (message?: string) => void;
   onProfileSaved?: () => void | Promise<void>;
-  onLogout?: () => void;
+  onLogout?: () => void | Promise<void>;
 }) {
   const [profile, setProfile] = useState({
     name: "林见鹿",
@@ -837,7 +837,7 @@ export function AccountContent({
           onLogout?.();
         }}
         title="确认退出登录？"
-        message="退出后会切换为访客模式，本地活动仍可查看，但账号信息与高级权限会暂时收起，确认退出吗？"
+        message="退出后会回到登录页，本地会保留登录前产生的待上传队列，确认退出吗？"
         confirmText="退出"
         type="danger"
       />

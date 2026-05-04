@@ -105,6 +105,26 @@ class DeviceSession(Base):
     __table_args__ = (UniqueConstraint("user_id", "device_id", name="uq_device_sessions_user_device"),)
 
 
+class EmailVerificationCode(Base):
+    __tablename__ = "email_verification_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    email: Mapped[str] = mapped_column(String(256), nullable=False)
+    code_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(32), default="admin_register", server_default="admin_register", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_email_codes_user_purpose", "user_id", "purpose", "created_at"),
+        Index("idx_email_codes_email_purpose", "email", "purpose", "created_at"),
+    )
+
+
 class BrandTask(Base):
     __tablename__ = "brand_tasks"
 
@@ -116,12 +136,16 @@ class BrandTask(Base):
     config_json: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}", nullable=False)
     config_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delete_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
         UniqueConstraint("workspace_id", "task_key", name="uq_brand_tasks_workspace_task_key"),
         Index("idx_tasks_workspace", "workspace_id"),
+        Index("idx_tasks_workspace_deleted", "workspace_id", "deleted_at"),
     )
 
 

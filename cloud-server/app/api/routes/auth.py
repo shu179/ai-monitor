@@ -3,8 +3,28 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from app.api.deps import CurrentUser, DbSession
-from app.schemas import AdminRegisterRequest, APIMessage, LoginRequest, RefreshRequest, TokenPair, UserPublic
-from app.services.auth_service import login_user, refresh_access_token, register_admin, revoke_refresh_token
+from app.schemas import (
+    AdminRegisterRequest,
+    APIMessage,
+    LoginRequest,
+    RefreshRequest,
+    RequestPasswordResetRequest,
+    ResendEmailVerificationRequest,
+    ResetPasswordRequest,
+    TokenPair,
+    UserPublic,
+    VerifyEmailRequest,
+)
+from app.services.auth_service import (
+    login_user,
+    refresh_access_token,
+    register_admin,
+    request_password_reset,
+    resend_admin_verification_code,
+    reset_admin_password,
+    revoke_refresh_token,
+    verify_admin_email,
+)
 
 router = APIRouter()
 
@@ -18,6 +38,41 @@ def admin_register(payload: AdminRegisterRequest, db: DbSession) -> UserPublic:
         workspace_name=payload.workspace_name,
         display_name=payload.display_name,
     )
+
+
+@router.post("/email/verify", response_model=TokenPair)
+def verify_email(payload: VerifyEmailRequest, db: DbSession) -> TokenPair:
+    user, access_token, refresh_token = verify_admin_email(
+        db,
+        email=str(payload.email),
+        code=payload.code,
+        device_id=payload.device_id,
+        app_version=payload.app_version,
+    )
+    return TokenPair(access_token=access_token, refresh_token=refresh_token, user=user)
+
+
+@router.post("/email/resend", response_model=APIMessage)
+def resend_email_verification(payload: ResendEmailVerificationRequest, db: DbSession) -> APIMessage:
+    resend_admin_verification_code(db, email=str(payload.email))
+    return APIMessage(message="ok")
+
+
+@router.post("/password/reset/request", response_model=APIMessage)
+def request_password_reset_code(payload: RequestPasswordResetRequest, db: DbSession) -> APIMessage:
+    request_password_reset(db, email=str(payload.email))
+    return APIMessage(message="ok")
+
+
+@router.post("/password/reset/confirm", response_model=APIMessage)
+def confirm_password_reset(payload: ResetPasswordRequest, db: DbSession) -> APIMessage:
+    reset_admin_password(
+        db,
+        email=str(payload.email),
+        code=payload.code,
+        password=payload.password,
+    )
+    return APIMessage(message="ok")
 
 
 @router.post("/login", response_model=TokenPair)
@@ -47,4 +102,3 @@ def logout(payload: RefreshRequest, db: DbSession) -> APIMessage:
 @router.get("/me", response_model=UserPublic)
 def me(current_user: CurrentUser) -> UserPublic:
     return current_user
-

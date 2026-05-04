@@ -9,16 +9,22 @@ from app.schemas import (
     BrandTaskPublic,
     CreateTaskRequest,
     CreateUserRequest,
+    UpdateTaskRequest,
     UpdateUserRequest,
     UserPublic,
 )
 from app.services.admin_service import (
     assign_task_member,
+    clear_task_operator_assignment,
     create_task,
     create_workspace_user,
     delete_workspace_user,
+    delete_task,
     list_tasks,
+    list_deleted_tasks,
     list_workspace_users,
+    restore_task,
+    update_task,
     update_workspace_user,
 )
 
@@ -67,6 +73,11 @@ def tasks(admin: AdminUser, db: DbSession) -> list[BrandTaskPublic]:
     return list_tasks(db, admin)
 
 
+@router.get("/tasks/deleted", response_model=list[BrandTaskPublic])
+def deleted_tasks(admin: AdminUser, db: DbSession) -> list[BrandTaskPublic]:
+    return list_deleted_tasks(db, admin)
+
+
 @router.post("/tasks", response_model=BrandTaskPublic, status_code=status.HTTP_201_CREATED)
 def create_brand_task(payload: CreateTaskRequest, admin: AdminUser, db: DbSession) -> BrandTaskPublic:
     return create_task(
@@ -78,6 +89,30 @@ def create_brand_task(payload: CreateTaskRequest, admin: AdminUser, db: DbSessio
         config_json=payload.config_json,
         enabled=payload.enabled,
     )
+
+
+@router.patch("/tasks/{task_id}", response_model=BrandTaskPublic)
+def update_brand_task(task_id: int, payload: UpdateTaskRequest, admin: AdminUser, db: DbSession) -> BrandTaskPublic:
+    return update_task(
+        db,
+        admin,
+        task_id,
+        name=payload.name,
+        brand=payload.brand,
+        config_json=payload.config_json,
+        enabled=payload.enabled,
+        expected_config_version=payload.expected_config_version,
+    )
+
+
+@router.delete("/tasks/{task_id}", response_model=BrandTaskPublic)
+def delete_brand_task(task_id: int, admin: AdminUser, db: DbSession) -> BrandTaskPublic:
+    return delete_task(db, admin, task_id)
+
+
+@router.post("/tasks/{task_id}/restore", response_model=BrandTaskPublic)
+def restore_brand_task(task_id: int, admin: AdminUser, db: DbSession) -> BrandTaskPublic:
+    return restore_task(db, admin, task_id)
 
 
 @router.post("/tasks/{task_id}/members", response_model=APIMessage)
@@ -92,3 +127,13 @@ def set_task_member(task_id: int, payload: AssignTaskRequest, admin: AdminUser, 
     )
     return APIMessage(message="ok")
 
+
+@router.delete("/tasks/{task_id}/members/operator", response_model=APIMessage)
+def clear_task_operator(task_id: int, admin: AdminUser, db: DbSession) -> APIMessage:
+    clear_task_operator_assignment(
+        db,
+        admin,
+        task_id=task_id,
+        note="清空品牌运营归属",
+    )
+    return APIMessage(message="ok")

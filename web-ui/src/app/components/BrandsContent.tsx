@@ -3,7 +3,7 @@ import { Search, Plus, ChevronDown, Zap, Edit2, Brain, X, Download, Calendar, La
 import { AreaChart, Area, ResponsiveContainer, YAxis } from "recharts";
 import { ConfirmModal } from "./ConfirmModal";
 import { AnimatedLoadingText } from "./AnimatedLoadingText";
-import { ARTICLE_DATA_CHANGED_EVENT, TASK_DATA_CHANGED_EVENT, fetchTasksFull, readTasksFullCache, deleteTask, startTestRunTask, fetchTestRunStatus, cancelTestRunTask, updateTask, type TaskFull, type TestRunStatus } from "../lib/backend";
+import { ARTICLE_DATA_CHANGED_EVENT, TASK_DATA_CHANGED_EVENT, fetchCloudAdminTasks, fetchCloudAdminUsers, fetchCloudStatus, fetchDeletedTasks, fetchTasksFull, readTasksFullCache, deleteTask, startTestRunTask, fetchTestRunStatus, cancelTestRunTask, restoreDeletedTask, syncCloudAdminTask, updateTask, type CloudAdminTaskSnapshot, type CloudUserSnapshot, type DeletedTaskSnapshot, type TaskFull, type TestRunStatus } from "../lib/backend";
 import { notifySaveSuccess } from "../lib/saveToast";
 
 const ArticleSummaryModal = lazy(() => import("./ArticleSummaryModal").then((module) => ({ default: module.ArticleSummaryModal })));
@@ -97,6 +97,13 @@ function taskToBrand(task: TaskFull, idx: number) {
     fixedScreenshotTargetToday: Number(task.fixed_screenshot_target_today || 0),
     completedByQuotaToday: !!task.completed_by_quota_today,
     testFailureNotice: task.test_failure_notice || null,
+    cloudTaskId: Number(task.cloud_task_id || 0) || null,
+    cloudAssignedOperatorUserId: Number(task.cloud_assigned_operator_user_id || 0) || null,
+    cloudAssignedOperatorUsername: task.cloud_assigned_operator_username || "",
+    deletePending: Boolean(task.delete_pending),
+    deletePendingAt: task.delete_pending_at || "",
+    deletePendingExpiresAt: task.delete_pending_expires_at || "",
+    deletePendingError: task.delete_pending_error || "",
   };
 }
 
@@ -122,6 +129,10 @@ export function BrandsContent({
   const [testRunStatus, setTestRunStatus] = useState<TestRunStatus | null>(null);
   const [testRunModalOpen, setTestRunModalOpen] = useState(false);
   const [testRunAbortPending, setTestRunAbortPending] = useState(false);
+  const [cloudAdminEnabled, setCloudAdminEnabled] = useState(false);
+  const [cloudOperators, setCloudOperators] = useState<CloudUserSnapshot[]>([]);
+  const [cloudAdminTasks, setCloudAdminTasks] = useState<CloudAdminTaskSnapshot[]>([]);
+  const [deletedTasks, setDeletedTasks] = useState<DeletedTaskSnapshot[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
   const PAGE_SIZE = 6;
   const terminalTestRunToastRef = useRef<string>("");
@@ -162,6 +173,26 @@ export function BrandsContent({
     };
   }, [loadTasks]);
 
+  const refreshCloudAdminContext = useCallback(async () => {
+    const status = await fetchCloudStatus();
+    const isAdmin = Boolean(status.cloud?.loggedIn && status.cloud.user.role === "admin");
+    setCloudAdminEnabled(isAdmin);
+    if (!isAdmin) {
+      setCloudOperators([]);
+      setCloudAdminTasks([]);
+      setDeletedTasks([]);
+      return;
+    }
+    const [usersResult, tasksResult, deletedResult] = await Promise.all([fetchCloudAdminUsers(), fetchCloudAdminTasks(), fetchDeletedTasks()]);
+    setCloudOperators((usersResult.users || []).filter((user) => user.role === "operator"));
+    setCloudAdminTasks(tasksResult.tasks || []);
+    setDeletedTasks(deletedResult.tasks || []);
+  }, []);
+
+  useEffect(() => {
+    void refreshCloudAdminContext();
+  }, [refreshCloudAdminContext]);
+
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
       if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
@@ -187,6 +218,13 @@ export function BrandsContent({
 
   // Map tasks to brand card data
   const allBrandsData = useMemo(() => tasks.map((t, i) => taskToBrand(t, i)), [tasks]);
+  const cloudAdminTaskById = useMemo(() => {
+    const map = new Map<number, CloudAdminTaskSnapshot>();
+    for (const task of cloudAdminTasks) {
+      map.set(task.id, task);
+    }
+    return map;
+  }, [cloudAdminTasks]);
   const hasAnyFormalRunningTask = useMemo(() => allBrandsData.some((item) => item.formalRunning), [allBrandsData]);
 
   // Compute stats from real data
@@ -345,11 +383,44 @@ export function BrandsContent({
   }, []);
 
   const handleDelete = useCallback(async (taskId: string) => {
-    await deleteTask(taskId);
-    setTasks(prev => prev.filter(t => t.id !== taskId));
+    const result = await deleteTask(taskId);
+    if (!result.ok) {
+      notifySaveSuccess(onSaveSuccess, result.message || "删除失败");
+      setDeleteBrandConfirm(null);
+      return;
+    }
+    if (result.message) {
+      notifySaveSuccess(onSaveSuccess, result.message);
+    }
+    await loadTasks({ showLoadingState: false, force: true });
+    await refreshCloudAdminContext();
+    setEditingBrand((current) => (current?.id === taskId ? null : current));
+    setIsCreatingBrand(false);
     setDeleteBrandConfirm(null);
     emitTaskDataChanged();
-  }, []);
+  }, [loadTasks, onSaveSuccess, refreshCloudAdminContext]);
+
+  const handleRestoreDeletedTask = useCallback(async (deletedTaskId: string, brandName: string) => {
+    const result = await restoreDeletedTask({ deletedTaskId, brandName });
+    if (result.ok) {
+      await loadTasks({ showLoadingState: false, force: true });
+      await refreshCloudAdminContext();
+      emitTaskDataChanged();
+      notifySaveSuccess(onSaveSuccess, result.message || "品牌配置已恢复");
+    }
+    return { ok: result.ok, message: result.message || "" };
+  }, [loadTasks, onSaveSuccess, refreshCloudAdminContext]);
+
+  const handleSyncCloudTaskFromBrand = useCallback(async (localTaskId: string, operatorUserId?: number) => {
+    if (!cloudAdminEnabled) {
+      return { ok: true, message: "" };
+    }
+    const result = await syncCloudAdminTask({ localTaskId, operatorUserId });
+    if (result.ok) {
+      await refreshCloudAdminContext();
+    }
+    return { ok: result.ok, message: result.message || "" };
+  }, [cloudAdminEnabled, refreshCloudAdminContext]);
 
   return (
     <div className="flex-1 h-full overflow-hidden bg-transparent px-8 py-8 xl:px-10 flex flex-col relative">
@@ -468,12 +539,16 @@ export function BrandsContent({
           </div>
         ) : pagedBrands.length > 0 ? (
           <div className="space-y-4 xl:space-y-5">
-            {pagedBrands.map((brand, idx) => (
-              <BrandCardErrorBoundary
-                key={brand.id}
-                brandName={brand.name}
-              >
-                <BrandCard
+            {pagedBrands.map((brand, idx) => {
+              const cloudTask = brand.cloudTaskId ? cloudAdminTaskById.get(brand.cloudTaskId) : undefined;
+              const operatorUserId = Number(cloudTask?.assigned_operator_user_id || brand.cloudAssignedOperatorUserId || 0) || 0;
+              const operatorUsername = String(cloudTask?.assigned_operator_username || brand.cloudAssignedOperatorUsername || "").trim();
+              return (
+                <BrandCardErrorBoundary
+                  key={brand.id}
+                  brandName={brand.name}
+                >
+                  <BrandCard
                   taskId={brand.id}
                   name={brand.name}
                   industry={brand.industry}
@@ -505,6 +580,11 @@ export function BrandsContent({
                   fixedScreenshotTargetToday={brand.fixedScreenshotTargetToday}
                   completedByQuotaToday={brand.completedByQuotaToday}
                   testFailureNotice={brand.testFailureNotice}
+                  deletePending={brand.deletePending}
+                  deletePendingError={brand.deletePendingError}
+                  showOperatorBadge={cloudAdminEnabled}
+                  operatorUserId={operatorUserId}
+                  operatorUsername={operatorUsername}
                   testRunState={
                     activeTestRun?.taskId === brand.id
                       ? (
@@ -536,9 +616,10 @@ export function BrandsContent({
                   }}
                   onDeleteClick={() => setDeleteBrandConfirm(brand.id)}
                   onToggleEnabled={(enabled) => handleToggleEnabled(brand.id, enabled)}
-                />
-              </BrandCardErrorBoundary>
-            ))}
+                  />
+                </BrandCardErrorBoundary>
+              );
+            })}
           </div>
         ) : (
           <div className="flex flex-col items-center justify-center h-full text-gray-400 gap-3">
@@ -623,8 +704,24 @@ export function BrandsContent({
               brandName={editingBrand?.name || ""}
               brand={editingBrand || undefined}
               existingTasks={tasks}
+              deletedTasks={deletedTasks}
               currentDetectionMode={currentDetectionMode}
               isNew={isCreatingBrand}
+              cloudAdminEnabled={cloudAdminEnabled}
+              cloudOperators={cloudOperators}
+              canDelete={cloudAdminEnabled && !isCreatingBrand}
+              initialOperatorUserId={
+                editingBrand?.cloud_task_id
+                  ? Number(cloudAdminTaskById.get(Number(editingBrand.cloud_task_id))?.assigned_operator_user_id || editingBrand.cloud_assigned_operator_user_id || 0) || 0
+                  : 0
+              }
+              onCloudSync={handleSyncCloudTaskFromBrand}
+              onDeleteClick={() => {
+                if (editingBrand?.id) {
+                  setDeleteBrandConfirm(editingBrand.id);
+                }
+              }}
+              onRestoreDeletedTask={handleRestoreDeletedTask}
               onClose={() => {
                 setEditingBrand(null);
                 setIsCreatingBrand(false);
@@ -671,7 +768,7 @@ export function BrandsContent({
         onClose={() => setDeleteBrandConfirm(null)}
         onConfirm={() => { if (deleteBrandConfirm) handleDelete(deleteBrandConfirm); }}
         title="确认删除品牌？"
-        message="删除后将无法恢复该品牌的所有监控数据与配置。确定要继续吗？"
+        message="删除后品牌配置会保留三天可恢复备份；如果正式任务正在运行，会在运行结束并同步数据后自动删除。确定要继续吗？"
         confirmText="删除"
         type="danger"
       />
@@ -780,7 +877,7 @@ class BrandCardErrorBoundary extends Component<BrandCardErrorBoundaryProps, Bran
 // ---- Subcomponents ----
 
 function BrandCard({
-  taskId, name, industry, region, logo, logoColor, start, end, duration, articles, isTest, chartColor, taskPlatforms, optimizationTrend, taskKeywords, brandStatus, sentToday, scheduledToday, formalStarted, formalRunning, hasGap, gapReasons, failedToday, failedModes, failureKindToday, statusMessage, completedKeywordsToday, actualScreenshotCountToday, fixedScreenshotTargetToday, completedByQuotaToday, testFailureNotice, testRunState, testBlockedGlobally, onArticlesClick, onEditClick, onTestClick, onDeleteClick, onToggleEnabled
+  taskId, name, industry, region, logo, logoColor, start, end, duration, articles, isTest, chartColor, taskPlatforms, optimizationTrend, taskKeywords, brandStatus, sentToday, scheduledToday, formalStarted, formalRunning, hasGap, gapReasons, failedToday, failedModes, failureKindToday, statusMessage, completedKeywordsToday, actualScreenshotCountToday, fixedScreenshotTargetToday, completedByQuotaToday, testFailureNotice, deletePending, deletePendingError, showOperatorBadge, operatorUserId, operatorUsername, testRunState, testBlockedGlobally, onArticlesClick, onEditClick, onTestClick, onDeleteClick, onToggleEnabled
 }: {
   taskId: string, name: string, industry: string, region: string, logo: string, logoColor: string,
   start: string, end: string, duration: string, articles: number, isTest: boolean, chartColor: string,
@@ -803,6 +900,11 @@ function BrandCard({
   fixedScreenshotTargetToday: number,
   completedByQuotaToday: boolean,
   testFailureNotice?: { message: string; updatedAt: string; expiresAt: string } | null,
+  deletePending?: boolean,
+  deletePendingError?: string,
+  showOperatorBadge?: boolean,
+  operatorUserId?: number,
+  operatorUsername?: string,
   testRunState?: "running" | "cancelling" | null,
   testBlockedGlobally?: boolean,
   onArticlesClick?: () => void, onEditClick?: () => void, onTestClick?: () => void, onDeleteClick?: () => void,
@@ -852,6 +954,7 @@ function BrandCard({
       ? `今日进度：已完成 ${completedKeywordCount} 个关键词`
       : "";
   const testFailureMessage = String(testFailureNotice?.message || "").trim();
+  const deletePendingMessage = String(deletePendingError || "").trim() || (deletePending ? "删除已排队，正式任务结束后自动处理" : "");
   const isTesting = testRunState === "running";
   const isCancelling = testRunState === "cancelling";
   const isTestBlocked = !!testBlockedGlobally && !isTesting && !isCancelling;
@@ -890,23 +993,35 @@ function BrandCard({
               {logo}
             </div>
             <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-1.5 flex-wrap">
-                <span className="text-[16px] font-bold text-gray-900 leading-none">{name}</span>
-                <span className="px-1.5 py-0.5 bg-gray-100 text-gray-500 text-[9px] rounded font-bold tracking-wider">{industry}</span>
-                <span className="px-1.5 py-0.5 bg-gray-100 text-gray-500 text-[9px] rounded font-bold tracking-wider">{region}</span>
-                {testStatusBadge && (
-                  <span className={`px-1.5 py-0.5 text-[9px] rounded font-bold tracking-wider border ${testStatusBadge.className}`}>
-                    {testStatusBadge.label}
-                  </span>
-                )}
-                {brandStatusBadge && (
-                  <span className={`px-1.5 py-0.5 text-[9px] rounded font-bold tracking-wider border ${brandStatusBadge.className}`}>
-                    {brandStatusBadge.label}
-                  </span>
-                )}
-                {failedToday && (
-                  <span className={`px-1.5 py-0.5 text-[9px] rounded font-bold tracking-wider border ${failureBadgeClassName}`}>
-                    {failureLabel}
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex flex-wrap items-center gap-1.5">
+                  <span className="text-[16px] font-bold text-gray-900 leading-none">{name}</span>
+                  <span className="px-1.5 py-0.5 bg-gray-100 text-gray-500 text-[9px] rounded font-bold tracking-wider">{industry}</span>
+                  <span className="px-1.5 py-0.5 bg-gray-100 text-gray-500 text-[9px] rounded font-bold tracking-wider">{region}</span>
+                  {testStatusBadge && (
+                    <span className={`px-1.5 py-0.5 text-[9px] rounded font-bold tracking-wider border ${testStatusBadge.className}`}>
+                      {testStatusBadge.label}
+                    </span>
+                  )}
+                  {brandStatusBadge && (
+                    <span className={`px-1.5 py-0.5 text-[9px] rounded font-bold tracking-wider border ${brandStatusBadge.className}`}>
+                      {brandStatusBadge.label}
+                    </span>
+                  )}
+                  {failedToday && (
+                    <span className={`px-1.5 py-0.5 text-[9px] rounded font-bold tracking-wider border ${failureBadgeClassName}`}>
+                      {failureLabel}
+                    </span>
+                  )}
+                  {deletePending && (
+                    <span className="px-1.5 py-0.5 bg-rose-50 text-rose-600 text-[9px] rounded font-bold tracking-wider border border-rose-100">
+                      待删除
+                    </span>
+                  )}
+                </div>
+                {showOperatorBadge && (
+                  <span className="shrink-0 px-1.5 py-0.5 bg-slate-50 text-slate-600 text-[9px] rounded font-bold tracking-wider border border-slate-200">
+                    运营 {operatorUserId ? `#${operatorUserId}` : "未分配"}{operatorUsername ? ` · ${operatorUsername}` : ""}
                   </span>
                 )}
               </div>
@@ -925,7 +1040,7 @@ function BrandCard({
                 </button>
               </div>
 
-              {(failedToday || successProgressSummary || testStatusBadge || testFailureMessage || (showFormalGap && gapReasons.length > 0)) && (
+              {(failedToday || successProgressSummary || testStatusBadge || testFailureMessage || deletePendingMessage || (showFormalGap && gapReasons.length > 0)) && (
                 <div className="mt-3 space-y-1.5">
                   {failedToday && (
                     <div className="text-[11px] text-red-500/90 font-medium">
@@ -952,6 +1067,11 @@ function BrandCard({
                   {!failedToday && testFailureMessage && (
                     <div className="text-[11px] text-amber-600 font-medium">
                       测试失败提醒：{testFailureMessage}
+                    </div>
+                  )}
+                  {deletePendingMessage && (
+                    <div className="text-[11px] text-rose-500 font-medium">
+                      {deletePendingMessage}
                     </div>
                   )}
                 </div>

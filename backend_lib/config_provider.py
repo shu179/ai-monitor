@@ -28,6 +28,9 @@ class RuntimeConfigProvider:
         self.config_path = Path(config_path)
         self._on_load = on_load
 
+    def set_path(self, config_path: str | Path) -> None:
+        self.config_path = Path(config_path)
+
     def load(self) -> dict[str, Any]:
         config = read_config(self.config_path)
         ensure_config_task_ids(config)

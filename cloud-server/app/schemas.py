@@ -31,6 +31,27 @@ class AdminRegisterRequest(BaseModel):
     display_name: str | None = Field(default=None, max_length=128)
 
 
+class VerifyEmailRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=4, max_length=12)
+    device_id: str | None = Field(default=None, max_length=256)
+    app_version: str | None = Field(default=None, max_length=32)
+
+
+class ResendEmailVerificationRequest(BaseModel):
+    email: EmailStr
+
+
+class RequestPasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=4, max_length=12)
+    password: str = Field(min_length=8, max_length=128)
+
+
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=256)
     password: str = Field(min_length=1, max_length=128)
@@ -73,9 +94,19 @@ class BrandTaskPublic(BaseModel):
     config_json: dict[str, Any]
     config_version: int
     enabled: bool
+    deleted_at: datetime | None = None
+    delete_expires_at: datetime | None = None
     created_at: datetime
+    assigned_operator_user_id: int | None = None
+    assigned_operator_username: str | None = None
+    assigned_operator_display_name: str | None = None
+    assigned_viewer_user_ids: list[int] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
+
+
+class VisibleBrandTaskPublic(BrandTaskPublic):
+    access_level: Literal["admin", "operate", "view"]
 
 
 class CreateTaskRequest(BaseModel):
@@ -84,6 +115,14 @@ class CreateTaskRequest(BaseModel):
     brand: str = Field(min_length=1, max_length=128)
     config_json: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
+
+
+class UpdateTaskRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    brand: str | None = Field(default=None, min_length=1, max_length=128)
+    config_json: dict[str, Any] | None = None
+    enabled: bool | None = None
+    expected_config_version: int | None = Field(default=None, ge=1)
 
 
 class AssignTaskRequest(BaseModel):
@@ -105,6 +144,23 @@ class SyncEventsRequest(BaseModel):
 class SyncEventsResponse(BaseModel):
     accepted: int
     duplicates: int
+
+
+class RunRecordPublic(BaseModel):
+    id: int
+    workspace_id: int
+    task_id: int
+    executed_by: int
+    platform: str
+    keyword: str
+    brand: str
+    mode: str
+    result_json: dict[str, Any]
+    idempotency_key: str
+    executed_at: datetime
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 class ReferenceRankingItem(BaseModel):
@@ -137,4 +193,3 @@ class UpdateManifestChannel(BaseModel):
 class UpdateManifestResponse(BaseModel):
     app_name: str = "Surfaced"
     channels: dict[str, UpdateManifestChannel]
-
