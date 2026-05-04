@@ -4,19 +4,25 @@ playwright 只渲染本地 HTML 文件，不打开任何 AI 平台网页。
 """
 
 import base64
+import atexit
 import html
 import io
+import json
 import mimetypes
 import os
 import queue
 import re
+import shutil
+import subprocess
 import threading
+import time
+import uuid
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 
 from core.app_paths import resolve_app_dir, resolve_app_path
 from core.browser_runtime import resolve_system_browser_executable
@@ -40,6 +46,15 @@ _TEMPLATE_DEBUG_PRINTED = False
 _SCREENSHOT_RENDERER = None
 _SCREENSHOT_RENDERER_LOCK = threading.Lock()
 _RENDERER_IDLE_TIMEOUT_SECONDS = 180
+_SATORI_RENDERER = None
+_SATORI_RENDERER_LOCK = threading.Lock()
+_SATORI_RENDERER_UNAVAILABLE_LOGGED = False
+_SATORI_RENDERER_TIMEOUT_SECONDS = 45
+_SATORI_DEFAULT_SCALE = 2.0
+_SATORI_JPEG_QUALITY = 92
+_SATORI_TEMPLATE_WIDTH = 900
+_SATORI_TEMPLATE_MIN_VIEWPORT_HEIGHT = 800
+_SATORI_TEMPLATE_BOTTOM_PADDING = 30
 
 _DEFAULT_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><style>{style_block}</style></head><body>
@@ -94,6 +109,20 @@ def render_text_to_screenshot(
     markdown 文本 → HTML → playwright 截长图 → JPEG
     返回截图文件路径，失败返回空字符串。
     """
+    if output_path is None:
+        output_path = _build_default_screenshot_path(platform)
+
+    satori_path = _render_text_to_screenshot_with_satori(
+        text=text,
+        platform=platform,
+        keyword=keyword,
+        brand=brand,
+        output_path=output_path,
+        include_badges=include_badges,
+    )
+    if satori_path:
+        return satori_path
+
     html_body = _md_to_html(text)
     return render_html_to_screenshot(
         html_body,
@@ -105,42 +134,6 @@ def render_text_to_screenshot(
     )
 
 
-def render_image_to_screenshot(
-    image_path: str,
-    platform: str,
-    keyword: str = "",
-    brand: str = "",
-    output_path: str = None,
-    include_badges: bool = True,
-) -> str:
-    """
-    本地截图文件 -> 同一套 Surfaced HTML 模版 -> playwright 截图 -> JPEG
-    """
-    src = Path(str(image_path or "").strip())
-    if not src.exists() or not src.is_file():
-        return ""
-
-    data_uri = _path_to_data_uri(src)
-    if not data_uri:
-        return ""
-
-    alt_text = html.escape(str(keyword or brand or platform or "截图").strip() or "截图")
-    html_body = (
-        '<div class="embedded-shot">'
-        f'<img class="embedded-shot-image" src="{data_uri}" alt="{alt_text}">'
-        '</div>'
-    )
-    return render_html_to_screenshot(
-        html_body,
-        platform,
-        keyword=keyword,
-        brand=brand,
-        output_path=output_path,
-        include_badges=include_badges,
-        allow_answer_images=True,
-    )
-
-
 def render_html_to_screenshot(
     html_body: str,
     platform: str,
@@ -148,7 +141,6 @@ def render_html_to_screenshot(
     brand: str = "",
     output_path: Optional[str] = None,
     include_badges: bool = True,
-    allow_answer_images: bool = False,
 ) -> str:
     """HTML 片段 → playwright 截长图 → JPEG"""
     _debug_log_template_sources()
@@ -167,8 +159,6 @@ def render_html_to_screenshot(
     rendered_html_body = _highlight_brand_mentions_in_html(html_body, brand)
     timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S CST")
     style_block = _build_font_face_block() + "\n" + _load_style_block()
-    if allow_answer_images:
-        style_block += "\n" + _build_answer_image_style_block()
     full_html = (
         _load_html_template()
         .replace('{style_block}', style_block)
@@ -179,8 +169,7 @@ def render_html_to_screenshot(
     )
 
     if output_path is None:
-        ts = datetime.now().strftime("%m%d_%H%M%S")
-        output_path = str(resolve_app_dir("screenshots") / f"{platform}_api_{ts}.jpg")
+        output_path = _build_default_screenshot_path(platform)
 
     try:
         _playwright_screenshot(full_html, output_path)
@@ -192,6 +181,11 @@ def render_html_to_screenshot(
         print(f"[html_renderer] 截图已保存: {output_path}")
         return output_path
     return ""
+
+
+def _build_default_screenshot_path(platform: str) -> str:
+    ts = datetime.now().strftime("%m%d_%H%M%S")
+    return str(resolve_app_dir("screenshots") / f"{platform}_api_{ts}.jpg")
 
 
 def _load_html_template() -> str:
@@ -208,34 +202,6 @@ def _load_style_block() -> str:
         return style_path.read_text(encoding="utf-8")
     except Exception:
         return _DEFAULT_STYLE_BLOCK
-
-
-def _build_answer_image_style_block() -> str:
-    return """
-.answer-body img,
-.answer-body picture,
-.answer-body figure,
-.answer-body figure img {
-  display: block !important;
-}
-
-.answer-body .embedded-shot {
-  width: 100%;
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid rgba(226, 232, 240, 0.9);
-  border-radius: 24px;
-  padding: 14px;
-  box-shadow: 0 18px 36px -18px rgba(15, 23, 42, 0.24);
-}
-
-.answer-body .embedded-shot-image {
-  width: 100%;
-  height: auto;
-  border-radius: 18px;
-  object-fit: contain;
-  background: #ffffff;
-}
-"""
 
 
 def _debug_log_template_sources() -> None:
@@ -359,6 +325,352 @@ def _normalize_logo_image_bytes(path: Path) -> bytes:
         return output.getvalue()
     except Exception:
         return b""
+
+
+def _render_text_to_screenshot_with_satori(
+    *,
+    text: str,
+    platform: str,
+    keyword: str,
+    brand: str,
+    output_path: str,
+    include_badges: bool,
+) -> str:
+    """使用 Satori 快速渲染 Markdown 文本；失败时返回空字符串交给 Playwright fallback。"""
+    if not _should_use_satori_renderer():
+        return ""
+
+    output = Path(str(output_path or "").strip())
+    if not output:
+        return ""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_png = output.with_name(f"{output.stem}.satori.tmp.png")
+
+    payload = {
+        "text": str(text or ""),
+        "platform": str(platform or "AI"),
+        "keyword": str(keyword or ""),
+        "brand": str(brand or ""),
+        "outputPath": str(tmp_png),
+        "includeBadges": bool(include_badges),
+        "timestamp": datetime.now().strftime("%Y.%m.%d %H:%M:%S CST"),
+        "logoDataUri": _get_platform_logo_data_uri(platform),
+        "scale": _resolve_satori_render_scale(),
+    }
+
+    try:
+        _get_satori_renderer().render_text(payload)
+        if not tmp_png.exists():
+            raise RuntimeError("Satori renderer completed but no PNG was generated.")
+        _convert_satori_png_to_jpeg(tmp_png, output)
+    except Exception as exc:
+        _log_satori_renderer_unavailable(f"Satori 快速渲染失败，回退 Playwright: {exc}")
+        return ""
+    finally:
+        try:
+            tmp_png.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if output.exists():
+        print(f"[html_renderer] Satori截图已保存: {output}")
+        return str(output)
+    return ""
+
+
+def _should_use_satori_renderer() -> bool:
+    value = str(os.environ.get("AI_MONITOR_SATORI_RENDERER", "")).strip().lower()
+    return value not in {"0", "false", "off", "no", "playwright"}
+
+
+def _convert_satori_png_to_jpeg(png_path: Path, output_path: Path) -> None:
+    with Image.open(png_path) as img:
+        if img.mode in ("RGBA", "LA"):
+            rgba = img.convert("RGBA")
+            background = Image.new("RGBA", rgba.size, (250, 250, 250, 255))
+            background.alpha_composite(rgba)
+            rgb = background.convert("RGB")
+        elif img.mode == "P":
+            rgb = img.convert("RGB")
+        else:
+            rgb = img.convert("RGB")
+        min_height = round(max(1, rgb.width) / _SATORI_TEMPLATE_WIDTH * _SATORI_TEMPLATE_MIN_VIEWPORT_HEIGHT)
+        bottom_padding = round(max(1, rgb.width) / _SATORI_TEMPLATE_WIDTH * _SATORI_TEMPLATE_BOTTOM_PADDING)
+        rgb = _trim_bottom_background(rgb, background=(250, 250, 250), tolerance=4, padding=bottom_padding, min_height=min_height)
+        rgb = _apply_satori_template_background_effects(rgb)
+        rgb.save(output_path, format="JPEG", quality=_SATORI_JPEG_QUALITY, subsampling=0, optimize=True)
+
+
+def _resolve_satori_render_scale() -> float:
+    raw = str(os.environ.get("AI_MONITOR_SATORI_SCALE", "")).strip()
+    if raw:
+        try:
+            return min(3.0, max(1.0, float(raw)))
+        except ValueError:
+            return _SATORI_DEFAULT_SCALE
+    return _SATORI_DEFAULT_SCALE
+
+
+def _trim_bottom_background(
+    img: Image.Image,
+    *,
+    background: tuple[int, int, int],
+    tolerance: int,
+    padding: int,
+    min_height: int = 0,
+) -> Image.Image:
+    """裁掉 Satori 高度估算留下的底部纯背景，但保留与旧模板接近的底边距。"""
+    width, height = img.size
+    if width <= 0 or height <= 0:
+        return img
+
+    bg_r, bg_g, bg_b = background
+    sample_step = max(1, width // 120)
+    pixels = img.load()
+    last_content_y = height - 1
+
+    for y in range(height - 1, -1, -1):
+        has_content = False
+        for x in range(0, width, sample_step):
+            r, g, b = pixels[x, y][:3]
+            if (
+                abs(int(r) - bg_r) > tolerance
+                or abs(int(g) - bg_g) > tolerance
+                or abs(int(b) - bg_b) > tolerance
+            ):
+                has_content = True
+                break
+        if has_content:
+            last_content_y = y
+            break
+
+    crop_bottom = min(height, max(last_content_y + max(0, padding), int(min_height or 0)))
+    if crop_bottom < height:
+        return img.crop((0, 0, width, crop_bottom))
+    return img
+
+
+def _apply_satori_template_background_effects(img: Image.Image) -> Image.Image:
+    """补回浏览器模板里的轻微蓝色背景光晕，避开 Satori 长图渐变慢路径。"""
+    try:
+        scale = max(0.1, img.width / _SATORI_TEMPLATE_WIDTH)
+        canvas = img.convert("RGBA")
+        _alpha_composite_glow(
+            canvas,
+            left=round(-90 * scale),
+            top=round(-90 * scale),
+            diameter=round(360 * scale),
+            blur=round(120 * scale),
+            color=(14, 165, 233, 20),
+        )
+        _alpha_composite_glow(
+            canvas,
+            left=round(img.width - 45 * scale),
+            top=round(img.height - 80 * scale),
+            diameter=round(450 * scale),
+            blur=round(150 * scale),
+            color=(96, 165, 250, 10),
+        )
+        return canvas.convert("RGB")
+    except Exception:
+        return img
+
+
+def _alpha_composite_glow(
+    base: Image.Image,
+    *,
+    left: int,
+    top: int,
+    diameter: int,
+    blur: int,
+    color: tuple[int, int, int, int],
+) -> None:
+    diameter = max(1, int(diameter))
+    blur = max(0, int(blur))
+    patch_size = diameter + blur * 2
+    patch = Image.new("RGBA", (patch_size, patch_size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(patch)
+    draw.ellipse((blur, blur, blur + diameter, blur + diameter), fill=color)
+    if blur:
+        patch = patch.filter(ImageFilter.GaussianBlur(blur))
+
+    dest_left = left - blur
+    dest_top = top - blur
+    crop_left = max(0, -dest_left)
+    crop_top = max(0, -dest_top)
+    crop_right = min(patch.width, base.width - dest_left)
+    crop_bottom = min(patch.height, base.height - dest_top)
+    if crop_right <= crop_left or crop_bottom <= crop_top:
+        return
+    cropped = patch.crop((crop_left, crop_top, crop_right, crop_bottom))
+    base.alpha_composite(cropped, (max(0, dest_left), max(0, dest_top)))
+
+
+def _log_satori_renderer_unavailable(message: str) -> None:
+    global _SATORI_RENDERER_UNAVAILABLE_LOGGED
+    if _SATORI_RENDERER_UNAVAILABLE_LOGGED:
+        return
+    _SATORI_RENDERER_UNAVAILABLE_LOGGED = True
+    print(f"[html_renderer] {message}")
+
+
+def _get_satori_renderer():
+    global _SATORI_RENDERER
+    with _SATORI_RENDERER_LOCK:
+        if _SATORI_RENDERER is None:
+            _SATORI_RENDERER = _SatoriScreenshotRenderer()
+        return _SATORI_RENDERER
+
+
+class _SatoriScreenshotRenderer:
+    """常驻 Node worker：Markdown -> Satori SVG -> PNG。"""
+
+    def __init__(self) -> None:
+        self._process: subprocess.Popen | None = None
+        self._stdout_queue: queue.Queue[str] = queue.Queue()
+        self._lock = threading.Lock()
+        self._worker_mtime_ns: int | None = None
+
+    def render_text(self, payload: dict) -> dict:
+        with self._lock:
+            request = dict(payload)
+            request["id"] = uuid.uuid4().hex
+            request["type"] = "renderText"
+            self._ensure_process()
+            try:
+                self._send(request)
+                return self._read_response(request["id"])
+            except Exception:
+                self.close()
+                self._ensure_process()
+                self._send(request)
+                return self._read_response(request["id"])
+
+    def close(self) -> None:
+        process = self._process
+        self._process = None
+        self._worker_mtime_ns = None
+        if process is None:
+            return
+        try:
+            if process.stdin:
+                process.stdin.close()
+        except Exception:
+            pass
+        try:
+            process.terminate()
+            process.wait(timeout=2.0)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=2.0)
+            except Exception:
+                pass
+        finally:
+            for stream in (process.stdout, process.stderr):
+                try:
+                    if stream:
+                        stream.close()
+                except Exception:
+                    pass
+
+    def _ensure_process(self) -> None:
+        worker_path = _satori_worker_path()
+        worker_mtime_ns = worker_path.stat().st_mtime_ns if worker_path.exists() else None
+        if self._process is not None and self._process.poll() is None:
+            if self._worker_mtime_ns == worker_mtime_ns:
+                return
+            self.close()
+
+        node_path = _resolve_node_executable()
+        if not node_path:
+            raise RuntimeError("未找到 node，可设置 AI_MONITOR_NODE_PATH。")
+        if not worker_path.exists():
+            raise RuntimeError(f"未找到 Satori worker: {worker_path}")
+        if not (worker_path.parent / "node_modules" / "satori").exists():
+            raise RuntimeError(f"Satori renderer 依赖未安装，请在 {worker_path.parent} 执行 npm install。")
+
+        self._process = subprocess.Popen(
+            [node_path, str(worker_path)],
+            cwd=str(worker_path.parent),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+        threading.Thread(target=self._read_stdout, name="satori-renderer-stdout", daemon=True).start()
+        threading.Thread(target=self._read_stderr, name="satori-renderer-stderr", daemon=True).start()
+        self._worker_mtime_ns = worker_mtime_ns
+
+    def _send(self, request: dict) -> None:
+        process = self._process
+        if process is None or process.stdin is None or process.poll() is not None:
+            raise RuntimeError("Satori renderer worker is not running.")
+        process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+        process.stdin.flush()
+
+    def _read_response(self, request_id: str) -> dict:
+        deadline = time.monotonic() + _SATORI_RENDERER_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Satori renderer timed out.")
+            try:
+                line = self._stdout_queue.get(timeout=min(remaining, 1.0))
+            except queue.Empty:
+                process = self._process
+                if process is not None and process.poll() is not None:
+                    raise RuntimeError(f"Satori renderer exited with code {process.returncode}.")
+                continue
+
+            try:
+                response = json.loads(line)
+            except Exception:
+                continue
+            if response.get("id") != request_id:
+                continue
+            if not response.get("ok"):
+                raise RuntimeError(str(response.get("error") or "Satori renderer failed."))
+            return response.get("result") or {}
+
+    def _read_stdout(self) -> None:
+        process = self._process
+        if process is None or process.stdout is None:
+            return
+        for line in process.stdout:
+            if line.strip():
+                self._stdout_queue.put(line.strip())
+
+    def _read_stderr(self) -> None:
+        process = self._process
+        if process is None or process.stderr is None:
+            return
+        for line in process.stderr:
+            if line.strip():
+                print(f"[html_renderer:satori] {line.rstrip()}")
+
+
+def _resolve_node_executable() -> str:
+    configured = str(os.environ.get("AI_MONITOR_NODE_PATH", "")).strip()
+    if configured and Path(configured).exists():
+        return configured
+    return shutil.which("node") or ""
+
+
+def _satori_worker_path() -> Path:
+    return resolve_app_path("renderers/satori/render_worker.mjs")
+
+
+def _close_satori_renderer() -> None:
+    global _SATORI_RENDERER
+    if _SATORI_RENDERER is not None:
+        _SATORI_RENDERER.close()
+        _SATORI_RENDERER = None
+
+
+atexit.register(_close_satori_renderer)
 
 
 def _md_to_html(text: str) -> str:
