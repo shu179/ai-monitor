@@ -151,6 +151,13 @@ class TaskOverviewService:
                     brand_names,
                     10,
                     task_id=str(task.get("task_id") or derive_task_id(task)).strip(),
+                    task_created_at=str(
+                        task.get("created_at")
+                        or task.get("createdAt")
+                        or task.get("cloud_created_at")
+                        or task.get("cloud_synced_at")
+                        or ""
+                    ).strip(),
                 ) or {}
                 actual_values = [float(value) for value in (trend_series.get("actual") or []) if value is not None]
                 optimization_trend = [
@@ -216,6 +223,7 @@ class TaskOverviewService:
                 "fixed_screenshot_count": max(1, int(task.get("fixed_screenshot_count", task.get("recognition_batch_size", 3)) or 1)),
                 "optimization_start_date": task.get("optimization_start_date", ""),
                 "optimization_end_date": task.get("optimization_end_date", ""),
+                "created_at": str(task.get("created_at") or ""),
                 "total_records": total_records,
                 "success_records": success_records,
                 "success_rate": round(success_records / total_records * 100, 1) if total_records > 0 else 0,

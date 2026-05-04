@@ -17,6 +17,7 @@ from ui.article_window import ArticleWindow, _CalendarPopup
 from core.recognition import ClipboardRecognitionManager
 from core.daily_task_state import assign_task_id, build_task_state_extra, write_task_status
 from core.scheduler import describe_task_schedule, normalize_weekly_times
+from core.time_utils import local_now
 from ui.config_runtime import persist_config, persist_config_with_feedback
 from ui.keyword_guide import KeywordGuideWindow
 from ui.tk_compat import (
@@ -124,6 +125,7 @@ class TaskConfigDialog:
 
     def __init__(self, parent, task=None, existing_tasks=None):
         self.result = None
+        self._is_new_task = task is None
         self._existing_tasks = list(existing_tasks or [])
         self._original_task = task or {}
         # 向后兼容：旧格式转换
@@ -458,7 +460,13 @@ class TaskConfigDialog:
             return None
 
         try:
-            return get_brand_trend_series(task_name, brands, days, task_id=task_id)
+            return get_brand_trend_series(
+                task_name,
+                brands,
+                days,
+                task_id=task_id,
+                task_created_at=str((self._original_task or {}).get("created_at") or "").strip(),
+            )
         except Exception:
             return None
 
@@ -795,6 +803,8 @@ class TaskConfigDialog:
             'optimization_end_date': self.opt_end_var.get().strip(),
         })
         assign_task_id(result)
+        if self._is_new_task and not str(result.get('created_at') or '').strip():
+            result['created_at'] = local_now().isoformat(timespec='seconds')
 
         # 记录优化周期到历史 sidecar 文件
         opt_start = result.get('optimization_start_date', '')

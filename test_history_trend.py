@@ -1,5 +1,6 @@
 from datetime import date, timedelta
 from pathlib import Path
+import random
 import tempfile
 import unittest
 
@@ -69,6 +70,178 @@ class HistoryTrendSeriesTests(unittest.TestCase):
         assert_between(-2, 40.0, 60.0)    # 第 7 次实际失败进入 40-60
         assert_between(-1, 40.0, 60.0)    # 未运行：沿用 40-60 区间
         assert_between(0, 40.0, 60.0)     # 今天未运行，不继续累计失败
+
+    def test_gap_rate_does_not_flatline_at_zone_floor(self) -> None:
+        for low, high in ((80.0, 100.0), (60.0, 80.0), (40.0, 60.0)):
+            with self.subTest(zone=(low, high)):
+                value = low
+                values = []
+                for index in range(6):
+                    value = history._trend_gap_rate(value, low, high, random.Random(f"{low}-{index}"))
+                    values.append(value)
+
+                self.assertGreater(len(set(values)), 1)
+                self.assertTrue(any(item > low for item in values))
+                self.assertTrue(all(low <= item <= high for item in values))
+
+    def test_new_task_without_success_starts_low_and_climbs_smoothly(self) -> None:
+        task_name = "新任务启动曲线"
+        brand = "品牌N"
+        today = date.today()
+        created_at = (today - timedelta(days=4)).isoformat()
+
+        records = [
+            {
+                "id": f"failure-{offset}",
+                "ts": f"{(today - timedelta(days=offset)).isoformat()} 09:00",
+                "task_name": task_name,
+                "platform": "doubao",
+                "keyword": "关键词N",
+                "brand": brand,
+                "rank": 99,
+                "success": False,
+                "review_status": "",
+                "error_message": "未识别到品牌名",
+                "execution_source": "auto",
+            }
+            for offset in range(4, -1, -1)
+        ]
+        history._save(history._task_file(task_name), records)
+
+        series = history.get_brand_trend_series(task_name, [brand], 7, task_created_at=created_at)
+        self.assertIsNotNone(series)
+        values = {
+            day.isoformat(): value
+            for day, value in zip(series["dates"], series["actual"])
+            if value is not None
+        }
+        path = [
+            values[(today - timedelta(days=offset)).isoformat()]
+            for offset in range(4, -1, -1)
+        ]
+
+        self.assertLess(path[0], 5.0)
+        self.assertGreaterEqual(path[1], 7.0)
+        self.assertLessEqual(path[1], 13.0)
+        self.assertGreaterEqual(path[2], 17.0)
+        self.assertLessEqual(path[2], 26.0)
+        self.assertGreaterEqual(path[3], 33.0)
+        self.assertLessEqual(path[3], 45.0)
+        self.assertGreaterEqual(path[-1], 50.0)
+        self.assertLessEqual(path[-1], 60.0)
+        for previous, current in zip(path, path[1:]):
+            self.assertGreater(current, previous)
+            self.assertLessEqual(current - previous, 18.0)
+        self.assertEqual(series["recorded_dates"], [])
+
+    def test_new_task_without_success_stays_in_day_five_band_afterwards(self) -> None:
+        task_name = "新任务第五天后波动"
+        brand = "品牌F"
+        today = date.today()
+        created_at = (today - timedelta(days=8)).isoformat()
+
+        records = [
+            {
+                "id": f"failure-{offset}",
+                "ts": f"{(today - timedelta(days=offset)).isoformat()} 09:00",
+                "task_name": task_name,
+                "platform": "doubao",
+                "keyword": "关键词F",
+                "brand": brand,
+                "rank": 99,
+                "success": False,
+                "review_status": "",
+                "error_message": "未识别到品牌名",
+                "execution_source": "auto",
+            }
+            for offset in range(8, -1, -1)
+        ]
+        history._save(history._task_file(task_name), records)
+
+        series = history.get_brand_trend_series(task_name, [brand], 14, task_created_at=created_at)
+        self.assertIsNotNone(series)
+        values = {
+            day.isoformat(): value
+            for day, value in zip(series["dates"], series["actual"])
+            if value is not None
+        }
+
+        for offset in range(4, -1, -1):
+            ds = (today - timedelta(days=offset)).isoformat()
+            self.assertGreaterEqual(values[ds], 50.0, ds)
+            self.assertLessEqual(values[ds], 60.0, ds)
+        tail = [
+            values[(today - timedelta(days=offset)).isoformat()]
+            for offset in range(4, -1, -1)
+        ]
+        self.assertGreater(len(set(tail)), 1)
+
+    def test_success_connects_to_launch_curve_without_sudden_jump(self) -> None:
+        task_name = "新任务成功接续"
+        brand = "品牌J"
+        today = date.today()
+        created_at = (today - timedelta(days=3)).isoformat()
+
+        records = [
+            {
+                "id": "failure-created",
+                "ts": f"{(today - timedelta(days=3)).isoformat()} 09:00",
+                "task_name": task_name,
+                "platform": "doubao",
+                "keyword": "关键词J",
+                "brand": brand,
+                "rank": 99,
+                "success": False,
+                "review_status": "",
+                "error_message": "未识别到品牌名",
+                "execution_source": "auto",
+            },
+            {
+                "id": "failure-next",
+                "ts": f"{(today - timedelta(days=2)).isoformat()} 09:00",
+                "task_name": task_name,
+                "platform": "doubao",
+                "keyword": "关键词J",
+                "brand": brand,
+                "rank": 99,
+                "success": False,
+                "review_status": "",
+                "error_message": "未识别到品牌名",
+                "execution_source": "auto",
+            },
+            {
+                "id": "success",
+                "ts": f"{(today - timedelta(days=1)).isoformat()} 09:00",
+                "task_name": task_name,
+                "platform": "doubao",
+                "keyword": "关键词J",
+                "brand": brand,
+                "rank": 1,
+                "success": True,
+                "review_status": "",
+                "execution_source": "auto",
+            },
+        ]
+        history._save(history._task_file(task_name), records)
+
+        series = history.get_brand_trend_series(task_name, [brand], 7, task_created_at=created_at)
+        self.assertIsNotNone(series)
+        values = {
+            day.isoformat(): value
+            for day, value in zip(series["dates"], series["actual"])
+            if value is not None
+        }
+        launch_day = values[(today - timedelta(days=3)).isoformat()]
+        before_success = values[(today - timedelta(days=2)).isoformat()]
+        success_day = values[(today - timedelta(days=1)).isoformat()]
+        after_success = values[today.isoformat()]
+
+        self.assertLess(launch_day, 5.0)
+        self.assertLess(before_success, 80.0)
+        self.assertGreaterEqual(success_day, 80.0)
+        self.assertLessEqual(success_day, 86.0)
+        self.assertGreaterEqual(after_success, 80.0)
+        self.assertLessEqual(after_success, 100.0)
 
     def test_dashboard_summary_prefers_actual_run_days(self) -> None:
         from web_backend import _summarize_trend_points

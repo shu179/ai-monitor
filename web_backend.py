@@ -4670,6 +4670,8 @@ return changedCount
                 return {"ok": False, "message": "任务名称不能为空"}
             from core.daily_task_state import assign_task_id
             assign_task_id(new_task)
+            if not str(new_task.get("created_at") or "").strip():
+                new_task["created_at"] = local_now().isoformat(timespec="seconds")
             tasks.append(new_task)
             config["tasks"] = tasks
             self.save_config(config)

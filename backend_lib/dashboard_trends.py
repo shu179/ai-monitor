@@ -69,6 +69,16 @@ def _weekday_name_from_iso(date_text: str) -> str:
         return str(date_text or "")
 
 
+def _task_created_at(task: dict[str, Any]) -> str:
+    return str(
+        task.get("created_at")
+        or task.get("createdAt")
+        or task.get("cloud_created_at")
+        or task.get("cloud_synced_at")
+        or ""
+    ).strip()
+
+
 def _summarize_trend_points(
     points: list[dict[str, Any]],
     recorded_dates: list[str] | None = None,
@@ -235,6 +245,7 @@ def _build_task_trend(task: dict[str, Any], range_key: str) -> dict[str, Any]:
             get_task_brand_names(task),
             _range_to_days(range_key),
             task_id=str(task.get("task_id") or derive_task_id(task)).strip(),
+            task_created_at=_task_created_at(task),
         )
     except Exception:
         series = None
@@ -262,6 +273,7 @@ def _build_dashboard_trend(tasks: list[dict[str, Any]], range_key: str) -> dict[
                 get_task_brand_names(task),
                 days,
                 task_id=str(task.get("task_id") or derive_task_id(task)).strip(),
+                task_created_at=_task_created_at(task),
             )
         except Exception:
             series = None

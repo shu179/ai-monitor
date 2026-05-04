@@ -1121,6 +1121,7 @@ export type TaskFull = {
   fixed_screenshot_count: number;
   optimization_start_date: string;
   optimization_end_date: string;
+  created_at?: string;
   total_records: number;
   success_records: number;
   success_rate: number;

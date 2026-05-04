@@ -1042,6 +1042,7 @@ class MainWindow:
                     get_task_brand_names(task),
                     days,
                     task_id=str((task or {}).get("task_id") or derive_task_id(task or {})).strip() if task else "",
+                    task_created_at=str((task or {}).get("created_at") or "").strip() if task else "",
                 )
             except Exception:
                 series = None

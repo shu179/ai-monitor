@@ -816,7 +816,14 @@ def get_task_brand_names(task: dict | None) -> list[str]:
     return names
 
 
-def get_brand_trend_series(task_name: str, brands: list[str] | None, days: int, *, task_id: str = "") -> dict | None:
+def get_brand_trend_series(
+    task_name: str,
+    brands: list[str] | None,
+    days: int,
+    *,
+    task_id: str = "",
+    task_created_at: str = "",
+) -> dict | None:
     """生成品牌趋势展示序列（按自然日展示，按实际运行次数推进区间）。"""
     task_name = str(task_name or "").strip()
     task_id = str(task_id or "").strip()
@@ -831,18 +838,22 @@ def get_brand_trend_series(task_name: str, brands: list[str] | None, days: int, 
             record for record in records
             if str(record.get("brand", "")).strip() in allowed
         ]
-    if not records:
-        return None
 
     today = local_today()
     days = max(7, int(days or 30))
     window_start = today - timedelta(days=days - 1)
     record_dates = _effective_trend_record_dates(records)
     record_dates = [item for item in record_dates if item != date.min]
-    if not record_dates:
+    launch_start_date = parse_local_date(task_created_at)
+    if launch_start_date and launch_start_date > today:
+        launch_start_date = today
+    if not record_dates and launch_start_date is None:
         return None
 
-    series_start = min(window_start, min(record_dates))
+    start_candidates = list(record_dates)
+    if launch_start_date is not None:
+        start_candidates.append(launch_start_date)
+    series_start = min(window_start, min(start_candidates))
     date_list = [series_start + timedelta(days=i) for i in range((today - series_start).days + 1)]
     cache = _load_brand_trend_cache(task_name, brand_names, task_id=task_id)
     generated_items, effective_recorded_dates = _build_display_rate_items(
@@ -851,6 +862,7 @@ def get_brand_trend_series(task_name: str, brands: list[str] | None, days: int, 
         date_list=date_list,
         existing_items=cache.get("items") or [],
         seed_namespace=_brand_trend_cache_key(task_name, brand_names, task_id=task_id),
+        launch_start_date=launch_start_date,
     )
     _save_brand_trend_cache(task_name, brand_names, generated_items, task_id=task_id)
     values_by_date = {
@@ -1048,14 +1060,22 @@ def _build_display_rate_items(
     date_list: list[date] | None = None,
     existing_items: list[dict] | None = None,
     seed_namespace: str = "",
+    launch_start_date: date | None = None,
 ) -> tuple[list[dict], list[str]]:
     effective_records = _effective_trend_records(records)
     record_dates = _effective_trend_record_dates(effective_records)
-    if not record_dates:
+    record_dates = [item for item in record_dates if item != date.min]
+    has_success_record = any(is_success_record(record) for record in effective_records)
+    if launch_start_date is None and not has_success_record and record_dates:
+        launch_start_date = min(record_dates)
+    if not record_dates and launch_start_date is None:
         return [], []
 
     if date_list is None:
-        start = min(record_dates)
+        start_candidates = list(record_dates)
+        if launch_start_date is not None:
+            start_candidates.append(launch_start_date)
+        start = min(start_candidates)
         end = local_today()
         date_list = [start + timedelta(days=i) for i in range((end - start).days + 1)]
 
@@ -1075,6 +1095,7 @@ def _build_display_rate_items(
     prev_rate: float | None = None
     failed_run_count = 0
     current_zone: tuple[float, float] | None = None
+    success_seen = False
 
     for current_date in date_list:
         ds = current_date.isoformat()
@@ -1094,9 +1115,14 @@ def _build_display_rate_items(
         success_today = any(is_success_record(record) for record in day_records)
         failed_run_today = any(not is_success_record(record) for record in day_records)
         if success_today:
-            rate = round(rng.uniform(80.0, 100.0), 1)
+            rate = _trend_success_rate(prev_rate, rng)
             failed_run_count = 0
             current_zone = (80.0, 100.0)
+            success_seen = True
+        elif not success_seen and launch_start_date is not None and current_date >= launch_start_date:
+            rate = _trend_launch_rate(prev_rate, (current_date - launch_start_date).days, rng)
+            current_zone = None
+            failed_run_count = 0
         elif failed_run_today:
             failed_run_count += 1
             current_zone = _trend_failure_zone(failed_run_count)
@@ -1110,7 +1136,61 @@ def _build_display_rate_items(
         prev_rate = rate
         generated_items.append({"date": ds, "seed": seed, "rate": rate, "missing": False})
 
-    return generated_items, sorted(by_date.keys())
+    recorded_dates = sorted(by_date.keys()) if has_success_record else []
+    return generated_items, recorded_dates
+
+
+def _trend_launch_band(days_since_start: int) -> tuple[float, float]:
+    """首次成功前的新任务启动带宽：第 5 个自然日起稳定在 50-60。"""
+    elapsed = max(0, int(days_since_start or 0))
+    if elapsed <= 0:
+        return 1.2, 4.8
+    if elapsed == 1:
+        return 7.0, 13.0
+    if elapsed == 2:
+        return 17.0, 26.0
+    if elapsed == 3:
+        return 33.0, 45.0
+    return 50.0, 60.0
+
+
+def _trend_launch_rate(previous_rate: float | None, days_since_start: int, rng: random.Random) -> float:
+    band_low, band_high = _trend_launch_band(days_since_start)
+    if previous_rate is None:
+        return round(rng.uniform(band_low, band_high), 1)
+
+    band_mid = band_low + (band_high - band_low) / 2
+    if previous_rate < band_low:
+        gap = band_mid - previous_rate
+        step = max(2.0, min(13.0, gap * rng.uniform(0.58, 0.78)))
+        candidate = previous_rate + step + rng.uniform(-0.8, 0.8)
+    elif previous_rate > band_high:
+        gap = previous_rate - band_mid
+        step = max(1.0, min(6.0, gap * rng.uniform(0.25, 0.42)))
+        candidate = previous_rate - step + rng.uniform(-0.5, 0.5)
+    else:
+        drift = (band_mid - previous_rate) * rng.uniform(0.10, 0.24)
+        candidate = previous_rate + drift + rng.uniform(-1.2, 1.2)
+
+    rounded = round(max(band_low, min(band_high, candidate)), 1)
+    if rounded == round(previous_rate, 1):
+        nudge = 0.7 if previous_rate <= band_low + 0.7 else -0.7 if previous_rate >= band_high - 0.7 else (0.7 if rng.random() >= 0.5 else -0.7)
+        rounded = round(max(band_low, min(band_high, previous_rate + nudge)), 1)
+    return rounded
+
+
+def _trend_success_rate(previous_rate: float | None, rng: random.Random) -> float:
+    """成功后向成功区间靠拢，但从前序曲线自然接续。"""
+    if previous_rate is None:
+        return round(rng.uniform(80.0, 86.0), 1)
+    if previous_rate >= 80.0:
+        return _trend_gap_rate(previous_rate, 80.0, 100.0, rng)
+
+    candidate = 80.0 + min(
+        6.0,
+        max(0.0, (previous_rate - 50.0) * 0.25 + rng.uniform(0.0, 3.0)),
+    )
+    return round(max(80.0, min(86.0, candidate)), 1)
 
 
 def _brand_trend_cache_key(task_name: str, brands: list[str] | None, *, task_id: str = "") -> str:
@@ -1172,24 +1252,50 @@ def _save_brand_trend_cache(task_name: str, brands: list[str] | None, items: lis
 
 
 def _trend_gap_rate(previous_rate: float | None, zone_low: float, zone_high: float, rng: random.Random) -> float:
-    """生成无命中/未运行日的展示值，带步长限制和区间限制。"""
-    if previous_rate is None:
-        if zone_high <= zone_low:
-            return round(zone_low, 1)
-        start_low = max(zone_low, zone_high - max(5.0, (zone_high - zone_low) * 0.4))
-        return round(rng.uniform(start_low, zone_high), 1)
+    """生成无命中/未运行日的展示值；跨区间时做限幅过渡，避免折线突跳。"""
+    if zone_high <= zone_low:
+        return round(zone_low, 1)
 
-    step_limit = max(1.0, round(previous_rate * 0.05, 1))
-    target = zone_low
-    pull = min(step_limit, max(0.8, abs(previous_rate - target) * rng.uniform(0.28, 0.45)))
-    candidate = previous_rate - pull + rng.uniform(-0.6, 0.6)
-    candidate = max(zone_low, min(zone_high, candidate))
-    lower = previous_rate - step_limit
-    upper = previous_rate + step_limit
-    if lower <= upper:
-        candidate = max(lower, min(upper, candidate))
+    zone_width = zone_high - zone_low
+    zone_mid = zone_low + zone_width / 2
+    if previous_rate is None:
+        return round(rng.uniform(zone_low, zone_high), 1)
+
+    if previous_rate < zone_low:
+        gap = zone_low - previous_rate
+        step_limit = max(4.0, min(14.0, gap * 0.55 + 2.0))
+        candidate = previous_rate + step_limit + rng.uniform(-1.0, 1.0)
+        candidate = max(previous_rate + 1.0, min(zone_high, candidate))
+        return round(candidate, 1)
+
+    if previous_rate > zone_high:
+        gap = previous_rate - zone_high
+        step_limit = max(4.0, min(16.0, gap * 0.55 + 2.0))
+        candidate = previous_rate - step_limit + rng.uniform(-1.0, 1.0)
         candidate = max(zone_low, min(zone_high, candidate))
-    return round(candidate, 1)
+        return round(candidate, 1)
+
+    step_limit = max(1.2, min(4.0, zone_width * 0.18))
+    drift = (zone_mid - previous_rate) * rng.uniform(0.08, 0.22)
+    candidate = previous_rate + drift + rng.uniform(-step_limit, step_limit)
+
+    if candidate < zone_low:
+        candidate = zone_low + (zone_low - candidate) * rng.uniform(0.35, 0.85)
+    elif candidate > zone_high:
+        candidate = zone_high - (candidate - zone_high) * rng.uniform(0.35, 0.85)
+    candidate = max(zone_low, min(zone_high, candidate))
+
+    rounded = round(candidate, 1)
+    if rounded == round(previous_rate, 1):
+        nudge = max(0.3, min(1.2, zone_width * 0.04))
+        if previous_rate <= zone_low + nudge:
+            candidate = previous_rate + nudge
+        elif previous_rate >= zone_high - nudge:
+            candidate = previous_rate - nudge
+        else:
+            candidate = previous_rate + (nudge if rng.random() >= 0.5 else -nudge)
+        rounded = round(max(zone_low, min(zone_high, candidate)), 1)
+    return rounded
 
 
 def _trend_failure_zone(failed_run_count: int) -> tuple[float, float]:
