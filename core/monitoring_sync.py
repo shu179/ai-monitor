@@ -9,11 +9,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .app_paths import resolve_app_path
-from .daily_task_state import STATE_PATH as DAILY_TASK_STATUS_PATH
-from .diagnostics import DIAGNOSTICS_PATH
-from .history import HISTORY_DIR
-from .scheduler_state import STATE_PATH as SCHEDULER_STATE_PATH
+from .daily_task_state import get_state_path as get_daily_task_status_path
+from .diagnostics import get_diagnostics_path
+from .history import get_history_dir
+from .scheduler_state import get_state_path as get_scheduler_state_path
 
 
 def _read_json_file(path: Path, default):
@@ -53,9 +52,10 @@ def _merge_dicts(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, An
 
 
 def _list_history_files() -> list[Path]:
-    if not HISTORY_DIR.exists():
+    history_dir = get_history_dir()
+    if not history_dir.exists():
         return []
-    return sorted(path for path in HISTORY_DIR.glob("*.json") if path.is_file())
+    return sorted(path for path in history_dir.glob("*.json") if path.is_file())
 
 
 def _record_dedupe_key(item: Any) -> str:
@@ -87,9 +87,9 @@ def export_monitoring_sync_bundle() -> dict[str, Any]:
 
     return {
         "history_files": history_files,
-        "daily_task_status": _read_json_file(DAILY_TASK_STATUS_PATH, {}),
-        "scheduler_state": _read_json_file(SCHEDULER_STATE_PATH, {}),
-        "diagnostics": _read_json_file(DIAGNOSTICS_PATH, []),
+        "daily_task_status": _read_json_file(get_daily_task_status_path(), {}),
+        "scheduler_state": _read_json_file(get_scheduler_state_path(), {}),
+        "diagnostics": _read_json_file(get_diagnostics_path(), []),
     }
 
 
@@ -104,7 +104,7 @@ def import_monitoring_sync_bundle(bundle: dict[str, Any] | None, *, mode: str = 
         history_files = {}
 
     imported_history_files = 0
-    if normalized_mode == "replace" and HISTORY_DIR.exists():
+    if normalized_mode == "replace" and get_history_dir().exists():
         for path in _list_history_files():
             try:
                 path.unlink()
@@ -115,7 +115,7 @@ def import_monitoring_sync_bundle(bundle: dict[str, Any] | None, *, mode: str = 
         file_name = Path(str(raw_name or "").strip()).name
         if not file_name.endswith(".json"):
             continue
-        target_path = HISTORY_DIR / file_name
+        target_path = get_history_dir() / file_name
         incoming_data = copy.deepcopy(raw_data)
         if normalized_mode == "replace":
             final_data = incoming_data
@@ -135,30 +135,30 @@ def import_monitoring_sync_bundle(bundle: dict[str, Any] | None, *, mode: str = 
         if normalized_mode == "replace":
             final_daily = copy.deepcopy(daily_payload)
         else:
-            final_daily = _merge_dicts(_read_json_file(DAILY_TASK_STATUS_PATH, {}), daily_payload)
-        _write_json_atomic(DAILY_TASK_STATUS_PATH, final_daily)
+            final_daily = _merge_dicts(_read_json_file(get_daily_task_status_path(), {}), daily_payload)
+        _write_json_atomic(get_daily_task_status_path(), final_daily)
     else:
-        final_daily = _read_json_file(DAILY_TASK_STATUS_PATH, {})
+        final_daily = _read_json_file(get_daily_task_status_path(), {})
 
     scheduler_payload = payload.get("scheduler_state", {})
     if isinstance(scheduler_payload, dict):
         if normalized_mode == "replace":
             final_scheduler = copy.deepcopy(scheduler_payload)
         else:
-            final_scheduler = _merge_dicts(_read_json_file(SCHEDULER_STATE_PATH, {}), scheduler_payload)
-        _write_json_atomic(SCHEDULER_STATE_PATH, final_scheduler)
+            final_scheduler = _merge_dicts(_read_json_file(get_scheduler_state_path(), {}), scheduler_payload)
+        _write_json_atomic(get_scheduler_state_path(), final_scheduler)
     else:
-        final_scheduler = _read_json_file(SCHEDULER_STATE_PATH, {})
+        final_scheduler = _read_json_file(get_scheduler_state_path(), {})
 
     diagnostics_payload = payload.get("diagnostics", [])
     if isinstance(diagnostics_payload, list):
         if normalized_mode == "replace":
             final_diagnostics = copy.deepcopy(diagnostics_payload)
         else:
-            final_diagnostics = _merge_lists(_read_json_file(DIAGNOSTICS_PATH, []), diagnostics_payload)
-        _write_json_atomic(DIAGNOSTICS_PATH, final_diagnostics)
+            final_diagnostics = _merge_lists(_read_json_file(get_diagnostics_path(), []), diagnostics_payload)
+        _write_json_atomic(get_diagnostics_path(), final_diagnostics)
     else:
-        final_diagnostics = _read_json_file(DIAGNOSTICS_PATH, [])
+        final_diagnostics = _read_json_file(get_diagnostics_path(), [])
 
     return {
         "mode": normalized_mode,

@@ -292,6 +292,8 @@ class SmartScheduler:
     def should_run_task_today(self, task: dict, now: datetime | None = None) -> bool:
         if not task.get("enabled", True):
             return False
+        if bool(task.get("delete_pending")):
+            return False
         current = now or datetime.now()
         today = current.date()
 
@@ -963,6 +965,16 @@ class SmartScheduler:
                 name: (now - started_at).total_seconds()
                 for name, (started_at, _) in self._task_start_times.items()
             }
+
+    def get_running_task_ids(self) -> list[str]:
+        with self._state_lock:
+            task_ids: set[str] = set()
+            for _, unit in self._task_start_times.values():
+                for key in ("_scheduler_original_task_id", "_scheduler_unit_id", "task_id"):
+                    value = str((unit or {}).get(key) or "").strip()
+                    if value:
+                        task_ids.add(value)
+            return sorted(task_ids)
 
     def get_status(self) -> dict:
         self._refresh_config()

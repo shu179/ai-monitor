@@ -196,7 +196,6 @@ const DEFAULT_PROFILE_AVATAR =
 const AVATAR_CROP_VIEWPORT = 240;
 const AVATAR_OUTPUT_SIZE = 320;
 const AVATAR_MAX_ZOOM = 3;
-
 const PLATFORM_LABELS: Record<string, string> = {
   local_model: "本地模型",
   doubao: "豆包",
@@ -830,7 +829,7 @@ export function SettingsContent({
   localOCR?: boolean,
   setLocalOCR?: (val: boolean) => void,
   onSaveSuccess?: (message?: string) => void,
-  onLogout?: () => void,
+  onLogout?: () => void | Promise<void>,
 }) {
   const normalizeBrowserAnswerMode = useCallback((value: unknown) => {
     const mode = String(value || "page").trim().toLowerCase();
@@ -920,7 +919,6 @@ export function SettingsContent({
   const [localUpdatePlanMessage, setLocalUpdatePlanMessage] = useState("");
   const [localUpdatePlanSummary, setLocalUpdatePlanSummary] = useState("");
   const [localUpdatePending, setLocalUpdatePending] = useState(false);
-
   // New states for models
   const [smartPlatform, setSmartPlatform] = useState("");
   const [smartModel, setSmartModel] = useState("");
@@ -3937,7 +3935,7 @@ export function SettingsContent({
           onLogout?.();
         }}
         title="确认退出登录？"
-        message="退出后会切换为访客模式，本地活动仍可查看，但账号信息与高级权限会暂时收起，确认退出吗？"
+        message="退出后会回到登录页，本地会保留登录前产生的待上传队列，确认退出吗？"
         confirmText="退出"
         type="danger"
       />
