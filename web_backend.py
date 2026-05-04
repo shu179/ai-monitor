@@ -6,7 +6,9 @@ UI. It serves both API endpoints and the built frontend assets.
 
 from __future__ import annotations
 
+import base64
 import copy
+import hashlib
 import importlib
 import json
 import mimetypes
@@ -15,6 +17,7 @@ import re
 import secrets
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -2115,6 +2118,214 @@ class AppRuntime:
     def _recognition_browser_is_alive(self) -> bool:
         return isinstance(self._recognition_browser_json("/json/version", timeout=0.5), dict)
 
+    @staticmethod
+    def _websocket_frame(opcode: int, payload: bytes = b"") -> bytes:
+        mask_key = os.urandom(4)
+        first_byte = 0x80 | (int(opcode) & 0x0F)
+        length = len(payload)
+        header = bytearray([first_byte])
+        if length < 126:
+            header.append(0x80 | length)
+        elif length <= 0xFFFF:
+            header.extend([0x80 | 126])
+            header.extend(struct.pack("!H", length))
+        else:
+            header.extend([0x80 | 127])
+            header.extend(struct.pack("!Q", length))
+        masked = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+        return bytes(header) + mask_key + masked
+
+    @staticmethod
+    def _websocket_recv_exact(sock: socket.socket, size: int) -> bytes:
+        chunks: list[bytes] = []
+        remaining = int(size or 0)
+        while remaining > 0:
+            chunk = sock.recv(remaining)
+            if not chunk:
+                raise RuntimeError("WebSocket 连接已关闭")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _websocket_recv_frame(self, sock: socket.socket) -> tuple[int, bool, bytes]:
+        header = self._websocket_recv_exact(sock, 2)
+        first, second = header[0], header[1]
+        fin = bool(first & 0x80)
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._websocket_recv_exact(sock, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._websocket_recv_exact(sock, 8))[0]
+        mask_key = self._websocket_recv_exact(sock, 4) if masked else b""
+        payload = self._websocket_recv_exact(sock, int(length)) if length else b""
+        if masked and mask_key:
+            payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+        return opcode, fin, payload
+
+    def _cdp_browser_command(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = 1.5,
+    ) -> dict[str, Any] | None:
+        version = self._recognition_browser_json("/json/version", timeout=timeout)
+        if not isinstance(version, dict):
+            return None
+        ws_url = str(version.get("webSocketDebuggerUrl") or "").strip()
+        if not ws_url:
+            return None
+        parsed = urlparse(ws_url)
+        if parsed.scheme != "ws" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            return None
+        host = parsed.hostname or "127.0.0.1"
+        port = int(parsed.port or 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        websocket_guid = "".join(("258EA", "FA5-E", "914-47", "DA-95", "CA-C5", "AB0DC", "85B11"))
+        expected_accept = base64.b64encode(
+            hashlib.sha1((key + websocket_guid).encode("ascii")).digest()
+        ).decode("ascii")
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        ).encode("ascii")
+
+        try:
+            with socket.create_connection((host, port), timeout=max(0.2, float(timeout or 1.5))) as sock:
+                sock.settimeout(max(0.2, float(timeout or 1.5)))
+                sock.sendall(request)
+                response = b""
+                while b"\r\n\r\n" not in response and len(response) < 8192:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+                header_text = response.decode("iso-8859-1", errors="replace")
+                status_line = header_text.split("\r\n", 1)[0]
+                if " 101 " not in status_line:
+                    return None
+                if f"Sec-WebSocket-Accept: {expected_accept}".casefold() not in header_text.casefold():
+                    return None
+
+                message = json.dumps(
+                    {"id": 1, "method": str(method or "").strip(), "params": params or {}},
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                sock.sendall(self._websocket_frame(0x1, message))
+
+                deadline = time.time() + max(0.2, float(timeout or 1.5))
+                fragments: list[bytes] = []
+                while time.time() < deadline:
+                    opcode, fin, payload = self._websocket_recv_frame(sock)
+                    if opcode == 0x8:
+                        return None
+                    if opcode == 0x9:
+                        sock.sendall(self._websocket_frame(0xA, payload))
+                        continue
+                    if opcode not in {0x0, 0x1}:
+                        continue
+                    fragments.append(payload)
+                    if not fin:
+                        continue
+                    decoded = b"".join(fragments).decode("utf-8", errors="replace")
+                    fragments.clear()
+                    result = json.loads(decoded)
+                    if isinstance(result, dict) and result.get("id") == 1:
+                        return result
+        except Exception:
+            return None
+        return None
+
+    def _recognition_browser_target_id(self) -> str:
+        tabs = self._recognition_browser_json("/json/list", timeout=0.7)
+        if not isinstance(tabs, list):
+            return ""
+        cached_tab_ids = {
+            str(tab_id or "").strip()
+            for tab_id in self._recognition_browser_tabs.values()
+            if str(tab_id or "").strip()
+        }
+        candidates: list[dict[str, Any]] = [tab for tab in tabs if isinstance(tab, dict)]
+        for tab in candidates:
+            tab_id = str(tab.get("id") or "").strip()
+            if tab_id and tab_id in cached_tab_ids:
+                return tab_id
+        for tab in candidates:
+            tab_id = str(tab.get("id") or "").strip()
+            tab_type = str(tab.get("type") or "").strip()
+            tab_url = str(tab.get("url") or "").strip()
+            if tab_id and tab_type == "page" and not tab_url.startswith(("chrome://", "devtools://")):
+                return tab_id
+        return ""
+
+    def _recognition_browser_window_info(self) -> dict[str, Any] | None:
+        target_id = self._recognition_browser_target_id()
+        if not target_id:
+            return None
+        result = self._cdp_browser_command(
+            "Browser.getWindowForTarget",
+            {"targetId": target_id},
+            timeout=1.5,
+        )
+        payload = result.get("result") if isinstance(result, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            window_id = int(payload.get("windowId") or 0)
+        except Exception:
+            window_id = 0
+        if window_id <= 0:
+            return None
+        bounds = payload.get("bounds") if isinstance(payload.get("bounds"), dict) else {}
+        return {
+            "window_id": window_id,
+            "window_state": str((bounds or {}).get("windowState") or "").strip(),
+            "target_id": target_id,
+        }
+
+    def _recognition_browser_window_state(self) -> str:
+        info = self._recognition_browser_window_info()
+        if not isinstance(info, dict):
+            return ""
+        return str(info.get("window_state") or "").strip()
+
+    def _set_recognition_browser_window_state(self, window_state: str) -> bool:
+        target_state = str(window_state or "").strip()
+        if target_state not in {"normal", "minimized", "maximized", "fullscreen"}:
+            return False
+        info = self._recognition_browser_window_info()
+        if not isinstance(info, dict):
+            return False
+        window_id = int(info.get("window_id") or 0)
+        if window_id <= 0:
+            return False
+        current_state = str(info.get("window_state") or "").strip()
+        if current_state == target_state:
+            if target_state == "normal":
+                self._activate_existing_browser_window()
+            return True
+        result = self._cdp_browser_command(
+            "Browser.setWindowBounds",
+            {"windowId": window_id, "bounds": {"windowState": target_state}},
+            timeout=1.5,
+        )
+        if not isinstance(result, dict) or result.get("error"):
+            return False
+        if target_state == "normal":
+            self._activate_existing_browser_window()
+        return True
+
     def _wait_recognition_browser_ready(self, *, timeout_seconds: float = 8.0) -> bool:
         deadline = time.time() + max(0.5, float(timeout_seconds or 0.0))
         while time.time() < deadline:
@@ -2403,6 +2614,19 @@ class AppRuntime:
             "session_external_in_use": bool((session or {}).get("external_in_use")),
         }
 
+    def _recognition_shared_browser_pids(self) -> list[int]:
+        candidates: list[int] = []
+        candidates.extend(int(pid) for pid in self._recognition_browser_launch_pids if int(pid or 0) > 0)
+        candidates.extend(int(pid) for pid in browser_profile_owner_pids(self._recognition_browser_profile) if int(pid or 0) > 0)
+        pids: list[int] = []
+        seen: set[int] = set()
+        for pid in candidates:
+            if pid <= 0 or pid in seen:
+                continue
+            seen.add(pid)
+            pids.append(pid)
+        return pids
+
     def _activate_existing_browser_window(self) -> bool:
         if sys.platform == "win32":
             try:
@@ -2436,10 +2660,10 @@ class AppRuntime:
         return activated
 
     def _minimize_recognition_shared_browser(self) -> bool:
-        pids = [pid for pid in self._recognition_browser_launch_pids if int(pid or 0) > 0]
-        if not pids:
-            pids = browser_profile_owner_pids(self._recognition_browser_profile)
-        pids = [int(pid) for pid in pids if int(pid or 0) > 0]
+        if self._set_recognition_browser_window_state("minimized"):
+            return True
+
+        pids = self._recognition_shared_browser_pids()
         if not pids:
             return False
 
@@ -2531,10 +2755,14 @@ return changedCount
         return False
 
     def _restore_recognition_shared_browser(self) -> bool:
-        pids = [pid for pid in self._recognition_browser_launch_pids if int(pid or 0) > 0]
-        if not pids:
-            pids = browser_profile_owner_pids(self._recognition_browser_profile)
-        pids = [int(pid) for pid in pids if int(pid or 0) > 0]
+        window_state = self._recognition_browser_window_state()
+        if window_state and window_state != "minimized":
+            self._recognition_browser_minimized = False
+            return self._activate_existing_browser_window() or True
+        if self._set_recognition_browser_window_state("normal"):
+            return True
+
+        pids = self._recognition_shared_browser_pids()
         if not pids:
             return False
 
@@ -2634,7 +2862,9 @@ return changedCount
 
     def _toggle_recognition_shared_browser(self) -> tuple[str, bool]:
         with self._recognition_browser_lock:
-            if self._recognition_browser_minimized:
+            window_state = self._recognition_browser_window_state()
+            should_restore = window_state == "minimized" or (not window_state and self._recognition_browser_minimized)
+            if should_restore:
                 restored = self._restore_recognition_shared_browser()
                 if restored:
                     self._recognition_browser_minimized = False

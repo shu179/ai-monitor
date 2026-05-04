@@ -802,6 +802,15 @@ export function OcrFloatingWindow({
     flashActionMessage(result.ok ? (result.message || "请框选截图区域") : result.message || "截图失败");
   }, [flashActionMessage]);
 
+  const handleTogglePlatformBrowser = useCallback(async () => {
+    platformBrowserCloseRequestedRef.current = false;
+    const result = await recognitionAction("toggle_platform_browser");
+    flashActionMessage(result.ok ? (result.message || "已切换浏览器窗口") : result.message || "浏览器窗口切换失败");
+    if (result.ok) {
+      platformBrowserOpenedRef.current = true;
+    }
+  }, [flashActionMessage]);
+
   const handleResidentArticleSubmit = useCallback(async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const url = residentArticleInput.trim();
@@ -940,12 +949,7 @@ export function OcrFloatingWindow({
       ballClickCountRef.current = 0;
       ballClickTimerRef.current = null;
       if (clickCount >= 2) {
-        if (isResidentToolMode && !platformBrowserOpenedRef.current) {
-          flashActionMessage("请先打开平台");
-          return;
-        }
-        platformBrowserCloseRequestedRef.current = false;
-        void recognitionAction("toggle_platform_browser");
+        void handleTogglePlatformBrowser();
         collapseWindow();
         return;
       }
@@ -955,7 +959,7 @@ export function OcrFloatingWindow({
       }
       expandWindow();
     }, 320);
-  }, [ballMenuOpen, collapseWindow, expandWindow, expanded, flashActionMessage, isResidentToolMode]);
+  }, [ballMenuOpen, collapseWindow, expandWindow, expanded, handleTogglePlatformBrowser]);
 
   const statusDetailMessage = detailText.trim();
   const helperMessage = actionMessage

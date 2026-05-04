@@ -281,6 +281,62 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         runtime._open_recognition_shared_browser_tab.assert_called_once_with("doubao")
 
+    def test_toggle_recognition_browser_uses_actual_minimized_state(self):
+        runtime = AppRuntime()
+        runtime._recognition_browser_minimized = False
+
+        with patch.object(runtime, "_recognition_browser_window_state", return_value="minimized"), patch.object(
+            runtime,
+            "_restore_recognition_shared_browser",
+            return_value=True,
+        ) as restore_mock, patch.object(runtime, "_minimize_recognition_shared_browser") as minimize_mock:
+            toggled_to, changed = runtime._toggle_recognition_shared_browser()
+
+        self.assertEqual(toggled_to, "restore")
+        self.assertTrue(changed)
+        self.assertFalse(runtime._recognition_browser_minimized)
+        restore_mock.assert_called_once()
+        minimize_mock.assert_not_called()
+
+    def test_toggle_recognition_browser_actual_state_overrides_stale_flag(self):
+        runtime = AppRuntime()
+        runtime._recognition_browser_minimized = True
+
+        with patch.object(runtime, "_recognition_browser_window_state", return_value="normal"), patch.object(
+            runtime,
+            "_minimize_recognition_shared_browser",
+            return_value=True,
+        ) as minimize_mock, patch.object(runtime, "_restore_recognition_shared_browser") as restore_mock:
+            toggled_to, changed = runtime._toggle_recognition_shared_browser()
+
+        self.assertEqual(toggled_to, "minimize")
+        self.assertTrue(changed)
+        self.assertTrue(runtime._recognition_browser_minimized)
+        minimize_mock.assert_called_once()
+        restore_mock.assert_not_called()
+
+    def test_recognition_browser_window_state_reads_cdp_window_bounds(self):
+        runtime = AppRuntime()
+        runtime._recognition_browser_tabs = {"doubao": "tab-1"}
+
+        def fake_browser_json(path, *, timeout=1.0):
+            if path == "/json/list":
+                return [{"id": "tab-1", "type": "page", "url": "https://example.com"}]
+            return None
+
+        runtime._recognition_browser_json = Mock(side_effect=fake_browser_json)
+        runtime._cdp_browser_command = Mock(return_value={
+            "id": 1,
+            "result": {"windowId": 7, "bounds": {"windowState": "minimized"}},
+        })
+
+        self.assertEqual(runtime._recognition_browser_window_state(), "minimized")
+        runtime._cdp_browser_command.assert_called_once_with(
+            "Browser.getWindowForTarget",
+            {"targetId": "tab-1"},
+            timeout=1.5,
+        )
+
     def test_recognition_action_can_trigger_system_screenshot(self):
         runtime = AppRuntime()
         runtime._recognition_manager = FakeRecognitionManager(running=True)
