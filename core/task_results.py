@@ -249,7 +249,15 @@ def finalize_daily_pool_keyword_results(
     }
 
 
-def record_result_history(task_name: str, result: dict, *, execution_source: str = '', task_id: str = '') -> None:
+def record_result_history(
+    task_name: str,
+    result: dict,
+    *,
+    execution_source: str = '',
+    task_id: str = '',
+    cloud_task_id: object = None,
+    run_started_at: str = '',
+) -> None:
     from core.history import record as history_record
 
     if execution_source == 'manual_test' and result.get('rank', 99) == 99:
@@ -261,6 +269,12 @@ def record_result_history(task_name: str, result: dict, *, execution_source: str
     body_references = result.get('body_references', [])
     if not isinstance(body_references, list):
         body_references = []
+    resolved_cloud_task_id = (
+        cloud_task_id
+        or result.get('cloud_task_id')
+        or result.get('cloudTaskId')
+        or _cloud_task_id_from_local_task_id(task_id)
+    )
 
     previous_index_signature = None
     build_reference_index_source_signature = None
@@ -279,6 +293,18 @@ def record_result_history(task_name: str, result: dict, *, execution_source: str
         build_reference_index_source_signature = None
         update_reference_index_with_records = None
 
+    extra_payload = {
+        'references': references,
+        'body_references': body_references,
+        'reference_count': len(references),
+        'body_reference_count': len(body_references),
+        'total_reference_count': len(references) + len(body_references),
+    }
+    if resolved_cloud_task_id:
+        extra_payload['cloud_task_id'] = resolved_cloud_task_id
+    if str(run_started_at or '').strip():
+        extra_payload['run_started_at'] = str(run_started_at or '').strip()
+
     written_entry = history_record(
         task_name,
         result.get('platform', ''),
@@ -289,21 +315,15 @@ def record_result_history(task_name: str, result: dict, *, execution_source: str
         task_id=task_id,
         details={
             'screenshot': result.get('screenshot'),
-            'answer_text': result.get('answer_text'),
-            'evidence': result.get('evidence'),
+            'answer_text': '',
+            'evidence': '',
             'error_message': result.get('error_message'),
             'highlight_count': result.get('highlight_count', 0),
             'diagnostic_id': result.get('diagnostic_id', ''),
             'mode': result.get('mode', ''),
             'recovered_manually': result.get('recovered_manually', False),
             'execution_source': execution_source,
-            'extra': {
-                'references': references,
-                'body_references': body_references,
-                'reference_count': len(references),
-                'body_reference_count': len(body_references),
-                'total_reference_count': len(references) + len(body_references),
-            },
+            'extra': extra_payload,
         },
     )
     if isinstance(written_entry, dict) and build_reference_index_source_signature and update_reference_index_with_records:
@@ -318,6 +338,28 @@ def record_result_history(task_name: str, result: dict, *, execution_source: str
             )
         except Exception:
             pass
+
+    if isinstance(written_entry, dict):
+        try:
+            from core.cloud_run_sync import enqueue_run_record_from_history
+
+            enqueue_run_record_from_history(
+                written_entry,
+                cloud_task_id=resolved_cloud_task_id,
+            )
+        except Exception:
+            pass
+
+
+def _cloud_task_id_from_local_task_id(task_id: object) -> int | None:
+    text = str(task_id or '').strip()
+    if not text.startswith('cloud_'):
+        return None
+    try:
+        value = int(text.split('_', 1)[1])
+    except Exception:
+        return None
+    return value if value > 0 else None
 
 
 STRUCTURAL_ERROR_PATTERNS = (

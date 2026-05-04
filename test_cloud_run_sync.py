@@ -125,12 +125,32 @@ class CloudRunSyncTests(unittest.TestCase):
         self.assertNotIn("evidence", event["payload"]["result"])
         self.assertNotIn("references", event["payload"]["result"])
         self.assertNotIn("body_references", event["payload"]["result"])
+        self.assertTrue(event["payload"]["run_started_at"].startswith("2026-05-03T12:50:00"))
         self.assertEqual(event["payload"]["result"]["total_reference_count"], 2)
 
         reference_events = history_record_to_reference_events(record, cloud_task_id=1)
         self.assertEqual(len(reference_events), 2)
         self.assertEqual(reference_events[0]["event_type"], "article_reference_event")
+        self.assertTrue(reference_events[0]["payload"]["run_started_at"].startswith("2026-05-03T12:50:00"))
         self.assertEqual(reference_events[0]["payload"]["normalized_url"], "https://example.com/a")
+
+    def test_history_record_to_run_event_preserves_explicit_run_started_at(self):
+        record = {
+            "id": "history-explicit-start",
+            "ts": "2026-05-03 12:50",
+            "platform": "doubao",
+            "keyword": "测试品牌",
+            "brand": "测试品牌",
+            "rank": 1,
+            "success": True,
+            "extra": {"run_started_at": "2026-05-03T08:00:00+08:00"},
+        }
+
+        event = history_record_to_run_event(record, cloud_task_id=1)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event["payload"]["run_started_at"], "2026-05-03T08:00:00+08:00")
 
     def test_cloud_outbox_dedupes_run_records(self):
         with tempfile.TemporaryDirectory() as tmpdir:

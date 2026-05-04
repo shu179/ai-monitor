@@ -823,6 +823,7 @@ def run_task_group(
         task = {**task, 'keywords': [{'keyword': task['keyword'], 'brand': task.get('brand', ''), 'platforms': [task['platform']]}]}
 
     started_at = time.time()
+    run_started_at_text = datetime.fromtimestamp(started_at, tz=local_now().tzinfo).isoformat(timespec='seconds')
 
     keywords = task.get('keywords', [])
     if not keywords:
@@ -839,6 +840,7 @@ def run_task_group(
     default_brand = keywords[0].get('brand', '') if keywords else ''
     task_name = task.get('name', default_brand)
     history_task_id = str(task.get('_scheduler_original_task_id') or task.get('task_id') or '').strip()
+    cloud_task_id = task.get('cloud_task_id') or task.get('cloudTaskId')
     daily_state_task = _task_for_daily_state(task)
     day_status = get_task_day_status(daily_state_task)
     historical_keyword_states = dict(day_status.get('keyword_states') or {})
@@ -1305,7 +1307,14 @@ def run_task_group(
                     "error_message": result.get('error_message', ''),
                 })
                 try:
-                    _record_result_history(task_name, result, execution_source=execution_source, task_id=history_task_id)
+                    _record_result_history(
+                        task_name,
+                        result,
+                        execution_source=execution_source,
+                        task_id=history_task_id,
+                        cloud_task_id=cloud_task_id,
+                        run_started_at=run_started_at_text,
+                    )
                 except Exception as he:
                     print(f"[Main] 历史记录失败: {he}")
                 return result
@@ -1340,7 +1349,14 @@ def run_task_group(
                     "error_message": str(e),
                 })
                 try:
-                    _record_result_history(task_name, result, execution_source=execution_source, task_id=history_task_id)
+                    _record_result_history(
+                        task_name,
+                        result,
+                        execution_source=execution_source,
+                        task_id=history_task_id,
+                        cloud_task_id=cloud_task_id,
+                        run_started_at=run_started_at_text,
+                    )
                 except Exception as he:
                     print(f"[Main] 历史记录失败: {he}")
                 return result
@@ -1487,7 +1503,14 @@ def run_task_group(
                     "error_message": result.get('error_message', ''),
                 })
                 try:
-                    _record_result_history(task_name, result, execution_source=execution_source, task_id=history_task_id)
+                    _record_result_history(
+                        task_name,
+                        result,
+                        execution_source=execution_source,
+                        task_id=history_task_id,
+                        cloud_task_id=cloud_task_id,
+                        run_started_at=run_started_at_text,
+                    )
                 except Exception as he:
                     print(f"[Main] 历史记录失败: {he}")
                 return result
@@ -1532,7 +1555,14 @@ def run_task_group(
                     "error_message": str(e),
                 })
                 try:
-                    _record_result_history(task_name, result, execution_source=execution_source, task_id=history_task_id)
+                    _record_result_history(
+                        task_name,
+                        result,
+                        execution_source=execution_source,
+                        task_id=history_task_id,
+                        cloud_task_id=cloud_task_id,
+                        run_started_at=run_started_at_text,
+                    )
                 except Exception as he:
                     print(f"[Main] 历史记录失败: {he}")
                 return result
@@ -1654,7 +1684,14 @@ def run_task_group(
                     "error_message": result.get('error_message', ''),
                 })
                 try:
-                    _record_result_history(task_name, result, execution_source=execution_source, task_id=history_task_id)
+                    _record_result_history(
+                        task_name,
+                        result,
+                        execution_source=execution_source,
+                        task_id=history_task_id,
+                        cloud_task_id=cloud_task_id,
+                        run_started_at=run_started_at_text,
+                    )
                 except Exception as he:
                     print(f"[Main] 历史记录失败: {he}")
                 return result
@@ -1703,7 +1740,14 @@ def run_task_group(
                 "error_message": str(e),
             })
             try:
-                _record_result_history(task_name, result, execution_source=execution_source, task_id=history_task_id)
+                _record_result_history(
+                    task_name,
+                    result,
+                    execution_source=execution_source,
+                    task_id=history_task_id,
+                    cloud_task_id=cloud_task_id,
+                    run_started_at=run_started_at_text,
+                )
             except Exception as he:
                 print(f"[Main] 历史记录失败: {he}")
             return result

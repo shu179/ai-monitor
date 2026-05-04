@@ -1,8 +1,10 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import main
+from core.cloud_outbox import CloudOutbox
 from core.task_results import (
     build_execution_report,
     count_task_keywords,
@@ -89,19 +91,56 @@ class TaskResultsTests(unittest.TestCase):
                         "brand": "品牌A",
                         "rank": 1,
                         "mode": "browser",
+                        "answer_text": "这段回答正文不应该写入本地历史",
+                        "evidence": "命中片段也不落盘",
                         "references": [{"url": "https://example.com/a"}],
                         "body_references": [{"url": "https://example.com/b"}],
                     },
                     task_id="task-a",
+                    run_started_at="2026-05-03T08:00:00+08:00",
                 )
 
                 records = history.get_records("品牌A", task_id="task-a")
                 self.assertEqual(len(records), 1)
+                self.assertEqual(records[0].get("answer_text"), "")
+                self.assertEqual(records[0].get("evidence"), "")
                 extra = records[0].get("extra") or {}
                 self.assertEqual([item["url"] for item in extra.get("references") or []], ["https://example.com/a"])
                 self.assertEqual([item["url"] for item in extra.get("body_references") or []], ["https://example.com/b"])
                 self.assertEqual(extra.get("body_reference_count"), 1)
                 self.assertEqual(extra.get("total_reference_count"), 2)
+                self.assertEqual(extra.get("run_started_at"), "2026-05-03T08:00:00+08:00")
+            finally:
+                history.HISTORY_DIR = original_history_dir
+
+    def test_record_result_history_enqueues_cloud_event_from_cloud_task_id(self):
+        from core import history
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_history_dir = history.HISTORY_DIR
+            history.HISTORY_DIR = Path(tmpdir) / "logs" / "history"
+            outbox = CloudOutbox(Path(tmpdir) / "cloud_outbox.json")
+            try:
+                with patch("core.cloud_run_sync.CloudOutbox", return_value=outbox):
+                    record_result_history(
+                        "云端品牌",
+                        {
+                            "platform": "doubao",
+                            "keyword": "云端关键词",
+                            "brand": "云端品牌",
+                            "rank": 99,
+                            "mode": "browser",
+                            "error_message": "未识别到品牌名",
+                        },
+                        execution_source="manual",
+                        task_id="cloud_9",
+                    )
+
+                pending = outbox.pending()
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0]["event_type"], "run_record")
+                self.assertEqual(pending[0]["payload"]["task_id"], 9)
+                self.assertEqual(pending[0]["payload"]["brand"], "云端品牌")
             finally:
                 history.HISTORY_DIR = original_history_dir
 

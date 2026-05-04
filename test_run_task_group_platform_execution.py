@@ -134,6 +134,39 @@ class RunTaskGroupPlatformExecutionTests(unittest.TestCase):
         self.assertEqual(report["attempted_queries"], 1)
         self.assertEqual(report["success_queries"], 1)
 
+    def test_passes_task_cloud_id_to_history_records(self) -> None:
+        task = {
+            "name": "云端任务",
+            "task_id": "legacy_local_task",
+            "cloud_task_id": 42,
+            "keywords": [
+                {
+                    "keyword": "云端关键词",
+                    "brand": "云端品牌",
+                    "platforms": ["kimi"],
+                    "mode": "api",
+                }
+            ],
+        }
+
+        with patch("main._load_today_success_only_query_results", return_value={}):
+            with patch("main._record_result_history", return_value=None) as record_history:
+                with patch(
+                    "main._send_task_notifications",
+                    return_value={"attempted": False, "success": False, "found_results": 0, "error_message": ""},
+                ):
+                    results, report = main.run_task_group(
+                        task,
+                        {},
+                        {"detection_mode": "api", "platforms": {"kimi": {"api_key": ""}}},
+                        return_report=True,
+                    )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(report["attempted_queries"], 1)
+        self.assertTrue(record_history.called)
+        self.assertEqual(record_history.call_args.kwargs.get("cloud_task_id"), 42)
+
     def test_stop_checker_cancels_browser_round_without_recording_failed_query(self) -> None:
         task = self._task()
 
