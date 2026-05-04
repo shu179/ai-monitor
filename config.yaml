@@ -131,7 +131,6 @@ recognition:
   platform: doubao
   model: doubao-seed-2-0-pro-260215
   dom_render_mode: true
-  dom_render_default_platform: ''
   dom_render_min_length: 500
   dom_render_max_length: 5000
 screenshot_template:

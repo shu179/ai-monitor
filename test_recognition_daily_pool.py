@@ -692,6 +692,131 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertTrue(status["sent_today"])
         self.assertEqual(status["brand_status"], "sent")
 
+    def test_manual_test_send_keeps_current_image_when_pool_has_previous_success(self) -> None:
+        previous_path = Path(self._tmpdir.name) / "screenshots" / "previous_success.jpg"
+        current_path = Path(self._tmpdir.name) / "screenshots" / "current_success.jpg"
+        previous_path.parent.mkdir(parents=True, exist_ok=True)
+        previous_path.write_bytes(b"previous-image")
+        current_path.write_bytes(b"current-image")
+
+        task = {
+            "name": "品牌R",
+            "task_id": "task_r_manual_pool_reuse",
+            "brand": "品牌R",
+            "webhook_url": "https://example.com/webhook",
+            "recognition_batch_size": 1,
+            "_daily_state_source": "manual_test",
+            "keywords": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao"], "mode": "recognition"},
+            ],
+        }
+        batch = {
+            "id": "manual-batch-current",
+            "task_name": "品牌R",
+            "brands": ["品牌R"],
+            "image_paths": [str(current_path)],
+            "image_items": [{"path": str(current_path), "ocr_text": "新一轮示例", "source_text": "新一轮示例"}],
+            "matched_pairs": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao"]},
+            ],
+            "task": task,
+        }
+
+        notifier_calls: list[tuple] = []
+
+        class FakeNotifier:
+            def __init__(self, *args, **kwargs):
+                self.last_error = ""
+
+            def send_detected_images(self, *args, **kwargs):
+                notifier_calls.append((args, kwargs))
+                return True
+
+        stale_pool = {
+            "keywords": {
+                "词R": {
+                    "run_success": True,
+                    "screenshot_saved": True,
+                    "image_path": str(previous_path),
+                    "platform": "doubao",
+                }
+            }
+        }
+
+        with patch("core.recognition.WeComNotifier", FakeNotifier):
+            with patch.object(
+                self.manager,
+                "_prepare_send_images",
+                return_value=([str(current_path)], ["doubao"]),
+            ):
+                with patch("core.recognition.apply_task_keyword_updates", return_value=stale_pool):
+                    with patch(
+                        "core.recognition.get_task_day_status",
+                        return_value={"has_gap": False, "completed_keywords": ["词R"]},
+                    ):
+                        with patch.object(
+                            self.manager,
+                            "_extract_completed_send_state_from_pool",
+                            return_value=([str(previous_path)], ["doubao"]),
+                        ) as extract_from_pool:
+                            self.manager._send_batch(batch)
+
+        self.assertEqual(len(notifier_calls), 1)
+        self.assertEqual(notifier_calls[0][1]["screenshot_paths"], [str(current_path)])
+        extract_from_pool.assert_not_called()
+
+    def test_manual_test_send_uses_canonical_path_after_state_move(self) -> None:
+        current_path = Path(self._tmpdir.name) / "screenshots" / "recognition" / "decorated" / "current_dom.jpg"
+        current_path.parent.mkdir(parents=True, exist_ok=True)
+        current_path.write_bytes(b"current-image")
+
+        task = {
+            "name": "品牌R",
+            "task_id": "task_r_manual_moved_path",
+            "brand": "品牌R",
+            "webhook_url": "https://example.com/webhook",
+            "recognition_batch_size": 1,
+            "_daily_state_source": "manual_test",
+            "keywords": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao"], "mode": "recognition"},
+            ],
+        }
+        batch = {
+            "id": "manual-batch-moved-path",
+            "task_name": "品牌R",
+            "brands": ["品牌R"],
+            "image_paths": [str(current_path)],
+            "image_items": [{"path": str(current_path), "ocr_text": "新一轮示例", "source_text": "新一轮示例"}],
+            "matched_pairs": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao"]},
+            ],
+            "task": task,
+        }
+
+        notifier_calls: list[tuple] = []
+
+        class FakeNotifier:
+            def __init__(self, *args, **kwargs):
+                self.last_error = ""
+
+            def send_detected_images(self, *args, **kwargs):
+                notifier_calls.append((args, kwargs))
+                return True
+
+        with patch("core.recognition.WeComNotifier", FakeNotifier):
+            with patch.object(
+                self.manager,
+                "_prepare_send_images",
+                return_value=([str(current_path)], ["doubao"]),
+            ):
+                self.manager._send_batch(batch)
+
+        self.assertEqual(len(notifier_calls), 1)
+        sent_paths = notifier_calls[0][1]["screenshot_paths"]
+        self.assertEqual(len(sent_paths), 1)
+        self.assertNotEqual(sent_paths[0], str(current_path))
+        self.assertTrue(Path(sent_paths[0]).exists())
+
     def test_dom_text_send_rerenders_template_with_matched_keyword(self) -> None:
         send_path = Path(self._tmpdir.name) / "screenshots" / "dom_text.jpg"
         send_path.parent.mkdir(parents=True, exist_ok=True)
@@ -754,8 +879,7 @@ class RecognitionDailyPoolTests(unittest.TestCase):
 
         with patch.object(manager, "_poll_clipboard_text", return_value="这是一段包含品牌R的原始回答正文"):
             with patch.object(manager, "_match_brands_from_text", return_value=["品牌R"]):
-                with patch.object(manager, "_render_text_to_screenshot") as render_mock:
-                    manager._poll_once_text_mode()
+                manager._poll_once_text_mode()
 
         self.assertEqual(manager._recognition_queue.qsize(), 1)
         payload = manager._recognition_queue.get_nowait()
@@ -764,7 +888,6 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertEqual(payload["matched_brands"], ["品牌R"])
         self.assertTrue(payload["skip_ai_recognition"])
         self.assertEqual(payload["platform_hint"], "doubao")
-        render_mock.assert_not_called()
 
     def test_dom_text_send_rerenders_template_without_intermediate_image(self) -> None:
         batch = {

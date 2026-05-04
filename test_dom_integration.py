@@ -85,9 +85,9 @@ Kimi是月之暗面推出的智能助手。
     print("  1. 检测到剪贴板文本变化")
     print("  2. 文本长度检查通过（{} 字符）".format(len(test_text)))
     print("  3. 品牌匹配：DeepSeek, Kimi, 豆包")
-    print("  4. 渲染为格式化截图（markdown → HTML → 截图）")
-    print("  5. 跳过AI识别（已在文本态完成）")
-    print("  6. 路由到对应任务批次")
+    print("  4. 跳过AI识别（已在文本态完成）")
+    print("  5. 路由到对应任务批次")
+    print("  6. 发送前使用最终关键词和品牌渲染通知截图")
     print("  7. 发送企业微信通知")
     print()
 
@@ -105,12 +105,10 @@ Kimi是月之暗面推出的智能助手。
 
     recognition_config = config.get("recognition", {})
     dom_mode = recognition_config.get("dom_render_mode", False)
-    default_platform = recognition_config.get("dom_render_default_platform", "")
     min_length = recognition_config.get("dom_render_min_length", 10)
     max_length = recognition_config.get("dom_render_max_length", 50000)
 
     print(f"DOM渲染模式: {'✅ 已启用' if dom_mode else '❌ 未启用（需要设置为true）'}")
-    print(f"默认平台: {default_platform or '未设置（将显示AI）'}")
     print(f"文本长度限制: {min_length} - {max_length} 字符")
     print()
 
@@ -126,9 +124,9 @@ Kimi是月之暗面推出的智能助手。
     print("4. 从AI对话页面复制一段包含品牌词的回答")
     print("5. 观察日志输出：")
     print("   - [Recognition] 文本已识别品牌 [...]")
-    print("   - [Recognition] 文本已渲染为截图: ...")
     print("   - [Recognition] 使用文本匹配结果: [...]")
-    print("6. 检查 screenshots/recognition/ 目录下的 text_*.jpg 文件")
+    print("   - [html_renderer] Satori截图已保存: ...（或 Playwright fallback 截图已保存）")
+    print("6. 检查 screenshots/recognition/decorated/ 目录下的 *_dom.jpg 文件")
     print("7. 验证企业微信是否收到通知")
     print()
 

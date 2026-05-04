@@ -61,16 +61,16 @@ Kimi是月之暗面推出的智能助手。
 
 日志输出：
 ```
-[Recognition] 文本已识别品牌 ['DeepSeek', 'Kimi', '豆包']，截图已渲染: text_0422_143025_abc12345.jpg
+[Recognition] 文本已识别品牌 ['DeepSeek', 'Kimi', '豆包']，已直接入队等待最终渲染
 [Recognition] 使用文本匹配结果: ['DeepSeek', 'Kimi', '豆包']
+[html_renderer] Satori截图已保存: ...
 ```
 
-截图文件：`screenshots/recognition/text_*.jpg`
+截图文件：`screenshots/recognition/decorated/*_dom.jpg`
 
 ## 更多信息
 
 - 详细使用指南：[docs/DOM_TEXT_MODE_GUIDE.md](docs/DOM_TEXT_MODE_GUIDE.md)
-- 实现总结：[DOM_TEXT_MODE_SUMMARY.md](DOM_TEXT_MODE_SUMMARY.md)
 - 单元测试：`python3 test_dom_render.py`
 - 集成测试：`python3 test_dom_integration.py`
 
@@ -98,7 +98,8 @@ recognition:
 **检查：**
 1. 字体文件：`ls assets/fonts/`
 2. 模板文件：`ls assets/templates/`
-3. Playwright安装：`python3 -c "from patchright.sync_api import sync_playwright"`
+3. Satori依赖：`cd renderers/satori && npm install`
+4. Playwright fallback：`python3 -c "from patchright.sync_api import sync_playwright"`
 
 ## 支持
 

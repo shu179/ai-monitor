@@ -46,7 +46,6 @@ recognition:
   
   # DOM文本渲染模式（新增）
   dom_render_mode: true                    # ✅ 启用文本监听模式
-  dom_render_default_platform: "deepseek"  # 默认平台logo（可选）
   dom_render_min_length: 10                # 最小文本长度（避免误触发）
   dom_render_max_length: 50000             # 最大文本长度（避免渲染超大文本）
 ```
@@ -56,7 +55,6 @@ recognition:
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `dom_render_mode` | boolean | `false` | 是否启用文本监听模式（而非截图监听） |
-| `dom_render_default_platform` | string | `""` | 默认平台标识，用于显示logo（如"deepseek"、"kimi"等），留空则显示"AI" |
 | `dom_render_min_length` | integer | `10` | 最小文本长度，少于此长度的文本会被跳过 |
 | `dom_render_max_length` | integer | `50000` | 最大文本长度，超过此长度的文本会被跳过 |
 
@@ -90,24 +88,27 @@ python3 main.py
    ↓
 3. 文本品牌匹配（纯文本正则匹配，<10ms）
    ↓
-4. 如果匹配到品牌 → 渲染为格式化截图（1-2秒）
+4. 如果匹配到品牌 → 原始文本入队等待最终发送
    ↓
 5. 跳过AI识别（已在文本态完成）
    ↓
 6. 路由到对应任务批次
    ↓
-7. 发送企业微信通知
+7. 发送前按最终关键词、品牌、平台渲染通知截图
+   ↓
+8. 发送企业微信通知
 ```
 
 ### 5. 查看结果
 
 - **日志输出**：
   ```
-  [Recognition] 文本已识别品牌 ['DeepSeek', 'Kimi']，截图已渲染: text_0422_143025_abc12345.jpg
+  [Recognition] 文本已识别品牌 ['DeepSeek', 'Kimi']，已直接入队等待最终渲染
   [Recognition] 使用文本匹配结果: ['DeepSeek', 'Kimi']
+  [html_renderer] Satori截图已保存: ...
   ```
 
-- **截图文件**：`screenshots/recognition/text_*.jpg`
+- **截图文件**：`screenshots/recognition/decorated/*_dom.jpg`
 - **企业微信通知**：自动发送到配置的webhook
 
 ## 工作原理
@@ -190,7 +191,9 @@ ai-monitor/
 ├── core/
 │   └── recognition.py              # 识别模式主逻辑
 ├── platforms/
-│   └── html_renderer.py            # HTML渲染器
+│   └── html_renderer.py            # Satori快速渲染和Playwright兜底
+├── renderers/
+│   └── satori/                     # Node/Satori渲染worker
 ├── assets/
 │   ├── templates/                  # HTML/CSS模板
 │   ├── fonts/                      # 字体文件

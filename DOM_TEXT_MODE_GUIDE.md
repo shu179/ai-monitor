@@ -33,7 +33,6 @@ recognition:
   
   # DOM文本渲染模式配置
   dom_render_mode: true                    # 启用文本监听模式（而非截图监听）
-  dom_render_default_platform: "deepseek"  # 默认平台logo（可选，留空则显示"AI"）
   dom_render_min_length: 10                # 最小文本长度（避免误触发）
   dom_render_max_length: 50000             # 最大文本长度（避免渲染超大文本）
 ```
@@ -109,7 +108,7 @@ Kimi是月之暗面推出的智能助手。
 豆包和文心一言也是不错的选择。
 ```
 
-4. 检查 `screenshots/recognition/` 目录，应生成 `text_*.jpg` 文件
+4. 检查 `screenshots/recognition/decorated/` 目录，应生成 `*_dom.jpg` 文件
 5. 检查企业微信是否收到通知
 
 ### 验证点
@@ -123,7 +122,7 @@ Kimi是月之暗面推出的智能助手。
 
 ## 支持的Markdown格式
 
-DOM文本渲染模式使用Python `markdown` 库，完整支持：
+DOM文本渲染模式默认使用 Satori 快速渲染，失败时回退到原 Playwright/Markdown 渲染路径，支持：
 
 - **标题**: `#`, `##`, `###`, `####`, `#####`, `######`
 - **列表**: `*`, `-`, `+`, `1.`, `2.`
@@ -216,17 +215,17 @@ DOM文本渲染模式使用Python `markdown` 库，完整支持：
   - `_poll_clipboard_text()` - 跨平台剪贴板文本获取
   - `_match_brands_from_text()` - 文本品牌匹配
   - `_poll_once_text_mode()` - 文本模式轮询
-  - `_render_text_to_screenshot()` - 文本渲染为截图
+  - `_build_text_mode_send_image()` - 发送前渲染最终通知截图
   - `_poll_loop()` - 模式切换逻辑
   - `_recognize_one()` - 支持跳过AI识别
 
 - `platforms/html_renderer.py` - 渲染能力
-  - `render_text_to_screenshot()` - 文本→HTML→截图
-  - `_md_to_html()` - Markdown解析
+  - `render_text_to_screenshot()` - 文本→Satori截图，失败回退 Playwright
+  - `_render_text_to_screenshot_with_satori()` - Satori 快速路径
+  - `_md_to_html()` - Playwright fallback 的 Markdown 解析
 
 - `config.yaml` - 配置项
   - `recognition.dom_render_mode` - 启用开关
-  - `recognition.dom_render_default_platform` - 默认平台
   - `recognition.dom_render_min_length` - 最小长度
   - `recognition.dom_render_max_length` - 最大长度
 
@@ -251,8 +250,8 @@ DOM文本渲染模式使用Python `markdown` 库，完整支持：
          │
          ▼ 有品牌？
 ┌─────────────────┐
-│ _render_text_to │
-│  _screenshot()  │ ← Markdown→HTML→截图
+│ source_text     │
+│ 入队等待发送渲染 │
 └────────┬────────┘
          │
          ▼

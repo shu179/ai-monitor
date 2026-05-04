@@ -2142,53 +2142,6 @@ class ClipboardRecognitionManager:
         matched = match_candidate_brands(text, all_candidate_brands)
         return matched
 
-    def _render_text_to_screenshot(self, text: str, text_hash: str) -> Optional[str]:
-        """
-        将剪贴板文本通过DOM模板渲染为截图
-
-        Args:
-            text: 剪贴板文本
-            text_hash: 文本哈希（用于文件名）
-
-        Returns:
-            渲染后的截图路径，失败返回None
-        """
-        try:
-            from platforms.html_renderer import render_text_to_screenshot
-
-            # 构建输出路径
-            ts = datetime.now().strftime("%m%d_%H%M%S_%f")[:-3]
-            output_path = resolve_app_path("screenshots") / "recognition" / f"text_{ts}_{text_hash[:8]}.jpg"
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-
-            # 获取配置
-            config = self._config_getter() or {}
-            recognition_config = config.get("recognition", {})
-            default_platform = recognition_config.get("dom_render_default_platform", "")
-
-            # 直接调用渲染器（内部会使用markdown库完美解析）
-            result_path = render_text_to_screenshot(
-                text=text,
-                platform=default_platform or "AI",
-                keyword="",
-                brand="",
-                output_path=str(output_path),
-                include_badges=False
-            )
-
-            if result_path and os.path.exists(result_path):
-                print(f"[Recognition] 文本已渲染为截图: {result_path}")
-                return result_path
-            else:
-                print("[Recognition] 文本渲染失败")
-                return None
-
-        except Exception as e:
-            print(f"[Recognition] 渲染文本时出错: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-
     def _poll_once_text_mode(self):
         """
         DOM文本渲染模式的轮询逻辑（监听剪贴板文本）
@@ -2992,6 +2945,42 @@ class ClipboardRecognitionManager:
                 f"剩余 {len(matched_pairs) - len(normalized_paths)} 个关键词保留缺口"
             )
         return updates
+
+    def _extract_current_send_state_from_pool_updates(
+        self,
+        keyword_updates: list[dict],
+        applied_pool: dict,
+    ) -> tuple[list[str], list[str]]:
+        """Resolve paths moved by the daily-state canonicalization for this send only."""
+        pool_keywords = dict((applied_pool or {}).get("keywords") or {})
+        image_paths: list[str] = []
+        platforms: list[str] = []
+        seen_paths: set[str] = set()
+
+        for update in keyword_updates or []:
+            keyword = str((update or {}).get("keyword") or "").strip()
+            if not keyword:
+                continue
+            update_platform = self._normalize_platform_id((update or {}).get("platform", ""))
+            state = pool_keywords.get(keyword)
+            if not isinstance(state, dict):
+                continue
+
+            candidate_state = state
+            platform_states = state.get("platform_states") if isinstance(state.get("platform_states"), dict) else {}
+            if update_platform and isinstance(platform_states.get(update_platform), dict):
+                candidate_state = platform_states[update_platform]
+
+            path = str((candidate_state or {}).get("image_path") or "").strip()
+            if path and path not in seen_paths and Path(path).exists():
+                seen_paths.add(path)
+                image_paths.append(path)
+
+            platform_text = self._normalize_platform_id((candidate_state or {}).get("platform", "")) or update_platform
+            if platform_text and platform_text not in platforms:
+                platforms.append(platform_text)
+
+        return image_paths, platforms
 
     def _expand_matched_pair_slots(self, matched_pairs: list[dict]) -> list[dict]:
         slots: list[dict] = []
@@ -3846,21 +3835,46 @@ class ClipboardRecognitionManager:
                 keyword_updates,
                 source_mode="test" if daily_state_source == "manual_test" else "formal",
             )
+            if daily_state_source == "manual_test":
+                missing_current_paths = any(
+                    not Path(str((update or {}).get("image_path") or "").strip()).exists()
+                    for update in keyword_updates
+                    if str((update or {}).get("image_path") or "").strip()
+                )
+                if missing_current_paths:
+                    refreshed_current_paths, refreshed_current_platforms = self._extract_current_send_state_from_pool_updates(
+                        keyword_updates,
+                        applied_pool,
+                    )
+                    if refreshed_current_paths:
+                        if refreshed_current_paths != merged_image_paths:
+                            print(
+                                f"[Recognition] 当前测试图片路径已移动，发送路径刷新: task={batch['task_name']}, "
+                                f"paths={refreshed_current_paths}"
+                            )
+                        merged_image_paths = list(refreshed_current_paths)
+                        batch["image_paths"] = list(refreshed_current_paths)
+                    if refreshed_current_platforms:
+                        merged_detected_platforms = list(dict.fromkeys(refreshed_current_platforms))
+                        batch["detected_platforms"] = list(merged_detected_platforms)
 
         updated_status = get_task_day_status(task)
         updated_progress = self._get_task_daily_progress(task)
-        refreshed_image_paths = [
-            str(path).strip()
-            for path in (updated_progress.get("historical_screenshot_paths") or [])
-            if str(path).strip() and Path(str(path).strip()).exists()
-        ]
-        refreshed_platforms = [
-            str(platform).strip()
-            for platform in (updated_progress.get("historical_query_platforms") or [])
-            if str(platform).strip()
-        ]
-        if not refreshed_image_paths and applied_pool:
-            refreshed_image_paths, refreshed_platforms = self._extract_completed_send_state_from_pool(applied_pool)
+        refreshed_image_paths: list[str] = []
+        refreshed_platforms: list[str] = []
+        if daily_state_source != "manual_test":
+            refreshed_image_paths = [
+                str(path).strip()
+                for path in (updated_progress.get("historical_screenshot_paths") or [])
+                if str(path).strip() and Path(str(path).strip()).exists()
+            ]
+            refreshed_platforms = [
+                str(platform).strip()
+                for platform in (updated_progress.get("historical_query_platforms") or [])
+                if str(platform).strip()
+            ]
+            if not refreshed_image_paths and applied_pool:
+                refreshed_image_paths, refreshed_platforms = self._extract_completed_send_state_from_pool(applied_pool)
         if refreshed_image_paths:
             if refreshed_image_paths != merged_image_paths:
                 print(
