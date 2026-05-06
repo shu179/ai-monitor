@@ -409,16 +409,16 @@ class WenxinPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             return self.page.evaluate(
-                """({containerSel, resultSel, lastOnly}) => {
+                """({containerSel, resultSel, lastOnly, shouldScroll}) => {
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (container) {
+                    if (shouldScroll && container) {
                         const style = window.getComputedStyle(container);
                         if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
                             container.scrollTop = container.scrollHeight;
                         } else {
                             window.scrollTo(0, document.body.scrollHeight);
                         }
-                    } else {
+                    } else if (shouldScroll) {
                         window.scrollTo(0, document.body.scrollHeight);
                     }
 
@@ -435,6 +435,7 @@ class WenxinPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector,
                     "resultSel": self.result_selector,
                     "lastOnly": True,
+                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as e:
@@ -624,6 +625,7 @@ class WenxinPlatform(BasePlatform):
         if get_text is None:
             get_text = self._get_answer_text
 
+        self._begin_answer_capture(keyword=keyword, brand=brand)
         start_time = time.time()
         last_text = ""
         stable_count = 0
@@ -639,6 +641,7 @@ class WenxinPlatform(BasePlatform):
                 self._cooperative_sleep(2)
                 continue
 
+            self._schedule_answer_poll_read()
             page_text = get_text() or ""
             elapsed = time.time() - start_time
             if elapsed < min_wait:
@@ -665,45 +668,62 @@ class WenxinPlatform(BasePlatform):
 
             if stable_count >= 2:
                 print(f"[{self.name}] 文心回答已稳定，判定生成完成")
-                try:
-                    if self.chat_container_selector:
-                        self.page.evaluate(
-                            """(containerSel) => {
-                                const el = document.querySelector(containerSel);
-                                if (el) el.scrollTop = el.scrollHeight;
-                                else window.scrollTo(0, document.body.scrollHeight);
-                            }""",
-                            self.chat_container_selector,
-                        )
-                    else:
-                        self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                except Exception as e:
-                    self._reraise_stop_requested(e)
-                    pass
                 self._cooperative_sleep(0.8)
+                self._schedule_answer_poll_read(force_scroll=True)
                 final_text = get_text() or ""
                 self.last_answer_text = final_text
                 if not self.has_usable_answer_text(final_text, keyword=keyword, brand=brand):
                     self.last_error = "未获取到有效回答内容，可能回答尚未完全生成"
                     print(f"[{self.name}] {self.last_error}")
+                    self._finish_answer_poll_metrics(
+                        outcome="post_complete_unusable",
+                        final_text=final_text,
+                        keyword=keyword,
+                        brand=brand,
+                    )
                     return
                 on_rank(self.parse_ranking(final_text, brand), final_text)
+                self._finish_answer_poll_metrics(
+                    outcome="ranked",
+                    final_text=final_text,
+                    keyword=keyword,
+                    brand=brand,
+                )
                 return
 
             self._cooperative_sleep(1)
 
         print(f"[{self.name}] 等待生成超时（{timeout}s），尝试用当前内容解析排名")
         try:
+            self._schedule_answer_poll_read(force_scroll=True)
             final_text = get_text() or ""
             self.last_answer_text = final_text
             if not self.has_usable_answer_text(final_text, keyword=keyword, brand=brand):
                 self.last_error = "未获取到有效回答内容，可能回答尚未完全生成"
                 print(f"[{self.name}] {self.last_error}")
+                self._finish_answer_poll_metrics(
+                    outcome="timeout_unusable",
+                    final_text=final_text,
+                    keyword=keyword,
+                    brand=brand,
+                )
                 return
             on_rank(self.parse_ranking(final_text, brand), final_text)
+            self._finish_answer_poll_metrics(
+                outcome="timeout_ranked",
+                final_text=final_text,
+                keyword=keyword,
+                brand=brand,
+            )
         except Exception as e:
             self._reraise_stop_requested(e)
             print(f"[{self.name}] 超时兜底解析失败: {e}")
+            self._finish_answer_poll_metrics(
+                outcome="timeout_error",
+                final_text=self.last_answer_text,
+                keyword=keyword,
+                brand=brand,
+            )
 
     def submit_prompt(self) -> None:
         self._raise_if_stop_requested()

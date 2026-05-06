@@ -147,6 +147,7 @@ from core.article_store import (
 )
 from core.browser_auth import (
     activate_browser_auth_profile,
+    build_browser_runtime_diagnostics,
     create_fresh_browser_auth_profile,
     get_browser_auth_snapshot,
     mark_browser_auth_profile_authenticated,
@@ -3234,7 +3235,10 @@ return changedCount
                 )
                 snapshot["login_window_open"] = tracked_open
                 snapshot["login_opened_at"] = str((session or {}).get("opened_at") or "")
-        return {"platforms": snapshots}
+        return {
+            "platforms": snapshots,
+            "diagnostics": build_browser_runtime_diagnostics(snapshots),
+        }
 
     def _open_browser_auth_login(
         self,
@@ -6484,6 +6488,7 @@ return changedCount
             "finishedAt": "",
             "errorMessage": "",
             "failureDetails": [],
+            "pollDiagnostics": [],
             "cancelRequested": False,
             "sendableSuccessCount": 0,
             "actualScreenshotCount": 0,
@@ -6544,6 +6549,37 @@ return changedCount
                     "message": "本次命中目标" if succeeded else "本次未命中目标",
                     "errorMessage": str(payload.get("error_message") or "").strip(),
                 })
+                return
+            if stage == "browser_poll_diagnostics":
+                raw_metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+                metrics = dict(raw_metrics or {})
+                item = {
+                    "platform": str(payload.get("platform") or metrics.get("platform") or "").strip(),
+                    "outcome": str(metrics.get("outcome") or "").strip(),
+                    "pollSchedules": int(metrics.get("poll_schedules") or 0),
+                    "fullTextReads": int(metrics.get("full_text_reads") or 0),
+                    "fullTextSkips": int(metrics.get("full_text_read_skips") or 0),
+                    "answerReads": int(metrics.get("answer_reads") or 0),
+                    "answerScrolls": int(metrics.get("answer_scrolls") or 0),
+                    "domProbeChecks": int(metrics.get("dom_probe_checks") or 0),
+                    "domDoneSignals": int(metrics.get("dom_done_signals") or 0),
+                    "overlayChecks": int(metrics.get("overlay_checks") or 0),
+                    "overlayScans": int(metrics.get("overlay_scans") or 0),
+                    "overlaySkips": int(metrics.get("overlay_scan_skips") or 0),
+                    "snapshots": int(metrics.get("snapshots") or 0),
+                    "finalAnswerChars": int(metrics.get("final_answer_chars") or 0),
+                    "finalCompactChars": int(metrics.get("final_compact_chars") or 0),
+                    "durationSeconds": float(metrics.get("duration_seconds") or 0.0),
+                    "recordedAt": datetime.now().isoformat(timespec="seconds"),
+                }
+                with self._test_run_lock:
+                    state = self._test_runs.get(run_id)
+                    if not state:
+                        return
+                    diagnostics = list(state.get("pollDiagnostics") or [])
+                    diagnostics.append(item)
+                    state["pollDiagnostics"] = diagnostics[-50:]
+                    state["updatedAt"] = datetime.now().isoformat(timespec="seconds")
                 return
             if stage == "query_done":
                 completed_queries = int(payload.get("completed_queries") or 0)

@@ -168,14 +168,26 @@ class KimiPlatform(BasePlatform):
                         el.getAttribute('name'),
                         el.innerText,
                         el.textContent,
-                        el.className,
                     ].filter(Boolean).join(' ');
                     const iconNames = (el) => Array.from(el.querySelectorAll('svg'))
+                        .filter((svg) => isVisible(svg))
                         .map((svg) => String(svg.getAttribute('name') || svg.getAttribute('data-icon') || '').trim().toLowerCase())
                         .filter(Boolean);
 
                     const stopTextPattern = /停止|暂停|stop|pause|停止回答|停止生成/i;
                     const sendTextPattern = /发送|send/i;
+                    const iconNameMatches = (value, words) => {
+                        const raw = String(value || '').trim();
+                        if (!raw) return false;
+                        const spaced = raw
+                            .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+                            .replace(/[^A-Za-z0-9\u4e00-\u9fff]+/g, ' ')
+                            .toLowerCase();
+                        const tokens = spaced.split(/\\s+/).filter(Boolean);
+                        return tokens.some((token) => words.includes(token));
+                    };
+                    const hasStopIconName = (names) => names.some((name) => iconNameMatches(name, ['stop', 'pause']));
+                    const hasSendIconName = (names) => names.some((name) => iconNameMatches(name, ['send', 'submit', 'arrowup', 'up']));
 
                     let stopVisibleCount = 0;
                     let sendVisibleCount = 0;
@@ -191,8 +203,8 @@ class KimiPlatform(BasePlatform):
                         const names = iconNames(el);
                         const hasStopText = stopTextPattern.test(String(signals || ''));
                         const hasSendText = sendTextPattern.test(String(signals || ''));
-                        const hasStopNamedIcon = names.some((name) => /stop|pause/.test(name));
-                        const hasSendNamedIcon = names.some((name) => /send|submit|arrowup|up/.test(name));
+                        const hasStopNamedIcon = hasStopIconName(names);
+                        const hasSendNamedIcon = hasSendIconName(names);
 
                         if (hasStopText || hasStopNamedIcon) {
                             stopVisibleCount += 1;
@@ -207,8 +219,9 @@ class KimiPlatform(BasePlatform):
                     }
 
                     const standaloneStopSvgs = Array.from(document.querySelectorAll('svg[name], svg[data-icon]'))
-                        .map((svg) => String(svg.getAttribute('name') || svg.getAttribute('data-icon') || '').trim().toLowerCase())
-                        .filter((name) => /stop|pause/.test(name));
+                        .filter((svg) => isVisible(svg) && !svg.closest('button, [role="button"], div[role="button"], a[role="button"], .ds-icon-button, .ds-atom-button'))
+                        .map((svg) => String(svg.getAttribute('name') || svg.getAttribute('data-icon') || '').trim())
+                        .filter((name) => iconNameMatches(name, ['stop', 'pause']));
 
                     return {
                         inputLength: inputText.length,
@@ -272,16 +285,18 @@ class KimiPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             return self.page.evaluate(
-                """({containerSel, resultSel}) => {
+                """({containerSel, resultSel, shouldScroll}) => {
                     const normalize = (value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (container) {
+                    if (shouldScroll && container) {
                         const style = window.getComputedStyle(container);
                         if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
                             container.scrollTop = container.scrollHeight;
                         } else {
                             window.scrollTo(0, document.body.scrollHeight);
                         }
+                    } else if (shouldScroll) {
+                        window.scrollTo(0, document.body.scrollHeight);
                     }
 
                     const isVisible = (el) => {
@@ -367,6 +382,7 @@ class KimiPlatform(BasePlatform):
                 {
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
+                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as e:
@@ -378,15 +394,17 @@ class KimiPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             return self.page.evaluate(
-                """({containerSel, resultSel}) => {
+                """({containerSel, resultSel, shouldScroll}) => {
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (container) {
+                    if (shouldScroll && container) {
                         const style = window.getComputedStyle(container);
                         if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
                             container.scrollTop = container.scrollHeight;
                         } else {
                             window.scrollTo(0, document.body.scrollHeight);
                         }
+                    } else if (shouldScroll) {
+                        window.scrollTo(0, document.body.scrollHeight);
                     }
 
                     const normalize = (value) => String(value || '').trim();
@@ -549,6 +567,7 @@ class KimiPlatform(BasePlatform):
                 {
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
+                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or {"root_key": "", "blocks": [], "raw_text": "", "raw_html": ""}
         except Exception as e:

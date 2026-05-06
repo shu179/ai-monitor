@@ -271,9 +271,25 @@ class DoubaoPlatform(BasePlatform):
                 "outerHTML": button.evaluate("(el) => String(el.outerHTML || '')"),
                 "dataState": button.get_attribute("data-state") or "",
                 "paths": button.evaluate(
-                    """(el) => Array.from(el.querySelectorAll('svg path'))
-                        .map((node) => String(node.getAttribute('d') || ''))
-                        .filter(Boolean)"""
+                    """(el) => {
+                        const isVisible = (node) => {
+                            if (!node) return false;
+                            const style = window.getComputedStyle(node);
+                            const rect = node.getBoundingClientRect();
+                            return (
+                                style.display !== 'none' &&
+                                style.visibility !== 'hidden' &&
+                                style.opacity !== '0' &&
+                                rect.width > 0 &&
+                                rect.height > 0
+                            );
+                        };
+                        if (!isVisible(el)) return [];
+                        return Array.from(el.querySelectorAll('svg path'))
+                            .filter((node) => isVisible(node.closest('svg') || node))
+                            .map((node) => String(node.getAttribute('d') || ''))
+                            .filter(Boolean);
+                    }"""
                 ) or [],
                 "disabled": False,
             }
@@ -1016,16 +1032,16 @@ class DoubaoPlatform(BasePlatform):
     def _get_answer_text(self) -> str:
         try:
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel, inputSel}) => {
+                """({containerSel, resultSel, thinkSel, inputSel, shouldScroll}) => {
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (container) {
+                    if (shouldScroll && container) {
                         const style = window.getComputedStyle(container);
                         if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
                             container.scrollTop = container.scrollHeight;
                         } else {
                             window.scrollTo(0, document.body.scrollHeight);
                         }
-                    } else {
+                    } else if (shouldScroll) {
                         window.scrollTo(0, document.body.scrollHeight);
                     }
 
@@ -1194,6 +1210,7 @@ class DoubaoPlatform(BasePlatform):
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
                     "inputSel": self.input_selector or "",
+                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as e:

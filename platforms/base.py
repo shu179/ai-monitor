@@ -133,6 +133,7 @@ class BasePlatform(ABC):
     skip_runtime_startup_goto: bool = False
     external_chrome_light_control: bool = True
     force_reclaim_profile_processes_on_start: bool = False
+    debug_poll_metrics: str = ""
 
     def __init__(self, user_data_dir: str):
         self.name = self.__class__.__name__.replace("Platform", "").lower()
@@ -143,6 +144,7 @@ class BasePlatform(ABC):
         self._browser_connection = None
         self._external_browser_process = None
         self._external_browser_port = 0
+        self._external_cdp_runtime_summary_logged = False
         self.screenshot_on_mention = False
         self.answer_screenshot_mode = "page"
         self.extract_references_enabled = False
@@ -158,6 +160,14 @@ class BasePlatform(ABC):
         self.progress_callback = None
         self._active_baseline_answer_text = ""
         self._answer_capture_session: AnswerCaptureSession | None = None
+        self._answer_poll_iteration = 0
+        self._answer_next_scroll_poll = 1
+        self._answer_scroll_reads_remaining = 0
+        self._answer_next_full_text_poll = 1
+        self._answer_poll_metrics = {}
+        self.last_answer_poll_metrics = {}
+        self._interruption_overlay_scan_interval_seconds = 8.0
+        self._last_interruption_overlay_scan_at = 0.0
         self._last_prompt_text = ""
         self.stop_checker = None
         self._stop_requested = False
@@ -602,17 +612,74 @@ class BasePlatform(ABC):
             sock.listen(1)
             return int(sock.getsockname()[1])
 
+    def _request_external_browser_close(self, *, timeout: float = 3.0) -> bool:
+        process = getattr(self, "_external_browser_process", None)
+        connection = getattr(self, "_browser_connection", None)
+        if process is None or connection is None:
+            return False
+        try:
+            if process.poll() is not None:
+                return True
+        except Exception:
+            return False
+        try:
+            session = connection.new_browser_cdp_session()
+            session.send("Browser.close")
+            process.wait(timeout=max(0.5, float(timeout or 0.0)))
+            return True
+        except Exception:
+            return False
+
+    def _log_external_cdp_runtime_summary(self) -> None:
+        if self._external_cdp_runtime_summary_logged:
+            return
+        self._external_cdp_runtime_summary_logged = True
+        if not bool(getattr(self, "use_external_chrome_cdp", False)):
+            return
+        proxy = self._browser_proxy_settings()
+        if proxy and (proxy.get("username") or proxy.get("password")):
+            print(
+                f"[{self.name}] 外部 Chrome CDP 模式已设置代理服务器；"
+                "用户名/密码字段不会通过 --proxy-server 自动完成认证，"
+                "如代理需要认证请确认 Chrome 端已能自行通过。"
+            )
+        disabled_features = [
+            name
+            for name in (
+                "use_automation_user_agent",
+                "use_automation_extra_headers",
+                "use_automation_ignore_default_args",
+                "use_automation_stealth_scripts",
+                "use_automation_storage_warmup",
+            )
+            if not self._automation_feature_enabled(name, True)
+        ]
+        if disabled_features:
+            print(
+                f"[{self.name}] 外部 Chrome 轻控制模式跳过浏览器上下文级设置: "
+                f"{', '.join(disabled_features)}"
+            )
+
     def _terminate_external_browser_process(self, *, graceful_timeout: float = 8.0, force: bool = True) -> None:
         process = getattr(self, "_external_browser_process", None)
-        self._external_browser_process = None
-        self._external_browser_port = 0
         if process is None:
+            self._external_browser_port = 0
             return
         try:
             if process.poll() is not None:
+                self._external_browser_process = None
+                self._external_browser_port = 0
                 return
         except Exception:
+            self._external_browser_process = None
+            self._external_browser_port = 0
             return
+        if self._request_external_browser_close(timeout=min(3.0, max(0.5, float(graceful_timeout or 0.0)))):
+            self._external_browser_process = None
+            self._external_browser_port = 0
+            return
+        self._external_browser_process = None
+        self._external_browser_port = 0
         pgid = None
         if hasattr(os, "getpgid"):
             try:
@@ -671,23 +738,25 @@ class BasePlatform(ABC):
         self._terminate_residual_profile_processes(graceful_timeout=1.0)
 
     def _release_browser_handles(self, *, stop_playwright: bool) -> None:
-        try:
-            if self.context:
-                self._close_all_pages()
-        except Exception:
-            pass
-        try:
-            if self.context:
-                self.context.close()
-        except Exception:
-            pass
+        external_close_requested = self._request_external_browser_close(timeout=3.0)
+        if not external_close_requested:
+            try:
+                if self.context:
+                    self._close_all_pages()
+            except Exception:
+                pass
+            try:
+                if self.context:
+                    self.context.close()
+            except Exception:
+                pass
+        self._terminate_external_browser_process()
         try:
             if self._browser_connection:
                 self._browser_connection.close()
         except Exception:
             pass
         self._browser_connection = None
-        self._terminate_external_browser_process()
         self._terminate_residual_profile_processes()
         if stop_playwright:
             try:
@@ -726,6 +795,11 @@ class BasePlatform(ABC):
             "--remote-debugging-address=127.0.0.1",
             "--no-first-run",
             "--no-default-browser-check",
+            "--disable-infobars",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            "--disable-save-password-bubble",
+            "--disable-prompt-on-repost",
             f"--window-size={window_size}",
         ]
         if self._automation_feature_enabled("use_automation_control_flag", True):
@@ -779,6 +853,7 @@ class BasePlatform(ABC):
                 self._browser_connection = browser
                 self._browser_app_label = browser_label
                 self._current_context_headless = bool(headless)
+                self._log_external_cdp_runtime_summary()
                 return contexts[0]
             except Exception as exc:
                 last_error = exc
@@ -1017,6 +1092,232 @@ class BasePlatform(ABC):
     def _should_simulate_human_behavior(self) -> bool:
         # 外部正式版 Chrome + CDP 时优先减少人为伪装痕迹。
         return not self._external_chrome_light_control_enabled()
+
+    def _reset_answer_read_controls(self) -> None:
+        self._answer_poll_iteration = 0
+        self._answer_next_scroll_poll = 1
+        self._answer_scroll_reads_remaining = 0
+        self._answer_next_full_text_poll = 1
+
+    @staticmethod
+    def _config_truthy(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        text = str(value).strip().lower()
+        return text in {"1", "true", "yes", "y", "on", "enabled", "enable", "是", "开启"}
+
+    def _answer_poll_metrics_enabled(self) -> bool:
+        return self._config_truthy(getattr(self, "debug_poll_metrics", "")) or self._config_truthy(
+            os.environ.get("AI_MONITOR_DEBUG_POLL_METRICS", "")
+        )
+
+    def _reset_answer_poll_metrics(self, *, keyword: str = "", brand: str = "") -> None:
+        enabled = self._answer_poll_metrics_enabled()
+        self._answer_poll_metrics = {
+            "enabled": enabled,
+            "platform": self.name,
+            "started_at": time.time(),
+            "keyword_chars": len(str(keyword or "")),
+            "brand_chars": len(str(brand or "")),
+            "poll_schedules": 0,
+            "scheduled_scrolls": 0,
+            "forced_scroll_schedules": 0,
+            "full_text_reads": 0,
+            "full_text_read_skips": 0,
+            "dom_probe_checks": 0,
+            "dom_done_signals": 0,
+            "answer_reads": 0,
+            "answer_scrolls": 0,
+            "overlay_checks": 0,
+            "overlay_scans": 0,
+            "overlay_scan_skips": 0,
+            "snapshots": 0,
+            "final_answer_chars": 0,
+            "final_compact_chars": 0,
+            "duration_seconds": 0.0,
+            "outcome": "",
+            "finished": False,
+        }
+        if enabled:
+            print(
+                f"[{self.name}] 轮询诊断已开启: "
+                f"debug_poll_metrics={getattr(self, 'debug_poll_metrics', '')!r}, "
+                f"keyword_chars={len(str(keyword or ''))}, brand_chars={len(str(brand or ''))}"
+            )
+
+    def _answer_poll_metrics_active(self) -> bool:
+        metrics = getattr(self, "_answer_poll_metrics", None)
+        return isinstance(metrics, dict) and bool(metrics.get("enabled")) and not bool(metrics.get("finished"))
+
+    def _increment_answer_poll_metric(self, key: str, amount: int = 1) -> None:
+        if not self._answer_poll_metrics_active():
+            return
+        metrics = self._answer_poll_metrics
+        try:
+            metrics[key] = int(metrics.get(key, 0) or 0) + int(amount or 0)
+        except Exception:
+            metrics[key] = int(amount or 0)
+
+    def _record_answer_poll_schedule(self, *, should_scroll: bool, force_scroll: bool) -> None:
+        if not self._answer_poll_metrics_active():
+            return
+        self._increment_answer_poll_metric("poll_schedules")
+        if should_scroll:
+            self._increment_answer_poll_metric("scheduled_scrolls")
+        if force_scroll:
+            self._increment_answer_poll_metric("forced_scroll_schedules")
+
+    def _record_answer_text_read(self, *, should_scroll: bool) -> None:
+        if not self._answer_poll_metrics_active():
+            return
+        self._increment_answer_poll_metric("answer_reads")
+        if should_scroll:
+            self._increment_answer_poll_metric("answer_scrolls")
+
+    def _should_read_answer_text_for_poll(
+        self,
+        *,
+        elapsed: float,
+        min_wait: int,
+        has_cached_text: bool,
+        force: bool = False,
+    ) -> bool:
+        if force:
+            return True
+        current_poll = max(1, int(self._answer_poll_iteration or 1))
+        if current_poll <= 2:
+            return True
+        if not has_cached_text:
+            return True
+        if current_poll >= int(self._answer_next_full_text_poll or 1):
+            return True
+        return False
+
+    def _mark_answer_text_read_cadence(
+        self,
+        *,
+        elapsed: float,
+        min_wait: int,
+        fallback_active: bool = False,
+    ) -> None:
+        current_poll = max(1, int(self._answer_poll_iteration or 1))
+        if elapsed < min_wait:
+            interval = 2
+        elif fallback_active and elapsed < max(min_wait + 35, 45):
+            interval = random.randint(2, 3)
+        elif fallback_active:
+            interval = random.randint(3, 5)
+        elif elapsed < max(min_wait + 17, 25):
+            interval = random.randint(3, 4)
+        else:
+            interval = random.randint(4, 6)
+        self._answer_next_full_text_poll = current_poll + interval
+
+    def _record_full_text_read_decision(self, *, did_read: bool) -> None:
+        if did_read:
+            self._increment_answer_poll_metric("full_text_reads")
+        else:
+            self._increment_answer_poll_metric("full_text_read_skips")
+
+    def _record_dom_probe_check(self, *, done: bool = False) -> None:
+        self._increment_answer_poll_metric("dom_probe_checks")
+        if done:
+            self._increment_answer_poll_metric("dom_done_signals")
+
+    def _finish_answer_poll_metrics(
+        self,
+        *,
+        outcome: str,
+        final_text: str = "",
+        keyword: str = "",
+        brand: str = "",
+    ) -> None:
+        metrics = getattr(self, "_answer_poll_metrics", None)
+        if not isinstance(metrics, dict) or not bool(metrics.get("enabled")) or bool(metrics.get("finished")):
+            return
+
+        text = str(final_text or self.last_answer_text or "")
+        metrics["finished"] = True
+        metrics["outcome"] = str(outcome or "").strip() or "unknown"
+        started_at = float(metrics.get("started_at", time.time()) or time.time())
+        metrics["duration_seconds"] = round(max(0.0, time.time() - started_at), 2)
+        metrics["final_answer_chars"] = len(text)
+        metrics["final_compact_chars"] = len(self._normalize_compact_text(text))
+        metrics["keyword_chars"] = len(str(keyword or ""))
+        metrics["brand_chars"] = len(str(brand or ""))
+
+        summary = {
+            key: value
+            for key, value in metrics.items()
+            if key not in {"enabled", "started_at", "finished"}
+        }
+        self.last_answer_poll_metrics = dict(summary)
+        print(
+            f"[{self.name}] 轮询诊断: outcome={summary.get('outcome')}, "
+            f"poll_schedules={summary.get('poll_schedules')}, "
+            f"full_reads={summary.get('full_text_reads')}, "
+            f"full_skips={summary.get('full_text_read_skips')}, "
+            f"answer_reads={summary.get('answer_reads')}, "
+            f"answer_scrolls={summary.get('answer_scrolls')}, "
+            f"dom_probes={summary.get('dom_probe_checks')}, "
+            f"dom_done={summary.get('dom_done_signals')}, "
+            f"overlay_checks={summary.get('overlay_checks')}, "
+            f"overlay_scans={summary.get('overlay_scans')}, "
+            f"overlay_skips={summary.get('overlay_scan_skips')}, "
+            f"snapshots={summary.get('snapshots')}, "
+            f"final_chars={summary.get('final_answer_chars')}, "
+            f"duration={summary.get('duration_seconds')}s"
+        )
+        callback = getattr(self, "progress_callback", None)
+        if callable(callback):
+            try:
+                callback({
+                    "stage": "browser_poll_diagnostics",
+                    "platform": self.name,
+                    "keyword_chars": summary.get("keyword_chars", 0),
+                    "brand_chars": summary.get("brand_chars", 0),
+                    "metrics": dict(summary),
+                })
+            except Exception:
+                pass
+
+    def _schedule_answer_poll_read(self, *, force_scroll: bool = False) -> None:
+        """
+        Decouple DOM reads from scrolling. During active answer capture we allow
+        at most one scroll for a poll, and only every few polls unless a final
+        stabilization pass explicitly asks for it.
+        """
+        if self._answer_capture_session is None:
+            self._answer_scroll_reads_remaining = 1
+            return
+        self._answer_poll_iteration += 1
+        current_poll = max(1, int(self._answer_poll_iteration or 1))
+        should_scroll = bool(
+            force_scroll
+            or current_poll == 1
+            or current_poll >= self._answer_next_scroll_poll
+        )
+        self._answer_scroll_reads_remaining = 1 if should_scroll else 0
+        self._record_answer_poll_schedule(should_scroll=should_scroll, force_scroll=force_scroll)
+        if should_scroll:
+            self._answer_next_scroll_poll = current_poll + random.randint(5, 8)
+
+    def _force_next_answer_read_scroll(self) -> None:
+        self._answer_scroll_reads_remaining = max(1, int(self._answer_scroll_reads_remaining or 0))
+
+    def _consume_answer_read_scroll(self, *, force: bool = False) -> bool:
+        if force or self._answer_capture_session is None:
+            self._record_answer_text_read(should_scroll=True)
+            return True
+        remaining = int(self._answer_scroll_reads_remaining or 0)
+        if remaining <= 0:
+            self._record_answer_text_read(should_scroll=False)
+            return False
+        self._answer_scroll_reads_remaining = remaining - 1
+        self._record_answer_text_read(should_scroll=True)
+        return True
 
     def _browser_proxy_settings(self) -> dict | None:
         server = str(getattr(self, "browser_proxy_server", "") or "").strip()
@@ -2159,6 +2460,7 @@ class BasePlatform(ABC):
         return False
 
     def _collect_interruption_state(self, *, check_input_visible: bool) -> dict:
+        self._increment_answer_poll_metric("overlay_checks")
         try:
             current_url = self.page.url
         except Exception:
@@ -2166,7 +2468,25 @@ class BasePlatform(ABC):
 
         overlay_state = {"matched": False}
         if self._overlay_detection_enabled:
-            overlay_state = self._scan_blocking_overlay()
+            now = time.time()
+            last_scan = float(getattr(self, "_last_interruption_overlay_scan_at", 0.0) or 0.0)
+            interval = float(getattr(self, "_interruption_overlay_scan_interval_seconds", 8.0) or 8.0)
+            cached_state = {}
+            if isinstance(getattr(self, "last_interruption_state", None), dict):
+                cached_state = dict((self.last_interruption_state or {}).get("overlay_state") or {})
+            should_scan_overlay = (
+                bool(check_input_visible)
+                or not cached_state
+                or bool(cached_state.get("matched"))
+                or now - last_scan >= max(1.0, interval)
+            )
+            if should_scan_overlay:
+                self._increment_answer_poll_metric("overlay_scans")
+                overlay_state = self._scan_blocking_overlay()
+                self._last_interruption_overlay_scan_at = now
+            else:
+                self._increment_answer_poll_metric("overlay_scan_skips")
+                overlay_state = {"matched": False, "cached": True}
         overlay_text = str(overlay_state.get("text") or "")
         matched_keywords = [
             kw for kw in self._captcha_keywords
@@ -3020,8 +3340,11 @@ class BasePlatform(ABC):
 
     def _begin_answer_capture(self, *, keyword: str = "", brand: str = "") -> None:
         self._answer_capture_session = AnswerCaptureSession(started_at=time.time())
+        self._reset_answer_read_controls()
+        self._reset_answer_poll_metrics(keyword=keyword, brand=brand)
 
     def _capture_answer_snapshot(self) -> dict:
+        self._increment_answer_poll_metric("snapshots")
         text = str(self._get_answer_text() or "").strip()
         html_body = str(self._get_answer_html() or "").strip()
         blocks = []
@@ -3232,6 +3555,7 @@ class BasePlatform(ABC):
         captured_text = self._materialize_captured_answer(keyword=keyword, brand=brand)
         if callable(get_text):
             try:
+                self._force_next_answer_read_scroll()
                 dom_text = str(get_text() or "").strip()
             except Exception as exc:
                 self._reraise_stop_requested(exc)
@@ -3271,26 +3595,11 @@ class BasePlatform(ABC):
             except InterruptionDetected:
                 raise
 
-            if self.chat_container_selector:
-                self.page.evaluate(
-                    """(selector) => {
-                        const el = document.querySelector(selector);
-                        if (el) el.scrollTop = el.scrollHeight;
-                        else window.scrollTo(0, document.body.scrollHeight);
-                    }""",
-                    self.chat_container_selector,
-                )
-            else:
-                self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            self._schedule_answer_poll_read(force_scroll=(index == 0 or index % 3 == 0))
 
             wait_seconds = 0.5 if index == 0 else interval
             self._cooperative_sleep(wait_seconds)
 
-            try:
-                answer_text = get_text() or ""
-            except Exception as exc:
-                self._reraise_stop_requested(exc)
-                raise
             try:
                 snapshot = self._capture_answer_snapshot()
             except Exception as exc:
@@ -3301,13 +3610,14 @@ class BasePlatform(ABC):
                 keyword=keyword,
                 brand=brand,
             )
-            answer_text = self._choose_better_answer_text(
-                answer_text,
-                captured_text,
-                baseline_text=self._active_baseline_answer_text,
-                keyword=keyword,
-                brand=brand,
-            )
+            if captured_text:
+                answer_text = captured_text
+            else:
+                try:
+                    answer_text = get_text() or ""
+                except Exception as exc:
+                    self._reraise_stop_requested(exc)
+                    raise
             compact = self._normalize_compact_text(answer_text)
             if len(compact) > best_score:
                 best_text = answer_text
@@ -3332,13 +3642,14 @@ class BasePlatform(ABC):
         """Centralized polling loop. Waits for generation to complete, then calls on_rank once."""
         if get_text is None:
             def get_text():
-                if self.chat_container_selector:
+                should_scroll = self._consume_answer_read_scroll()
+                if should_scroll and self.chat_container_selector:
                     self.page.evaluate("""(selector) => {
                         const el = document.querySelector(selector);
                         if (el) el.scrollTop = el.scrollHeight;
                         else window.scrollTo(0, document.body.scrollHeight);
                     }""", self.chat_container_selector)
-                else:
+                elif should_scroll:
                     self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 return self.page.evaluate("() => document.body.innerText") or ""
         self._begin_answer_capture(keyword=keyword, brand=brand)
@@ -3349,6 +3660,34 @@ class BasePlatform(ABC):
         dom_pending_count = 0  # DOM 持续返回“未完成”的次数，用于触发文本稳定兜底
         last_wait_log_bucket = -1
         baseline_text = str(getattr(self, "_active_baseline_answer_text", "") or "")
+
+        def read_answer_text_for_poll(*, force_scroll: bool = False) -> str:
+            if force_scroll:
+                self._schedule_answer_poll_read(force_scroll=True)
+            snapshot = {}
+            try:
+                snapshot = self._capture_answer_snapshot()
+            except Exception as exc:
+                self._reraise_stop_requested(exc)
+            captured_text = self._merge_answer_snapshot(
+                snapshot,
+                keyword=keyword,
+                brand=brand,
+            )
+            if captured_text:
+                return self._choose_better_answer_text(
+                    last_text,
+                    captured_text,
+                    baseline_text=baseline_text,
+                    keyword=keyword,
+                    brand=brand,
+                )
+            try:
+                return get_text() or ""
+            except Exception as exc:
+                self._reraise_stop_requested(exc)
+                raise
+
         while time.time() - start_time < timeout:
             self._raise_if_stop_requested()
             # 每次轮询前检测人机识别/弹窗
@@ -3364,29 +3703,26 @@ class BasePlatform(ABC):
                 self._cooperative_sleep(2)
                 continue
 
+            elapsed = time.time() - start_time
+            last_text_before_poll = last_text
+            fresh_text_read = False
             try:
-                page_text = get_text()
+                self._schedule_answer_poll_read()
+                should_read_text = self._should_read_answer_text_for_poll(
+                    elapsed=elapsed,
+                    min_wait=min_wait,
+                    has_cached_text=bool(last_text),
+                )
+                self._record_full_text_read_decision(did_read=should_read_text)
+                if should_read_text:
+                    page_text = read_answer_text_for_poll()
+                    fresh_text_read = True
+                    self._mark_answer_text_read_cadence(elapsed=elapsed, min_wait=min_wait)
+                else:
+                    page_text = last_text
             except Exception as exc:
                 self._reraise_stop_requested(exc)
                 raise
-            try:
-                snapshot = self._capture_answer_snapshot()
-            except Exception as exc:
-                self._reraise_stop_requested(exc)
-                snapshot = {}
-            captured_text = self._merge_answer_snapshot(
-                snapshot,
-                keyword=keyword,
-                brand=brand,
-            )
-            page_text = self._choose_better_answer_text(
-                page_text,
-                captured_text,
-                baseline_text=baseline_text,
-                keyword=keyword,
-                brand=brand,
-            )
-            elapsed = time.time() - start_time
             has_new_content = self._has_new_answer_content(
                 page_text,
                 baseline_text=baseline_text,
@@ -3404,7 +3740,8 @@ class BasePlatform(ABC):
                 )
 
             if elapsed < min_wait:
-                last_text = page_text
+                if fresh_text_read:
+                    last_text = page_text
                 # 增强：随机轮询间隔（0.8-1.5秒），避免固定1秒的机器人特征
                 poll_interval = random.uniform(0.8, 1.5)
                 self._cooperative_sleep(poll_interval)
@@ -3414,6 +3751,7 @@ class BasePlatform(ABC):
             generation_done = False
             try:
                 dom_done = self.is_generation_complete(page_text, start_time)
+                self._record_dom_probe_check(done=bool(dom_done))
                 if dom_done:
                     dom_fail_count = 0
                     dom_pending_count = 0
@@ -3421,7 +3759,10 @@ class BasePlatform(ABC):
                     confirm_wait = random.uniform(0.8, 1.5)
                     self._cooperative_sleep(confirm_wait)
                     try:
-                        page_text = get_text()
+                        self._record_full_text_read_decision(did_read=True)
+                        page_text = read_answer_text_for_poll(force_scroll=True)
+                        self._mark_answer_text_read_cadence(elapsed=elapsed, min_wait=min_wait)
+                        fresh_text_read = True
                     except Exception as exc:
                         self._reraise_stop_requested(exc)
                         raise
@@ -3431,15 +3772,17 @@ class BasePlatform(ABC):
                         keyword=keyword,
                         brand=brand,
                     )
-                    if self.is_generation_complete(page_text, start_time) and has_new_content:
+                    confirm_dom_done = self.is_generation_complete(page_text, start_time)
+                    self._record_dom_probe_check(done=bool(confirm_dom_done))
+                    if confirm_dom_done and has_new_content:
                         print(f"[{self.name}] DOM信号：生成完成")
                         generation_done = True
-                    elif self.is_generation_complete(page_text, start_time):
+                    elif confirm_dom_done:
                         print(f"[{self.name}] DOM已提示完成，但尚未检测到本轮新回答内容，继续等待")
                 else:
                     dom_pending_count += 1
                     # DOM明确返回"未完成"，重置稳定计数，继续等待
-                    if page_text != last_text:
+                    if fresh_text_read and page_text != last_text:
                         stable_count = 0
                         last_text = page_text
             except Exception:
@@ -3453,12 +3796,27 @@ class BasePlatform(ABC):
                 or (dom_pending_count >= 8 and elapsed >= max(min_wait + 8, 20))
             )
             if not generation_done and should_use_text_fallback:
-                if (
-                    page_text == last_text
+                if not fresh_text_read:
+                    # 兜底阶段不再每轮强制读取正文；等下一次计划中的读取来推进稳定计数。
+                    pass
+                elif (
+                    fresh_text_read
+                    and page_text
                     and has_new_content
                     and self.has_usable_answer_text(page_text, keyword=keyword, brand=brand)
                 ):
-                    stable_count += 1
+                    self._mark_answer_text_read_cadence(
+                        elapsed=elapsed,
+                        min_wait=min_wait,
+                        fallback_active=True,
+                    )
+                    current_compact = self._normalize_compact_text(page_text)
+                    previous_compact = self._normalize_compact_text(last_text_before_poll)
+                    if previous_compact and current_compact == previous_compact:
+                        stable_count += 1
+                    else:
+                        stable_count = 1
+                    last_text = page_text
                     if stable_count >= 4:
                         debug_state = {}
                         try:
@@ -3482,7 +3840,8 @@ class BasePlatform(ABC):
                         generation_done = True
                 else:
                     stable_count = 0
-                    last_text = page_text
+                    if fresh_text_read:
+                        last_text = page_text
 
             if generation_done:
                 final_text, usable = self._get_stable_answer_text(
@@ -3507,8 +3866,20 @@ class BasePlatform(ABC):
                 if not usable:
                     self.last_error = self._POST_COMPLETE_EMPTY_ANSWER_ERROR
                     print(f"[{self.name}] {self.last_error}")
+                    self._finish_answer_poll_metrics(
+                        outcome="post_complete_unusable",
+                        final_text=final_text,
+                        keyword=keyword,
+                        brand=brand,
+                    )
                     return
                 on_rank(self.parse_ranking(final_text, brand), final_text)
+                self._finish_answer_poll_metrics(
+                    outcome="ranked",
+                    final_text=final_text,
+                    keyword=keyword,
+                    brand=brand,
+                )
                 break
 
             self._cooperative_sleep(1)
@@ -3517,6 +3888,7 @@ class BasePlatform(ABC):
             # 超时兜底：用当前页面文本尝试解析排名
             print(f"[{self.name}] 等待生成超时（{timeout}s），尝试用当前内容解析排名")
             try:
+                self._schedule_answer_poll_read(force_scroll=True)
                 final_text = get_text()
                 capture_final_text = self._end_answer_capture(
                     get_text,
@@ -3539,17 +3911,41 @@ class BasePlatform(ABC):
                 ):
                     self.last_error = "未检测到本轮新的回答内容，可能仍停留在旧对话或问题未真正发送"
                     print(f"[{self.name}] {self.last_error}")
+                    self._finish_answer_poll_metrics(
+                        outcome="timeout_no_new_content",
+                        final_text=final_text,
+                        keyword=keyword,
+                        brand=brand,
+                    )
                     return
                 if not self.has_usable_answer_text(final_text, keyword=keyword, brand=brand):
                     reason = self.explain_unusable_answer_text(final_text, keyword=keyword, brand=brand) or "unknown"
                     self.last_error = "未获取到有效回答内容，可能触发验证码或回答尚未生成"
                     preview = (final_text or "")[:300].replace("\n", "\\n")
                     print(f"[{self.name}] {self.last_error} ({reason}); 预览: {preview}")
+                    self._finish_answer_poll_metrics(
+                        outcome="timeout_unusable",
+                        final_text=final_text,
+                        keyword=keyword,
+                        brand=brand,
+                    )
                     return
                 on_rank(self.parse_ranking(final_text, brand), final_text)
+                self._finish_answer_poll_metrics(
+                    outcome="timeout_ranked",
+                    final_text=final_text,
+                    keyword=keyword,
+                    brand=brand,
+                )
             except Exception as e:
                 self._reraise_stop_requested(e)
                 print(f"[{self.name}] 超时兜底解析失败: {e}")
+                self._finish_answer_poll_metrics(
+                    outcome="timeout_error",
+                    final_text=self.last_answer_text,
+                    keyword=keyword,
+                    brand=brand,
+                )
 
     def _scroll_brand_into_view(self, brand: str) -> None:
         """滚动到品牌词第一次出现的位置，尽量让命中区域进入可视区。"""
@@ -4140,16 +4536,16 @@ class BasePlatform(ABC):
         """获取回答文本，优先提取回答区，避免把提问内容或验证码文案混入判定。"""
         try:
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel, lastOnly}) => {
+                """({containerSel, resultSel, thinkSel, lastOnly, shouldScroll}) => {
                     const root = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (root) {
+                    if (shouldScroll && root) {
                         const style = window.getComputedStyle(root);
                         if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
                             root.scrollTop = root.scrollHeight;
                         } else {
                             window.scrollTo(0, document.body.scrollHeight);
                         }
-                    } else {
+                    } else if (shouldScroll) {
                         window.scrollTo(0, document.body.scrollHeight);
                     }
 
@@ -4175,6 +4571,7 @@ class BasePlatform(ABC):
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
                     "lastOnly": bool(self.prefer_last_result_block),
+                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as exc:

@@ -35,18 +35,18 @@ class TongyiPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel}) => {
+                """({containerSel, resultSel, thinkSel, shouldScroll}) => {
                     const h = window.__aiMonitorHelpers__ || {};
                     const normalize = h.normalize || ((value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim());
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (container) {
+                    if (shouldScroll && container) {
                         const style = window.getComputedStyle(container);
                         if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
                             container.scrollTop = container.scrollHeight;
                         } else {
                             window.scrollTo(0, document.body.scrollHeight);
                         }
-                    } else {
+                    } else if (shouldScroll) {
                         window.scrollTo(0, document.body.scrollHeight);
                     }
 
@@ -194,6 +194,7 @@ class TongyiPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
+                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as e:
@@ -205,15 +206,17 @@ class TongyiPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel}) => {
+                """({containerSel, resultSel, thinkSel, shouldScroll}) => {
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (container) {
+                    if (shouldScroll && container) {
                         const style = window.getComputedStyle(container);
                         if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
                             container.scrollTop = container.scrollHeight;
                         } else {
                             window.scrollTo(0, document.body.scrollHeight);
                         }
+                    } else if (shouldScroll) {
+                        window.scrollTo(0, document.body.scrollHeight);
                     }
 
                     const normalize = (value) => String(value || '').trim();
@@ -464,6 +467,7 @@ class TongyiPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
+                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or {"root_key": "", "blocks": [], "raw_text": "", "raw_html": ""}
         except Exception as e:

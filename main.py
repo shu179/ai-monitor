@@ -38,6 +38,7 @@ from core.local_model_manager import get_local_model_manager
 from core.local_runtime_prep import prepare_local_runtime, shutdown_owned_local_runtime
 from core.shutdown import install_shutdown_handlers, register_shutdown_callback, run_shutdown_callbacks
 from core.browser_platform_factory import (
+    apply_browser_runtime_config,
     create_browser_platform,
     resolve_browser_answer_screenshot_mode,
 )
@@ -715,8 +716,13 @@ def _apply_browser_runtime_config(platform, platform_name: str, config: dict | N
     if not config:
         return
     browser_cfg = (config.get("browser_automation", {}) or {}).get(platform_name, {}) or {}
+    if hasattr(platform, "debug_poll_metrics") and "debug_poll_metrics" not in browser_cfg:
+        setattr(platform, "debug_poll_metrics", "")
     for key, value in browser_cfg.items():
         if not hasattr(platform, key):
+            continue
+        if key == "debug_poll_metrics" and isinstance(value, (bool, int, float)):
+            setattr(platform, key, value)
             continue
         if not isinstance(value, str):
             continue
@@ -795,6 +801,7 @@ def _sync_reused_platform_runtime_state(
         platform.inspect = target_inspect
 
     platform.stop_checker = stop_checker
+    apply_browser_runtime_config(platform, platform_name, config)
     platform.screenshot_on_mention = task.get('screenshot_on_mention', False)
     platform.deep_think = kw_entry.get('deep_think', {}).get(platform_name, False)
     platform.extract_references_enabled = bool(task.get('extract_references_enabled', False))

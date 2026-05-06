@@ -100,17 +100,17 @@ class YuanbaoPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel}) => {
+                """({containerSel, resultSel, thinkSel, shouldScroll}) => {
                     const normalize = (value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (container) {
+                    if (shouldScroll && container) {
                         const style = window.getComputedStyle(container);
                         if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
                             container.scrollTop = container.scrollHeight;
                         } else {
                             window.scrollTo(0, document.body.scrollHeight);
                         }
-                    } else {
+                    } else if (shouldScroll) {
                         window.scrollTo(0, document.body.scrollHeight);
                     }
 
@@ -232,6 +232,7 @@ class YuanbaoPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
+                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as e:
@@ -243,16 +244,16 @@ class YuanbaoPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel}) => {
+                """({containerSel, resultSel, thinkSel, shouldScroll}) => {
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (container) {
+                    if (shouldScroll && container) {
                         const style = window.getComputedStyle(container);
                         if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
                             container.scrollTop = container.scrollHeight;
                         } else {
                             window.scrollTo(0, document.body.scrollHeight);
                         }
-                    } else {
+                    } else if (shouldScroll) {
                         window.scrollTo(0, document.body.scrollHeight);
                     }
 
@@ -469,6 +470,7 @@ class YuanbaoPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
+                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or {"root_key": "", "blocks": [], "raw_text": "", "raw_html": ""}
         except Exception as e:
@@ -792,9 +794,21 @@ class YuanbaoPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             return self.page.evaluate("""() => {
-                if (document.querySelector('[class*="stopBtn"], [class*="stop-btn"], [class*="stopGenerate"], [class*="stop_btn"]')) return false;
-                if (document.querySelector('[class*="yb-loading"], [class*="hyc-loading"], [class*="chatLoading"]')) return false;
-                if (document.querySelector('rect[x="7.71448"]')) return false;
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return (
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.opacity !== '0' &&
+                        rect.width > 0 &&
+                        rect.height > 0
+                    );
+                };
+                if (Array.from(document.querySelectorAll('[class*="stopBtn"], [class*="stop-btn"], [class*="stopGenerate"], [class*="stop_btn"]')).some((el) => isVisible(el))) return false;
+                if (Array.from(document.querySelectorAll('[class*="yb-loading"], [class*="hyc-loading"], [class*="chatLoading"]')).some((el) => isVisible(el))) return false;
+                if (Array.from(document.querySelectorAll('rect[x="7.71448"]')).some((el) => isVisible(el.closest('svg') || el))) return false;
                 return true;
             }""")
         except Exception as e:
@@ -805,9 +819,21 @@ class YuanbaoPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             return bool(self.page.evaluate("""() => {
-                if (document.querySelector('[class*="stopBtn"], [class*="stop-btn"], [class*="stopGenerate"], [class*="stop_btn"]')) return true;
-                if (document.querySelector('[class*="yb-loading"], [class*="hyc-loading"], [class*="chatLoading"]')) return true;
-                if (document.querySelector('rect[x="7.71448"]')) return true;
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return (
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.opacity !== '0' &&
+                        rect.width > 0 &&
+                        rect.height > 0
+                    );
+                };
+                if (Array.from(document.querySelectorAll('[class*="stopBtn"], [class*="stop-btn"], [class*="stopGenerate"], [class*="stop_btn"]')).some((el) => isVisible(el))) return true;
+                if (Array.from(document.querySelectorAll('[class*="yb-loading"], [class*="hyc-loading"], [class*="chatLoading"]')).some((el) => isVisible(el))) return true;
+                if (Array.from(document.querySelectorAll('rect[x="7.71448"]')).some((el) => isVisible(el.closest('svg') || el))) return true;
                 return false;
             }"""))
         except Exception as e:

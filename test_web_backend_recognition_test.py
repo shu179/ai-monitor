@@ -130,7 +130,11 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
             manager = runtime._ensure_recognition_manager()
 
         self.assertIs(manager.kwargs["on_send_complete"], runtime._scheduler_reporter.record_recognition_result)
-        self.assertIs(manager.kwargs["on_round_complete"], runtime._scheduler_reporter.send_recognition_round_summary)
+        payload = {"mode": "recognition", "completed": 1}
+        with patch.object(runtime, "_process_pending_task_deletions") as process_pending:
+            manager.kwargs["on_round_complete"](payload)
+        runtime._scheduler_reporter.send_recognition_round_summary.assert_called_once_with(payload)
+        process_pending.assert_called_once()
 
     def test_begin_mode_round_starts_listener_when_scheduler_round_begins(self):
         runtime = AppRuntime()

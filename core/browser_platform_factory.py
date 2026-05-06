@@ -5,10 +5,13 @@ from __future__ import annotations
 from typing import Any
 
 from core.browser_auth import (
+    build_browser_runtime_diagnostics,
     cleanup_browser_runtime_cache,
     get_active_browser_auth_dir,
+    mark_browser_auth_profile_runtime_binding,
     mark_browser_auth_profile_used,
 )
+from core.local_account_space import current_account_profile_dir
 from platforms import (
     DoubaoPlatform,
     DeepSeekPlatform,
@@ -81,10 +84,15 @@ def apply_browser_runtime_config(platform, platform_name: str, config: dict | No
     if not config:
         return
     browser_cfg = (config.get("browser_automation", {}) or {}).get(platform_name, {}) or {}
+    if hasattr(platform, "debug_poll_metrics") and "debug_poll_metrics" not in browser_cfg:
+        setattr(platform, "debug_poll_metrics", "")
     for key, value in browser_cfg.items():
         if key in _RUNTIME_CONFIG_BLOCKED_FIELDS:
             continue
         if not hasattr(platform, key):
+            continue
+        if key == "debug_poll_metrics" and isinstance(value, (bool, int, float)):
+            setattr(platform, key, value)
             continue
         if not isinstance(value, str):
             continue
@@ -92,6 +100,57 @@ def apply_browser_runtime_config(platform, platform_name: str, config: dict | No
         if not normalized:
             continue
         setattr(platform, key, normalized)
+
+
+def _redact_proxy_server(value: str) -> str:
+    text = str(value or "").strip()
+    if not text or "@" not in text:
+        return text
+    prefix, suffix = text.rsplit("@", 1)
+    scheme = ""
+    if "://" in prefix:
+        scheme = prefix.split("://", 1)[0] + "://"
+    return f"{scheme}<credentials>@{suffix}"
+
+
+def _runtime_binding_for_platform(platform) -> dict[str, Any]:
+    account_dir = current_account_profile_dir()
+    return {
+        "account_profile_dir": str(account_dir or ""),
+        "user_data_dir": str(getattr(platform, "user_data_dir", "") or ""),
+        "proxy_server": _redact_proxy_server(getattr(platform, "browser_proxy_server", "")),
+        "has_proxy_username": bool(str(getattr(platform, "browser_proxy_username", "") or "").strip()),
+        "use_external_chrome_cdp": bool(getattr(platform, "use_external_chrome_cdp", False)),
+        "external_chrome_light_control": bool(getattr(platform, "external_chrome_light_control", True)),
+        "browser_locale": str(getattr(platform, "browser_locale", "") or ""),
+        "browser_timezone_id": str(getattr(platform, "browser_timezone_id", "") or ""),
+    }
+
+
+def _log_runtime_identity_diagnostics(platform_name: str, binding: dict[str, Any]) -> None:
+    try:
+        proxy = str(binding.get("proxy_server") or "").strip() or "直连"
+        account_dir = str(binding.get("account_profile_dir") or "").strip() or "未绑定"
+        user_data_dir = str(binding.get("user_data_dir") or "").strip() or "未知"
+        cdp_mode = "external_cdp_port" if bool(binding.get("use_external_chrome_cdp")) else "persistent_context"
+        light_control = "light" if bool(binding.get("external_chrome_light_control")) else "full"
+        print(
+            f"[{platform_name}] 账号/Profile/IP诊断: "
+            f"account_dir={account_dir}, user_data_dir={user_data_dir}, "
+            f"proxy={proxy}, browser_mode={cdp_mode}/{light_control}"
+        )
+        diagnostics = build_browser_runtime_diagnostics()
+        issues = [
+            issue for issue in diagnostics.get("issues", [])
+            if platform_name in (issue.get("platforms") or [])
+        ]
+        for issue in issues[:3]:
+            print(
+                f"[{platform_name}] 账号/Profile/IP风险: "
+                f"{issue.get('severity')} {issue.get('title')} - {issue.get('message')}"
+            )
+    except Exception:
+        pass
 
 
 def resolve_browser_answer_screenshot_mode(config: dict | None) -> str:
@@ -116,6 +175,12 @@ def create_browser_platform(
     mark_browser_auth_profile_used(normalized)
     platform = platform_class(str(user_data_dir))
     apply_browser_runtime_config(platform, normalized, config)
+    try:
+        binding = _runtime_binding_for_platform(platform)
+        mark_browser_auth_profile_runtime_binding(normalized, binding)
+        _log_runtime_identity_diagnostics(normalized, binding)
+    except Exception:
+        pass
     platform.answer_screenshot_mode = resolve_browser_answer_screenshot_mode(config)
     platform.inspect = bool(inspect)
     platform.stop_checker = stop_checker

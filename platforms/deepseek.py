@@ -22,7 +22,7 @@ class DeepSeekPlatform(BasePlatform):
     deep_think_selector = "button:has-text('深度思考'), div:has-text('深度思考'), span:has-text('深度思考')"
     generation_pause_selector = 'path[d^="M2 4.88"], path[d^="M2 4.87988"], path[d^="M2 4.8"]'
     prefer_last_result_block = True
-    use_automation_control_flag = False
+    use_automation_control_flag = True
     use_automation_user_agent = False
     use_automation_extra_headers = False
     use_automation_ignore_default_args = False
@@ -254,11 +254,19 @@ class DeepSeekPlatform(BasePlatform):
                     ];
                     const stopPathSet = new Set();
                     const configuredStopControlSet = new Set();
+                    const pathLooksVisible = (path) => {
+                        if (!path) return false;
+                        const control = controlFor(path);
+                        if (!control || !isVisible(control)) return false;
+                        const svg = path.closest?.('svg');
+                        if (svg && !isVisible(svg)) return false;
+                        return isVisible(path) || isVisible(control);
+                    };
                     const addConfiguredStopNode = (node) => {
                         if (!node) return;
                         const tag = String(node.tagName || '').toLowerCase();
                         if (tag === 'path') {
-                            stopPathSet.add(node);
+                            if (pathLooksVisible(node)) stopPathSet.add(node);
                             return;
                         }
                         const control = controlFor(node);
@@ -267,7 +275,7 @@ class DeepSeekPlatform(BasePlatform):
                         }
                         try {
                             for (const path of node.querySelectorAll('svg path, path')) {
-                                stopPathSet.add(path);
+                                if (pathLooksVisible(path)) stopPathSet.add(path);
                             }
                         } catch (_) {}
                     };
@@ -287,7 +295,7 @@ class DeepSeekPlatform(BasePlatform):
                             d.startsWith('M2 4.8') ||
                             stopPathMarkers.some((marker) => d.includes(marker))
                         ) {
-                            stopPathSet.add(node);
+                            if (pathLooksVisible(node)) stopPathSet.add(node);
                         }
                     }
                     const stopPathDetails = Array.from(stopPathSet).map((path) => {
@@ -958,16 +966,18 @@ class DeepSeekPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel}) => {
+                """({containerSel, resultSel, thinkSel, shouldScroll}) => {
                     const normalize = (value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (container) {
+                    if (shouldScroll && container) {
                         const style = window.getComputedStyle(container);
                         if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
                             container.scrollTop = container.scrollHeight;
                         } else {
                             window.scrollTo(0, document.body.scrollHeight);
                         }
+                    } else if (shouldScroll) {
+                        window.scrollTo(0, document.body.scrollHeight);
                     }
 
                     const isVisible = (el) => {
@@ -1101,6 +1111,7 @@ class DeepSeekPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
+                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as e:
@@ -1112,15 +1123,17 @@ class DeepSeekPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel}) => {
+                """({containerSel, resultSel, thinkSel, shouldScroll}) => {
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (container) {
+                    if (shouldScroll && container) {
                         const style = window.getComputedStyle(container);
                         if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
                             container.scrollTop = container.scrollHeight;
                         } else {
                             window.scrollTo(0, document.body.scrollHeight);
                         }
+                    } else if (shouldScroll) {
+                        window.scrollTo(0, document.body.scrollHeight);
                     }
 
                     const normalize = (value) => String(value || '').trim();
@@ -1339,6 +1352,7 @@ class DeepSeekPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
+                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or {"root_key": "", "blocks": [], "raw_text": "", "raw_html": ""}
         except Exception as e:

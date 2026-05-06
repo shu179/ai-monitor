@@ -166,26 +166,32 @@ selector_agent:
   model: doubao-seed-2-0-pro-260215
 browser_automation:
   doubao:
+    debug_poll_metrics: true
     new_chat_selector: div[data-testid='create_conversation_button']
     deep_think_menu_trigger_selector: div[data-testid="deep-thinking-action-button"],
       button:has(div[data-testid="deep-thinking-action-button"])
     deep_think_think_selector: div[data-testid="deep-thinking-action-item-1"], [role="menuitem"]:has-text("思考")
     deep_think_quick_selector: '[role="menuitem"]:has-text("快速")'
   deepseek:
+    debug_poll_metrics: true
     new_chat_selector: button:has(path[d^='M8 0.599609'])
     deep_think_selector: button:has-text('深度思考'), div:has-text('深度思考'), span:has-text('深度思考')
   kimi:
+    debug_poll_metrics: true
     new_chat_selector: button:has(svg[name='AddConversation']), [role='button']:has(svg[name='AddConversation']),
       svg[name='AddConversation']
   yuanbao:
+    debug_poll_metrics: true
     new_chat_selector: .yb-icon.icon-yb-ic_newchat_20
     deep_think_selector: button:has-text('Deep thinking'), div:has-text('Deep thinking'),
       span:has-text('Deep thinking'), button:has-text('深度思考'), div:has-text('深度思考')
   tongyi:
+    debug_poll_metrics: true
     new_chat_selector: button:has-text("新建对话"), button[aria-label="新建对话"], button[class*="newChat"],
       button[class*="new-chat"]
     deep_think_selector: button[aria-label="深度思考"], button:has-text("深度思考")
   wenxin:
+    debug_poll_metrics: true
     new_chat_selector: img[alt="New Session Btn"]
     deep_think_menu_selector: '[class*="inputToolbarLeft"] [class*="item__"]'
     deep_think_enable_item_selector: '[class*="dtModeItem__"]'
