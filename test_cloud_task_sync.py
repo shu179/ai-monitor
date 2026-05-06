@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 from pathlib import Path
 import tempfile
 import unittest
 
+import core.daily_task_state as daily_task_state_module
 import core.history as history_module
 from core.cloud_client import CloudClientError
 from core.cloud_session_store import CloudSessionStore
+from core.cloud_task_sync import _cloud_run_record_to_history_entry
 from core.cloud_task_sync import merge_cloud_tasks_into_config, pull_cloud_tasks_into_config
+from core.time_utils import local_today
 
 
 class FakeTaskClient:
@@ -19,15 +23,18 @@ class FakeTaskClient:
         fail_once_401: bool = False,
         fail_run_records_once_401: bool = False,
         run_records_by_task: dict[int, list[dict]] | None = None,
+        task_day_status_events_by_task: dict[int, list[dict]] | None = None,
     ) -> None:
         self.tasks = tasks
         self.deleted_tasks = deleted_tasks or []
         self.fail_once_401 = fail_once_401
         self.fail_run_records_once_401 = fail_run_records_once_401
         self.run_records_by_task = run_records_by_task or {}
+        self.task_day_status_events_by_task = task_day_status_events_by_task or {}
         self.list_tokens: list[str] = []
         self.list_deleted_tokens: list[str] = []
         self.run_record_calls: list[tuple[str, int, int]] = []
+        self.task_day_status_calls: list[tuple[str, dict[int, int], int]] = []
         self.refresh_calls = 0
 
     def list_tasks(self, access_token: str) -> list[dict]:
@@ -68,6 +75,85 @@ class FakeTaskClient:
             if int(record.get("id") or 0) > normalized_since_id
         ]
         return list(records)[:limit]
+
+    def task_day_status_events_batch(
+        self,
+        access_token: str,
+        task_cursors: dict[int, int],
+        *,
+        limit_per_task: int = 500,
+    ) -> dict[int, list[dict]]:
+        normalized_cursors = {int(task_id): int(cursor or 0) for task_id, cursor in (task_cursors or {}).items()}
+        self.task_day_status_calls.append((access_token, normalized_cursors, limit_per_task))
+        result: dict[int, list[dict]] = {}
+        for task_id, cursor in normalized_cursors.items():
+            result[task_id] = [
+                event for event in self.task_day_status_events_by_task.get(task_id, [])
+                if int(event.get("id") or 0) > cursor
+            ][:limit_per_task]
+        return result
+
+
+class SyncChangesNoRunIdsClient(FakeTaskClient):
+    def __init__(self, tasks: list[dict], *, run_records_by_task: dict[int, list[dict]] | None = None) -> None:
+        super().__init__(tasks, run_records_by_task=run_records_by_task)
+        self.sync_changes_calls: list[dict] = []
+
+    def sync_changes(
+        self,
+        access_token: str,
+        *,
+        known_snapshot: dict | None = None,
+        task_cursors: dict[int, int] | None = None,
+        task_day_status_cursors: dict[int, int] | None = None,
+    ) -> dict:
+        self.sync_changes_calls.append({
+            "access_token": access_token,
+            "known_snapshot": known_snapshot or {},
+            "task_cursors": task_cursors or {},
+            "task_day_status_cursors": task_day_status_cursors or {},
+        })
+        return {
+            "snapshot": {"run_record_id": 13, "task_count": 1},
+            "event_id": "13",
+            "events": ["run_record_changed"],
+            "full_task_pull_required": False,
+            "run_record_task_ids": [],
+            "run_record_max_ids": {},
+            "reference_changed": False,
+        }
+
+
+class SyncChangesTaskDayStatusClient(FakeTaskClient):
+    def __init__(self, *, task_day_status_events_by_task: dict[int, list[dict]] | None = None) -> None:
+        super().__init__([], task_day_status_events_by_task=task_day_status_events_by_task)
+        self.sync_changes_calls: list[dict] = []
+
+    def sync_changes(
+        self,
+        access_token: str,
+        *,
+        known_snapshot: dict | None = None,
+        task_cursors: dict[int, int] | None = None,
+        task_day_status_cursors: dict[int, int] | None = None,
+    ) -> dict:
+        self.sync_changes_calls.append({
+            "access_token": access_token,
+            "known_snapshot": known_snapshot or {},
+            "task_cursors": task_cursors or {},
+            "task_day_status_cursors": task_day_status_cursors or {},
+        })
+        return {
+            "snapshot": {"run_record_id": 13, "task_day_status_event_id": 21, "task_count": 1},
+            "event_id": "21",
+            "events": ["task_day_status_changed"],
+            "full_task_pull_required": False,
+            "run_record_task_ids": [],
+            "run_record_max_ids": {},
+            "task_day_status_task_ids": [9],
+            "task_day_status_max_ids": {9: 21},
+            "reference_changed": False,
+        }
 
 
 class CloudTaskSyncTests(unittest.TestCase):
@@ -306,7 +392,9 @@ class CloudTaskSyncTests(unittest.TestCase):
     def test_pull_imports_cloud_run_records_for_trend_history(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             original_history_dir = history_module.HISTORY_DIR
+            original_state_path = daily_task_state_module.STATE_PATH
             history_module.HISTORY_DIR = Path(tmpdir) / "logs" / "history"
+            daily_task_state_module.STATE_PATH = Path(tmpdir) / "user_data" / "daily_task_status.json"
             store = CloudSessionStore(Path(tmpdir) / "session.json")
             try:
                 store.save(
@@ -361,8 +449,220 @@ class CloudTaskSyncTests(unittest.TestCase):
                 self.assertEqual(records[0]["answer_text"], "")
                 self.assertEqual(records[0]["rank"], 1)
                 self.assertTrue(records[0]["success"])
+                status = daily_task_state_module.get_task_day_status(
+                    config["tasks"][0],
+                    target_date=date(2026, 5, 3),
+                )
+                self.assertEqual(status["brand_status"], "success")
+                self.assertEqual(status["completed_keywords"], ["趋势品牌"])
             finally:
                 history_module.HISTORY_DIR = original_history_dir
+                daily_task_state_module.STATE_PATH = original_state_path
+
+    def test_pull_imports_recognition_cloud_run_record_as_task_success(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_history_dir = history_module.HISTORY_DIR
+            original_state_path = daily_task_state_module.STATE_PATH
+            history_module.HISTORY_DIR = Path(tmpdir) / "logs" / "history"
+            daily_task_state_module.STATE_PATH = Path(tmpdir) / "user_data" / "daily_task_status.json"
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            try:
+                store.save(
+                    {
+                        "base_url": "https://api.example.com",
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "user": {"id": 1, "workspace_id": 1, "role": "admin"},
+                    }
+                )
+                client = FakeTaskClient(
+                    [
+                        {
+                            "id": 9,
+                            "workspace_id": 1,
+                            "task_key": "brand-demo",
+                            "name": "趋势品牌",
+                            "brand": "趋势品牌",
+                            "config_json": {"keywords": ["趋势品牌"], "platforms": ["doubao"]},
+                            "config_version": 1,
+                            "enabled": True,
+                            "access_level": "admin",
+                        }
+                    ],
+                    run_records_by_task={
+                        9: [
+                            {
+                                "id": 15,
+                                "task_id": 9,
+                                "platform": "doubao",
+                                "keyword": "趋势品牌",
+                                "brand": "趋势品牌",
+                                "mode": "recognition",
+                                "result_json": {"rank": 1, "success": True},
+                                "idempotency_key": "run:recognition-record-15",
+                                "executed_at": f"{local_today().isoformat()}T08:00:00+08:00",
+                            }
+                        ]
+                    },
+                )
+                config = {"tasks": []}
+
+                result = pull_cloud_tasks_into_config(config, client=client, session_store=store)
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["summary"]["run_records"]["imported"], 1)
+                status = daily_task_state_module.get_task_day_status(
+                    config["tasks"][0],
+                    target_date=local_today(),
+                )
+                self.assertEqual(status["brand_status"], "success")
+                self.assertEqual(status["completed_keywords"], ["趋势品牌"])
+            finally:
+                history_module.HISTORY_DIR = original_history_dir
+                daily_task_state_module.STATE_PATH = original_state_path
+
+    def test_pull_applies_cloud_task_day_status_event_without_run_record(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_history_dir = history_module.HISTORY_DIR
+            original_state_path = daily_task_state_module.STATE_PATH
+            history_module.HISTORY_DIR = Path(tmpdir) / "logs" / "history"
+            daily_task_state_module.STATE_PATH = Path(tmpdir) / "user_data" / "daily_task_status.json"
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            try:
+                store.save(
+                    {
+                        "base_url": "https://api.example.com",
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "user": {"id": 1, "workspace_id": 1, "role": "admin"},
+                    }
+                )
+                today_text = local_today().isoformat()
+                client = FakeTaskClient(
+                    [
+                        {
+                            "id": 9,
+                            "workspace_id": 1,
+                            "task_key": "brand-demo",
+                            "name": "趋势品牌",
+                            "brand": "趋势品牌",
+                            "config_json": {"keywords": ["趋势品牌"], "platforms": ["doubao"]},
+                            "config_version": 1,
+                            "enabled": True,
+                            "access_level": "admin",
+                        }
+                    ],
+                    task_day_status_events_by_task={
+                        9: [
+                            {
+                                "id": 21,
+                                "task_id": 9,
+                                "task_day": today_text,
+                                "status": "success",
+                                "source": "dashboard_force_send",
+                                "message": "看板无视失败后已发送 1 张成功截图",
+                                "brands": ["趋势品牌"],
+                                "completed_keywords": ["趋势品牌"],
+                                "detected_platforms": ["doubao"],
+                                "image_count": 1,
+                                "actual_screenshot_count": 1,
+                                "notification_success": True,
+                                "forced_ignore_failure": True,
+                            }
+                        ]
+                    },
+                )
+                config = {"tasks": []}
+
+                result = pull_cloud_tasks_into_config(config, client=client, session_store=store)
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["summary"]["task_day_status_events"]["applied"], 1)
+                self.assertEqual(client.task_day_status_calls, [("access", {9: 0}, 500)])
+                self.assertEqual(config["tasks"][0]["cloud_last_task_day_status_synced_id"], 21)
+                self.assertEqual(history_module.get_records("趋势品牌", task_id="cloud_9"), [])
+                status = daily_task_state_module.get_task_day_status(
+                    config["tasks"][0],
+                    target_date=local_today(),
+                )
+                self.assertEqual(status["brand_status"], "sent")
+                self.assertTrue(status["sent_today"])
+                self.assertTrue(status["official_extra"]["forced_ignore_failure"])
+            finally:
+                history_module.HISTORY_DIR = original_history_dir
+                daily_task_state_module.STATE_PATH = original_state_path
+
+    def test_changes_pull_applies_cloud_task_day_status_without_full_task_pull(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_history_dir = history_module.HISTORY_DIR
+            original_state_path = daily_task_state_module.STATE_PATH
+            history_module.HISTORY_DIR = Path(tmpdir) / "logs" / "history"
+            daily_task_state_module.STATE_PATH = Path(tmpdir) / "user_data" / "daily_task_status.json"
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            try:
+                store.save(
+                    {
+                        "base_url": "https://api.example.com",
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "user": {"id": 1, "workspace_id": 1, "role": "admin"},
+                    }
+                )
+                today_text = local_today().isoformat()
+                client = SyncChangesTaskDayStatusClient(
+                    task_day_status_events_by_task={
+                        9: [
+                            {
+                                "id": 21,
+                                "task_id": 9,
+                                "task_day": today_text,
+                                "status": "success",
+                                "source": "dashboard_force_send",
+                                "message": "看板无视失败后已发送 1 张成功截图",
+                                "brands": ["趋势品牌"],
+                                "completed_keywords": ["趋势品牌"],
+                                "detected_platforms": ["doubao"],
+                                "actual_screenshot_count": 1,
+                                "notification_success": True,
+                                "forced_ignore_failure": True,
+                            }
+                        ]
+                    }
+                )
+                config = {
+                    "cloud_platform_sync": {
+                        "event_snapshot": {"run_record_id": 13, "task_day_status_event_id": 20, "task_count": 1},
+                    },
+                    "tasks": [
+                        {
+                            "task_id": "cloud_9",
+                            "name": "趋势品牌",
+                            "brand": "趋势品牌",
+                            "cloud_task_id": 9,
+                            "cloud_last_task_day_status_synced_id": 20,
+                            "keywords": [{"keyword": "趋势品牌", "platforms": ["doubao"]}],
+                        }
+                    ],
+                }
+
+                result = pull_cloud_tasks_into_config(config, client=client, session_store=store)
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(client.list_tokens, [])
+                self.assertEqual(client.sync_changes_calls[0]["task_day_status_cursors"], {9: 20})
+                self.assertEqual(client.task_day_status_calls, [("access", {9: 20}, 500)])
+                self.assertEqual(result["summary"]["task_day_status_events"]["applied"], 1)
+                self.assertEqual(config["tasks"][0]["cloud_last_task_day_status_synced_id"], 21)
+                status = daily_task_state_module.get_task_day_status(
+                    config["tasks"][0],
+                    target_date=local_today(),
+                )
+                self.assertEqual(status["brand_status"], "sent")
+                self.assertTrue(status["sent_today"])
+                self.assertTrue(status["official_extra"]["forced_ignore_failure"])
+            finally:
+                history_module.HISTORY_DIR = original_history_dir
+                daily_task_state_module.STATE_PATH = original_state_path
 
     def test_pull_refreshes_when_run_records_token_expires(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -438,6 +738,8 @@ class CloudTaskSyncTests(unittest.TestCase):
                         "user": {"id": 2, "workspace_id": 1, "role": "operator"},
                     }
                 )
+                today_text = local_today().isoformat()
+                previous_day_text = (local_today() - timedelta(days=1)).isoformat()
                 cloud_task = {
                     "id": 9,
                     "workspace_id": 1,
@@ -468,12 +770,12 @@ class CloudTaskSyncTests(unittest.TestCase):
                                 "id": 13,
                                 "task_id": 9,
                                 "platform": "doubao",
-                                "keyword": "新记录",
+                                "keyword": "趋势品牌",
                                 "brand": "趋势品牌",
                                 "mode": "browser",
                                 "result_json": {"rank": 2, "success": True},
                                 "idempotency_key": "run:new",
-                                "executed_at": "2026-05-03T08:00:00Z",
+                                "executed_at": f"{today_text}T08:00:00+08:00",
                             },
                         ]
                     },
@@ -487,9 +789,31 @@ class CloudTaskSyncTests(unittest.TestCase):
                             "name": "趋势品牌",
                             "brand": "趋势品牌",
                             "cloud_last_run_record_synced_id": 12,
+                            "cloud_run_record_backfill_date": today_text,
                         }
                     ]
                 }
+                history_module.import_records(
+                    "趋势品牌",
+                    [
+                        _cloud_run_record_to_history_entry(
+                            {
+                                "id": 12,
+                                "task_id": 9,
+                                "platform": "doubao",
+                                "keyword": "旧记录",
+                                "brand": "趋势品牌",
+                                "mode": "browser",
+                                "result_json": {"rank": 1, "success": True},
+                                "idempotency_key": "run:old",
+                                "executed_at": f"{previous_day_text}T08:00:00+08:00",
+                            },
+                            local_task=config["tasks"][0],
+                            cloud_task_id=9,
+                        )
+                    ],
+                    task_id="cloud_9",
+                )
 
                 result = pull_cloud_tasks_into_config(config, client=client, session_store=store)
 
@@ -498,9 +822,91 @@ class CloudTaskSyncTests(unittest.TestCase):
                 self.assertEqual(result["summary"]["run_records"]["imported"], 1)
                 self.assertEqual(config["tasks"][0]["cloud_last_run_record_synced_id"], 13)
                 records = history_module.get_records("趋势品牌", task_id="cloud_9")
-                self.assertEqual([record["keyword"] for record in records], ["新记录"])
+                self.assertEqual([record["keyword"] for record in records], ["旧记录", "趋势品牌"])
+                status = daily_task_state_module.get_task_day_status(
+                    config["tasks"][0],
+                    target_date=local_today(),
+                )
+                self.assertEqual(status["brand_status"], "success")
             finally:
                 history_module.HISTORY_DIR = original_history_dir
+
+    def test_run_record_change_without_task_ids_falls_back_to_full_pull(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_history_dir = history_module.HISTORY_DIR
+            original_state_path = daily_task_state_module.STATE_PATH
+            history_module.HISTORY_DIR = Path(tmpdir) / "logs" / "history"
+            daily_task_state_module.STATE_PATH = Path(tmpdir) / "user_data" / "daily_task_status.json"
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            try:
+                store.save(
+                    {
+                        "base_url": "https://api.example.com",
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "user": {"id": 1, "workspace_id": 1, "role": "admin"},
+                    }
+                )
+                cloud_task = {
+                    "id": 9,
+                    "workspace_id": 1,
+                    "task_key": "brand-demo",
+                    "name": "趋势品牌",
+                    "brand": "趋势品牌",
+                    "config_json": {"keywords": ["趋势品牌"], "platforms": ["doubao"]},
+                    "config_version": 1,
+                    "enabled": True,
+                    "access_level": "admin",
+                }
+                client = SyncChangesNoRunIdsClient(
+                    [cloud_task],
+                    run_records_by_task={
+                        9: [
+                            {
+                                "id": 13,
+                                "task_id": 9,
+                                "platform": "doubao",
+                                "keyword": "趋势品牌",
+                                "brand": "趋势品牌",
+                                "mode": "browser",
+                                "result_json": {"rank": 1, "success": True},
+                                "idempotency_key": "run:new",
+                                "executed_at": f"{local_today().isoformat()}T08:00:00+08:00",
+                            }
+                        ]
+                    },
+                )
+                config = {
+                    "cloud_platform_sync": {
+                        "event_snapshot": {"run_record_id": 12, "task_count": 1},
+                    },
+                    "tasks": [
+                        {
+                            "task_id": "cloud_9",
+                            "cloud_task_id": 9,
+                            "cloud_task_key": "brand-demo",
+                            "name": "趋势品牌",
+                            "brand": "趋势品牌",
+                            "cloud_last_run_record_synced_id": 12,
+                        }
+                    ],
+                }
+
+                result = pull_cloud_tasks_into_config(config, client=client, session_store=store)
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(client.list_tokens, ["access"])
+                self.assertEqual(client.run_record_calls, [("access", 9, 6000, 0)])
+                self.assertEqual(result["summary"]["run_records"]["imported"], 1)
+                self.assertEqual(config["tasks"][0]["cloud_last_run_record_synced_id"], 13)
+                status = daily_task_state_module.get_task_day_status(
+                    config["tasks"][0],
+                    target_date=local_today(),
+                )
+                self.assertEqual(status["brand_status"], "success")
+            finally:
+                history_module.HISTORY_DIR = original_history_dir
+                daily_task_state_module.STATE_PATH = original_state_path
 
     def test_pull_imports_run_records_for_deleted_task_backup(self):
         with tempfile.TemporaryDirectory() as tmpdir:

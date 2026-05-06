@@ -3720,6 +3720,19 @@ class ClipboardRecognitionManager:
             print(f"[Recognition] 写入企业微信补发队列失败: task={batch.get('task_name', '')}, error={exc}")
             return {}
 
+    def _enqueue_recognition_cloud_records(self, task: dict, record: dict | None) -> None:
+        if not isinstance(record, dict):
+            return
+        cloud_task_id = (task or {}).get("cloud_task_id") or (task or {}).get("cloudTaskId")
+        try:
+            from core.cloud_run_sync import enqueue_run_record_from_history
+        except Exception:
+            return
+        try:
+            enqueue_run_record_from_history(record, cloud_task_id=cloud_task_id)
+        except Exception:
+            pass
+
     def _send_batch(self, batch: dict):
         from core.diagnostics import record_event
 
@@ -3963,7 +3976,7 @@ class ClipboardRecognitionManager:
 
         if ok or daily_state_source != "manual_test":
             for brand in batch["brands"]:
-                history_record(
+                written_entry = history_record(
                     batch["task_name"],
                     "recognition",
                     "clipboard",
@@ -3988,6 +4001,7 @@ class ClipboardRecognitionManager:
                         },
                     },
                 )
+                self._enqueue_recognition_cloud_records(task, written_entry)
 
         self._set_guide_status(
             f"{batch['task_name']} 已发送，准备继续下一个关键词"

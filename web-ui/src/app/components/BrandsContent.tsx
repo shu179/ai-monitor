@@ -3,7 +3,7 @@ import { Search, Plus, ChevronDown, Zap, Edit2, Brain, X, Download, Calendar, La
 import { AreaChart, Area, ResponsiveContainer, YAxis } from "recharts";
 import { ConfirmModal } from "./ConfirmModal";
 import { AnimatedLoadingText } from "./AnimatedLoadingText";
-import { ARTICLE_DATA_CHANGED_EVENT, TASK_DATA_CHANGED_EVENT, fetchCloudAdminTasks, fetchCloudAdminUsers, fetchCloudStatus, fetchDeletedTasks, fetchTasksFull, readTasksFullCache, deleteTask, startTestRunTask, fetchTestRunStatus, cancelTestRunTask, restoreDeletedTask, syncCloudAdminTask, updateTask, type CloudAdminTaskSnapshot, type CloudUserSnapshot, type DeletedTaskSnapshot, type TaskFull, type TestRunStatus } from "../lib/backend";
+import { ARTICLE_DATA_CHANGED_EVENT, CLOUD_ADMIN_USERS_CHANGED_EVENT, TASK_DATA_CHANGED_EVENT, fetchCloudAdminTasks, fetchCloudAdminUsers, fetchCloudStatus, fetchDeletedTasks, fetchTasksFull, readTasksFullCache, deleteTask, startTestRunTask, fetchTestRunStatus, cancelTestRunTask, forceSendSuccessfulTaskResults, restoreDeletedTask, syncCloudAdminTask, updateTask, type CloudAdminTaskSnapshot, type CloudUserSnapshot, type DeletedTaskSnapshot, type TaskFull, type TestRunStatus } from "../lib/backend";
 import { notifySaveSuccess } from "../lib/saveToast";
 
 const ArticleSummaryModal = lazy(() => import("./ArticleSummaryModal").then((module) => ({ default: module.ArticleSummaryModal })));
@@ -35,8 +35,50 @@ const PLATFORM_ID_TO_NAME: Record<string, string> = {
   gemini: "Gemini",
 };
 
+type ActiveTestRun = { runId: string; brandName: string; taskId: string };
+
+const ACTIVE_TEST_RUN_STORAGE_KEY = "surfaced-active-test-run";
+const TASK_EVENT_SOURCE = "brands-content";
+
 function emitTaskDataChanged() {
-  window.dispatchEvent(new CustomEvent(TASK_DATA_CHANGED_EVENT));
+  window.dispatchEvent(new CustomEvent(TASK_DATA_CHANGED_EVENT, { detail: { source: TASK_EVENT_SOURCE } }));
+}
+
+function readStoredActiveTestRun(): ActiveTestRun | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(ACTIVE_TEST_RUN_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<ActiveTestRun>;
+    const runId = String(parsed.runId || "").trim();
+    const taskId = String(parsed.taskId || "").trim();
+    const brandName = String(parsed.brandName || "").trim();
+    if (!runId || !taskId) return null;
+    return { runId, taskId, brandName: brandName || "当前品牌" };
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredActiveTestRun(run: ActiveTestRun | null) {
+  if (typeof window === "undefined") return;
+  try {
+    if (!run?.runId || !run.taskId) {
+      window.localStorage.removeItem(ACTIVE_TEST_RUN_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(ACTIVE_TEST_RUN_STORAGE_KEY, JSON.stringify(run));
+  } catch {
+    // Storage can be unavailable in restricted browser contexts.
+  }
+}
+
+function clearStoredActiveTestRun() {
+  writeStoredActiveTestRun(null);
+}
+
+function isTerminalTestRunStatus(status?: TestRunStatus | null) {
+  return status?.status === "success" || status?.status === "failed" || status?.status === "cancelled";
 }
 
 function taskToBrand(task: TaskFull, idx: number) {
@@ -109,10 +151,12 @@ function taskToBrand(task: TaskFull, idx: number) {
 
 export function BrandsContent({
   currentDetectionMode = "smart",
+  cloudRole = "",
   onSaveSuccess,
   onRecognitionTestStart,
 }: {
   currentDetectionMode?: "browser" | "recognition" | "api" | "smart";
+  cloudRole?: string;
   onSaveSuccess?: (message?: string) => void;
   onRecognitionTestStart?: (payload: { taskId: string; taskName: string }) => void;
 }) {
@@ -125,10 +169,13 @@ export function BrandsContent({
   const [searchQuery, setSearchQuery] = useState("");
   const [testBrandConfirm, setTestBrandConfirm] = useState<{ id: string; name: string } | null>(null);
   const [deleteBrandConfirm, setDeleteBrandConfirm] = useState<string | null>(null);
-  const [activeTestRun, setActiveTestRun] = useState<{ runId: string; brandName: string; taskId: string } | null>(null);
+  const [activeTestRun, setActiveTestRun] = useState<ActiveTestRun | null>(null);
   const [testRunStatus, setTestRunStatus] = useState<TestRunStatus | null>(null);
   const [testRunModalOpen, setTestRunModalOpen] = useState(false);
   const [testRunAbortPending, setTestRunAbortPending] = useState(false);
+  const [testRunForceSending, setTestRunForceSending] = useState(false);
+  const [testRunForceSendMessage, setTestRunForceSendMessage] = useState("");
+  const [testRunForceSendError, setTestRunForceSendError] = useState("");
   const [cloudAdminEnabled, setCloudAdminEnabled] = useState(false);
   const [cloudOperators, setCloudOperators] = useState<CloudUserSnapshot[]>([]);
   const [cloudAdminTasks, setCloudAdminTasks] = useState<CloudAdminTaskSnapshot[]>([]);
@@ -136,6 +183,7 @@ export function BrandsContent({
   const [currentPage, setCurrentPage] = useState(1);
   const PAGE_SIZE = 6;
   const terminalTestRunToastRef = useRef<string>("");
+  const isCloudViewer = cloudRole === "viewer";
 
   // Dropdown states
   const [selectedIndustry, setSelectedIndustry] = useState<string>('行业筛选');
@@ -143,15 +191,21 @@ export function BrandsContent({
   const [activeDropdown, setActiveDropdown] = useState<'industry' | 'region' | null>(null);
 
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const loadTasksRequestRef = useRef(0);
 
   // Fetch tasks on mount
   const loadTasks = useCallback(async (options: { showLoadingState?: boolean; force?: boolean } = {}) => {
     const { showLoadingState = true, force = false } = options;
+    const requestId = loadTasksRequestRef.current + 1;
+    loadTasksRequestRef.current = requestId;
     const hasCachedTasks = Boolean(readTasksFullCache()?.length);
     if (showLoadingState && !hasCachedTasks) {
       setLoading(true);
     }
     const result = await fetchTasksFull({ force });
+    if (requestId !== loadTasksRequestRef.current) {
+      return;
+    }
     setTasks(result);
     setLoading(false);
   }, []);
@@ -162,7 +216,10 @@ export function BrandsContent({
   }, [loadTasks]);
 
   useEffect(() => {
-    const handleDataChanged = () => {
+    const handleDataChanged = (event: Event) => {
+      if (event instanceof CustomEvent && event.detail?.source === TASK_EVENT_SOURCE) {
+        return;
+      }
       void loadTasks({ showLoadingState: false, force: true });
     };
     window.addEventListener(ARTICLE_DATA_CHANGED_EVENT, handleDataChanged);
@@ -191,6 +248,14 @@ export function BrandsContent({
 
   useEffect(() => {
     void refreshCloudAdminContext();
+  }, [refreshCloudAdminContext]);
+
+  useEffect(() => {
+    const handleCloudUsersChanged = () => {
+      void refreshCloudAdminContext();
+    };
+    window.addEventListener(CLOUD_ADMIN_USERS_CHANGED_EVENT, handleCloudUsersChanged);
+    return () => window.removeEventListener(CLOUD_ADMIN_USERS_CHANGED_EVENT, handleCloudUsersChanged);
   }, [refreshCloudAdminContext]);
 
   useEffect(() => {
@@ -258,6 +323,10 @@ export function BrandsContent({
   const safePage = Math.min(currentPage, totalPages);
   const pagedBrands = filteredBrands.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
+  const resolveBrandName = useCallback((taskId: string, fallback = "当前品牌") => {
+    return allBrandsData.find((item) => item.id === taskId)?.name || fallback || "当前品牌";
+  }, [allBrandsData]);
+
   // Reset to page 1 when filters change
   useEffect(() => { setCurrentPage(1); }, [searchQuery, selectedIndustry, selectedRegion]);
 
@@ -266,6 +335,9 @@ export function BrandsContent({
     const brand = allBrandsData.find((item) => item.id === taskId);
     const brandName = brand?.name || "当前品牌";
     setTestRunAbortPending(false);
+    setTestRunForceSending(false);
+    setTestRunForceSendMessage("");
+    setTestRunForceSendError("");
     const result = await startTestRunTask(taskId);
     if (result.ok && result.recognitionTest) {
       onRecognitionTestStart?.({
@@ -292,7 +364,9 @@ export function BrandsContent({
     }
 
     terminalTestRunToastRef.current = "";
-    setActiveTestRun({ runId: result.runId, brandName, taskId });
+    const nextRun = { runId: result.runId, brandName, taskId };
+    setActiveTestRun(nextRun);
+    writeStoredActiveTestRun(nextRun);
     setTestRunStatus({
       ok: true,
       runId: result.runId,
@@ -309,7 +383,12 @@ export function BrandsContent({
 
   const handleBackgroundContinue = useCallback(() => {
     setTestRunModalOpen(false);
-  }, []);
+    if (isTerminalTestRunStatus(testRunStatus) || !activeTestRun?.runId) {
+      clearStoredActiveTestRun();
+      setActiveTestRun(null);
+      setTestRunAbortPending(false);
+    }
+  }, [activeTestRun?.runId, testRunStatus]);
 
   const handleAbortTestRun = useCallback(async () => {
     if (!activeTestRun?.runId || testRunAbortPending) {
@@ -340,6 +419,180 @@ export function BrandsContent({
     setTestRunModalOpen(false);
   }, [activeTestRun?.runId, testRunAbortPending]);
 
+  const handleForceSendTestRun = useCallback(async () => {
+    if (!activeTestRun?.taskId || testRunForceSending) {
+      return;
+    }
+    setTestRunForceSending(true);
+    setTestRunForceSendMessage("");
+    setTestRunForceSendError("");
+    try {
+      const result = await forceSendSuccessfulTaskResults(activeTestRun.taskId);
+      if (!result.ok) {
+        setTestRunForceSendError(result.message || "发送失败");
+        return;
+      }
+      const sentCount = Math.max(0, Number(result.actualScreenshotCount || 0));
+      const message = result.message || `已发送 ${sentCount} 张成功截图，并将任务改判为成功`;
+      setTestRunForceSendMessage(message);
+      setTestRunStatus((prev) => ({
+        ...(prev || { ok: true }),
+        ok: true,
+        status: "success",
+        message,
+        result: "success",
+        errorMessage: "",
+        failureDetails: [],
+        sendableSuccessCount: sentCount,
+        actualScreenshotCount: sentCount,
+        canForceSendSuccess: false,
+      }));
+      clearStoredActiveTestRun();
+      emitTaskDataChanged();
+      await loadTasks({ showLoadingState: false, force: true });
+      notifySaveSuccess(onSaveSuccess, message);
+    } finally {
+      setTestRunForceSending(false);
+    }
+  }, [activeTestRun?.taskId, loadTasks, onSaveSuccess, testRunForceSending]);
+
+  const handleOpenActiveTestRunModal = useCallback(async () => {
+    if (!activeTestRun?.taskId) {
+      return;
+    }
+    setTestRunForceSending(false);
+    setTestRunForceSendMessage("");
+    setTestRunForceSendError("");
+    setTestRunModalOpen(true);
+    if (!activeTestRun.runId) {
+      return;
+    }
+    const status = await fetchTestRunStatus(activeTestRun.runId);
+    if (!status.ok) {
+      return;
+    }
+    setTestRunStatus(status);
+    if (isTerminalTestRunStatus(status)) {
+      clearStoredActiveTestRun();
+    } else {
+      writeStoredActiveTestRun(activeTestRun);
+    }
+  }, [activeTestRun]);
+
+  const handleOpenTestFailureNotice = useCallback(async (brand: ReturnType<typeof taskToBrand>) => {
+    const noticeMessage = String(brand.testFailureNotice?.message || "测试失败").trim() || "测试失败";
+    const runId = String(brand.testFailureNotice?.runId || "").trim();
+    const sendableCount = Math.max(0, Number(brand.actualScreenshotCountToday || 0));
+    const nextRun = { runId, brandName: brand.name || "当前品牌", taskId: brand.id };
+    const fallbackStatus: TestRunStatus = {
+      ok: true,
+      runId,
+      taskId: brand.id,
+      taskName: brand.taskName,
+      status: "failed",
+      message: noticeMessage,
+      result: "failed",
+      errorMessage: noticeMessage,
+      failureDetails: [],
+      sendableSuccessCount: sendableCount,
+      actualScreenshotCount: sendableCount,
+      canForceSendSuccess: sendableCount > 0,
+    };
+
+    setActiveTestRun(nextRun);
+    setTestRunStatus(fallbackStatus);
+    setTestRunAbortPending(false);
+    setTestRunForceSending(false);
+    setTestRunForceSendMessage("");
+    setTestRunForceSendError("");
+    setTestRunModalOpen(true);
+    if (!runId) {
+      return;
+    }
+
+    const status = await fetchTestRunStatus(runId);
+    if (!status.ok) {
+      return;
+    }
+    setTestRunStatus(status);
+    if (isTerminalTestRunStatus(status)) {
+      clearStoredActiveTestRun();
+      return;
+    }
+    writeStoredActiveTestRun(nextRun);
+  }, []);
+
+  const handleOpenTaskProgress = useCallback((brand: ReturnType<typeof taskToBrand>) => {
+    const sendableCount = Math.max(0, Number(brand.actualScreenshotCountToday || 0));
+    const completedCount = Math.max(0, Number(brand.completedKeywordsToday?.length || 0));
+    const noticeMessage = String(brand.testFailureNotice?.message || "").trim();
+    const message = noticeMessage
+      || (sendableCount > 0
+        ? `测试已完成 ${completedCount || sendableCount} 项，企业微信尚未发送`
+        : `测试已完成 ${completedCount} 项，暂无可发送截图`);
+    const runId = String(brand.testFailureNotice?.runId || "").trim();
+    const nextRun = { runId, brandName: brand.name || "当前品牌", taskId: brand.id };
+    setActiveTestRun(nextRun);
+    setTestRunStatus({
+      ok: true,
+      runId,
+      taskId: brand.id,
+      taskName: brand.taskName,
+      status: "failed",
+      message,
+      result: "failed",
+      errorMessage: message,
+      failureDetails: [],
+      sendableSuccessCount: sendableCount,
+      actualScreenshotCount: sendableCount,
+      canForceSendSuccess: sendableCount > 0,
+    });
+    setTestRunAbortPending(false);
+    setTestRunForceSending(false);
+    setTestRunForceSendMessage("");
+    setTestRunForceSendError("");
+    setTestRunModalOpen(true);
+    if (runId) {
+      void handleOpenTestFailureNotice(brand);
+    }
+  }, [handleOpenTestFailureNotice]);
+
+  useEffect(() => {
+    if (activeTestRun?.runId) {
+      return;
+    }
+    const stored = readStoredActiveTestRun();
+    if (!stored?.runId) {
+      return;
+    }
+    let cancelled = false;
+    const restore = async () => {
+      const status = await fetchTestRunStatus(stored.runId);
+      if (cancelled) {
+        return;
+      }
+      if (!status.ok || isTerminalTestRunStatus(status)) {
+        clearStoredActiveTestRun();
+        return;
+      }
+      const restoredRun = {
+        ...stored,
+        brandName: resolveBrandName(stored.taskId, stored.brandName),
+      };
+      setActiveTestRun(restoredRun);
+      setTestRunStatus(status);
+      setTestRunAbortPending(false);
+      setTestRunForceSending(false);
+      setTestRunForceSendMessage("");
+      setTestRunForceSendError("");
+      writeStoredActiveTestRun(restoredRun);
+    };
+    void restore();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTestRun?.runId, resolveBrandName]);
+
   useEffect(() => {
     if (!activeTestRun?.runId) return;
 
@@ -349,6 +602,7 @@ export function BrandsContent({
       if (cancelled) return;
       setTestRunStatus(status);
       if (status.status === "success" || status.status === "failed" || status.status === "cancelled") {
+        clearStoredActiveTestRun();
         void loadTasks({ showLoadingState: false, force: true });
         emitTaskDataChanged();
         if (!testRunModalOpen && terminalTestRunToastRef.current !== activeTestRun.runId) {
@@ -416,10 +670,15 @@ export function BrandsContent({
       return { ok: true, message: "" };
     }
     const result = await syncCloudAdminTask({ localTaskId, operatorUserId });
-    if (result.ok) {
+    if (result.ok && !result.task) {
       await refreshCloudAdminContext();
     }
-    return { ok: result.ok, message: result.message || "" };
+    return {
+      ok: result.ok,
+      message: result.message || "",
+      task: result.task,
+      localTask: result.localTask,
+    };
   }, [cloudAdminEnabled, refreshCloudAdminContext]);
 
   return (
@@ -521,13 +780,15 @@ export function BrandsContent({
             />
           </div>
 
-          <button 
-            type="button"
-            onClick={() => setIsCreatingBrand(true)}
-            className="flex h-10 shrink-0 items-center gap-1.5 text-gray-900 px-0 text-[12px] font-bold transition-colors hover:text-black"
-          >
-            <Plus className="w-4 h-4" strokeWidth={2.5} /> 新建品牌
-          </button>
+          {!isCloudViewer && (
+            <button
+              type="button"
+              onClick={() => setIsCreatingBrand(true)}
+              className="flex h-10 shrink-0 items-center gap-1.5 text-gray-900 px-0 text-[12px] font-bold transition-colors hover:text-black"
+            >
+              <Plus className="w-4 h-4" strokeWidth={2.5} /> 新建品牌
+            </button>
+          )}
         </div>
       </div>
 
@@ -585,6 +846,7 @@ export function BrandsContent({
                   showOperatorBadge={cloudAdminEnabled}
                   operatorUserId={operatorUserId}
                   operatorUsername={operatorUsername}
+                  viewOnly={isCloudViewer}
                   testRunState={
                     activeTestRun?.taskId === brand.id
                       ? (
@@ -597,9 +859,27 @@ export function BrandsContent({
                       : null
                   }
                   testBlockedGlobally={hasAnyFormalRunningTask}
+                  onTestRunStatusClick={
+                    activeTestRun?.taskId === brand.id
+                      ? () => void handleOpenActiveTestRunModal()
+                      : undefined
+                  }
+                  onTestFailureNoticeClick={
+                    brand.testFailureNotice
+                      ? () => void handleOpenTestFailureNotice(brand)
+                      : undefined
+                  }
+                  onProgressClick={
+                    !brand.sentToday && (brand.completedKeywordsToday.length > 0 || brand.actualScreenshotCountToday > 0)
+                      ? () => handleOpenTaskProgress(brand)
+                      : undefined
+                  }
                   onArticlesClick={() => setSelectedBrand({ name: brand.name, articles: brand.articles, taskId: brand.id, taskName: brand.taskName })}
-                  onEditClick={() => setEditingBrand(tasks.find(t => t.id === brand.id) || null)}
+                  onEditClick={isCloudViewer ? undefined : () => setEditingBrand(tasks.find(t => t.id === brand.id) || null)}
                   onTestClick={() => {
+                    if (isCloudViewer) {
+                      return;
+                    }
                     if (hasAnyFormalRunningTask) {
                       setActiveTestRun({ runId: "", brandName: brand.name, taskId: brand.id });
                       setTestRunStatus({
@@ -614,8 +894,8 @@ export function BrandsContent({
                     }
                     setTestBrandConfirm({ id: brand.id, name: brand.name });
                   }}
-                  onDeleteClick={() => setDeleteBrandConfirm(brand.id)}
-                  onToggleEnabled={(enabled) => handleToggleEnabled(brand.id, enabled)}
+                  onDeleteClick={isCloudViewer ? undefined : () => setDeleteBrandConfirm(brand.id)}
+                  onToggleEnabled={isCloudViewer ? undefined : (enabled) => handleToggleEnabled(brand.id, enabled)}
                   />
                 </BrandCardErrorBoundary>
               );
@@ -726,10 +1006,28 @@ export function BrandsContent({
                 setEditingBrand(null);
                 setIsCreatingBrand(false);
               }}
-              onSave={() => {
-                setEditingBrand(null);
-                setIsCreatingBrand(false);
-                void loadTasks({ showLoadingState: false, force: true });
+              onSave={async (savedTask, savedCloudTask) => {
+                if (savedTask?.id) {
+                  setTasks((prev) => {
+                    const exists = prev.some((task) => task.id === savedTask.id);
+                    return exists
+                      ? prev.map((task) => (task.id === savedTask.id ? savedTask : task))
+                      : [...prev, savedTask];
+                  });
+                  if (isCreatingBrand) {
+                    setCurrentPage(1);
+                  }
+                } else {
+                  await loadTasks({ showLoadingState: false, force: true });
+                }
+                if (savedCloudTask?.id) {
+                  setCloudAdminTasks((prev) => {
+                    const exists = prev.some((task) => task.id === savedCloudTask.id);
+                    return exists
+                      ? prev.map((task) => (task.id === savedCloudTask.id ? savedCloudTask : task))
+                      : [...prev, savedCloudTask];
+                  });
+                }
                 emitTaskDataChanged();
                 notifySaveSuccess(onSaveSuccess, "保存成功");
               }}
@@ -755,9 +1053,13 @@ export function BrandsContent({
             isOpen={testRunModalOpen}
             onBackgroundContinue={handleBackgroundContinue}
             onAbort={handleAbortTestRun}
+            onForceSend={handleForceSendTestRun}
             brandName={activeTestRun?.brandName || testBrandConfirm?.name || "当前品牌"}
             status={testRunStatus}
             abortPending={testRunAbortPending}
+            forceSendPending={testRunForceSending}
+            forceSendMessage={testRunForceSendMessage}
+            forceSendError={testRunForceSendError}
           />
         </Suspense>
       )}
@@ -877,7 +1179,7 @@ class BrandCardErrorBoundary extends Component<BrandCardErrorBoundaryProps, Bran
 // ---- Subcomponents ----
 
 function BrandCard({
-  taskId, name, industry, region, logo, logoColor, start, end, duration, articles, isTest, chartColor, taskPlatforms, optimizationTrend, taskKeywords, brandStatus, sentToday, scheduledToday, formalStarted, formalRunning, hasGap, gapReasons, failedToday, failedModes, failureKindToday, statusMessage, completedKeywordsToday, actualScreenshotCountToday, fixedScreenshotTargetToday, completedByQuotaToday, testFailureNotice, deletePending, deletePendingError, showOperatorBadge, operatorUserId, operatorUsername, testRunState, testBlockedGlobally, onArticlesClick, onEditClick, onTestClick, onDeleteClick, onToggleEnabled
+  taskId, name, industry, region, logo, logoColor, start, end, duration, articles, isTest, chartColor, taskPlatforms, optimizationTrend, taskKeywords, brandStatus, sentToday, scheduledToday, formalStarted, formalRunning, hasGap, gapReasons, failedToday, failedModes, failureKindToday, statusMessage, completedKeywordsToday, actualScreenshotCountToday, fixedScreenshotTargetToday, completedByQuotaToday, testFailureNotice, deletePending, deletePendingError, showOperatorBadge, operatorUserId, operatorUsername, viewOnly, testRunState, testBlockedGlobally, onTestRunStatusClick, onTestFailureNoticeClick, onProgressClick, onArticlesClick, onEditClick, onTestClick, onDeleteClick, onToggleEnabled
 }: {
   taskId: string, name: string, industry: string, region: string, logo: string, logoColor: string,
   start: string, end: string, duration: string, articles: number, isTest: boolean, chartColor: string,
@@ -899,14 +1201,18 @@ function BrandCard({
   actualScreenshotCountToday: number,
   fixedScreenshotTargetToday: number,
   completedByQuotaToday: boolean,
-  testFailureNotice?: { message: string; updatedAt: string; expiresAt: string } | null,
+  testFailureNotice?: { message: string; updatedAt: string; expiresAt: string; runId?: string } | null,
   deletePending?: boolean,
   deletePendingError?: string,
   showOperatorBadge?: boolean,
   operatorUserId?: number,
   operatorUsername?: string,
+  viewOnly?: boolean,
   testRunState?: "running" | "cancelling" | null,
   testBlockedGlobally?: boolean,
+  onTestRunStatusClick?: () => void,
+  onTestFailureNoticeClick?: () => void,
+  onProgressClick?: () => void,
   onArticlesClick?: () => void, onEditClick?: () => void, onTestClick?: () => void, onDeleteClick?: () => void,
   onToggleEnabled?: (currentEnabled: boolean) => void
 }) {
@@ -938,7 +1244,7 @@ function BrandCard({
   const failureSummary = isSendFailure
     ? "发送状态：企业微信发送未成功"
     : `失败模式：${failedModes.length > 0 ? failedModes.join("、") : "今日任务失败"}`;
-  const completedToday = sentToday || brandStatus === "success";
+  const completedToday = sentToday;
   const configuredKeywordCount = useMemo(() => {
     const keywords = new Set<string>();
     for (const item of taskKeywords || []) {
@@ -953,6 +1259,9 @@ function BrandCard({
     : completedKeywordCount > 0
       ? `今日进度：已完成 ${completedKeywordCount} 个关键词`
       : "";
+  const progressToneClassName = sentToday
+    ? "text-emerald-600 hover:text-emerald-700"
+    : "text-amber-700 hover:text-amber-800";
   const testFailureMessage = String(testFailureNotice?.message || "").trim();
   const deletePendingMessage = String(deletePendingError || "").trim() || (deletePending ? "删除已排队，正式任务结束后自动处理" : "");
   const isTesting = testRunState === "running";
@@ -972,7 +1281,7 @@ function BrandCard({
       : showFormalGap
         ? { className: "bg-red-100/90 text-red-600 border-red-200/80", label: "失败待补齐" }
         : brandStatus === "success"
-          ? { className: "bg-emerald-100/90 text-emerald-700 border-emerald-200/80", label: "成功" }
+          ? { className: "bg-amber-100/90 text-amber-700 border-amber-200/80", label: "待发送" }
           : showPendingBadge
             ? { className: "bg-gray-100/90 text-gray-600 border-gray-200/80", label: "未运行" }
             : null;
@@ -999,9 +1308,14 @@ function BrandCard({
                   <span className="px-1.5 py-0.5 bg-gray-100 text-gray-500 text-[9px] rounded font-bold tracking-wider">{industry}</span>
                   <span className="px-1.5 py-0.5 bg-gray-100 text-gray-500 text-[9px] rounded font-bold tracking-wider">{region}</span>
                   {testStatusBadge && (
-                    <span className={`px-1.5 py-0.5 text-[9px] rounded font-bold tracking-wider border ${testStatusBadge.className}`}>
+                    <button
+                      type="button"
+                      onClick={onTestRunStatusClick}
+                      disabled={!onTestRunStatusClick}
+                      className={`px-1.5 py-0.5 text-[9px] rounded font-bold tracking-wider border transition-colors disabled:cursor-default ${testStatusBadge.className}`}
+                    >
                       {testStatusBadge.label}
-                    </span>
+                    </button>
                   )}
                   {brandStatusBadge && (
                     <span className={`px-1.5 py-0.5 text-[9px] rounded font-bold tracking-wider border ${brandStatusBadge.className}`}>
@@ -1054,20 +1368,34 @@ function BrandCard({
                     </div>
                   )}
                   {successProgressSummary && (
-                    <div className={`text-[11px] font-medium ${(showFormalGap || failedToday) ? "text-amber-700" : "text-emerald-600"}`}>
+                    <button
+                      type="button"
+                      onClick={onProgressClick}
+                      disabled={!onProgressClick}
+                      className={`block text-left text-[11px] font-medium transition-colors disabled:cursor-default ${progressToneClassName}`}
+                    >
                       {successProgressSummary}
-                    </div>
+                    </button>
                   )}
                   {testStatusBadge && (
-                    <div className={`inline-flex items-center gap-1 text-[11px] font-medium ${isCancelling ? "text-amber-700" : "text-[var(--brand-navy)]"}`}>
+                    <button
+                      type="button"
+                      onClick={onTestRunStatusClick}
+                      disabled={!onTestRunStatusClick}
+                      className={`inline-flex items-center gap-1 text-left text-[11px] font-medium transition-colors disabled:cursor-default ${isCancelling ? "text-amber-700 hover:text-amber-800" : "text-[var(--brand-navy)] hover:text-blue-700"}`}
+                    >
                       <Loader2 className="w-3 h-3 animate-spin" />
                       {isCancelling ? "测试任务正在安全中断，当前步骤结束后会停止" : "测试任务正在后台执行，关闭弹窗后仍会继续"}
-                    </div>
+                    </button>
                   )}
                   {!failedToday && testFailureMessage && (
-                    <div className="text-[11px] text-amber-600 font-medium">
+                    <button
+                      type="button"
+                      onClick={onTestFailureNoticeClick}
+                      className="block text-left text-[11px] text-amber-600 font-medium transition-colors hover:text-amber-700"
+                    >
                       测试失败提醒：{testFailureMessage}
-                    </div>
+                    </button>
                   )}
                   {deletePendingMessage && (
                     <div className="text-[11px] text-rose-500 font-medium">
@@ -1093,7 +1421,8 @@ function BrandCard({
 
         <div className="xl:pl-2 xl:border-l xl:border-gray-200/70">
           <div className="flex items-center justify-between xl:justify-start xl:gap-5">
-            <div className="flex items-center gap-2">
+            {!viewOnly && (
+              <div className="flex items-center gap-2">
                 <button 
                   type="button"
                   onClick={onTestClick}
@@ -1116,13 +1445,16 @@ function BrandCard({
               >
                 <Edit2 size={10} /> 编辑
               </button>
-            </div>
-            <div className="flex items-center gap-1.5 cursor-pointer" onClick={() => { setTaskActive(!taskActive); onToggleEnabled?.(taskActive); }}>
-              <span className={`text-[9px] font-bold uppercase tracking-widest transition-colors ${taskActive ? 'text-gray-500' : 'text-gray-400'}`}>
-                {taskActive ? '任务进行中' : '任务已暂停'}
-              </span>
-              <TinySwitch checked={taskActive} onChange={() => { setTaskActive(!taskActive); onToggleEnabled?.(taskActive); }} />
-            </div>
+              </div>
+            )}
+            {!viewOnly && (
+              <div className="flex items-center gap-1.5 cursor-pointer" onClick={() => { setTaskActive(!taskActive); onToggleEnabled?.(taskActive); }}>
+                <span className={`text-[9px] font-bold uppercase tracking-widest transition-colors ${taskActive ? 'text-gray-500' : 'text-gray-400'}`}>
+                  {taskActive ? '任务进行中' : '任务已暂停'}
+                </span>
+                <TinySwitch checked={taskActive} onChange={() => { setTaskActive(!taskActive); onToggleEnabled?.(taskActive); }} />
+              </div>
+            )}
           </div>
 
           <div className="mt-4 space-y-4">

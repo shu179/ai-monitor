@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, EmailStr, Field
@@ -17,8 +17,13 @@ class UserPublic(BaseModel):
     role: Literal["admin", "operator", "viewer"]
     display_name: str | None = None
     email: str | None = None
+    avatar: str | None = None
+    birthday: date | None = None
+    hire_date: date | None = None
+    view_all_tasks: bool = False
     enabled: bool
     token_version: int
+    deleted_at: datetime | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -76,13 +81,29 @@ class CreateUserRequest(BaseModel):
     role: Literal["operator", "viewer"]
     display_name: str | None = Field(default=None, max_length=128)
     email: EmailStr | None = None
+    birthday: date | None = None
+    hire_date: date | None = None
+    view_all_tasks: bool = False
+    visible_task_ids: list[int] = Field(default_factory=list, max_length=1000)
 
 
 class UpdateUserRequest(BaseModel):
+    username: str | None = Field(default=None, min_length=1, max_length=128)
     password: str | None = Field(default=None, min_length=8, max_length=128)
     display_name: str | None = Field(default=None, max_length=128)
     email: EmailStr | None = None
+    birthday: date | None = None
+    hire_date: date | None = None
+    view_all_tasks: bool | None = None
+    visible_task_ids: list[int] | None = Field(default=None, max_length=1000)
     enabled: bool | None = None
+
+
+class UpdateMyProfileRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=128)
+    avatar: str | None = Field(default=None, max_length=1_000_000)
+    birthday: date | None = None
+    hire_date: date | None = None
 
 
 class BrandTaskPublic(BaseModel):
@@ -146,6 +167,24 @@ class SyncEventsResponse(BaseModel):
     duplicates: int
 
 
+class SyncChangesRequest(BaseModel):
+    known_snapshot: dict[str, Any] = Field(default_factory=dict)
+    task_cursors: dict[int, int] = Field(default_factory=dict, max_length=200)
+    task_day_status_cursors: dict[int, int] = Field(default_factory=dict, max_length=200)
+
+
+class SyncChangesResponse(BaseModel):
+    snapshot: dict[str, Any]
+    event_id: str
+    events: list[str]
+    full_task_pull_required: bool
+    run_record_task_ids: list[int]
+    run_record_max_ids: dict[int, int]
+    task_day_status_task_ids: list[int] = Field(default_factory=list)
+    task_day_status_max_ids: dict[int, int] = Field(default_factory=dict)
+    reference_changed: bool
+
+
 class RunRecordPublic(BaseModel):
     id: int
     workspace_id: int
@@ -161,6 +200,24 @@ class RunRecordPublic(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class RunRecordsBatchRequest(BaseModel):
+    task_cursors: dict[int, int] = Field(default_factory=dict, max_length=200)
+    limit_per_task: int = Field(default=6000, ge=1, le=10000)
+
+
+class RunRecordsBatchResponse(BaseModel):
+    records: dict[int, list[RunRecordPublic]]
+
+
+class TaskDayStatusEventsBatchRequest(BaseModel):
+    task_cursors: dict[int, int] = Field(default_factory=dict, max_length=200)
+    limit_per_task: int = Field(default=500, ge=1, le=2000)
+
+
+class TaskDayStatusEventsBatchResponse(BaseModel):
+    events: dict[int, list[dict[str, Any]]]
 
 
 class ReferenceRankingItem(BaseModel):

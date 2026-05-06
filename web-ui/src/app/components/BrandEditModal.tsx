@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { X, Plus, Brain, Save, Trash2, Settings2, Check, Map as MapIcon, Globe, ArrowUpRight, Calendar, Download, ChevronDown } from "lucide-react";
 import { ChartArea } from "./Charts";
-import { createTask, fetchTaskTrend, generateBrandTaskDraft, importKeywordsFromFile, updateTask, type BrandTaskDraft, type CloudUserSnapshot, type DeletedTaskSnapshot, type TaskFull, type TrendSnapshot } from "../lib/backend";
+import { createTask, fetchTaskTrend, generateBrandTaskDraft, importKeywordsFromFile, updateTask, type BrandTaskDraft, type CloudAdminTaskSnapshot, type CloudUserSnapshot, type DeletedTaskSnapshot, type TaskFull, type TrendSnapshot } from "../lib/backend";
 import { DatePickerField } from "./ui/date-picker-field";
 
 type PlatformState = {
@@ -59,13 +59,13 @@ export function BrandEditModal({
   deletedTasks?: DeletedTaskSnapshot[],
   currentDetectionMode?: "browser" | "recognition" | "api" | "smart",
   onClose: () => void,
-  onSave?: () => void,
+  onSave?: (task?: TaskFull, cloudTask?: CloudAdminTaskSnapshot) => void | Promise<void>,
   isNew?: boolean,
   initialInstruction?: string,
   cloudAdminEnabled?: boolean,
   cloudOperators?: CloudUserSnapshot[],
   initialOperatorUserId?: number,
-  onCloudSync?: (localTaskId: string, operatorUserId?: number) => Promise<{ ok: boolean; message?: string }>,
+  onCloudSync?: (localTaskId: string, operatorUserId?: number) => Promise<{ ok: boolean; message?: string; task?: CloudAdminTaskSnapshot; localTask?: TaskFull }>,
   canDelete?: boolean,
   onDeleteClick?: () => void,
   onRestoreDeletedTask?: (deletedTaskId: string, brandName: string) => Promise<{ ok: boolean; message?: string }>,
@@ -540,7 +540,7 @@ export function BrandEditModal({
       };
 
       let localTaskId = brand?.id || "";
-      let localResult: { ok: boolean; task_id?: string; message?: string };
+      let localResult: { ok: boolean; task_id?: string; task?: TaskFull; message?: string };
       if (isNew) {
         localResult = await createTask(taskPayload);
         localTaskId = localResult.task_id || "";
@@ -554,15 +554,19 @@ export function BrandEditModal({
         return;
       }
 
+      let savedTask = localResult.task;
+      let savedCloudTask: CloudAdminTaskSnapshot | undefined;
       if (cloudAdminEnabled && onCloudSync && localTaskId) {
         const cloudResult = await onCloudSync(localTaskId, cloudOperatorUserId || 0);
         if (!cloudResult.ok) {
           setSaveNotice({ tone: "error", message: cloudResult.message || "云端任务同步失败" });
           return;
         }
+        savedTask = cloudResult.localTask || savedTask;
+        savedCloudTask = cloudResult.task;
       }
 
-      onSave?.();
+      await onSave?.(savedTask, savedCloudTask);
       onClose();
     } finally {
       setSaving(false);
@@ -753,7 +757,7 @@ export function BrandEditModal({
         setSaveNotice({ tone: "error", message: result.message || "恢复品牌配置失败" });
         return;
       }
-      onSave?.();
+      await onSave?.();
       onClose();
     } finally {
       setRestoringDeletedTask(false);

@@ -443,6 +443,10 @@ def _iter_record_query_updates(record: dict) -> list[dict]:
             return updates
         extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
         detected_platforms = extract_success_record_detected_platforms(record)
+        if not detected_platforms:
+            record_platform = _normalize_platform_id(record.get("platform") or "")
+            if record_platform and record_platform != "recognition":
+                detected_platforms = [record_platform]
         matched_pairs = extra.get("matched_pairs") if isinstance(extra.get("matched_pairs"), list) else []
         if matched_pairs:
             for item in matched_pairs:

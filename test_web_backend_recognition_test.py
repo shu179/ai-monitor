@@ -212,6 +212,96 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("进行中的测试任务", result["message"])
 
+    def test_failed_test_run_status_exposes_force_send_when_screenshots_exist(self):
+        runtime = AppRuntime()
+        runtime.load_config = Mock(return_value={
+            "tasks": [
+                {
+                    "task_id": "task-1",
+                    "name": "品牌任务",
+                    "brand": "品牌A",
+                }
+            ],
+        })
+        runtime._test_runs["run-1"] = {
+            "runId": "run-1",
+            "taskId": "task-1",
+            "status": "failed",
+            "message": "测试失败",
+        }
+
+        with patch("web_backend._collect_today_successful_task_payload", return_value={
+            "screenshotPaths": ["/tmp/ok.png"],
+            "actualScreenshotCount": 1,
+        }):
+            status = runtime.get_test_run_status("run-1")
+
+        self.assertTrue(status["ok"])
+        self.assertTrue(status["canForceSendSuccess"])
+        self.assertEqual(status["sendableSuccessCount"], 1)
+
+        with patch("web_backend._collect_today_successful_task_payload", return_value={
+            "screenshotPaths": [],
+            "actualScreenshotCount": 0,
+        }):
+            status = runtime.get_test_run_status("run-1")
+
+        self.assertFalse(status["canForceSendSuccess"])
+        self.assertEqual(status["sendableSuccessCount"], 0)
+
+    def test_force_send_successful_task_results_marks_failed_test_run_success(self):
+        runtime = AppRuntime()
+        task = {
+            "task_id": "task-1",
+            "name": "品牌任务",
+            "brand": "品牌A",
+            "cloud_task_id": 9,
+            "webhook_url": "https://example.com/test-webhook",
+        }
+        runtime.load_config = Mock(return_value={"tasks": [task]})
+        runtime._set_test_failure_notice("task-1", "测试失败", run_id="run-1")
+        self.assertEqual(runtime._get_test_failure_notice("task-1")["runId"], "run-1")
+        runtime._test_runs["run-1"] = {
+            "runId": "run-1",
+            "taskId": "task-1",
+            "status": "failed",
+            "message": "测试失败",
+            "result": "failed",
+            "errorMessage": "未补齐",
+            "failureDetails": [{"keyword": "词1"}],
+        }
+        notifier = Mock()
+        notifier.last_error = ""
+        notifier.send_detected_images.return_value = True
+
+        with patch("web_backend._collect_today_successful_task_payload", return_value={
+            "taskName": "品牌任务",
+            "brands": ["品牌A"],
+            "completedKeywords": ["词1"],
+            "detectedPlatforms": ["doubao"],
+            "screenshotPaths": ["/tmp/ok.png"],
+            "actualScreenshotCount": 1,
+        }):
+            with patch("web_backend.WeComNotifier", return_value=notifier):
+                with patch("web_backend.write_task_status"):
+                    with patch("web_backend.update_cycle_report_with_forced_success", return_value=None):
+                        with patch("web_backend.enqueue_task_day_status") as enqueue_status:
+                            result = runtime.force_send_successful_task_results("task-1")
+
+        self.assertTrue(result["ok"])
+        enqueue_status.assert_called_once()
+        cloud_payload = enqueue_status.call_args.args[0]
+        self.assertEqual(cloud_payload["task_id"], 9)
+        self.assertEqual(cloud_payload["source"], "dashboard_force_send")
+        self.assertTrue(cloud_payload["notification_success"])
+        self.assertTrue(cloud_payload["forced_ignore_failure"])
+        status = runtime.get_test_run_status("run-1")
+        self.assertEqual(status["status"], "success")
+        self.assertEqual(status["result"], "success")
+        self.assertFalse(status["canForceSendSuccess"])
+        self.assertEqual(status["failureDetails"], [])
+        self.assertIsNone(runtime._get_test_failure_notice("task-1"))
+
     def test_recognition_test_message_uses_text_hint_in_dom_mode(self):
         runtime = AppRuntime()
         runtime.load_config = Mock(return_value={

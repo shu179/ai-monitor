@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import signal
+import shutil
 import socket
 import struct
 import subprocess
@@ -167,19 +168,35 @@ from core.browser_platform_factory import (
 from core.browser_runtime import resolve_system_browser_executable
 from core.cloud_sync import CloudSyncManager
 from core.cloud_client import CloudClientError, SurfacedCloudClient
+from core.cloud_event_types import EVENT_PROFILE_UPDATE, FORCE_SEND_SOURCE
 from core.cloud_outbox import CloudOutbox
 from core.cloud_platform_auto_sync import CloudPlatformAutoSync
-from core.cloud_run_sync import flush_cloud_outbox as flush_cloud_outbox_events
+from core.cloud_run_sync import (
+    enqueue_profile_update,
+    enqueue_recent_cloud_run_records_from_history,
+    enqueue_task_day_status,
+    flush_cloud_outbox as flush_cloud_outbox_events,
+)
 from core.cloud_session_store import (
     CloudSessionChangedError,
     CloudSessionStore,
     cloud_session_identity,
     cloud_session_identity_key,
+    normalize_cloud_base_url,
 )
-from core.cloud_task_sync import pull_cloud_tasks_into_config
-from core.local_account_space import current_account_config_path, ensure_current_account_space
+from core.cloud_task_sync import (
+    pull_cloud_tasks_into_config,
+    refresh_visible_cloud_task_day_statuses_from_history,
+)
+from core.local_account_space import (
+    account_profile_dir_from_session,
+    current_account_config_path,
+    ensure_account_space,
+    ensure_current_account_space,
+)
 from core.profile_assets import (
     is_profile_avatar_url,
+    profile_avatar_data_url,
     public_profile_avatar_url,
     read_profile_avatar_asset,
     store_profile_avatar,
@@ -399,6 +416,9 @@ POST_JSON_RUNTIME_METHODS = {
     "/api/cloud/logout": "logout_cloud",
     "/api/cloud/flush-outbox": "flush_cloud_outbox",
     "/api/cloud/pull-tasks": "pull_cloud_tasks",
+    "/api/cloud/admin/create-user": "create_cloud_admin_user",
+    "/api/cloud/admin/update-user": "update_cloud_admin_user",
+    "/api/cloud/admin/delete-user": "delete_cloud_admin_user",
     "/api/cloud/admin/update-task": "update_cloud_admin_task",
     "/api/cloud/admin/sync-task": "sync_cloud_admin_task",
     "/api/cloud/admin/delete-task": "delete_cloud_admin_task",
@@ -535,6 +555,31 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+
+def _normalize_cloud_task_id_list(values: Any) -> list[int]:
+    if not isinstance(values, list):
+        return []
+    task_ids: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        task_id = _safe_int(value, 0)
+        if task_id <= 0 or task_id in seen:
+            continue
+        seen.add(task_id)
+        task_ids.append(task_id)
+    return task_ids
+
+
+def _has_pending_profile_update_for_session(session: dict[str, Any]) -> bool:
+    try:
+        queue = CloudOutbox().bind_to_session(session)
+        return any(
+            str(item.get("event_type") or "") == EVENT_PROFILE_UPDATE
+            for item in queue.pending(limit=50)
+        )
+    except Exception:
+        return False
 
 
 def _mask_secret(value: Any, *, visible: int = 4) -> str:
@@ -1688,7 +1733,9 @@ class AppRuntime:
     """Holds live state used by the frontend."""
 
     def __init__(self) -> None:
-        ensure_current_account_space()
+        startup_session = CloudSessionStore().load()
+        startup_user = startup_session.get("user") if isinstance(startup_session.get("user"), dict) else {}
+        ensure_current_account_space(copy_legacy=str(startup_user.get("role") or "").strip() == "admin")
         self.config_path = current_account_config_path()
         self.config_provider = RuntimeConfigProvider(
             self.config_path,
@@ -1803,9 +1850,11 @@ class AppRuntime:
             logger=lambda message: print(redact_secret_text(message)),
         )
         self._cloud_platform_auto_sync = CloudPlatformAutoSync(
-            pull_tasks=lambda: self.pull_cloud_tasks({}),
+            pull_tasks=lambda force=False: self.pull_cloud_tasks({"force": force}),
+            recover_upload_candidates=lambda: self._recover_cloud_run_history_uploads(),
             logger=lambda message: print(redact_secret_text(message)),
         )
+        self._isolate_ordinary_cloud_account_config(CloudSessionStore().load())
 
     def _activate_current_account_space(self, *, copy_legacy: bool = True) -> None:
         ensure_current_account_space(copy_legacy=copy_legacy)
@@ -1822,6 +1871,140 @@ class AppRuntime:
         self._invalidate_tasks_full_cache()
         self._invalidate_article_cache()
 
+    @staticmethod
+    def _cloud_login_session_preview(*, base_url: str, token_pair: dict[str, Any]) -> dict[str, Any]:
+        user = token_pair.get("user") if isinstance(token_pair.get("user"), dict) else {}
+        return {
+            "base_url": normalize_cloud_base_url(base_url),
+            "access_token": str(token_pair.get("access_token") or "").strip(),
+            "refresh_token": str(token_pair.get("refresh_token") or "").strip(),
+            "token_type": str(token_pair.get("token_type") or "bearer").strip() or "bearer",
+            "user": dict(user or {}),
+        }
+
+    @staticmethod
+    def _cloud_role(session: dict[str, Any] | None) -> str:
+        user = session.get("user") if isinstance(session, dict) and isinstance(session.get("user"), dict) else {}
+        return str(user.get("role") or "").strip()
+
+    def _login_cloud_account_space(self, *, base_url: str, token_pair: dict[str, Any]) -> dict[str, Any]:
+        preview_session = self._cloud_login_session_preview(base_url=base_url, token_pair=token_pair)
+        store = CloudSessionStore()
+        previous_session = store.load()
+        previous_key = cloud_session_identity_key(previous_session)
+        next_key = cloud_session_identity_key(preview_session)
+        if previous_key and next_key and previous_key != next_key:
+            try:
+                previous_outbox = CloudOutbox().bind_to_session(previous_session)
+                previous_stats = previous_outbox.stats()
+                if previous_stats.get("pending", 0) or previous_stats.get("failed", 0):
+                    flush_cloud_outbox_events(outbox=previous_outbox)
+            except Exception as exc:
+                print(f"[WebBackend] 切换账号前旧账号运行数据补传失败，将继续登录新账号: {exc}")
+        profile_dir = account_profile_dir_from_session(preview_session)
+        marker_exists = bool(profile_dir and (profile_dir / "profile_meta.json").exists())
+        copy_legacy = self._cloud_role(preview_session) == "admin" and not marker_exists
+        ensure_account_space(preview_session, copy_legacy=copy_legacy)
+
+        saved_session = store.save_login(base_url=base_url, token_pair=token_pair)
+        self._activate_current_account_space(copy_legacy=False)
+        self._isolate_ordinary_cloud_account_config(saved_session)
+        self._close_execution_runtime_for_viewer()
+        return saved_session
+
+    def _isolate_ordinary_cloud_account_config(self, session: dict[str, Any] | None) -> bool:
+        if not isinstance(session, dict):
+            return False
+        role = self._cloud_role(session)
+        if role in {"", "admin"}:
+            return False
+
+        profile_dir = account_profile_dir_from_session(session)
+        if profile_dir is None:
+            return False
+
+        meta_path = profile_dir / "profile_meta.json"
+        meta: dict[str, Any] = {}
+        try:
+            if meta_path.exists():
+                loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    meta = loaded
+        except Exception:
+            meta = {}
+
+        config = self.config_provider.load()
+        next_config = copy.deepcopy(config or {})
+        changed = False
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        desired_profile = {
+            "name": str(user.get("username") or "").strip(),
+            "role": self._cloud_profile_role_label(role),
+            "avatar": "",
+            "birthday": str(user.get("birthday") or "").strip(),
+            "hire_date": str(user.get("hire_date") or "").strip(),
+        }
+
+        profile = next_config.get("profile") if isinstance(next_config.get("profile"), dict) else {}
+        if dict(profile or {}) != desired_profile:
+            next_config["profile"] = desired_profile
+            changed = True
+
+        isolated_at = str(meta.get("ordinary_account_isolated_at") or "").strip()
+        needs_one_time_isolation = not isolated_at
+        if needs_one_time_isolation:
+            tasks = next_config.get("tasks")
+            if isinstance(tasks, list):
+                filtered_tasks = []
+                for task in tasks:
+                    if not isinstance(task, dict):
+                        continue
+                    cloud_task_id = task.get("cloud_task_id") or task.get("cloudTaskId")
+                    cloud_task_key = str(task.get("cloud_task_key") or task.get("cloudTaskKey") or "").strip()
+                    access_level = str(task.get("cloud_access_level") or "").strip()
+                    if not cloud_task_id and not cloud_task_key:
+                        continue
+                    if access_level == "admin":
+                        continue
+                    filtered_tasks.append(task)
+                if filtered_tasks != tasks:
+                    next_config["tasks"] = filtered_tasks
+                    changed = True
+
+            for key in ("account_crawling", "scheduler", "search", "cloud_sync", "platforms"):
+                if key in next_config:
+                    next_config.pop(key, None)
+                    changed = True
+
+            meta["ordinary_account_isolated_at"] = local_now().isoformat(timespec="seconds")
+            meta["ordinary_account_isolated_role"] = role
+            meta["ordinary_account_isolated_user_id"] = user.get("id")
+            try:
+                meta_path.parent.mkdir(parents=True, exist_ok=True)
+                meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+            except Exception:
+                pass
+
+        if changed:
+            if needs_one_time_isolation:
+                self._backup_ordinary_account_config(profile_dir)
+            self.config_provider.save(next_config)
+        return changed
+
+    @staticmethod
+    def _backup_ordinary_account_config(profile_dir: Path) -> None:
+        timestamp = local_now().strftime("%Y%m%d-%H%M%S")
+        backup_dir = profile_dir / "backups" / f"ordinary-account-isolation-{timestamp}"
+        for name in ("config.yaml", "config.local.yaml"):
+            source = profile_dir / name
+            if not source.exists():
+                continue
+            try:
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, backup_dir / name)
+            except Exception:
+                pass
+
     def load_config(self) -> dict:
         self._activate_current_account_space(copy_legacy=False)
         return self.config_provider.load()
@@ -1832,6 +2015,19 @@ class AppRuntime:
 
     def _invalidate_tasks_full_cache(self) -> None:
         self.task_overview_service.invalidate_cache()
+
+    def _get_full_task_snapshot(self, task_id: str) -> dict[str, Any]:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return {}
+        try:
+            payload = self.task_overview_service.get_tasks_full()
+            for task in payload.get("tasks", []) or []:
+                if isinstance(task, dict) and str(task.get("id") or "").strip() == normalized_task_id:
+                    return copy.deepcopy(task)
+        except Exception as exc:
+            print(f"[WebBackend] 获取任务完整快照失败: task_id={normalized_task_id}, error={exc}")
+        return {}
 
     def _invalidate_article_cache(self) -> None:
         with self._article_cache_lock:
@@ -3246,7 +3442,7 @@ return changedCount
         for task_id in expired:
             self._test_failure_notices.pop(task_id, None)
 
-    def _set_test_failure_notice(self, task_id: str, message: str, *, ttl_minutes: int = 30) -> None:
+    def _set_test_failure_notice(self, task_id: str, message: str, *, ttl_minutes: int = 30, run_id: str = "") -> None:
         task_id = str(task_id or "").strip()
         if not task_id:
             return
@@ -3256,6 +3452,7 @@ return changedCount
             "message": str(message or "测试失败").strip() or "测试失败",
             "updatedAt": now.isoformat(timespec="seconds"),
             "expiresAt": expires_at.isoformat(timespec="seconds"),
+            "runId": str(run_id or "").strip(),
         }
 
     def _clear_test_failure_notice(self, task_id: str) -> None:
@@ -3340,6 +3537,8 @@ return changedCount
         refresh_token = str(session.get("refresh_token") or "").strip()
         if not base_url or not access_token or not refresh_token:
             return
+        if _has_pending_profile_update_for_session(session):
+            return
 
         now_ts = time.time()
         with self._cloud_status_validation_lock:
@@ -3356,7 +3555,9 @@ return changedCount
         identity = cloud_session_identity(session)
         client = SurfacedCloudClient(base_url, timeout_seconds=3.0)
         try:
-            client.me(access_token)
+            me_payload = client.me(access_token)
+            if isinstance(me_payload, dict) and cloud_session_identity_key(store.load()) == identity_key:
+                store.update_user(me_payload)
             with self._cloud_status_validation_lock:
                 self._cloud_status_validation_error = ""
             return
@@ -3378,7 +3579,9 @@ return changedCount
             refreshed_access_token = str(refreshed_session.get("access_token") or "").strip()
             if refreshed_access_token:
                 try:
-                    client.me(refreshed_access_token)
+                    me_payload = client.me(refreshed_access_token)
+                    if isinstance(me_payload, dict) and cloud_session_identity_key(store.load()) == cloud_session_identity_key(refreshed_session):
+                        store.update_user(me_payload)
                 except CloudClientError as verify_exc:
                     if verify_exc.status_code == 401:
                         refreshed_identity = cloud_session_identity(refreshed_session)
@@ -3430,6 +3633,13 @@ return changedCount
                     "role": user.get("role"),
                     "display_name": user.get("display_name"),
                     "email": user.get("email"),
+                    "avatar": user.get("avatar"),
+                    "birthday": user.get("birthday"),
+                    "hire_date": user.get("hire_date"),
+                    "enabled": user.get("enabled"),
+                    "token_version": user.get("token_version"),
+                    "created_at": user.get("created_at"),
+                    "deleted_at": user.get("deleted_at"),
                 },
                 "savedAt": str(session.get("saved_at") or ""),
                 "localProfile": {
@@ -3521,6 +3731,121 @@ return changedCount
             return {"ok": False, "message": message or "云端账号获取失败", "users": [], "cloud": self.get_cloud_status().get("cloud")}
         return {"ok": True, "message": "云端账号已刷新", "users": users if isinstance(users, list) else [], "cloud": self.get_cloud_status().get("cloud")}
 
+    def create_cloud_admin_user(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return {"ok": False, "message": "当前云端账号不是管理员", "cloud": self.get_cloud_status().get("cloud")}
+        username = str(request_payload.get("username") or "").strip()
+        password = str(request_payload.get("password") or "")
+        role = str(request_payload.get("role") or "").strip()
+        display_name = str(request_payload.get("display_name") or request_payload.get("displayName") or "").strip()
+        email = str(request_payload.get("email") or "").strip()
+        birthday = str(request_payload.get("birthday") or "").strip()
+        hire_date = str(request_payload.get("hire_date") or request_payload.get("hireDate") or "").strip()
+        view_all_tasks = bool(request_payload.get("view_all_tasks") or request_payload.get("viewAllTasks"))
+        visible_task_ids = request_payload.get("visible_task_ids") or request_payload.get("visibleTaskIds") or []
+        if not username or not password:
+            return {"ok": False, "message": "请填写账号和密码", "cloud": self.get_cloud_status().get("cloud")}
+        if len(password) < 8:
+            return {"ok": False, "message": "密码至少需要 8 位", "cloud": self.get_cloud_status().get("cloud")}
+        if role not in {"operator", "viewer"}:
+            return {"ok": False, "message": "账号类型只能是运营账号或浏览账号", "cloud": self.get_cloud_status().get("cloud")}
+
+        create_payload: dict[str, Any] = {
+            "username": username,
+            "password": password,
+            "role": role,
+            "display_name": display_name or None,
+            "email": email or None,
+            "birthday": birthday or None,
+            "hire_date": hire_date or None,
+        }
+        if role == "viewer":
+            create_payload["view_all_tasks"] = view_all_tasks
+            create_payload["visible_task_ids"] = _normalize_cloud_task_id_list(visible_task_ids)
+        ok, created_user, message = self._cloud_request_with_refresh(
+            lambda client, token: client.create_admin_user(token, create_payload)
+        )
+        if not ok:
+            return {"ok": False, "message": message or "云端账号创建失败", "cloud": self.get_cloud_status().get("cloud")}
+        return {
+            "ok": True,
+            "message": "云端账号已创建",
+            "user": created_user if isinstance(created_user, dict) else {},
+            "cloud": self.get_cloud_status().get("cloud"),
+        }
+
+    def update_cloud_admin_user(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return {"ok": False, "message": "当前云端账号不是管理员", "cloud": self.get_cloud_status().get("cloud")}
+        user_id = _safe_int(request_payload.get("user_id") or request_payload.get("userId"), 0)
+        if user_id <= 0:
+            return {"ok": False, "message": "缺少云端账号 ID", "cloud": self.get_cloud_status().get("cloud")}
+
+        update_payload: dict[str, Any] = {}
+        if "username" in request_payload:
+            username = str(request_payload.get("username") or "").strip()
+            if not username:
+                return {"ok": False, "message": "请填写账号名", "cloud": self.get_cloud_status().get("cloud")}
+            update_payload["username"] = username
+        if "password" in request_payload and str(request_payload.get("password") or ""):
+            password = str(request_payload.get("password") or "")
+            if len(password) < 8:
+                return {"ok": False, "message": "密码至少需要 8 位", "cloud": self.get_cloud_status().get("cloud")}
+            update_payload["password"] = password
+        if "display_name" in request_payload or "displayName" in request_payload:
+            update_payload["display_name"] = str(request_payload.get("display_name") or request_payload.get("displayName") or "").strip() or None
+        if "email" in request_payload:
+            email = str(request_payload.get("email") or "").strip()
+            update_payload["email"] = email or None
+        if "birthday" in request_payload:
+            update_payload["birthday"] = str(request_payload.get("birthday") or "").strip() or None
+        if "hire_date" in request_payload or "hireDate" in request_payload:
+            update_payload["hire_date"] = str(request_payload.get("hire_date") or request_payload.get("hireDate") or "").strip() or None
+        if "view_all_tasks" in request_payload or "viewAllTasks" in request_payload:
+            update_payload["view_all_tasks"] = bool(request_payload.get("view_all_tasks") or request_payload.get("viewAllTasks"))
+        if "visible_task_ids" in request_payload or "visibleTaskIds" in request_payload:
+            update_payload["visible_task_ids"] = _normalize_cloud_task_id_list(
+                request_payload.get("visible_task_ids") or request_payload.get("visibleTaskIds") or []
+            )
+        if "enabled" in request_payload:
+            update_payload["enabled"] = bool(request_payload.get("enabled"))
+        if not update_payload:
+            return {"ok": False, "message": "没有可保存的账号改动", "cloud": self.get_cloud_status().get("cloud")}
+
+        ok, updated_user, message = self._cloud_request_with_refresh(
+            lambda client, token: client.update_admin_user(token, user_id, update_payload)
+        )
+        if not ok:
+            return {"ok": False, "message": message or "云端账号保存失败", "cloud": self.get_cloud_status().get("cloud")}
+        return {
+            "ok": True,
+            "message": "云端账号已保存",
+            "user": updated_user if isinstance(updated_user, dict) else {},
+            "cloud": self.get_cloud_status().get("cloud"),
+        }
+
+    def delete_cloud_admin_user(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return {"ok": False, "message": "当前云端账号不是管理员", "cloud": self.get_cloud_status().get("cloud")}
+        user_id = _safe_int(request_payload.get("user_id") or request_payload.get("userId"), 0)
+        if user_id <= 0:
+            return {"ok": False, "message": "缺少云端账号 ID", "cloud": self.get_cloud_status().get("cloud")}
+        ok, _payload, message = self._cloud_request_with_refresh(
+            lambda client, token: client.delete_admin_user(token, user_id)
+        )
+        if not ok:
+            return {"ok": False, "message": message or "云端账号删除失败", "cloud": self.get_cloud_status().get("cloud")}
+        return {"ok": True, "message": "云端账号已删除", "cloud": self.get_cloud_status().get("cloud")}
+
     def login_cloud(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
         base_url = str(request_payload.get("base_url") or request_payload.get("baseUrl") or "").strip()
@@ -3544,11 +3869,13 @@ return changedCount
             )
         except CloudClientError as exc:
             return {"ok": False, "message": str(exc), "cloud": self.get_cloud_status().get("cloud")}
-        CloudSessionStore().save_login(base_url=base_url, token_pair=token_pair)
-        self._activate_current_account_space(copy_legacy=True)
+        self._login_cloud_account_space(
+            base_url=base_url,
+            token_pair=token_pair,
+        )
         pull_result = self.pull_cloud_tasks({})
         message = "云端登录成功"
-        if pull_result.get("ok"):
+        if isinstance(pull_result, dict) and pull_result.get("ok"):
             message = str(pull_result.get("message") or message)
         return {"ok": True, "message": message, "cloud": self.get_cloud_status().get("cloud")}
 
@@ -3593,11 +3920,13 @@ return changedCount
         return login_result
 
     def _save_cloud_token_pair(self, *, base_url: str, token_pair: dict[str, Any], message: str) -> dict[str, Any]:
-        CloudSessionStore().save_login(base_url=base_url, token_pair=token_pair)
-        self._activate_current_account_space(copy_legacy=True)
+        self._login_cloud_account_space(
+            base_url=base_url,
+            token_pair=token_pair,
+        )
         pull_result = self.pull_cloud_tasks({})
         next_message = message
-        if pull_result.get("ok"):
+        if isinstance(pull_result, dict) and pull_result.get("ok"):
             next_message = str(pull_result.get("message") or next_message)
         return {"ok": True, "message": next_message, "cloud": self.get_cloud_status().get("cloud")}
 
@@ -3671,6 +4000,13 @@ return changedCount
         session = store.load()
         base_url = str(session.get("base_url") or "").strip()
         refresh_token = str(session.get("refresh_token") or "").strip()
+        try:
+            current_outbox = CloudOutbox().bind_to_session(session)
+            current_stats = current_outbox.stats()
+            if current_stats.get("pending", 0) or current_stats.get("failed", 0):
+                flush_cloud_outbox_events(outbox=current_outbox)
+        except Exception as exc:
+            print(f"[WebBackend] 退出前运行数据补传失败，将继续退出: {exc}")
         if base_url and refresh_token:
             try:
                 SurfacedCloudClient(base_url).logout(refresh_token)
@@ -3685,14 +4021,30 @@ return changedCount
         limit = _safe_int(request_payload.get("limit", 100), 100)
         return flush_cloud_outbox_events(limit=limit)
 
+    def _recover_cloud_run_history_uploads(self) -> dict[str, Any]:
+        try:
+            with self._lock:
+                config = self.load_config()
+            session_outbox = CloudOutbox().bind_to_session(CloudSessionStore().load())
+            metrics = enqueue_recent_cloud_run_records_from_history(config, outbox=session_outbox, days=7)
+            return {"ok": True, **metrics}
+        except Exception as exc:
+            return {"ok": False, "message": f"本地运行历史恢复失败：{exc}"}
+
     def pull_cloud_tasks(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        del payload
+        request_payload = payload if isinstance(payload, dict) else {}
+        force_full = bool(request_payload.get("force") or request_payload.get("force_full") or request_payload.get("forceFull"))
         with self._lock:
             config = self.load_config()
-            result = pull_cloud_tasks_into_config(config)
+            result = pull_cloud_tasks_into_config(config, force_full=force_full)
             if result.get("ok"):
                 summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
                 run_summary = summary.get("run_records") if isinstance(summary.get("run_records"), dict) else {}
+                status_summary = (
+                    summary.get("task_day_status_events")
+                    if isinstance(summary.get("task_day_status_events"), dict)
+                    else {}
+                )
                 changed = (
                     int(summary.get("added") or 0)
                     + int(summary.get("updated") or 0)
@@ -3700,7 +4052,10 @@ return changedCount
                     + int(summary.get("deleted") or 0)
                     + int(summary.get("deleted_backups") or 0)
                     + int(summary.get("deleted_pending") or 0)
+                    + int(summary.get("state_updated") or 0)
                     + int(run_summary.get("cursor_updates") or 0)
+                    + int(run_summary.get("backfilled") or 0)
+                    + int(status_summary.get("cursor_updates") or 0)
                 )
                 if changed:
                     self.save_config(config)
@@ -3800,6 +4155,13 @@ return changedCount
                 )
             elif saved_task_id > 0:
                 client.clear_admin_task_operator(token, saved_task_id)
+            if saved_task_id > 0:
+                try:
+                    for task in client.list_admin_tasks(token):
+                        if _safe_int(task.get("id") if isinstance(task, dict) else 0, 0) == saved_task_id:
+                            return task
+                except Exception as exc:
+                    print(f"[WebBackend] 云端任务分配后刷新任务快照失败，将使用保存结果: {exc}")
             return saved
 
         ok, saved_task, message = self._cloud_request_with_refresh(operation)
@@ -3836,6 +4198,7 @@ return changedCount
             "ok": True,
             "message": "云端任务已同步",
             "task": saved_task,
+            "local_task": self._get_full_task_snapshot(local_task_id),
             "cloud": self.get_cloud_status().get("cloud"),
         }
 
@@ -4009,6 +4372,8 @@ return changedCount
         return bool(self._scheduler and self._scheduler.get_status().get("running"))
 
     def _execute_scheduled_task(self, task: dict) -> dict:
+        if self._is_cloud_viewer_account():
+            return {"ok": False, "message": "浏览账号仅可查看管理员分配的数据，不能运行任务"}
         from main import run_task_group
 
         config = self.load_config()
@@ -4172,6 +4537,9 @@ return changedCount
         self._process_pending_task_deletions()
 
     def start_monitoring(self) -> dict:
+        blocked = self._viewer_execution_block_response()
+        if blocked:
+            return blocked
         config = self.load_config()
         enabled_tasks = [task for task in (config.get("tasks", []) or []) if task.get("enabled", True)]
         query_tasks = self._get_query_tasks(enabled_tasks)
@@ -4221,6 +4589,10 @@ return changedCount
 
     def set_monitoring_enabled(self, payload: dict[str, Any]) -> dict:
         enabled = bool(payload.get("enabled", False))
+        if enabled:
+            blocked = self._viewer_execution_block_response()
+            if blocked:
+                return blocked
         return self.start_monitoring() if enabled else self.stop_monitoring()
 
     def _refresh_monitoring_runtime(self, *, restart_scheduler: bool = True) -> None:
@@ -4269,6 +4641,16 @@ return changedCount
         self._account_crawl_thread = None
 
     def run_account_article_crawl(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        blocked = self._viewer_execution_block_response(
+            fetched_count=0,
+            added_count=0,
+            duplicate_count=0,
+            excluded_count=0,
+            excluded_links=[],
+            results=[],
+        )
+        if blocked:
+            return blocked
         normalized_payload = payload or {}
         if not self._account_crawl_lock.acquire(blocking=False):
             return {
@@ -4429,6 +4811,8 @@ return changedCount
             return list(articles)
 
     def _ensure_recognition_manager(self):
+        if self._is_cloud_viewer_account():
+            return None
         if self._recognition_manager is not None:
             return self._recognition_manager
         try:
@@ -4501,6 +4885,15 @@ return changedCount
             self._schedule_recognition_test_reap(restore_previous=True)
 
     def _get_active_recognition_manager(self, *, init_if_missing: bool = True):
+        if self._is_cloud_viewer_account():
+            self._reap_inactive_recognition_test_session(restore_previous=False)
+            manager = self._recognition_manager
+            if manager is not None:
+                try:
+                    manager.stop()
+                except Exception:
+                    pass
+            return None, "viewer"
         self._reap_inactive_recognition_test_session(restore_previous=True)
         if self._recognition_test_manager is not None:
             return self._recognition_test_manager, "test"
@@ -4544,6 +4937,8 @@ return changedCount
         )
 
     def schedule_recognition_warmup(self, *, delay_seconds: float = 1.2) -> None:
+        if self._is_cloud_viewer_account():
+            return
         if self._recognition_test_manager is not None or self._recognition_manager is not None:
             return
 
@@ -4699,6 +5094,15 @@ return changedCount
         }
 
     def _sync_recognition_mode(self, config: dict | None = None) -> None:
+        if self._is_cloud_viewer_account():
+            self._reap_inactive_recognition_test_session(restore_previous=False)
+            manager = self._recognition_manager
+            if manager is not None:
+                try:
+                    manager.stop()
+                except Exception:
+                    pass
+            return
         self._reap_inactive_recognition_test_session(restore_previous=True)
         if self._recognition_test_manager is not None:
             return
@@ -4803,10 +5207,15 @@ return changedCount
             hit_record_count=hit_records,
         )
 
-        profile_summary = _build_snapshot_profile_summary(
-            config,
-            avatar_url_builder=public_profile_avatar_url,
-        )
+        profile_payload = self.get_public_profile(config)
+        profile_summary = {
+            "name": str(profile_payload.get("name") or "").strip(),
+            "role": str(profile_payload.get("role") or "").strip(),
+            "avatar": str(profile_payload.get("avatar") or "").strip(),
+            "avatarUrl": str(profile_payload.get("avatar") or "").strip(),
+            "birthday": str(profile_payload.get("birthday") or "").strip(),
+            "hireDate": str(profile_payload.get("hireDate") or profile_payload.get("hire_date") or "").strip(),
+        }
         profile_name = profile_summary["name"]
 
         platform_items = _build_snapshot_platform_items(config.get("platforms", {}) or {})
@@ -4881,6 +5290,9 @@ return changedCount
         }
 
     def trigger_run_all(self) -> dict:
+        blocked = self._viewer_execution_block_response()
+        if blocked:
+            return blocked
         if self._worker and self._worker.is_alive():
             return {"queued": False, "message": "已有任务正在执行"}
 
@@ -5032,6 +5444,18 @@ return changedCount
 
     def save_profile(self, payload: dict) -> dict:
         """保存用户账号信息到 config.yaml 的 profile 段。"""
+        cloud_profile_payload: dict[str, Any] = {}
+        session = CloudSessionStore().load()
+        session_user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        cloud_logged_in = bool(session.get("base_url") and session.get("access_token") and session.get("refresh_token") and session_user)
+        if cloud_logged_in and isinstance(session_user, dict) and str(session_user.get("role") or "").strip() == "admin":
+            if "name" in payload:
+                cloud_profile_payload["display_name"] = str(payload.get("name") or "").strip() or None
+            if "birthday" in payload:
+                cloud_profile_payload["birthday"] = str(payload.get("birthday") or "").strip() or None
+            if "hire_date" in payload:
+                cloud_profile_payload["hire_date"] = str(payload.get("hire_date") or "").strip() or None
+
         with self._lock:
             config = self.load_config()
             profile = config.get("profile", {}) or {}
@@ -5048,13 +5472,94 @@ return changedCount
 
             config["profile"] = profile
             self.save_config(config)
-        return {"ok": True}
+            if cloud_logged_in and "avatar" in payload:
+                raw_avatar = str(payload.get("avatar") or "").strip()
+                if is_profile_avatar_url(raw_avatar):
+                    portable_avatar = profile_avatar_data_url(profile.get("avatar", ""))
+                    if portable_avatar:
+                        cloud_profile_payload["avatar"] = portable_avatar
+                    elif not profile.get("avatar"):
+                        cloud_profile_payload["avatar"] = ""
+                elif raw_avatar.startswith("user_data/profile/avatar"):
+                    portable_avatar = profile_avatar_data_url(raw_avatar)
+                    if portable_avatar:
+                        cloud_profile_payload["avatar"] = portable_avatar
+                else:
+                    cloud_profile_payload["avatar"] = raw_avatar
+        if cloud_profile_payload:
+            store = CloudSessionStore()
+            session_identity_key = cloud_session_identity_key(session)
+            optimistic_user = dict(session_user)
+            if "avatar" in cloud_profile_payload:
+                optimistic_user["avatar"] = cloud_profile_payload.get("avatar") or None
+            if str(optimistic_user.get("role") or "").strip() == "admin":
+                if "display_name" in cloud_profile_payload:
+                    optimistic_user["display_name"] = cloud_profile_payload.get("display_name")
+                if "birthday" in cloud_profile_payload:
+                    optimistic_user["birthday"] = cloud_profile_payload.get("birthday")
+                if "hire_date" in cloud_profile_payload:
+                    optimistic_user["hire_date"] = cloud_profile_payload.get("hire_date")
+            try:
+                store.update_user(optimistic_user)
+            except Exception as exc:
+                print(f"[WebBackend] 资料本地会话更新失败，将保留配置资料: {exc}")
+
+            uploaded_immediately = False
+            base_url = str(session.get("base_url") or "").strip()
+            access_token = str(session.get("access_token") or "").strip()
+            if base_url and access_token:
+                try:
+                    updated_user = SurfacedCloudClient(base_url, timeout_seconds=5.0).update_me_profile(
+                        access_token,
+                        cloud_profile_payload,
+                    )
+                    if isinstance(updated_user, dict) and cloud_session_identity_key(store.load()) == session_identity_key:
+                        store.update_user(updated_user)
+                        uploaded_immediately = True
+                except Exception as exc:
+                    print(f"[WebBackend] 资料云端即时同步失败，将转入后台补传: {exc}")
+
+            if not uploaded_immediately:
+                try:
+                    enqueue_profile_update(cloud_profile_payload)
+                except Exception as exc:
+                    print(f"[WebBackend] 资料云端后台同步入队失败，将保留本地资料: {exc}")
+        return {"ok": True, "cloud": self.get_cloud_status().get("cloud")}
 
     @staticmethod
     def get_public_profile(config: dict[str, Any]) -> dict[str, Any]:
         profile = dict(config.get("profile", {}) or {})
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        is_cloud_logged_in = bool(session.get("base_url") and session.get("access_token") and session.get("refresh_token") and user)
+        if is_cloud_logged_in:
+            cloud_avatar = str(user.get("avatar") or "").strip()
+            cloud_role = str(user.get("role") or "").strip()
+            is_admin = cloud_role == "admin"
+            local_avatar = public_profile_avatar_url(profile.get("avatar", "")) if is_admin else ""
+            cloud_name = str(
+                (user.get("display_name") if is_admin else "")
+                or user.get("username")
+                or (profile.get("name") if is_admin else "")
+                or ""
+            ).strip()
+            return {
+                "name": cloud_name,
+                "role": AppRuntime._cloud_profile_role_label(cloud_role),
+                "avatar": public_profile_avatar_url(cloud_avatar) if cloud_avatar else local_avatar,
+                "birthday": str(user.get("birthday") or (profile.get("birthday") if is_admin else "") or "").strip(),
+                "hire_date": str(user.get("hire_date") or (profile.get("hire_date") if is_admin else "") or "").strip(),
+            }
         profile["avatar"] = public_profile_avatar_url(profile.get("avatar", ""))
         return profile
+
+    @staticmethod
+    def _cloud_profile_role_label(role: Any) -> str:
+        return {
+            "admin": "管理",
+            "operator": "运营",
+            "viewer": "销售",
+        }.get(str(role or "").strip(), "")
 
     def get_profile_avatar_asset(self) -> tuple[bytes, str] | None:
         return read_profile_avatar_asset(self.load_config())
@@ -5242,6 +5747,15 @@ return changedCount
     def get_tasks_full(self) -> dict:
         """返回所有任务的完整信息。"""
         self._process_pending_task_deletions()
+        try:
+            with self._lock:
+                config = self.load_config()
+                repaired = refresh_visible_cloud_task_day_statuses_from_history(config)
+                if repaired:
+                    self.save_config(config)
+                    self._invalidate_tasks_full_cache()
+        except Exception as exc:
+            print(f"[WebBackend] 云端运行状态本地修复失败，将继续返回任务列表: {exc}")
         return self.task_overview_service.get_tasks_full()
 
     def get_deleted_tasks(self) -> dict:
@@ -5327,6 +5841,39 @@ return changedCount
         session = CloudSessionStore().load()
         user = session.get("user") if isinstance(session.get("user"), dict) else {}
         return str(user.get("role") or "").strip()
+
+    def _is_cloud_viewer_account(self) -> bool:
+        return self._current_cloud_role() == "viewer"
+
+    def _viewer_execution_block_response(self, **extra: Any) -> dict[str, Any] | None:
+        if not self._is_cloud_viewer_account():
+            return None
+        response = {
+            "ok": False,
+            "queued": False,
+            "enabled": False,
+            "message": "浏览账号仅可查看管理员分配的数据，不能运行任务",
+        }
+        response.update(extra)
+        return response
+
+    def _close_execution_runtime_for_viewer(self) -> None:
+        if not self._is_cloud_viewer_account():
+            return
+        try:
+            self.stop_monitoring(persist_preference=True)
+        except Exception:
+            pass
+        try:
+            self._stop_recognition_test_session(restore_previous=False)
+        except Exception:
+            pass
+        manager = self._recognition_manager
+        if manager is not None:
+            try:
+                manager.stop()
+            except Exception:
+                pass
 
     def _task_is_formal_running(self, task: dict[str, Any]) -> bool:
         try:
@@ -5544,7 +6091,8 @@ return changedCount
             self._invalidate_tasks_full_cache()
             self._invalidate_article_cache()
         self._refresh_monitoring_runtime()
-        return {"ok": True, "task_id": new_task.get("task_id", "")}
+        task_id = str(new_task.get("task_id", "") or "").strip()
+        return {"ok": True, "task_id": task_id, "task": self._get_full_task_snapshot(task_id)}
 
     def update_task(self, task_id: str, payload: dict) -> dict:
         """合并更新任务（只覆盖 payload 中存在的字段）。"""
@@ -5568,7 +6116,7 @@ return changedCount
             self._invalidate_tasks_full_cache()
             self._invalidate_article_cache()
         self._refresh_monitoring_runtime()
-        return {"ok": True}
+        return {"ok": True, "task": self._get_full_task_snapshot(task_id)}
 
     def delete_task(self, task_id: str) -> dict:
         """软删除任务，保留三天可恢复备份。"""
@@ -5648,7 +6196,11 @@ return changedCount
 
     def test_run_task(self, task_id: str) -> dict:
         """单任务测试运行（同步，阻塞直到完成）。"""
+        blocked = self._viewer_execution_block_response()
+        if blocked:
+            return blocked
         from main import run_task_group
+
         config = self.load_config()
         target_task = None
         for task in config.get("tasks", []) or []:
@@ -5775,6 +6327,41 @@ return changedCount
             })
         return failed_details
 
+    def _build_test_run_force_send_snapshot(
+        self,
+        task: dict[str, Any] | None = None,
+        *,
+        task_id: str = "",
+    ) -> dict[str, Any]:
+        target_task = task
+        resolved_id = str(task_id or "").strip()
+        if target_task is None:
+            config = self.load_config()
+            _, located_task, located_id = self._locate_task(config, task_id=resolved_id)
+            target_task = located_task
+            resolved_id = located_id or resolved_id
+        if not target_task:
+            return {
+                "sendableSuccessCount": 0,
+                "actualScreenshotCount": 0,
+                "canForceSendSuccess": False,
+            }
+        payload = _collect_today_successful_task_payload(target_task)
+        screenshot_paths = [
+            str(item or "").strip()
+            for item in list(payload.get("screenshotPaths") or [])
+            if str(item or "").strip()
+        ]
+        actual_screenshot_count = max(
+            len(screenshot_paths),
+            int(payload.get("actualScreenshotCount") or 0),
+        )
+        return {
+            "sendableSuccessCount": len(screenshot_paths),
+            "actualScreenshotCount": actual_screenshot_count,
+            "canForceSendSuccess": bool(screenshot_paths),
+        }
+
     def cancel_test_run(self, run_id: str) -> dict:
         with self._test_run_lock:
             state = self._test_runs.get(run_id)
@@ -5836,6 +6423,9 @@ return changedCount
 
     def start_test_run_task(self, task_id: str) -> dict:
         """异步启动单任务测试运行，返回 run_id 给前端轮询。"""
+        blocked = self._viewer_execution_block_response()
+        if blocked:
+            return blocked
         blocked_reason = self._get_test_run_block_reason()
         if blocked_reason:
             return {"ok": False, "message": blocked_reason}
@@ -5895,6 +6485,9 @@ return changedCount
             "errorMessage": "",
             "failureDetails": [],
             "cancelRequested": False,
+            "sendableSuccessCount": 0,
+            "actualScreenshotCount": 0,
+            "canForceSendSuccess": False,
         }
         cancel_event = threading.Event()
         with self._test_run_lock:
@@ -6043,6 +6636,9 @@ return changedCount
                         "message": final_message,
                         "result": "success",
                         "failureDetails": [],
+                        "sendableSuccessCount": 0,
+                        "actualScreenshotCount": 0,
+                        "canForceSendSuccess": False,
                         "finishedAt": datetime.now().isoformat(timespec="seconds"),
                         "report": report,
                     })
@@ -6052,7 +6648,7 @@ return changedCount
                     if str(task_day_status.get("brand_status") or "").strip() in {"success", "sent"}:
                         self._clear_test_failure_notice(task_id)
                     else:
-                        self._set_test_failure_notice(task_id, final_message)
+                        self._set_test_failure_notice(task_id, final_message, run_id=run_id)
                     self._set_test_run_state(run_id, {
                         "status": "failed",
                         "completedQueries": len(result_items),
@@ -6065,6 +6661,7 @@ return changedCount
                         "result": "failed",
                         "errorMessage": error_message,
                         "failureDetails": self._build_test_run_failure_details(report),
+                        **self._build_test_run_force_send_snapshot(target_task),
                         "finishedAt": datetime.now().isoformat(timespec="seconds"),
                         "report": report,
                     })
@@ -6074,13 +6671,14 @@ return changedCount
                 if str(task_day_status.get("brand_status") or "").strip() in {"success", "sent"}:
                     self._clear_test_failure_notice(task_id)
                 else:
-                    self._set_test_failure_notice(task_id, str(exc) or "测试失败")
+                    self._set_test_failure_notice(task_id, str(exc) or "测试失败", run_id=run_id)
                 self._set_test_run_state(run_id, {
                     "status": "failed",
                     "message": "测试失败",
                     "result": "failed",
                     "errorMessage": str(exc),
                     "failureDetails": [],
+                    **self._build_test_run_force_send_snapshot(target_task),
                     "finishedAt": datetime.now().isoformat(timespec="seconds"),
                 })
             finally:
@@ -6097,10 +6695,16 @@ return changedCount
             state = self._test_runs.get(run_id)
             if not state:
                 return {"ok": False, "message": "未找到测试任务"}
-            return {"ok": True, **state}
+            snapshot = dict(state)
+        if str(snapshot.get("status") or "").strip() == "failed":
+            snapshot.update(self._build_test_run_force_send_snapshot(task_id=str(snapshot.get("taskId") or "").strip()))
+        return {"ok": True, **snapshot}
 
     def start_batch_test(self, payload: dict) -> dict:
         """启动批量测试"""
+        blocked = self._viewer_execution_block_response()
+        if blocked:
+            return blocked
         from core.batch_test_runner import BatchTestRunner
 
         print(f"[WebBackend] 收到批量测试请求: {redact_secrets(payload)}")
@@ -6825,6 +7429,9 @@ return changedCount
         }
 
     def run_search_brand_rank(self, payload: dict) -> dict:
+        blocked = self._viewer_execution_block_response()
+        if blocked:
+            return blocked
         file_id = str(payload.get("file_id", "") or "").strip()
         brand = str(payload.get("brand", "") or "").strip()
         if not file_id:
@@ -7480,6 +8087,9 @@ return changedCount
                 pass
 
     def force_send_successful_task_results(self, task_id: str) -> dict:
+        blocked = self._viewer_execution_block_response()
+        if blocked:
+            return blocked
         config = self.load_config()
         _, task, resolved_id = self._locate_task(config, task_id=str(task_id or "").strip())
         if not task or not resolved_id:
@@ -7519,7 +8129,7 @@ return changedCount
         write_task_status(
             task,
             status="success",
-            source="dashboard_force_send",
+            source=FORCE_SEND_SOURCE,
             message=f"看板无视失败后已发送 {actual_screenshot_count} 张成功截图",
             extra=build_task_state_extra(
                 brands=list(brands),
@@ -7531,6 +8141,24 @@ return changedCount
                 forced_ignore_failure=True,
             ),
         )
+        try:
+            enqueue_task_day_status({
+                "task_id": task.get("cloud_task_id") or task.get("cloudTaskId"),
+                "task_day": local_today().isoformat(),
+                "status": "success",
+                "source": FORCE_SEND_SOURCE,
+                "message": f"看板无视失败后已发送 {actual_screenshot_count} 张成功截图",
+                "brands": list(brands),
+                "completed_keywords": list(completed_keywords),
+                "detected_platforms": list(detected_platforms),
+                "image_count": actual_screenshot_count,
+                "actual_screenshot_count": actual_screenshot_count,
+                "notification_success": True,
+                "forced_ignore_failure": True,
+                "updated_at": local_now().isoformat(timespec="seconds"),
+            })
+        except Exception as exc:
+            print(f"[WebBackend] 强制发送成功状态云端同步入队失败，将保留本地成功状态: {exc}")
         self._invalidate_tasks_full_cache()
         task_name = str(payload.get("taskName") or task.get("name") or resolved_id).strip()
         for manager in (self._recognition_manager, self._recognition_test_manager):
@@ -7553,9 +8181,28 @@ return changedCount
                 self._scheduler_reporter._maybe_send_all_success_notification(cycle_payload)
             except Exception:
                 pass
+        success_message = f"已发送 {actual_screenshot_count} 张成功截图，并将任务改判为成功"
+        self._clear_test_failure_notice(resolved_id)
+        with self._test_run_lock:
+            for state in self._test_runs.values():
+                if str(state.get("taskId") or "").strip() != resolved_id:
+                    continue
+                if str(state.get("status") or "").strip() != "failed":
+                    continue
+                state.update({
+                    "status": "success",
+                    "message": success_message,
+                    "result": "success",
+                    "errorMessage": "",
+                    "failureDetails": [],
+                    "sendableSuccessCount": actual_screenshot_count,
+                    "actualScreenshotCount": actual_screenshot_count,
+                    "canForceSendSuccess": False,
+                    "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                })
         return {
             "ok": True,
-            "message": f"已发送 {actual_screenshot_count} 张成功截图，并将任务改判为成功",
+            "message": success_message,
             "actualScreenshotCount": actual_screenshot_count,
         }
 
@@ -7614,6 +8261,9 @@ return changedCount
 
     def recognition_action(self, payload: dict) -> dict:
         """执行 OCR 识别操作。"""
+        blocked = self._viewer_execution_block_response()
+        if blocked:
+            return blocked
         action = str(payload.get("action", "")).strip()
         if not action:
             return {"ok": False, "message": "缺少 action 参数"}
@@ -8493,6 +9143,9 @@ return changedCount
 
     def trigger_run_selected(self, payload: dict) -> dict:
         """按 task_id 列表筛选并执行任务。"""
+        blocked = self._viewer_execution_block_response()
+        if blocked:
+            return blocked
         task_ids = payload.get("task_ids", [])
         if not isinstance(task_ids, list) or not task_ids:
             return {"queued": False, "message": "请指定要运行的任务 ID"}
@@ -8596,6 +9249,17 @@ def _text_response(handler: BaseHTTPRequestHandler, text: str, status: int = HTT
     _apply_cors_headers(handler)
     handler.end_headers()
     _safe_write_response(handler, data)
+
+
+def _bytes_response(handler: BaseHTTPRequestHandler, data: bytes, status: int = HTTPStatus.OK, content_type: str = "application/octet-stream") -> None:
+    payload = data if isinstance(data, bytes) else bytes(data or b"")
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(payload)))
+    handler.send_header("Cache-Control", "private, max-age=300")
+    _apply_cors_headers(handler)
+    handler.end_headers()
+    _safe_write_response(handler, payload)
 
 
 def _download_file_response(handler: BaseHTTPRequestHandler, path: Path, file_name: str) -> None:

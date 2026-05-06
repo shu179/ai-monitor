@@ -8,12 +8,16 @@ from unittest.mock import patch
 from core.cloud_client import CloudClientError
 from core.cloud_outbox import CloudOutbox
 from core.cloud_run_sync import (
+    enqueue_recent_cloud_run_records_from_history,
     enqueue_run_record_from_history,
+    enqueue_task_day_status,
     flush_cloud_outbox,
     history_record_to_reference_events,
     history_record_to_run_event,
+    history_record_to_run_events,
 )
 from core.cloud_session_store import CloudSessionStore
+import core.history as history_module
 
 
 class FakeCloudClient:
@@ -134,6 +138,75 @@ class CloudRunSyncTests(unittest.TestCase):
         self.assertTrue(reference_events[0]["payload"]["run_started_at"].startswith("2026-05-03T12:50:00"))
         self.assertEqual(reference_events[0]["payload"]["normalized_url"], "https://example.com/a")
 
+    def test_history_record_to_run_event_infers_cloud_task_id_from_local_task_id(self):
+        record = {
+            "id": "history-cloud-local-id",
+            "task_id": "cloud_42",
+            "ts": "2026-05-03 12:50",
+            "platform": "doubao",
+            "keyword": "测试品牌",
+            "brand": "测试品牌",
+            "rank": 1,
+            "success": True,
+        }
+
+        event = history_record_to_run_event(record)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event["payload"]["task_id"], 42)
+
+    def test_recognition_history_record_expands_to_real_query_events(self):
+        record = {
+            "id": "recognition-history-1",
+            "task_id": "cloud_42",
+            "ts": "2026-05-05 18:30",
+            "platform": "recognition",
+            "keyword": "clipboard",
+            "brand": "即搜AI",
+            "rank": 1,
+            "success": True,
+            "mode": "recognition",
+            "extra": {
+                "detected_platforms": ["doubao"],
+                "matched_pairs": [
+                    {
+                        "keyword": "武汉GEO优化公司",
+                        "brand": "即搜AI",
+                        "platforms": ["doubao"],
+                    }
+                ],
+            },
+        }
+
+        events = history_record_to_run_events(record)
+
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["event_type"], "run_record")
+        self.assertNotEqual(event["idempotency_key"], "run:recognition-history-1")
+        self.assertEqual(event["payload"]["task_id"], 42)
+        self.assertEqual(event["payload"]["keyword"], "武汉GEO优化公司")
+        self.assertEqual(event["payload"]["brand"], "即搜AI")
+        self.assertEqual(event["payload"]["platform"], "doubao")
+        self.assertEqual(event["payload"]["mode"], "recognition")
+
+    def test_recognition_clipboard_without_matched_pairs_is_not_uploaded(self):
+        record = {
+            "id": "recognition-history-without-pairs",
+            "task_id": "cloud_42",
+            "ts": "2026-05-05 18:30",
+            "platform": "recognition",
+            "keyword": "clipboard",
+            "brand": "即搜AI",
+            "rank": 1,
+            "success": True,
+            "mode": "recognition",
+            "extra": {"detected_platforms": ["doubao"]},
+        }
+
+        self.assertEqual(history_record_to_run_events(record), [])
+
     def test_history_record_to_run_event_preserves_explicit_run_started_at(self):
         record = {
             "id": "history-explicit-start",
@@ -171,6 +244,186 @@ class CloudRunSyncTests(unittest.TestCase):
             self.assertIsNotNone(first)
             self.assertIsNotNone(second)
             self.assertEqual(outbox.stats()["pending"], 1)
+
+    def test_manual_test_success_is_not_uploaded_as_run_record(self):
+        record = {
+            "id": "manual-test-success",
+            "task_id": "cloud_42",
+            "ts": "2026-05-06 12:00",
+            "platform": "doubao",
+            "keyword": "测试品牌",
+            "brand": "测试品牌",
+            "rank": 1,
+            "success": True,
+            "execution_source": "manual_test",
+            "extra": {"references": [{"url": "https://example.com/a"}]},
+        }
+
+        self.assertEqual(history_record_to_run_events(record), [])
+        self.assertEqual(history_record_to_reference_events(record), [])
+
+    def test_enqueue_task_day_status_sanitizes_forced_send_payload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outbox = CloudOutbox(Path(tmpdir) / "outbox.json")
+
+            queued = enqueue_task_day_status(
+                {
+                    "task_id": 42,
+                    "task_day": "2026-05-06",
+                    "status": "success",
+                    "source": "dashboard_force_send",
+                    "message": "已发送 1 张成功截图",
+                    "brands": ["即搜AI", "即搜AI"],
+                    "completed_keywords": ["武汉GEO优化公司"],
+                    "detected_platforms": ["doubao"],
+                    "image_count": 1,
+                    "notification_success": True,
+                    "forced_ignore_failure": True,
+                    "screenshot_paths": ["/tmp/local-only.png"],
+                },
+                outbox=outbox,
+            )
+
+            self.assertIsNotNone(queued)
+            pending = outbox.pending()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["event_type"], "task_day_status")
+            self.assertEqual(pending[0]["payload"]["task_id"], 42)
+            self.assertEqual(pending[0]["payload"]["brands"], ["即搜AI"])
+            self.assertTrue(pending[0]["payload"]["forced_ignore_failure"])
+            self.assertNotIn("screenshot_paths", pending[0]["payload"])
+
+    def test_flush_cloud_outbox_only_sends_latest_profile_update(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outbox = CloudOutbox(Path(tmpdir) / "outbox.json")
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save({
+                "base_url": "https://api.example.com",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "user": {"id": 1, "workspace_id": 1, "role": "admin"},
+            })
+            outbox.enqueue(
+                event_type="profile_update",
+                idempotency_key="profile:old",
+                payload={"display_name": "shuao"},
+            )
+            outbox.enqueue(
+                event_type="run_record",
+                idempotency_key="run:1",
+                payload={"task_id": 1, "platform": "doubao"},
+            )
+            outbox.enqueue(
+                event_type="profile_update",
+                idempotency_key="profile:new",
+                payload={"display_name": "管理员"},
+            )
+            client = FakeCloudClient()
+
+            result = flush_cloud_outbox(client=client, session_store=store, outbox=outbox)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual([event["idempotency_key"] for event in client.events], ["run:1", "profile:new"])
+            self.assertEqual(client.events[-1]["payload"]["display_name"], "管理员")
+            self.assertEqual(outbox.stats()["pending"], 0)
+
+    def test_enqueue_recent_cloud_run_records_from_history_recovers_local_records(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_dir = Path(tmpdir) / "history"
+            outbox = CloudOutbox(Path(tmpdir) / "outbox.json")
+            with patch.object(history_module, "HISTORY_DIR", history_dir):
+                written = history_module.record(
+                    "即搜AI",
+                    "recognition",
+                    "clipboard",
+                    "即搜AI",
+                    1,
+                    True,
+                    {
+                        "mode": "recognition",
+                        "extra": {
+                            "detected_platforms": ["doubao"],
+                            "matched_pairs": [
+                                {
+                                    "keyword": "武汉GEO优化公司",
+                                    "brand": "即搜AI",
+                                    "platforms": ["doubao"],
+                                }
+                            ],
+                        },
+                    },
+                    task_id="cloud_42",
+                )
+                config = {
+                    "tasks": [
+                        {
+                            "task_id": "cloud_42",
+                            "cloud_task_id": 42,
+                            "name": "即搜AI",
+                            "brand": "即搜AI",
+                        }
+                    ]
+                }
+
+                result = enqueue_recent_cloud_run_records_from_history(config, outbox=outbox, days=7)
+
+            self.assertTrue(written["id"])
+            self.assertEqual(result["tasks"], 1)
+            self.assertEqual(result["records"], 1)
+            self.assertEqual(result["candidates"], 1)
+            self.assertEqual(result["queued"], 1)
+            pending = outbox.pending()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["payload"]["task_id"], 42)
+            self.assertEqual(pending[0]["payload"]["keyword"], "武汉GEO优化公司")
+            self.assertEqual(pending[0]["payload"]["platform"], "doubao")
+
+    def test_enqueue_recent_cloud_run_records_skips_cloud_imported_history(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_dir = Path(tmpdir) / "history"
+            outbox = CloudOutbox(Path(tmpdir) / "outbox.json")
+            with patch.object(history_module, "HISTORY_DIR", history_dir):
+                history_module.import_records(
+                    "即搜AI",
+                    [
+                        {
+                            "id": "cloud:run:already-uploaded",
+                            "ts": "2026-05-05 18:30",
+                            "task_id": "cloud_42",
+                            "task_name": "即搜AI",
+                            "platform": "doubao",
+                            "keyword": "武汉GEO优化公司",
+                            "brand": "即搜AI",
+                            "rank": 1,
+                            "success": True,
+                            "mode": "browser",
+                            "execution_source": "cloud",
+                            "extra": {
+                                "cloud_task_id": 42,
+                                "cloud_run_record_id": "88",
+                                "cloud_idempotency_key": "run:operator-local",
+                            },
+                        }
+                    ],
+                    task_id="cloud_42",
+                )
+                config = {
+                    "tasks": [
+                        {
+                            "task_id": "cloud_42",
+                            "cloud_task_id": 42,
+                            "name": "即搜AI",
+                            "brand": "即搜AI",
+                        }
+                    ]
+                }
+
+                result = enqueue_recent_cloud_run_records_from_history(config, outbox=outbox, days=7)
+
+            self.assertEqual(result["records"], 0)
+            self.assertEqual(result["candidates"], 0)
+            self.assertEqual(result["queued"], 0)
+            self.assertEqual(outbox.stats()["pending"], 0)
 
     def test_flush_cloud_outbox_marks_events_sent(self):
         with tempfile.TemporaryDirectory() as tmpdir:

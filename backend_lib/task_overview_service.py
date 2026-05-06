@@ -79,7 +79,11 @@ class TaskOverviewService:
         config = self._config_provider.load()
         active_mode = str(config.get("detection_mode", "browser") or "browser").strip()
         self._prune_test_failure_notices()
-        tasks = list(config.get("tasks", []) or [])
+        tasks = [
+            task
+            for task in list(config.get("tasks", []) or [])
+            if isinstance(task, dict) and not _is_revoked_cloud_task(task)
+        ]
         article_count_by_task: Counter[str] = Counter()
         try:
             all_articles = self._synced_articles_loader(config)
@@ -242,3 +246,7 @@ class TaskOverviewService:
             })
 
         return {"tasks": result}
+
+
+def _is_revoked_cloud_task(task: dict[str, Any]) -> bool:
+    return str(task.get("cloud_access_level") or "").strip().lower() == "revoked"

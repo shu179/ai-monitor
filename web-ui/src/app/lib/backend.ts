@@ -76,6 +76,14 @@ export type SidebarSnapshot = {
   online: boolean;
 };
 
+export type ProfileSnapshot = {
+  name: string;
+  role: string;
+  avatar: string;
+  birthday: string;
+  hireDate: string;
+};
+
 export type AssistantSnapshot = {
   name: string;
   level: string;
@@ -404,6 +412,14 @@ export type CloudUserSnapshot = {
   role?: "admin" | "operator" | "viewer" | string | null;
   display_name?: string | null;
   email?: string | null;
+  avatar?: string | null;
+  birthday?: string | null;
+  hire_date?: string | null;
+  view_all_tasks?: boolean | null;
+  enabled?: boolean;
+  token_version?: number;
+  created_at?: string;
+  deleted_at?: string | null;
 };
 
 export type CloudOutboxStats = {
@@ -422,6 +438,12 @@ export type CloudAutoSyncStatus = {
   last_pull_at: string;
   last_error: string;
   last_error_at: string;
+  last_upload_metrics?: Record<string, unknown>;
+  last_pull_metrics?: Record<string, unknown>;
+  startup_recovery_running?: boolean;
+  last_startup_recovery_at?: string;
+  last_startup_recovery_metrics?: Record<string, unknown>;
+  last_startup_recovery_error?: string;
 };
 
 export type CloudStatusSnapshot = {
@@ -444,8 +466,12 @@ export type CloudTaskPullSummary = {
   deleted_backups?: number;
   deleted_pending?: number;
   skipped: number;
+  state_updated?: number;
   matched_by?: Record<string, number>;
   task_ids?: number[];
+  changes?: Record<string, unknown>;
+  metrics?: Record<string, unknown>;
+  run_records?: Record<string, unknown>;
 };
 
 export type CloudActionResponse = {
@@ -474,6 +500,7 @@ export type CloudAdminTaskSnapshot = {
   assigned_operator_user_id?: number | null;
   assigned_operator_username?: string | null;
   assigned_operator_display_name?: string | null;
+  assigned_viewer_user_ids?: number[];
 };
 
 export type DeletedTaskSnapshot = {
@@ -511,15 +538,24 @@ export type CloudAdminUsersResponse = {
   cloud?: CloudStatusSnapshot;
 };
 
+export type CloudAdminUserUpdateResponse = {
+  ok: boolean;
+  message?: string;
+  user?: CloudUserSnapshot;
+  cloud?: CloudStatusSnapshot;
+};
+
 export type CloudAdminTaskUpdateResponse = {
   ok: boolean;
   message?: string;
   task?: CloudAdminTaskSnapshot;
+  localTask?: TaskFull;
   cloud?: CloudStatusSnapshot;
 };
 
 export const ARTICLE_DATA_CHANGED_EVENT = "article-updated";
 export const TASK_DATA_CHANGED_EVENT = "task-updated";
+export const CLOUD_ADMIN_USERS_CHANGED_EVENT = "cloud-admin-users-updated";
 
 const BOOTSTRAP_CACHE_TTL_MS = 2500;
 const TASKS_FULL_CACHE_TTL_MS = 5000;
@@ -568,6 +604,7 @@ export type BootstrapPayload = {
     subtitle: string;
   };
   sidebar: SidebarSnapshot;
+  profile?: ProfileSnapshot;
   assistant: AssistantSnapshot;
   dashboard: DashboardSnapshot;
   platforms: Array<{
@@ -637,6 +674,13 @@ export const FALLBACK_BOOTSTRAP: BootstrapPayload = {
     role: "系统运营",
     avatar: "",
     online: true,
+  },
+  profile: {
+    name: "林见鹿",
+    role: "系统运营",
+    avatar: "",
+    birthday: "",
+    hireDate: "",
   },
   assistant: {
     name: "Surfaced.Bot",
@@ -1034,6 +1078,12 @@ const EMPTY_CLOUD_STATUS: CloudStatusSnapshot = {
     last_pull_at: "",
     last_error: "",
     last_error_at: "",
+    last_upload_metrics: {},
+    last_pull_metrics: {},
+    startup_recovery_running: false,
+    last_startup_recovery_at: "",
+    last_startup_recovery_metrics: {},
+    last_startup_recovery_error: "",
   },
 };
 
@@ -1276,6 +1326,104 @@ export async function fetchCloudAdminUsers(): Promise<CloudAdminUsersResponse> {
   }
 }
 
+export async function createCloudAdminUser(payload: {
+  username: string;
+  password: string;
+  role: "operator" | "viewer";
+  displayName?: string;
+  birthday?: string;
+  hireDate?: string;
+  viewAllTasks?: boolean;
+  visibleTaskIds?: number[];
+}): Promise<CloudAdminUserUpdateResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/admin/create-user", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: payload.username,
+        password: payload.password,
+        role: payload.role,
+        display_name: payload.displayName || payload.username,
+        birthday: payload.birthday || null,
+        hire_date: payload.hireDate || null,
+        view_all_tasks: Boolean(payload.viewAllTasks),
+        visible_task_ids: Array.isArray(payload.visibleTaskIds) ? payload.visibleTaskIds : [],
+      }),
+    });
+    const data = await response.json();
+    const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
+    return {
+      ok: Boolean(source.ok && response.ok),
+      message: String(source.message || ""),
+      user: normalizeCloudUser(source.user),
+      cloud: source.cloud ? normalizeCloudStatus(source.cloud) : undefined,
+    };
+  } catch {
+    return { ok: false, message: "云端账号创建失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function updateCloudAdminUser(payload: {
+  userId: number | string;
+  username?: string;
+  displayName?: string;
+  password?: string;
+  enabled?: boolean;
+  birthday?: string;
+  hireDate?: string;
+  viewAllTasks?: boolean;
+  visibleTaskIds?: number[];
+}): Promise<CloudAdminUserUpdateResponse> {
+  try {
+    const body: Record<string, unknown> = { user_id: payload.userId };
+    if (payload.username !== undefined) body.username = payload.username;
+    if (payload.displayName !== undefined) body.display_name = payload.displayName;
+    if (payload.password) body.password = payload.password;
+    if (payload.enabled !== undefined) body.enabled = payload.enabled;
+    if (payload.birthday !== undefined) body.birthday = payload.birthday || null;
+    if (payload.hireDate !== undefined) body.hire_date = payload.hireDate || null;
+    if (payload.viewAllTasks !== undefined) body.view_all_tasks = Boolean(payload.viewAllTasks);
+    if (payload.visibleTaskIds !== undefined) body.visible_task_ids = Array.isArray(payload.visibleTaskIds) ? payload.visibleTaskIds : [];
+    const response = await apiFetch("/api/cloud/admin/update-user", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
+    return {
+      ok: Boolean(source.ok && response.ok),
+      message: String(source.message || ""),
+      user: normalizeCloudUser(source.user),
+      cloud: source.cloud ? normalizeCloudStatus(source.cloud) : undefined,
+    };
+  } catch {
+    return { ok: false, message: "云端账号保存失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function deleteCloudAdminUser(payload: {
+  userId: number | string;
+}): Promise<CloudAdminUserUpdateResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/admin/delete-user", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: payload.userId }),
+    });
+    const data = await response.json();
+    const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
+    return {
+      ok: Boolean(source.ok && response.ok),
+      message: String(source.message || ""),
+      cloud: source.cloud ? normalizeCloudStatus(source.cloud) : undefined,
+    };
+  } catch {
+    return { ok: false, message: "云端账号删除失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
 export async function updateCloudAdminTask(payload: {
   taskId: number;
   name?: string;
@@ -1331,6 +1479,7 @@ export async function syncCloudAdminTask(payload: {
       ok: Boolean(source.ok && response.ok),
       message: String(source.message || ""),
       task: normalizeCloudAdminTask(source.task),
+      localTask: source.local_task && typeof source.local_task === "object" ? source.local_task as TaskFull : undefined,
       cloud: source.cloud ? normalizeCloudStatus(source.cloud) : undefined,
     };
   } catch {
@@ -1369,6 +1518,18 @@ function normalizeCloudStatus(value: unknown): CloudStatusSnapshot {
       last_pull_at: String(autoSyncSource.last_pull_at || ""),
       last_error: String(autoSyncSource.last_error || ""),
       last_error_at: String(autoSyncSource.last_error_at || ""),
+      last_upload_metrics: autoSyncSource.last_upload_metrics && typeof autoSyncSource.last_upload_metrics === "object"
+        ? autoSyncSource.last_upload_metrics as Record<string, unknown>
+        : {},
+      last_pull_metrics: autoSyncSource.last_pull_metrics && typeof autoSyncSource.last_pull_metrics === "object"
+        ? autoSyncSource.last_pull_metrics as Record<string, unknown>
+        : {},
+      startup_recovery_running: Boolean(autoSyncSource.startup_recovery_running),
+      last_startup_recovery_at: String(autoSyncSource.last_startup_recovery_at || ""),
+      last_startup_recovery_metrics: autoSyncSource.last_startup_recovery_metrics && typeof autoSyncSource.last_startup_recovery_metrics === "object"
+        ? autoSyncSource.last_startup_recovery_metrics as Record<string, unknown>
+        : {},
+      last_startup_recovery_error: String(autoSyncSource.last_startup_recovery_error || ""),
     },
   };
 }
@@ -1385,6 +1546,14 @@ function normalizeCloudUser(value: unknown): CloudUserSnapshot | undefined {
     role: source.role as CloudUserSnapshot["role"],
     display_name: source.display_name ? String(source.display_name) : null,
     email: source.email ? String(source.email) : null,
+    avatar: source.avatar ? String(source.avatar) : null,
+    birthday: source.birthday ? String(source.birthday) : null,
+    hire_date: source.hire_date ? String(source.hire_date) : null,
+    view_all_tasks: Boolean(source.view_all_tasks),
+    enabled: source.enabled !== undefined ? Boolean(source.enabled) : undefined,
+    token_version: source.token_version !== undefined ? Number(source.token_version || 0) : undefined,
+    created_at: String(source.created_at || ""),
+    deleted_at: source.deleted_at ? String(source.deleted_at) : null,
   };
 }
 
@@ -1422,6 +1591,9 @@ function normalizeCloudAdminTask(value: unknown): CloudAdminTaskSnapshot | undef
     assigned_operator_user_id: Number(source.assigned_operator_user_id || 0) || null,
     assigned_operator_username: String(source.assigned_operator_username || ""),
     assigned_operator_display_name: String(source.assigned_operator_display_name || ""),
+    assigned_viewer_user_ids: Array.isArray(source.assigned_viewer_user_ids)
+      ? source.assigned_viewer_user_ids.map((item) => Number(item || 0)).filter((item) => Number.isFinite(item) && item > 0)
+      : [],
   };
 }
 
@@ -1436,13 +1608,21 @@ function normalizeCloudTaskPullSummary(value: unknown): CloudTaskPullSummary | u
     updated: Number(source.updated || 0),
     unchanged: Number(source.unchanged || 0),
     revoked: Number(source.revoked || 0),
+    deleted_received: Number(source.deleted_received || 0),
+    deleted: Number(source.deleted || 0),
+    deleted_backups: Number(source.deleted_backups || 0),
+    deleted_pending: Number(source.deleted_pending || 0),
     skipped: Number(source.skipped || 0),
+    state_updated: Number(source.state_updated || 0),
     matched_by: source.matched_by && typeof source.matched_by === "object"
       ? source.matched_by as Record<string, number>
       : undefined,
     task_ids: Array.isArray(source.task_ids)
       ? source.task_ids.map((item) => Number(item)).filter((item) => Number.isFinite(item))
       : undefined,
+    changes: source.changes && typeof source.changes === "object" ? source.changes as Record<string, unknown> : undefined,
+    metrics: source.metrics && typeof source.metrics === "object" ? source.metrics as Record<string, unknown> : undefined,
+    run_records: source.run_records && typeof source.run_records === "object" ? source.run_records as Record<string, unknown> : undefined,
   };
 }
 
@@ -1700,6 +1880,7 @@ export type TaskFull = {
     message: string;
     updatedAt: string;
     expiresAt: string;
+    runId?: string;
   } | null;
   platforms: string[];
   keywords: Array<{
@@ -1784,6 +1965,10 @@ export async function fetchTasksFull(options: { force?: boolean } = {}): Promise
   if (!options.force && tasksFullCache && now - tasksFullCache.updatedAt < TASKS_FULL_CACHE_TTL_MS) {
     return tasksFullCache.tasks;
   }
+  if (options.force) {
+    tasksFullInFlight = null;
+    tasksFullCacheVersion += 1;
+  }
   if (tasksFullInFlight) {
     return tasksFullInFlight;
   }
@@ -1791,7 +1976,10 @@ export async function fetchTasksFull(options: { force?: boolean } = {}): Promise
   const requestVersion = tasksFullCacheVersion;
   tasksFullInFlight = (async () => {
     try {
-      const res = await apiFetch("/api/tasks/full");
+      const res = await apiFetch("/api/tasks/full", {
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+      });
       if (!res.ok) return tasksFullCache?.tasks ?? [];
       const data = await res.json();
       const tasks = Array.isArray(data.tasks) ? data.tasks : [];
@@ -1802,7 +1990,9 @@ export async function fetchTasksFull(options: { force?: boolean } = {}): Promise
     } catch {
       return tasksFullCache?.tasks ?? [];
     } finally {
-      tasksFullInFlight = null;
+      if (requestVersion === tasksFullCacheVersion) {
+        tasksFullInFlight = null;
+      }
     }
   })();
 
@@ -1868,7 +2058,7 @@ async function mutateTasksFullCache<T>(operation: () => Promise<T>): Promise<T> 
   }
 }
 
-export async function createTask(task: Record<string, unknown>): Promise<{ ok: boolean; task_id?: string; message?: string }> {
+export async function createTask(task: Record<string, unknown>): Promise<{ ok: boolean; task_id?: string; task?: TaskFull; message?: string }> {
   try {
     return await mutateTasksFullCache(async () => {
       const res = await apiFetch("/api/tasks", {
@@ -1909,7 +2099,7 @@ export async function generateQuickTodosDraft(instruction: string): Promise<{ ok
   }
 }
 
-export async function updateTask(taskId: string, task: Record<string, unknown>): Promise<{ ok: boolean; message?: string }> {
+export async function updateTask(taskId: string, task: Record<string, unknown>): Promise<{ ok: boolean; task?: TaskFull; message?: string }> {
   try {
     return await mutateTasksFullCache(async () => {
       const res = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
@@ -2020,6 +2210,9 @@ export type TestRunStatus = {
   errorMessage?: string;
   failureDetails?: TestRunFailureDetail[];
   cancelRequested?: boolean;
+  sendableSuccessCount?: number;
+  actualScreenshotCount?: number;
+  canForceSendSuccess?: boolean;
 };
 
 export type TestRunCancelResponse = {
@@ -2995,7 +3188,7 @@ export async function triggerRunSelected(taskIds: string[]): Promise<{ queued: b
 
 // ── Save Profile ────────────────────────────────────────────
 
-export async function saveProfile(profile: Record<string, string>): Promise<{ ok: boolean }> {
+export async function saveProfile(profile: Record<string, string>): Promise<{ ok: boolean; message?: string; cloud?: CloudStatusSnapshot }> {
   try {
     const res = await apiFetch("/api/actions/save-profile", {
       method: "POST",

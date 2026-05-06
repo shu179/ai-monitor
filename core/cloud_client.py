@@ -121,6 +121,15 @@ class SurfacedCloudClient:
     def me(self, access_token: str) -> dict[str, Any]:
         return self._request("GET", "/api/v1/auth/me", access_token=access_token)
 
+    def update_me_profile(self, access_token: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._request(
+            "PATCH",
+            "/api/v1/auth/me/profile",
+            access_token=access_token,
+            json_body=dict(payload or {}),
+        )
+        return response if isinstance(response, dict) else {}
+
     def post_events(self, access_token: str, events: list[dict[str, Any]]) -> dict[str, Any]:
         return self._request(
             "POST",
@@ -128,6 +137,29 @@ class SurfacedCloudClient:
             access_token=access_token,
             json_body={"events": events},
         )
+
+    def sync_changes(
+        self,
+        access_token: str,
+        *,
+        known_snapshot: dict[str, Any] | None = None,
+        task_cursors: dict[int, int] | None = None,
+        task_day_status_cursors: dict[int, int] | None = None,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            "/api/v1/sync/changes",
+            access_token=access_token,
+            json_body={
+                "known_snapshot": dict(known_snapshot or {}),
+                "task_cursors": {str(int(task_id)): int(cursor or 0) for task_id, cursor in (task_cursors or {}).items()},
+                "task_day_status_cursors": {
+                    str(int(task_id)): int(cursor or 0)
+                    for task_id, cursor in (task_day_status_cursors or {}).items()
+                },
+            },
+        )
+        return response if isinstance(response, dict) else {}
 
     def list_tasks(self, access_token: str) -> list[dict[str, Any]]:
         payload = self._request("GET", "/api/v1/tasks", access_token=access_token)
@@ -140,6 +172,32 @@ class SurfacedCloudClient:
     def list_admin_users(self, access_token: str) -> list[dict[str, Any]]:
         payload = self._request("GET", "/api/v1/admin/users", access_token=access_token)
         return payload if isinstance(payload, list) else []
+
+    def create_admin_user(self, access_token: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            "/api/v1/admin/users",
+            access_token=access_token,
+            json_body=dict(payload or {}),
+        )
+        return response if isinstance(response, dict) else {}
+
+    def update_admin_user(self, access_token: str, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._request(
+            "PATCH",
+            f"/api/v1/admin/users/{int(user_id)}",
+            access_token=access_token,
+            json_body=dict(payload or {}),
+        )
+        return response if isinstance(response, dict) else {}
+
+    def delete_admin_user(self, access_token: str, user_id: int) -> dict[str, Any]:
+        response = self._request(
+            "DELETE",
+            f"/api/v1/admin/users/{int(user_id)}",
+            access_token=access_token,
+        )
+        return response if isinstance(response, dict) else {}
 
     def create_admin_task(self, access_token: str, payload: dict[str, Any]) -> dict[str, Any]:
         response = self._request(
@@ -223,6 +281,68 @@ class SurfacedCloudClient:
             params=params,
         )
         return payload if isinstance(payload, list) else []
+
+    def task_run_records_batch(
+        self,
+        access_token: str,
+        task_cursors: dict[int, int],
+        *,
+        limit_per_task: int = 6000,
+    ) -> dict[int, list[dict[str, Any]]]:
+        response = self._request(
+            "POST",
+            "/api/v1/tasks/run-records/batch",
+            access_token=access_token,
+            json_body={
+                "task_cursors": {str(int(task_id)): int(cursor or 0) for task_id, cursor in (task_cursors or {}).items()},
+                "limit_per_task": int(limit_per_task or 6000),
+            },
+        )
+        source = response.get("records") if isinstance(response, dict) else {}
+        if not isinstance(source, dict):
+            return {}
+        records: dict[int, list[dict[str, Any]]] = {}
+        for raw_task_id, raw_items in source.items():
+            try:
+                task_id = int(raw_task_id)
+            except Exception:
+                continue
+            if not isinstance(raw_items, list):
+                records[task_id] = []
+                continue
+            records[task_id] = [item for item in raw_items if isinstance(item, dict)]
+        return records
+
+    def task_day_status_events_batch(
+        self,
+        access_token: str,
+        task_cursors: dict[int, int],
+        *,
+        limit_per_task: int = 500,
+    ) -> dict[int, list[dict[str, Any]]]:
+        response = self._request(
+            "POST",
+            "/api/v1/tasks/day-status-events/batch",
+            access_token=access_token,
+            json_body={
+                "task_cursors": {str(int(task_id)): int(cursor or 0) for task_id, cursor in (task_cursors or {}).items()},
+                "limit_per_task": int(limit_per_task or 500),
+            },
+        )
+        source = response.get("events") if isinstance(response, dict) else {}
+        if not isinstance(source, dict):
+            return {}
+        events: dict[int, list[dict[str, Any]]] = {}
+        for raw_task_id, raw_items in source.items():
+            try:
+                task_id = int(raw_task_id)
+            except Exception:
+                continue
+            if not isinstance(raw_items, list):
+                events[task_id] = []
+                continue
+            events[task_id] = [item for item in raw_items if isinstance(item, dict)]
+        return events
 
     def stream_events(
         self,
@@ -322,6 +442,10 @@ def _extract_error_message(body: Any) -> str:
         detail = body.get("detail")
         if isinstance(detail, str):
             return detail
+        if isinstance(detail, dict):
+            message = detail.get("message")
+            if isinstance(message, str):
+                return message
         if detail:
             return str(detail)
         message = body.get("message")

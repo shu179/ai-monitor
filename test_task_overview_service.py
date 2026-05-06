@@ -153,6 +153,48 @@ class TaskOverviewServiceTests(unittest.TestCase):
         self.assertEqual(len(second["tasks"]), 1)
         self.assertEqual(len(third["tasks"]), 1)
 
+    def test_get_tasks_full_hides_revoked_cloud_tasks_but_keeps_disabled_visible_tasks(self) -> None:
+        config_provider = FakeConfigProvider(
+            {
+                "tasks": [
+                    {
+                        "task_id": "cloud_5",
+                        "name": "已转派任务",
+                        "brand": "旧品牌",
+                        "enabled": False,
+                        "cloud_task_id": 5,
+                        "cloud_access_level": "revoked",
+                    },
+                    {
+                        "task_id": "cloud_6",
+                        "name": "浏览任务",
+                        "brand": "浏览品牌",
+                        "enabled": False,
+                        "cloud_task_id": 6,
+                        "cloud_access_level": "view",
+                    },
+                    {
+                        "task_id": "local-disabled",
+                        "name": "本地停用任务",
+                        "brand": "本地品牌",
+                        "enabled": False,
+                    },
+                ]
+            }
+        )
+        service = self._make_service(config_provider)
+
+        with patch(
+            "backend_lib.task_overview_service.get_task_day_status",
+            return_value={"status": "pending", "brand_status": "pending"},
+        ):
+            with patch("backend_lib.task_overview_service.get_records", return_value=[]):
+                with patch("backend_lib.task_overview_service.get_brand_trend_series", return_value={}):
+                    payload = service.get_tasks_full()
+
+        task_ids = [task["id"] for task in payload["tasks"]]
+        self.assertEqual(task_ids, ["cloud_6", "local-disabled"])
+
 
 if __name__ == "__main__":
     unittest.main()

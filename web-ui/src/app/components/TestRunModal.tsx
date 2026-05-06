@@ -1,22 +1,30 @@
-import { CheckCircle2, Loader2, X, XCircle } from "lucide-react";
+import { CheckCircle2, Loader2, Send, X, XCircle } from "lucide-react";
 import type { TestRunStatus } from "../lib/backend";
 
 interface TestRunModalProps {
   isOpen: boolean;
   onBackgroundContinue: () => void;
   onAbort: () => void;
+  onForceSend?: () => void;
   brandName: string;
   status: TestRunStatus | null;
   abortPending?: boolean;
+  forceSendPending?: boolean;
+  forceSendMessage?: string;
+  forceSendError?: string;
 }
 
 export function TestRunModal({
   isOpen,
   onBackgroundContinue,
   onAbort,
+  onForceSend,
   brandName,
   status,
   abortPending = false,
+  forceSendPending = false,
+  forceSendMessage = "",
+  forceSendError = "",
 }: TestRunModalProps) {
   if (!isOpen) return null;
 
@@ -31,6 +39,11 @@ export function TestRunModal({
   const currentKeyword = String(status?.currentKeyword || "").trim();
   const currentPlatform = String(status?.currentPlatform || "").trim();
   const errorMessage = String(status?.errorMessage || "").trim();
+  const sendableSuccessCount = Math.max(
+    0,
+    Number(status?.sendableSuccessCount ?? status?.actualScreenshotCount ?? 0) || 0,
+  );
+  const showForceSend = runtimeStatus === "failed" && sendableSuccessCount > 0 && Boolean(onForceSend);
   const failedDetails = Array.isArray(status?.failureDetails)
     ? status.failureDetails
         .map((item) => ({
@@ -103,7 +116,7 @@ export function TestRunModal({
 
       <div className="relative bg-white rounded-2xl shadow-xl border border-gray-200 w-full max-w-[420px] p-6 animate-in zoom-in-95 duration-200 mx-4">
         <button
-          onClick={isRunning ? onAbort : onBackgroundContinue}
+          onClick={onBackgroundContinue}
           disabled={abortPending}
           className="absolute top-4 right-4 p-1.5 text-gray-400 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
         >
@@ -185,16 +198,40 @@ export function TestRunModal({
               </span>
             </div>
           )}
+
+          {showForceSend && (
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-[12px] text-gray-500">可发送截图</span>
+              <span className="text-[13px] font-bold text-blue-600">{sendableSuccessCount} 张</span>
+            </div>
+          )}
         </div>
+
+        {(forceSendMessage || forceSendError) && (
+          <div className={`mt-3 text-center text-[12px] font-medium ${forceSendError ? "text-red-600" : "text-emerald-600"}`}>
+            {forceSendError || forceSendMessage}
+          </div>
+        )}
 
         <div className="flex gap-3 mt-6">
           <button
             onClick={onBackgroundContinue}
-            disabled={abortPending}
+            disabled={abortPending || forceSendPending}
             className="flex-1 px-4 py-2.5 rounded-xl border border-gray-200 text-gray-700 font-bold text-[13px] hover:bg-gray-50 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            {abortPending ? "正在中断..." : isRunning ? "后台继续" : "关闭"}
+            {abortPending ? "正在中断..." : isRunning ? "后台继续" : "确认"}
           </button>
+          {showForceSend && (
+            <button
+              type="button"
+              onClick={() => onForceSend?.()}
+              disabled={forceSendPending || abortPending}
+              className="flex-1 inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-blue-600 text-white font-bold text-[13px] hover:bg-blue-700 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {forceSendPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+              {forceSendPending ? "发送中..." : "发送"}
+            </button>
+          )}
         </div>
       </div>
     </div>

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from core.cloud_client import SurfacedCloudClient, iter_sse_events
+from core.cloud_client import CloudClientError, SurfacedCloudClient, iter_sse_events
 
 
 class FakeResponse:
@@ -14,6 +14,20 @@ class FakeResponse:
         return {"id": 7, "config_version": 4}
 
 
+class FakeErrorResponse:
+    status_code = 409
+    text = '{"detail":{"message":"账号名已被使用，建议使用张三01","suggested_username":"张三01"}}'
+    content = text.encode("utf-8")
+
+    def json(self):
+        return {
+            "detail": {
+                "message": "账号名已被使用，建议使用张三01",
+                "suggested_username": "张三01",
+            }
+        }
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -21,6 +35,12 @@ class FakeSession:
     def request(self, method: str, url: str, **kwargs):
         self.calls.append({"method": method, "url": url, **kwargs})
         return FakeResponse()
+
+
+class FakeErrorSession(FakeSession):
+    def request(self, method: str, url: str, **kwargs):
+        self.calls.append({"method": method, "url": url, **kwargs})
+        return FakeErrorResponse()
 
 
 class CloudClientTests(unittest.TestCase):
@@ -35,6 +55,15 @@ class CloudClientTests(unittest.TestCase):
         self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/admin/tasks/7")
         self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
         self.assertEqual(session.calls[0]["json"], {"name": "新任务", "expected_config_version": 3})
+
+    def test_error_detail_dict_uses_message_text(self):
+        session = FakeErrorSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        with self.assertRaises(CloudClientError) as caught:
+            client.create_admin_user("access-token", {"username": "张三"})
+
+        self.assertEqual(str(caught.exception), "账号名已被使用，建议使用张三01")
 
     def test_register_admin_posts_public_auth_payload(self):
         session = FakeSession()

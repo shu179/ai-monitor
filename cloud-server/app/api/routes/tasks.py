@@ -4,11 +4,21 @@ from fastapi import APIRouter
 from fastapi import Query
 
 from app.api.deps import CurrentUser, DbSession
-from app.schemas import ReferenceRankingResponse, RunRecordPublic, VisibleBrandTaskPublic
+from app.schemas import (
+    ReferenceRankingResponse,
+    RunRecordPublic,
+    RunRecordsBatchRequest,
+    RunRecordsBatchResponse,
+    TaskDayStatusEventsBatchRequest,
+    TaskDayStatusEventsBatchResponse,
+    VisibleBrandTaskPublic,
+)
 from app.services.sync_service import (
     REFERENCE_ALGORITHM_VERSION,
     build_reference_ranking,
     list_deleted_visible_tasks,
+    list_task_day_status_events_batch,
+    list_task_run_records_batch,
     list_task_run_records,
     list_visible_tasks,
 )
@@ -36,6 +46,38 @@ def article_reference_ranking(task_id: int, current_user: CurrentUser, db: DbSes
     return ReferenceRankingResponse(
         algorithm_version=REFERENCE_ALGORITHM_VERSION,
         items=build_reference_ranking(db, current_user, task_id),
+    )
+
+
+@router.post("/day-status-events/batch", response_model=TaskDayStatusEventsBatchResponse)
+def task_day_status_events_batch(
+    payload: TaskDayStatusEventsBatchRequest,
+    current_user: CurrentUser,
+    db: DbSession,
+) -> TaskDayStatusEventsBatchResponse:
+    return TaskDayStatusEventsBatchResponse(
+        events=list_task_day_status_events_batch(
+            db,
+            current_user,
+            payload.task_cursors,
+            limit_per_task=payload.limit_per_task,
+        )
+    )
+
+
+@router.post("/run-records/batch", response_model=RunRecordsBatchResponse)
+def task_run_records_batch(
+    payload: RunRecordsBatchRequest,
+    current_user: CurrentUser,
+    db: DbSession,
+) -> RunRecordsBatchResponse:
+    return RunRecordsBatchResponse(
+        records=list_task_run_records_batch(
+            db,
+            current_user,
+            payload.task_cursors,
+            limit_per_task=payload.limit_per_task,
+        )
     )
 
 
