@@ -106,6 +106,8 @@ export function TestRunModal({
     : isCancelled
       ? "bg-gray-50 border-gray-200"
     : "bg-red-50 border-red-100";
+  const handleTopRightClose = isRunning ? onAbort : onBackgroundContinue;
+  const topRightCloseLabel = isRunning ? "取消测试任务" : "关闭弹窗";
 
   return (
     <div className="fixed inset-0 z-[110] flex items-center justify-center">
@@ -116,8 +118,11 @@ export function TestRunModal({
 
       <div className="relative bg-white rounded-2xl shadow-xl border border-gray-200 w-full max-w-[420px] p-6 animate-in zoom-in-95 duration-200 mx-4">
         <button
-          onClick={onBackgroundContinue}
-          disabled={abortPending}
+          type="button"
+          onClick={handleTopRightClose}
+          disabled={abortPending || forceSendPending}
+          aria-label={topRightCloseLabel}
+          title={topRightCloseLabel}
           className="absolute top-4 right-4 p-1.5 text-gray-400 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
         >
           <X className="w-4 h-4" />
