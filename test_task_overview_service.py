@@ -17,7 +17,13 @@ class FakeConfigProvider:
 
 
 class TaskOverviewServiceTests(unittest.TestCase):
-    def _make_service(self, config_provider: FakeConfigProvider, *, cache_ttl_seconds: float = 3.0) -> TaskOverviewService:
+    def _make_service(
+        self,
+        config_provider: FakeConfigProvider,
+        *,
+        cache_ttl_seconds: float = 3.0,
+        test_failure_notice_getter=None,
+    ) -> TaskOverviewService:
         return TaskOverviewService(
             config_provider=config_provider,
             synced_articles_loader=lambda _config: [
@@ -25,11 +31,11 @@ class TaskOverviewServiceTests(unittest.TestCase):
                 {"matched_tasks": ["任务一", "其他任务"]},
             ],
             prune_test_failure_notices=lambda: None,
-            test_failure_notice_getter=lambda task_id: {
+            test_failure_notice_getter=test_failure_notice_getter or (lambda task_id: {
                 "message": f"{task_id} 测试失败",
                 "updatedAt": "2026-01-05 10:00:00",
                 "expiresAt": "2026-01-05 10:05:00",
-            },
+            }),
             platform_display_name=lambda platform: {"doubao": "豆包", "kimi": "Kimi"}.get(platform, platform),
             secret_masker=lambda value: f"masked:{value}" if value else "",
             normalize_string_list=lambda values: list(dict.fromkeys(str(item).strip() for item in values if str(item).strip())),
@@ -194,6 +200,169 @@ class TaskOverviewServiceTests(unittest.TestCase):
 
         task_ids = [task["id"] for task in payload["tasks"]]
         self.assertEqual(task_ids, ["cloud_6", "local-disabled"])
+
+    def test_get_tasks_full_counts_nested_platform_success_screenshots(self) -> None:
+        config_provider = FakeConfigProvider(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-1",
+                        "name": "任务一",
+                        "brand": "品牌A",
+                        "keywords": [{"keyword": "关键词1", "platforms": ["doubao", "kimi"]}],
+                    }
+                ]
+            }
+        )
+        service = self._make_service(config_provider)
+
+        with patch(
+            "backend_lib.task_overview_service.get_task_day_status",
+            return_value={
+                "status": "query_failed",
+                "brand_status": "gap",
+                "formal_started": True,
+                "formal_running": False,
+                "has_gap": True,
+                "extra": {},
+                "keyword_states": {
+                    "关键词1": {
+                        "platform_states": {
+                            "doubao": {
+                                "run_success": True,
+                                "screenshot_saved": True,
+                                "image_path": "/tmp/doubao.png",
+                            },
+                            "kimi": {
+                                "run_success": False,
+                                "screenshot_saved": False,
+                                "image_path": "",
+                            },
+                        }
+                    }
+                },
+            },
+        ):
+            with patch("backend_lib.task_overview_service.get_records", return_value=[]):
+                with patch("backend_lib.task_overview_service.get_brand_trend_series", return_value={}):
+                    payload = service.get_tasks_full()
+
+        self.assertEqual(payload["tasks"][0]["actual_screenshot_count_today"], 1)
+
+    def test_get_tasks_full_merges_history_success_screenshots(self) -> None:
+        config_provider = FakeConfigProvider(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-1",
+                        "name": "任务一",
+                        "brand": "品牌A",
+                        "keywords": [{"keyword": "关键词1", "platforms": ["doubao", "kimi"]}],
+                    }
+                ]
+            }
+        )
+        service = self._make_service(config_provider)
+        history_results = {
+            ("关键词1", "品牌A", "doubao"): {
+                "keyword": "关键词1",
+                "brand": "品牌A",
+                "platform": "doubao",
+                "screenshot": "/tmp/doubao.png",
+            },
+            ("关键词1", "品牌A", "kimi"): {
+                "keyword": "关键词1",
+                "brand": "品牌A",
+                "platform": "kimi",
+                "screenshot": "/tmp/kimi.png",
+            },
+        }
+
+        with patch(
+            "backend_lib.task_overview_service.get_task_day_status",
+            return_value={
+                "status": "query_failed",
+                "brand_status": "gap",
+                "extra": {"actual_screenshot_count": 1},
+                "keyword_states": {},
+            },
+        ):
+            with patch("backend_lib.dashboard_tasks.load_today_success_only_query_results", return_value=history_results):
+                with patch("backend_lib.dashboard_tasks.screenshot_path_exists", side_effect=lambda path: bool(path)):
+                    with patch("backend_lib.task_overview_service.get_records", return_value=[]):
+                        with patch("backend_lib.task_overview_service.get_brand_trend_series", return_value={}):
+                            payload = service.get_tasks_full()
+
+        task = payload["tasks"][0]
+        self.assertEqual(task["actual_screenshot_count_today"], 2)
+        self.assertEqual(task["completed_keywords_today"], ["关键词1"])
+        self.assertEqual(task["detected_platforms_today"], ["doubao", "kimi"])
+
+    def test_get_tasks_full_restores_persisted_test_failure_notice(self) -> None:
+        config_provider = FakeConfigProvider(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-1",
+                        "name": "任务一",
+                        "brand": "品牌A",
+                    }
+                ]
+            }
+        )
+        service = self._make_service(config_provider, test_failure_notice_getter=lambda _task_id: None)
+
+        with patch(
+            "backend_lib.task_overview_service.get_task_day_status",
+            return_value={
+                "status": "pending",
+                "brand_status": "gap",
+                "test_status": "query_failed",
+                "test_message": "任务组未补齐（5/6），未发送企业微信",
+                "test_updated_at": "2026-01-05T10:00:00+08:00",
+                "keyword_states": {},
+                "extra": {},
+            },
+        ):
+            with patch("backend_lib.task_overview_service.get_records", return_value=[]):
+                with patch("backend_lib.task_overview_service.get_brand_trend_series", return_value={}):
+                    payload = service.get_tasks_full()
+
+        notice = payload["tasks"][0]["test_failure_notice"]
+        self.assertEqual(notice["message"], "任务组未补齐（5/6），未发送企业微信")
+        self.assertEqual(notice["runId"], "")
+
+    def test_get_tasks_full_does_not_restore_test_failure_notice_after_success(self) -> None:
+        config_provider = FakeConfigProvider(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-1",
+                        "name": "任务一",
+                        "brand": "品牌A",
+                    }
+                ]
+            }
+        )
+        service = self._make_service(config_provider, test_failure_notice_getter=lambda _task_id: None)
+
+        with patch(
+            "backend_lib.task_overview_service.get_task_day_status",
+            return_value={
+                "status": "success",
+                "brand_status": "sent",
+                "test_status": "query_failed",
+                "test_message": "旧的测试失败",
+                "test_updated_at": "2026-01-05T10:00:00+08:00",
+                "keyword_states": {},
+                "extra": {},
+            },
+        ):
+            with patch("backend_lib.task_overview_service.get_records", return_value=[]):
+                with patch("backend_lib.task_overview_service.get_brand_trend_series", return_value={}):
+                    payload = service.get_tasks_full()
+
+        self.assertIsNone(payload["tasks"][0]["test_failure_notice"])
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from typing import Any
 from core.daily_task_state import derive_task_id, get_task_day_status
 from core.scheduler import normalize_weekly_times
 from core.scheduler_state import get_entry as get_scheduler_state_entry
+from core.task_results import load_today_success_only_query_results, screenshot_path_exists
 from core.time_utils import local_today
 
 
@@ -203,11 +204,7 @@ def _build_dashboard_failed_tasks(
         )
         failed_queries: list[dict[str, Any]] = []
         gap_details = list(status_extra.get("gap_details") or []) if formal_started else []
-        sendable_screenshot_paths = [
-            str(item.get("image_path") or "").strip()
-            for item in (status.get("keyword_states") or {}).values()
-            if bool(item.get("run_success")) and bool(item.get("screenshot_saved")) and str(item.get("image_path") or "").strip()
-        ]
+        sendable_screenshot_paths = _collect_successful_screenshot_paths(status.get("keyword_states") or {})
         for state in gap_details:
             keyword = str(state.get("keyword") or "").strip()
             platform = str(state.get("platform") or "").strip()
@@ -356,11 +353,25 @@ def _collect_today_successful_task_payload(
         for item in (status_extra.get("detected_platforms") or [])
         if str(item).strip()
     ]
-    screenshot_paths = [
-        str(item.get("image_path") or "").strip()
-        for item in keyword_states.values()
-        if bool(item.get("run_success")) and bool(item.get("screenshot_saved")) and str(item.get("image_path") or "").strip()
-    ]
+    screenshot_paths = _collect_successful_screenshot_paths(keyword_states)
+    history_results = _load_today_successful_query_results(task_name, task_id)
+    if history_results:
+        completed_keywords = normalize_values(
+            completed_keywords
+            + [str(item.get("keyword") or "").strip() for item in history_results]
+        )
+        detected_platforms = normalize_values(
+            detected_platforms
+            + [str(item.get("platform") or "").strip() for item in history_results]
+        )
+        screenshot_paths = normalize_values(
+            screenshot_paths
+            + [
+                str(item.get("screenshot") or "").strip()
+                for item in history_results
+                if screenshot_path_exists(str(item.get("screenshot") or "").strip())
+            ]
+        )
 
     return {
         "taskId": task_id,
@@ -372,7 +383,7 @@ def _collect_today_successful_task_payload(
         "completedKeywords": completed_keywords,
         "detectedPlatforms": detected_platforms,
         "screenshotPaths": screenshot_paths,
-        "actualScreenshotCount": int(status_extra.get("actual_screenshot_count") or len(screenshot_paths)),
+        "actualScreenshotCount": max(int(status_extra.get("actual_screenshot_count") or 0), len(screenshot_paths)),
     }
 
 
@@ -393,3 +404,37 @@ def _compute_fixed_screenshot_target(task: dict) -> int:
     except Exception:
         raw_target = 1
     return max(raw_target, len(platforms))
+
+
+def _load_today_successful_query_results(task_name: str, task_id: str) -> list[dict[str, Any]]:
+    try:
+        result_map = load_today_success_only_query_results(task_name, task_id=task_id)
+    except Exception:
+        return []
+    return [dict(item) for item in (result_map or {}).values() if isinstance(item, dict)]
+
+
+def _iter_successful_state_candidates(keyword_states: dict[str, Any]):
+    for item in keyword_states.values():
+        if not isinstance(item, dict):
+            continue
+        platform_states = item.get("platform_states")
+        if isinstance(platform_states, dict):
+            for platform_state in platform_states.values():
+                if isinstance(platform_state, dict):
+                    yield platform_state
+        yield item
+
+
+def _collect_successful_screenshot_paths(keyword_states: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for item in _iter_successful_state_candidates(keyword_states):
+        path = str(item.get("image_path") or "").strip()
+        if not path or path in seen:
+            continue
+        if not bool(item.get("run_success")) or not bool(item.get("screenshot_saved")):
+            continue
+        seen.add(path)
+        paths.append(path)
+    return paths

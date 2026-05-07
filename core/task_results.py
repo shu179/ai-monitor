@@ -185,6 +185,22 @@ def summarize_keyword_result(results: list[dict]) -> dict:
     }
 
 
+def group_keyword_results_by_platform(results: list[dict]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    platformless_results: list[dict] = []
+    for item in results or []:
+        platform = str((item or {}).get('platform') or '').strip()
+        if platform:
+            grouped[platform].append(item)
+        else:
+            platformless_results.append(item)
+    if not grouped:
+        return {'': list(results or [])}
+    if platformless_results:
+        grouped[''].extend(platformless_results)
+    return dict(grouped)
+
+
 def finalize_daily_pool_keyword_results(
     task: dict,
     *,
@@ -201,40 +217,43 @@ def finalize_daily_pool_keyword_results(
         keyword, brand = key
         historical_state = dict(historical_states.get(keyword) or {})
         already_complete = bool(historical_state.get('run_success')) and bool(historical_state.get('screenshot_saved'))
-        summary = summarize_keyword_result(grouped_results)
-        chosen_result = dict(summary.get('result') or {})
 
-        if execution_source == 'manual_test' and not summary.get('run_success'):
-            continue
         if execution_source == 'manual_test' and already_complete:
             continue
 
-        image_path = str(chosen_result.get('screenshot') or '').strip()
-        platform_name = str(chosen_result.get('platform') or '').strip()
-        if summary.get('run_success') and summary.get('screenshot_saved') and image_path:
-            normalized_source_mode = SOURCE_MODE_FORMAL if execution_source == 'manual_test' else source_mode
-            normalized_path = normalize_task_screenshot_path(
-                task,
-                keyword=keyword,
-                brand=brand,
-                platform=platform_name,
-                source_mode=normalized_source_mode,
-                original_path=image_path,
-            )
-            for result in grouped_results:
-                if str(result.get('screenshot') or '').strip() == image_path:
-                    result['screenshot'] = normalized_path
-            image_path = normalized_path
+        for platform_name, platform_results in group_keyword_results_by_platform(grouped_results).items():
+            summary = summarize_keyword_result(platform_results)
+            chosen_result = dict(summary.get('result') or {})
 
-        updates.append({
-            'keyword': keyword,
-            'brand': brand,
-            'run_success': bool(summary.get('run_success')),
-            'screenshot_saved': bool(summary.get('screenshot_saved')),
-            'failure_reason': str(summary.get('failure_reason') or '').strip(),
-            'image_path': image_path,
-            'platform': platform_name,
-        })
+            if execution_source == 'manual_test' and not summary.get('run_success'):
+                continue
+
+            image_path = str(chosen_result.get('screenshot') or '').strip()
+            resolved_platform = platform_name or str(chosen_result.get('platform') or '').strip()
+            if summary.get('run_success') and summary.get('screenshot_saved') and image_path:
+                normalized_source_mode = SOURCE_MODE_FORMAL if execution_source == 'manual_test' else source_mode
+                normalized_path = normalize_task_screenshot_path(
+                    task,
+                    keyword=keyword,
+                    brand=brand,
+                    platform=resolved_platform,
+                    source_mode=normalized_source_mode,
+                    original_path=image_path,
+                )
+                for result in platform_results:
+                    if str(result.get('screenshot') or '').strip() == image_path:
+                        result['screenshot'] = normalized_path
+                image_path = normalized_path
+
+            updates.append({
+                'keyword': keyword,
+                'brand': brand,
+                'run_success': bool(summary.get('run_success')),
+                'screenshot_saved': bool(summary.get('screenshot_saved')),
+                'failure_reason': str(summary.get('failure_reason') or '').strip(),
+                'image_path': image_path,
+                'platform': resolved_platform,
+            })
 
     if updates:
         apply_task_keyword_updates(
@@ -609,6 +628,7 @@ _screenshot_path_exists = screenshot_path_exists
 _collect_unique_screenshot_paths = collect_unique_screenshot_paths
 _render_api_screenshot_with_retries = render_api_screenshot_with_retries
 _load_today_success_only_query_results = load_today_success_only_query_results
+_group_keyword_results_by_platform = group_keyword_results_by_platform
 _keyword_result_key = keyword_result_key
 _build_keyword_result_index = build_keyword_result_index
 _summarize_keyword_result = summarize_keyword_result

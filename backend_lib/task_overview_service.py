@@ -110,6 +110,8 @@ class TaskOverviewService:
             current_status = str(status.get("status") or "pending").strip()
             brand_status = str(status.get("brand_status") or "").strip()
             test_failure_notice = self._test_failure_notice_getter(str(task_id))
+            if not test_failure_notice:
+                test_failure_notice = _build_persisted_test_failure_notice(status)
             success_progress = _collect_today_successful_task_payload(
                 task,
                 day_status_loader=get_task_day_status,
@@ -250,3 +252,19 @@ class TaskOverviewService:
 
 def _is_revoked_cloud_task(task: dict[str, Any]) -> bool:
     return str(task.get("cloud_access_level") or "").strip().lower() == "revoked"
+
+
+def _build_persisted_test_failure_notice(status: dict[str, Any]) -> dict[str, str] | None:
+    if str(status.get("brand_status") or "").strip() in {"success", "sent"}:
+        return None
+    test_status = str(status.get("test_status") or "").strip()
+    if test_status not in {"failed", "query_failed", "send_failed"}:
+        return None
+    message = str(status.get("test_message") or "").strip() or "测试任务未完成"
+    updated_at = str(status.get("test_updated_at") or status.get("updated_at") or "").strip()
+    return {
+        "message": message,
+        "updatedAt": updated_at,
+        "expiresAt": "",
+        "runId": "",
+    }

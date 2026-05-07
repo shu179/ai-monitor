@@ -3,7 +3,15 @@ import { Search, Plus, ChevronDown, Zap, Edit2, Brain, X, Download, Calendar, La
 import { AreaChart, Area, ResponsiveContainer, YAxis } from "recharts";
 import { ConfirmModal } from "./ConfirmModal";
 import { AnimatedLoadingText } from "./AnimatedLoadingText";
-import { ARTICLE_DATA_CHANGED_EVENT, CLOUD_ADMIN_USERS_CHANGED_EVENT, TASK_DATA_CHANGED_EVENT, fetchCloudAdminTasks, fetchCloudAdminUsers, fetchCloudStatus, fetchDeletedTasks, fetchTasksFull, readTasksFullCache, deleteTask, startTestRunTask, fetchTestRunStatus, cancelTestRunTask, forceSendSuccessfulTaskResults, restoreDeletedTask, syncCloudAdminTask, updateTask, type CloudAdminTaskSnapshot, type CloudUserSnapshot, type DeletedTaskSnapshot, type TaskFull, type TestRunStatus } from "../lib/backend";
+import { ARTICLE_DATA_CHANGED_EVENT, CLOUD_ADMIN_USERS_CHANGED_EVENT, TASK_DATA_CHANGED_EVENT, fetchDeletedTasks, fetchTasksFull, readTasksFullCache, deleteTask, startTestRunTask, fetchTestRunStatus, cancelTestRunTask, forceSendSuccessfulTaskResults, restoreDeletedTask, syncCloudAdminTask, updateTask, type CloudAdminTaskSnapshot, type CloudUserSnapshot, type DeletedTaskSnapshot, type TaskFull, type TestRunStatus } from "../lib/backend";
+import {
+  ensureCloudAdminTasks,
+  ensureCloudAdminUsers,
+  invalidateCloudAdminTasksCache,
+  readCloudAdminCache,
+  subscribeCloudAdminCache,
+  upsertCloudAdminTaskCache,
+} from "../lib/cloudAdminCache";
 import { notifySaveSuccess } from "../lib/saveToast";
 
 const ArticleSummaryModal = lazy(() => import("./ArticleSummaryModal").then((module) => ({ default: module.ArticleSummaryModal })));
@@ -79,6 +87,26 @@ function clearStoredActiveTestRun() {
 
 function isTerminalTestRunStatus(status?: TestRunStatus | null) {
   return status?.status === "success" || status?.status === "failed" || status?.status === "cancelled";
+}
+
+function getForceSendCount(status?: TestRunStatus | null) {
+  return Math.max(0, Number(status?.sendableSuccessCount ?? status?.actualScreenshotCount ?? 0) || 0);
+}
+
+function mergeForceSendStatus(status: TestRunStatus, fallback?: TestRunStatus | null): TestRunStatus {
+  if (status.status !== "failed") {
+    return status;
+  }
+  const count = Math.max(getForceSendCount(status), getForceSendCount(fallback));
+  if (count <= 0) {
+    return status;
+  }
+  return {
+    ...status,
+    sendableSuccessCount: count,
+    actualScreenshotCount: Math.max(0, Number(status.actualScreenshotCount || 0), count),
+    canForceSendSuccess: true,
+  };
 }
 
 function taskToBrand(task: TaskFull, idx: number) {
@@ -231,8 +259,7 @@ export function BrandsContent({
   }, [loadTasks]);
 
   const refreshCloudAdminContext = useCallback(async () => {
-    const status = await fetchCloudStatus();
-    const isAdmin = Boolean(status.cloud?.loggedIn && status.cloud.user.role === "admin");
+    const isAdmin = cloudRole === "admin";
     setCloudAdminEnabled(isAdmin);
     if (!isAdmin) {
       setCloudOperators([]);
@@ -240,23 +267,39 @@ export function BrandsContent({
       setDeletedTasks([]);
       return;
     }
-    const [usersResult, tasksResult, deletedResult] = await Promise.all([fetchCloudAdminUsers(), fetchCloudAdminTasks(), fetchDeletedTasks()]);
-    setCloudOperators((usersResult.users || []).filter((user) => user.role === "operator"));
-    setCloudAdminTasks(tasksResult.tasks || []);
+    const cache = readCloudAdminCache();
+    if (cache.usersLoaded) {
+      setCloudOperators(cache.users.filter((user) => user.role === "operator"));
+    }
+    if (cache.tasksLoaded) {
+      setCloudAdminTasks(cache.tasks);
+    }
+    const [usersSnapshot, tasksSnapshot, deletedResult] = await Promise.all([
+      ensureCloudAdminUsers(),
+      ensureCloudAdminTasks(),
+      fetchDeletedTasks(),
+    ]);
+    setCloudOperators((usersSnapshot.users || []).filter((user) => user.role === "operator"));
+    setCloudAdminTasks(tasksSnapshot.tasks || []);
     setDeletedTasks(deletedResult.tasks || []);
-  }, []);
+  }, [cloudRole]);
 
   useEffect(() => {
+    const unsubscribe = subscribeCloudAdminCache((snapshot) => {
+      setCloudOperators(snapshot.users.filter((user) => user.role === "operator"));
+      setCloudAdminTasks(snapshot.tasks);
+    });
     void refreshCloudAdminContext();
+    return unsubscribe;
   }, [refreshCloudAdminContext]);
 
   useEffect(() => {
     const handleCloudUsersChanged = () => {
-      void refreshCloudAdminContext();
+      void ensureCloudAdminUsers();
     };
     window.addEventListener(CLOUD_ADMIN_USERS_CHANGED_EVENT, handleCloudUsersChanged);
     return () => window.removeEventListener(CLOUD_ADMIN_USERS_CHANGED_EVENT, handleCloudUsersChanged);
-  }, [refreshCloudAdminContext]);
+  }, []);
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -290,6 +333,16 @@ export function BrandsContent({
     }
     return map;
   }, [cloudAdminTasks]);
+  const cloudOperatorById = useMemo(() => {
+    const map = new Map<number, CloudUserSnapshot>();
+    for (const user of cloudOperators) {
+      const id = Number(user.id || 0);
+      if (id > 0) {
+        map.set(id, user);
+      }
+    }
+    return map;
+  }, [cloudOperators]);
   const hasAnyFormalRunningTask = useMemo(() => allBrandsData.some((item) => item.formalRunning), [allBrandsData]);
 
   // Compute stats from real data
@@ -471,7 +524,7 @@ export function BrandsContent({
     if (!status.ok) {
       return;
     }
-    setTestRunStatus(status);
+    setTestRunStatus((prev) => mergeForceSendStatus(status, prev));
     if (isTerminalTestRunStatus(status)) {
       clearStoredActiveTestRun();
     } else {
@@ -514,7 +567,7 @@ export function BrandsContent({
     if (!status.ok) {
       return;
     }
-    setTestRunStatus(status);
+    setTestRunStatus(mergeForceSendStatus(status, fallbackStatus));
     if (isTerminalTestRunStatus(status)) {
       clearStoredActiveTestRun();
       return;
@@ -580,7 +633,7 @@ export function BrandsContent({
         brandName: resolveBrandName(stored.taskId, stored.brandName),
       };
       setActiveTestRun(restoredRun);
-      setTestRunStatus(status);
+      setTestRunStatus((prev) => mergeForceSendStatus(status, prev));
       setTestRunAbortPending(false);
       setTestRunForceSending(false);
       setTestRunForceSendMessage("");
@@ -600,7 +653,7 @@ export function BrandsContent({
     const poll = async () => {
       const status = await fetchTestRunStatus(activeTestRun.runId);
       if (cancelled) return;
-      setTestRunStatus(status);
+      setTestRunStatus((prev) => mergeForceSendStatus(status, prev));
       if (status.status === "success" || status.status === "failed" || status.status === "cancelled") {
         clearStoredActiveTestRun();
         void loadTasks({ showLoadingState: false, force: true });
@@ -646,32 +699,42 @@ export function BrandsContent({
     if (result.message) {
       notifySaveSuccess(onSaveSuccess, result.message);
     }
+    invalidateCloudAdminTasksCache();
     await loadTasks({ showLoadingState: false, force: true });
-    await refreshCloudAdminContext();
+    await Promise.all([
+      ensureCloudAdminTasks({ force: true }),
+      fetchDeletedTasks().then((payload) => setDeletedTasks(payload.tasks || [])),
+    ]);
     setEditingBrand((current) => (current?.id === taskId ? null : current));
     setIsCreatingBrand(false);
     setDeleteBrandConfirm(null);
     emitTaskDataChanged();
-  }, [loadTasks, onSaveSuccess, refreshCloudAdminContext]);
+  }, [loadTasks, onSaveSuccess]);
 
   const handleRestoreDeletedTask = useCallback(async (deletedTaskId: string, brandName: string) => {
     const result = await restoreDeletedTask({ deletedTaskId, brandName });
     if (result.ok) {
+      invalidateCloudAdminTasksCache();
       await loadTasks({ showLoadingState: false, force: true });
-      await refreshCloudAdminContext();
+      await Promise.all([
+        ensureCloudAdminTasks({ force: true }),
+        fetchDeletedTasks().then((payload) => setDeletedTasks(payload.tasks || [])),
+      ]);
       emitTaskDataChanged();
       notifySaveSuccess(onSaveSuccess, result.message || "品牌配置已恢复");
     }
     return { ok: result.ok, message: result.message || "" };
-  }, [loadTasks, onSaveSuccess, refreshCloudAdminContext]);
+  }, [loadTasks, onSaveSuccess]);
 
   const handleSyncCloudTaskFromBrand = useCallback(async (localTaskId: string, operatorUserId?: number) => {
     if (!cloudAdminEnabled) {
       return { ok: true, message: "" };
     }
     const result = await syncCloudAdminTask({ localTaskId, operatorUserId });
-    if (result.ok && !result.task) {
-      await refreshCloudAdminContext();
+    if (result.ok && result.task) {
+      upsertCloudAdminTaskCache(result.task);
+    } else if (result.ok) {
+      await ensureCloudAdminTasks({ force: true });
     }
     return {
       ok: result.ok,
@@ -679,7 +742,7 @@ export function BrandsContent({
       task: result.task,
       localTask: result.localTask,
     };
-  }, [cloudAdminEnabled, refreshCloudAdminContext]);
+  }, [cloudAdminEnabled]);
 
   return (
     <div className="flex-1 h-full overflow-hidden bg-transparent px-8 py-8 xl:px-10 flex flex-col relative">
@@ -803,7 +866,15 @@ export function BrandsContent({
             {pagedBrands.map((brand, idx) => {
               const cloudTask = brand.cloudTaskId ? cloudAdminTaskById.get(brand.cloudTaskId) : undefined;
               const operatorUserId = Number(cloudTask?.assigned_operator_user_id || brand.cloudAssignedOperatorUserId || 0) || 0;
-              const operatorUsername = String(cloudTask?.assigned_operator_username || brand.cloudAssignedOperatorUsername || "").trim();
+              const operatorUser = operatorUserId > 0 ? cloudOperatorById.get(operatorUserId) : undefined;
+              const operatorUsername = String(
+                operatorUser?.display_name
+                || operatorUser?.username
+                || cloudTask?.assigned_operator_display_name
+                || cloudTask?.assigned_operator_username
+                || brand.cloudAssignedOperatorUsername
+                || "",
+              ).trim();
               return (
                 <BrandCardErrorBoundary
                   key={brand.id}

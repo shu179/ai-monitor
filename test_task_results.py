@@ -1,14 +1,17 @@
+import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import main
+import core.daily_task_state as dts
 from core.cloud_outbox import CloudOutbox
 from core.task_results import (
     build_execution_report,
     count_task_keywords,
     count_task_queries,
+    finalize_daily_pool_keyword_results,
     finalize_execution_report,
     make_query_result_key,
     result_has_usable_screenshot,
@@ -75,6 +78,63 @@ class TaskResultsTests(unittest.TestCase):
             )
             self.assertTrue(result_has_usable_screenshot({"screenshot": str(screenshot)}))
             self.assertFalse(result_has_usable_screenshot({"screenshot": str(screenshot) + ".missing"}))
+
+    def test_finalizes_multi_platform_keyword_screenshots_separately(self):
+        task = {
+            "task_id": "task_multi_platform",
+            "name": "品牌A",
+            "brand": "品牌A",
+            "keywords": [
+                {"keyword": "奶粉推荐", "brand": "品牌A", "platforms": ["doubao", "kimi"], "mode": "browser"},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_state_path = dts.STATE_PATH
+            original_data_dir = os.environ.get("AIBRANDMONITOR_DATA_DIR")
+            os.environ["AIBRANDMONITOR_DATA_DIR"] = tmpdir
+            dts.STATE_PATH = Path(tmpdir) / "daily_task_status.json"
+            try:
+                shot_doubao = Path(tmpdir) / "doubao.jpg"
+                shot_kimi = Path(tmpdir) / "kimi.jpg"
+                shot_doubao.write_bytes(b"doubao")
+                shot_kimi.write_bytes(b"kimi")
+
+                finalize_daily_pool_keyword_results(
+                    task,
+                    all_results=[
+                        {
+                            "keyword": "奶粉推荐",
+                            "platform": "doubao",
+                            "brand": "品牌A",
+                            "rank": 1,
+                            "screenshot": str(shot_doubao),
+                        },
+                        {
+                            "keyword": "奶粉推荐",
+                            "platform": "kimi",
+                            "brand": "品牌A",
+                            "rank": 1,
+                            "screenshot": str(shot_kimi),
+                        },
+                    ],
+                    execution_source="manual_test",
+                    historical_keyword_states={},
+                )
+
+                status = dts.get_task_day_status(task)
+                keyword_state = status["keyword_states"]["奶粉推荐"]
+                platform_states = keyword_state["platform_states"]
+                self.assertTrue(platform_states["doubao"]["screenshot_saved"])
+                self.assertTrue(platform_states["kimi"]["screenshot_saved"])
+                self.assertNotEqual(platform_states["doubao"]["image_path"], platform_states["kimi"]["image_path"])
+                self.assertEqual(status["actual_screenshot_count"], 2)
+            finally:
+                dts.STATE_PATH = original_state_path
+                if original_data_dir is None:
+                    os.environ.pop("AIBRANDMONITOR_DATA_DIR", None)
+                else:
+                    os.environ["AIBRANDMONITOR_DATA_DIR"] = original_data_dir
 
     def test_record_result_history_persists_body_references_and_supports_task_id_lookup(self):
         from core import history
