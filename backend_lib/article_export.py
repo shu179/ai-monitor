@@ -12,6 +12,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 from core.article_store import (
     build_article_export_keyword_order,
+    normalize_article_url,
     resolve_article_export_keywords,
     resolve_article_export_source,
 )
@@ -186,6 +187,45 @@ def _sort_articles_for_export(articles: list[dict[str, Any]]) -> list[dict[str, 
     return sorted(articles, key=sort_key)
 
 
+def _article_export_url_fingerprint(article: dict[str, Any]) -> str:
+    title = re.sub(r"\s+", " ", str(article.get("title") or "").strip()).lower()
+    source = re.sub(
+        r"\s+",
+        " ",
+        str(article.get("media_name") or article.get("source") or article.get("platform") or "").strip(),
+    ).lower()
+    published = _first_article_export_date_text(article, ("published_at", "published", "published_ts", "ts"))
+    if not title or not source:
+        return ""
+    return "|".join([title, source, published])
+
+
+def _hydrate_article_export_urls(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    url_by_fingerprint: dict[str, str] = {}
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        raw_url = str(article.get("url") or "").strip()
+        if not normalize_article_url(raw_url):
+            continue
+        fingerprint = _article_export_url_fingerprint(article)
+        if fingerprint and fingerprint not in url_by_fingerprint:
+            url_by_fingerprint[fingerprint] = raw_url
+
+    if not url_by_fingerprint:
+        return articles
+
+    hydrated: list[dict[str, Any]] = []
+    for article in articles:
+        item = dict(article)
+        if not normalize_article_url(str(item.get("url") or "")):
+            fallback_url = url_by_fingerprint.get(_article_export_url_fingerprint(item), "")
+            if fallback_url:
+                item["url"] = fallback_url
+        hydrated.append(item)
+    return hydrated
+
+
 def _article_export_keyword_sort_key(label: str, keyword_order: dict[str, int]) -> tuple[int, str]:
     text = str(label or "").strip()
     return (keyword_order.get(text, len(keyword_order) + 1), text)
@@ -198,6 +238,7 @@ def _article_export_items(
     config: dict[str, Any] | None = None,
     task_name: str = "",
 ) -> list[tuple[str, dict[str, Any]]]:
+    articles = _hydrate_article_export_urls(articles)
     if not show_keyword_category:
         return [("", article) for article in _sort_articles_for_export(articles)]
 

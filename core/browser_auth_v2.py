@@ -11,11 +11,11 @@ from __future__ import annotations
 import json
 import shutil
 import threading
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from core.app_paths import resolve_app_dir, resolve_app_path
+from core.time_utils import local_now
 
 BROWSER_AUTH_PLATFORM_IDS: tuple[str, ...] = (
     "doubao",
@@ -30,7 +30,7 @@ _LOCK = threading.RLock()
 
 
 def _now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return local_now().isoformat(timespec="seconds")
 
 
 def _normalize_platform_name(platform_name: str) -> str:

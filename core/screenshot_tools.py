@@ -8,12 +8,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from core.app_paths import resolve_app_path
 from core.config_watcher import load_config
+from core.time_utils import local_now
 
 
 PLATFORM_LABELS = {
@@ -186,7 +185,7 @@ def decorate_screenshot(
         return {
             "preview_available": False,
             "highlight_count": len(boxes),
-            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "generated_at": local_now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
     layout = theme.get("layout", {})
@@ -281,7 +280,7 @@ def decorate_screenshot(
         "platform_raw": normalized_platform or platform_name or "",
         "brand": brand or "未命名品牌",
         "keyword": keyword or "未填写关键词",
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "time": local_now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     title = _render_template(str(theme.get("title", DEFAULT_THEME["title"])), context)
     subtitle = _render_template(str(theme.get("subtitle", DEFAULT_THEME["subtitle"])), context)
@@ -384,7 +383,7 @@ def decorate_screenshot(
     return {
         "preview_available": False,
         "highlight_count": len(boxes),
-        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "generated_at": local_now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 

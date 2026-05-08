@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,7 @@ from urllib.parse import urlparse
 
 from .app_paths import get_data_root, resolve_app_path
 from .cloud_session_store import CloudSessionStore, normalize_cloud_base_url
+from .file_lock import CrossProcessRLock
 
 
 ACCOUNT_PROFILE_ROOT = get_data_root() / "user_data" / "cloud_profiles"
@@ -93,12 +96,17 @@ def ensure_account_space(session: dict[str, Any] | None, *, copy_legacy: bool = 
 
     profile_dir.mkdir(parents=True, exist_ok=True)
     marker_path = profile_dir / "profile_meta.json"
-    if copy_legacy and not marker_path.exists():
-        _copy_legacy_account_files(profile_dir)
+    with CrossProcessRLock(_profile_meta_lock_file(marker_path)):
+        existing_meta = _read_json_object(marker_path)
+        legacy_copied = False
+        if copy_legacy and not marker_path.exists():
+            _copy_legacy_account_files(profile_dir)
+            legacy_copied = True
 
-    meta = _build_profile_meta(session)
-    meta["initialized_at"] = meta.get("initialized_at") or _utc_now_text()
-    _write_json_if_changed(marker_path, meta)
+        meta = _build_profile_meta(session)
+        meta["initialized_at"] = existing_meta.get("initialized_at") or _utc_now_text()
+        meta["legacy_copied"] = existing_meta.get("legacy_copied", legacy_copied)
+        _write_json_if_changed(marker_path, meta)
     return profile_dir
 
 
@@ -136,19 +144,47 @@ def _build_profile_meta(session: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def _write_json_if_changed(path: Path, payload: dict[str, Any]) -> None:
-    existing: dict[str, Any] = {}
+def merge_profile_meta(profile_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Merge account profile metadata with a path-scoped lock and atomic write."""
+    return _write_json_if_changed(Path(profile_dir) / "profile_meta.json", payload)
+
+
+def _write_json_if_changed(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    with CrossProcessRLock(_profile_meta_lock_file(path)):
+        existing = _read_json_object(path)
+        merged = dict(existing)
+        merged.update(payload)
+        if merged == existing:
+            return merged
+        _atomic_write_json(path, merged)
+        return merged
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _profile_meta_lock_file(path: Path) -> Path:
+    return path.with_name(f"{path.name}.lock")
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
     try:
         existing_data = json.loads(path.read_text(encoding="utf-8"))
-        existing = existing_data if isinstance(existing_data, dict) else {}
+        return existing_data if isinstance(existing_data, dict) else {}
     except Exception:
-        existing = {}
-    merged = dict(existing)
-    merged.update(payload)
-    if merged == existing:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(merged, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        return {}
 
 
 def _slug(value: str) -> str:

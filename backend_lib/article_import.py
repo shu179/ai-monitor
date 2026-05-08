@@ -24,6 +24,8 @@ _ARTICLE_IMPORT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "task_name": ("任务", "任务名", "任务名称", "项目", "项目名", "项目名称", "监测任务", "归属任务", "task", "project"),
 }
 
+_CELL_HYPERLINK_MARKER = "\x1eHYPERLINK:"
+
 
 def _normalize_import_header(value: Any) -> str:
     return re.sub(r"[\s_:\-—–|｜/\\（）()【】\\[\\]\"'“”‘’]+", "", str(value or "").strip().lower())
@@ -84,6 +86,14 @@ def _stringify_table_cell(value: Any) -> str:
     return str(value).strip()
 
 
+def _split_cell_hyperlink(value: Any) -> tuple[str, str]:
+    text = _stringify_table_cell(value)
+    if _CELL_HYPERLINK_MARKER not in text:
+        return text, ""
+    display, hyperlink = text.split(_CELL_HYPERLINK_MARKER, 1)
+    return display.strip(), hyperlink.strip()
+
+
 def _decode_csv_rows(data: bytes) -> list[list[str]]:
     last_error = ""
     text = ""
@@ -124,6 +134,8 @@ def _decode_xlsx_sheets(data: bytes) -> list[tuple[str, list[list[str]]]]:
             or re.fullmatch(r"(点击)?查看|链接|原文|阅读原文|打开|详情|跳转", value, re.IGNORECASE)
         ):
             return hyperlink
+        if hyperlink:
+            return f"{value}{_CELL_HYPERLINK_MARKER}{hyperlink}"
         return value
 
     for worksheet in workbook.worksheets:
@@ -472,7 +484,17 @@ def _extract_article_import_items(file_name: str, data: bytes) -> tuple[list[dic
                     index = field_map.get(field)
                     if index is None or index >= len(row):
                         return ""
-                    return _stringify_table_cell(row[index])
+                    display, hyperlink = _split_cell_hyperlink(row[index])
+                    if field == "url" and hyperlink:
+                        return hyperlink
+                    return display
+
+                def hyperlink_for(field: str) -> str:
+                    index = field_map.get(field)
+                    if index is None or index >= len(row):
+                        return ""
+                    _display, hyperlink = _split_cell_hyperlink(row[index])
+                    return hyperlink
 
                 title = value_for("title")
                 if not title:
@@ -486,9 +508,16 @@ def _extract_article_import_items(file_name: str, data: bytes) -> tuple[list[dic
                 if supporting_values and not any(supporting_values):
                     skipped_without_title += 1
                     continue
+                item_url = value_for("url")
+                if not item_url:
+                    for fallback_field in ("title", "excerpt", "media_name", "account_name"):
+                        item_url = hyperlink_for(fallback_field)
+                        if item_url:
+                            break
+
                 item = {
                     "title": title,
-                    "url": value_for("url"),
+                    "url": item_url,
                     "media_name": value_for("media_name"),
                     "media_type": value_for("media_type") or str(block.get("default_media_type") or ""),
                     "published_at": value_for("published_at"),

@@ -53,6 +53,24 @@ def public_profile_avatar_url(value: Any) -> str:
     return f"{_PROFILE_AVATAR_URL}?v={version}" if version else _PROFILE_AVATAR_URL
 
 
+def profile_avatar_data_url(value: Any) -> str:
+    """Return a portable data URL for a stored avatar asset."""
+    avatar = str(value or "").strip()
+    if not avatar:
+        return ""
+    if avatar.startswith("data:"):
+        return avatar
+    path = resolve_profile_avatar_path(avatar)
+    if not path or not path.exists() or not path.is_file():
+        return ""
+    content_type = _IMAGE_CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
+    try:
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    except OSError:
+        return ""
+    return f"data:{content_type};base64,{encoded}"
+
+
 def resolve_profile_avatar_path(value: Any) -> Path | None:
     """Resolve a stored profile avatar path without allowing arbitrary file reads."""
     avatar = str(value or "").strip()

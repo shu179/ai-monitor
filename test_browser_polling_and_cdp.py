@@ -5,6 +5,7 @@ from unittest.mock import patch
 from core.browser_platform_factory import apply_browser_runtime_config
 from platforms.base import BasePlatform
 from platforms.deepseek import DeepSeekPlatform
+from platforms.yuanbao import YuanbaoPlatform
 
 
 class FakePlatform(BasePlatform):
@@ -213,6 +214,73 @@ class BrowserPollingAndCDPTests(unittest.TestCase):
             )
 
             self.assertTrue(platform.debug_poll_metrics)
+
+    def test_yuanbao_blocks_text_stable_completion_while_streaming(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            platform = YuanbaoPlatform(tmpdir)
+            self.assertFalse(
+                platform._allow_text_stable_completion(
+                    {
+                        "stop_visible": False,
+                        "loading_visible": False,
+                        "stream_icon_visible": True,
+                    }
+                )
+            )
+
+    def test_yuanbao_requires_two_inactive_stable_reads_before_finalize(self):
+        class FakeYuanbaoPlatform(YuanbaoPlatform):
+            def __init__(self, user_data_dir: str):
+                super().__init__(user_data_dir)
+                self._debug_states = [
+                    {"stop_visible": False, "loading_visible": False, "stream_icon_visible": True},
+                    {"stop_visible": False, "loading_visible": False, "stream_icon_visible": True},
+                    {"stop_visible": False, "loading_visible": False, "stream_icon_visible": False},
+                    {"stop_visible": False, "loading_visible": False, "stream_icon_visible": False},
+                ]
+                self._texts = [
+                    "3. 深圳华南3D打印、增材制造展览会（TCT Shenzhen）",
+                    "3. 深圳华南3D打印、增材制造展览会（TCT Shenzhen）",
+                    "3. 深圳华南3D打印、增材制造展览会（TCT Shenzhen）\n更多内容",
+                    "3. 深圳华南3D打印、增材制造展览会（TCT Shenzhen）\n更多内容",
+                ]
+
+            def check_for_interruption(self):
+                return None
+
+            def _cooperative_sleep(self, seconds):
+                return None
+
+            def _capture_answer_snapshot(self):
+                text = self._texts.pop(0) if self._texts else ""
+                return {
+                    "root_key": "",
+                    "blocks": [{"key": "answer:0", "order": 0, "text": text, "html": ""}] if text else [],
+                    "raw_text": text,
+                    "raw_html": "",
+                }
+
+            def _get_generation_debug_state(self):
+                return self._debug_states.pop(0) if self._debug_states else {
+                    "stop_visible": False,
+                    "loading_visible": False,
+                    "stream_icon_visible": False,
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            platform = FakeYuanbaoPlatform(tmpdir)
+            platform._begin_answer_capture(keyword="3D打印展会", brand="即搜")
+
+            text, usable = platform._get_stable_answer_text(
+                lambda: "3. 深圳华南3D打印、增材制造展览会（TCT Shenzhen）",
+                keyword="3D打印展会",
+                brand="即搜",
+                attempts=4,
+                interval=0.01,
+            )
+
+            self.assertTrue(usable)
+            self.assertIn("更多内容", text)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -42,6 +42,11 @@ from core.notifier import WeComNotifier
 from core.notification_retry import (
     enqueue_wecom_notification,
     start_notification_retry_worker,
+)
+from core.notification_idempotency import (
+    build_payload_hash,
+    notification_already_sent,
+    record_notification_sent,
 )
 from core.time_utils import local_now, local_today
 
@@ -233,11 +238,15 @@ class ClipboardRecognitionManager:
         self._sending = False
         self._clipboard_armed = True
         self._startup_clipboard_hash = None
+        self._clipboard_grab_lock = threading.Lock()
+        self._clipboard_grab_inflight = False
+        self._clipboard_grab_timeout_logged_at = 0.0
         self._reference_clipboard_armed = True
         self._startup_reference_text_hash = None
         self._seen_reference_hashes = deque(maxlen=200)
         self._seen_reference_set = set()
         self._last_image_seen_at = None
+        self._last_image_seen_monotonic = None
         self._idle_reminded = False
         self._work_started = False
         self._matched_in_cycle = False
@@ -378,6 +387,7 @@ class ClipboardRecognitionManager:
                 "manual_index": int(self._manual_index or 0),
                 "guide_status_text": str(self._guide_status_text or ""),
                 "last_image_seen_at": self._last_image_seen_at,
+                "last_image_seen_monotonic": self._last_image_seen_monotonic,
                 "idle_reminded": bool(self._idle_reminded),
                 "work_started": bool(self._work_started),
                 "matched_in_cycle": bool(self._matched_in_cycle),
@@ -399,6 +409,10 @@ class ClipboardRecognitionManager:
             self._manual_index = max(0, int(payload.get("manual_index", 0) or 0))
             self._guide_status_text = str(payload.get("guide_status_text", "") or "")
             self._last_image_seen_at = payload.get("last_image_seen_at")
+            self._last_image_seen_monotonic = self._restore_monotonic_timestamp(
+                payload.get("last_image_seen_monotonic"),
+                self._last_image_seen_at,
+            )
             self._idle_reminded = bool(payload.get("idle_reminded", False))
             self._work_started = bool(payload.get("work_started", False))
             self._matched_in_cycle = bool(payload.get("matched_in_cycle", False))
@@ -421,6 +435,44 @@ class ClipboardRecognitionManager:
 
     def _auto_send_recognition_batches_enabled(self) -> bool:
         return self._safe_mode_ocr_enabled() or self._dom_render_mode_enabled()
+
+    def _mark_image_seen(self) -> None:
+        self._last_image_seen_at = local_now()
+        self._last_image_seen_monotonic = time.monotonic()
+        self._idle_reminded = False
+
+    @staticmethod
+    def _wall_clock_elapsed_seconds_since(timestamp) -> float | None:
+        if not timestamp:
+            return None
+        try:
+            current = local_now()
+            if getattr(timestamp, "tzinfo", None) is None:
+                current = current.replace(tzinfo=None)
+            elif current.tzinfo is not None:
+                timestamp = timestamp.astimezone(current.tzinfo)
+            return max(0.0, (current - timestamp).total_seconds())
+        except Exception:
+            return None
+
+    def _last_image_elapsed_seconds(self) -> float | None:
+        if self._last_image_seen_monotonic is not None:
+            try:
+                return max(0.0, time.monotonic() - float(self._last_image_seen_monotonic))
+            except Exception:
+                pass
+        return self._wall_clock_elapsed_seconds_since(self._last_image_seen_at)
+
+    def _restore_monotonic_timestamp(self, value, last_seen_at) -> float | None:
+        try:
+            if value is not None:
+                return float(value)
+        except Exception:
+            pass
+        if not last_seen_at:
+            return None
+        elapsed = self._wall_clock_elapsed_seconds_since(last_seen_at) or 0.0
+        return time.monotonic() - elapsed
 
     def set_active_capture_platform(self, platform_name: str) -> None:
         normalized = self._normalize_platform_id(platform_name)
@@ -1627,8 +1679,9 @@ class ClipboardRecognitionManager:
 
         idle_seconds = None
         idle_minutes = None
-        if self._last_image_seen_at:
-            idle_seconds = max(0.0, (datetime.now() - self._last_image_seen_at).total_seconds())
+        elapsed = self._last_image_elapsed_seconds()
+        if elapsed is not None:
+            idle_seconds = elapsed
             idle_minutes = round(idle_seconds / 60, 1)
 
         status = {
@@ -1875,8 +1928,56 @@ class ClipboardRecognitionManager:
             configured = 16
         return min(256, max(4, configured))
 
+    def _clipboard_image_timeout_seconds(self) -> float:
+        config = self._config_getter() or {}
+        recognition_cfg = config.get("recognition", {})
+        try:
+            configured = float(recognition_cfg.get("clipboard_image_timeout_seconds", 5.0) or 5.0)
+        except Exception:
+            configured = 5.0
+        return min(30.0, max(0.5, configured))
+
+    def _log_clipboard_grab_timeout(self, message: str) -> None:
+        now = time.monotonic()
+        if now - self._clipboard_grab_timeout_logged_at < 60.0:
+            return
+        self._clipboard_grab_timeout_logged_at = now
+        print(f"[Recognition] {message}")
+
+    def _grab_clipboard_image_source(self):
+        with self._clipboard_grab_lock:
+            if self._clipboard_grab_inflight:
+                self._log_clipboard_grab_timeout("上一轮图片剪贴板读取仍未返回，本轮跳过")
+                return None
+            self._clipboard_grab_inflight = True
+
+        done = threading.Event()
+        result: dict[str, object] = {}
+
+        def _worker() -> None:
+            try:
+                result["clip"] = ImageGrab.grabclipboard()
+            except Exception as exc:
+                result["error"] = exc
+            finally:
+                with self._clipboard_grab_lock:
+                    self._clipboard_grab_inflight = False
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True, name="recognition-clipboard-grab").start()
+        timeout_seconds = self._clipboard_image_timeout_seconds()
+        if not done.wait(timeout_seconds):
+            self._log_clipboard_grab_timeout(
+                f"图片剪贴板读取超过 {timeout_seconds:.1f}s，本轮跳过"
+            )
+            return None
+        error = result.get("error")
+        if isinstance(error, Exception):
+            raise error
+        return result.get("clip")
+
     def _poll_once(self):
-        clip = ImageGrab.grabclipboard()
+        clip = self._grab_clipboard_image_source()
         clip = self._extract_clipboard_image(clip)
         if clip is None:
             if not self._clipboard_armed:
@@ -1902,8 +2003,7 @@ class ClipboardRecognitionManager:
             return
 
         self._work_started = True
-        self._last_image_seen_at = datetime.now()
-        self._idle_reminded = False
+        self._mark_image_seen()
         payload = {
             "hash": image_hash,
             "path": str(image_path),
@@ -2193,8 +2293,7 @@ class ClipboardRecognitionManager:
         # DOM 文本模式直接保留原始正文入队，最终发送前再统一渲染最终卡片，
         # 避免生成一张不会直接使用的中间 JPG。
         self._work_started = True
-        self._last_image_seen_at = datetime.now()
-        self._idle_reminded = False
+        self._mark_image_seen()
         payload = {
             "hash": text_hash,
             "path": "",
@@ -2450,7 +2549,7 @@ class ClipboardRecognitionManager:
                     print("[Recognition] 已记录启动时剪切板文本，后续仅监听新文本")
             else:
                 # 截图模式：记录图片哈希（原有逻辑）
-                clip = ImageGrab.grabclipboard()
+                clip = self._grab_clipboard_image_source()
                 clip = self._extract_clipboard_image(clip)
                 if clip is None:
                     return
@@ -2463,7 +2562,7 @@ class ClipboardRecognitionManager:
             print(f"[Recognition] 初始化剪切板基线失败: {e}")
 
     def _persist_clipboard_image(self, image_hash: str, image_bytes: bytes):
-        ts = datetime.now().strftime("%m%d_%H%M%S_%f")
+        ts = local_now().strftime("%m%d_%H%M%S_%f")
         path = self._save_dir / f"clip_{ts}_{image_hash[:8]}.jpg"
         try:
             path.write_bytes(image_bytes)
@@ -3180,9 +3279,11 @@ class ClipboardRecognitionManager:
 
     def _check_flush_timeout(self):
         """若 buffer 中有未满批次且超过 flush 超时，自动发送。"""
-        if not self._work_started or not self._last_image_seen_at:
+        if not self._work_started:
             return
-        elapsed = (datetime.now() - self._last_image_seen_at).total_seconds()
+        elapsed = self._last_image_elapsed_seconds()
+        if elapsed is None:
+            return
         if elapsed < self._batch_flush_seconds():
             return
         tasks = self._get_enabled_tasks()
@@ -3253,14 +3354,14 @@ class ClipboardRecognitionManager:
     def _check_idle_timeout(self):
         if not self._work_started or self._idle_reminded or not self._has_unfinished_work():
             return
-        if not self._last_image_seen_at:
+        elapsed_seconds = self._last_image_elapsed_seconds()
+        if elapsed_seconds is None:
             return
-        elapsed = datetime.now() - self._last_image_seen_at
-        if elapsed < timedelta(seconds=self._idle_timeout_seconds()):
+        if elapsed_seconds < self._idle_timeout_seconds():
             return
 
         self._idle_reminded = True
-        minutes = int(elapsed.total_seconds() // 60)
+        minutes = int(elapsed_seconds // 60)
         message = f"识别模式已有 {minutes} 分钟未收到新截图，且仍有未完成批次，请手动切换到抓取模式。"
         print(f"[Recognition] {message}")
         if self._on_manual_switch_required:
@@ -3645,6 +3746,38 @@ class ClipboardRecognitionManager:
             )
             self._notify_manual_state_change()
 
+    def _build_notification_idempotency(
+        self,
+        notifier: WeComNotifier,
+        *,
+        task: dict,
+        batch: dict,
+        completed_keywords: list[str],
+        supplemented_keywords: list[str],
+        detected_platforms: list[str],
+        image_count: int,
+    ) -> dict:
+        task_id = str((task or {}).get("task_id") or derive_task_id(task or {}) or "").strip()
+        task_name = str((batch or {}).get("task_name") or (task or {}).get("name") or task_id).strip()
+        channel = "recognition_detected_images"
+        run_date = local_today().isoformat()
+        payload_hash = build_payload_hash({
+            "brands": list((batch or {}).get("brands") or []),
+            "completed_keywords": list(completed_keywords or []),
+            "supplemented_keywords": list(supplemented_keywords or []),
+            "detected_platforms": list(detected_platforms or []),
+            "image_count": max(0, int(image_count or 0)),
+        })
+        return {
+            "webhook_url": str(getattr(notifier, "webhook_url", "") or "").strip(),
+            "task_id": task_id,
+            "task_name": task_name,
+            "channel": channel,
+            "run_date": run_date,
+            "round_id": f"{channel}:{task_id or task_name}:{run_date}",
+            "payload_hash": payload_hash,
+        }
+
     def _send_loop(self):
         while True:
             try:
@@ -3691,6 +3824,7 @@ class ClipboardRecognitionManager:
         detected_platforms: list,
         daily_state_source: str,
         last_error: str,
+        notification_identity: dict | None = None,
     ) -> dict:
         try:
             return enqueue_wecom_notification(
@@ -3699,6 +3833,7 @@ class ClipboardRecognitionManager:
                     "daily_state_source": daily_state_source,
                     "daily_state_scope": "test" if daily_state_source == "manual_test" else "official",
                     "last_error": last_error,
+                    "idempotency": dict(notification_identity or {}),
                     "notifier": {
                         "webhook_url": webhook_url,
                         "cooldown_minutes": default_notify.get("cooldown_minutes", 30),
@@ -3938,16 +4073,35 @@ class ClipboardRecognitionManager:
             return
 
         wecom_started = time.perf_counter()
-        ok = notifier.send_detected_images(
-            task_name=batch["task_name"],
-            brands=batch["brands"],
-            screenshot_paths=batch["image_paths"],
-            detected_platforms=merged_detected_platforms,
-            source="识别模式",
+        notification_identity = self._build_notification_idempotency(
+            notifier,
+            task=task,
+            batch=batch,
             completed_keywords=completed_keywords,
             supplemented_keywords=supplemented_keywords,
-            total_screenshot_count=len(merged_image_paths),
+            detected_platforms=merged_detected_platforms,
+            image_count=len(merged_image_paths),
         )
+        already_sent = (
+            daily_state_source != "manual_test"
+            and notification_already_sent(**notification_identity)
+        )
+        if already_sent:
+            print(f"[Recognition] {batch['task_name']} 本轮通知已发送过，跳过重复发送")
+            ok = True
+        else:
+            ok = notifier.send_detected_images(
+                task_name=batch["task_name"],
+                brands=batch["brands"],
+                screenshot_paths=batch["image_paths"],
+                detected_platforms=merged_detected_platforms,
+                source="识别模式",
+                completed_keywords=completed_keywords,
+                supplemented_keywords=supplemented_keywords,
+                total_screenshot_count=len(merged_image_paths),
+            )
+            if ok and daily_state_source != "manual_test":
+                record_notification_sent(**notification_identity)
         wecom_elapsed = time.perf_counter() - wecom_started
 
         diagnostic_id = ""
@@ -3972,6 +4126,7 @@ class ClipboardRecognitionManager:
                 detected_platforms=merged_detected_platforms,
                 daily_state_source=daily_state_source,
                 last_error=notifier.last_error or "识别模式企业微信发送失败",
+                notification_identity=notification_identity,
             )
 
         if ok or daily_state_source != "manual_test":

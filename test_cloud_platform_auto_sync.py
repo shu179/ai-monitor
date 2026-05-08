@@ -6,12 +6,63 @@ import time
 import unittest
 from unittest.mock import patch
 
+import requests
+
+from core.cloud_client import _format_request_exception
 from core.cloud_outbox import CloudOutbox
 from core.cloud_platform_auto_sync import CloudPlatformAutoSync
 from core.cloud_session_store import CloudSessionStore
 
 
 class CloudPlatformAutoSyncTests(unittest.TestCase):
+    def test_event_connection_error_message_does_not_duplicate_connection_word(self):
+        message = _format_request_exception("云端事件连接", requests.ConnectionError("broken"))
+
+        self.assertEqual(message, "云端事件连接失败，将自动重试")
+
+    def test_read_timeout_message_is_normalized_and_transient_logs_are_throttled(self):
+        logs: list[str] = []
+        manager = CloudPlatformAutoSync(
+            pull_tasks=lambda: {"ok": True},
+            event_stream_enabled=False,
+            logger=logs.append,
+        )
+
+        manager._record_error(  # noqa: SLF001 - assert log noise guard for operator-facing output
+            "云端事件监听失败：HTTPSConnectionPool(host='api.surfacedlab.com', port=443): Read timed out."
+        )
+        manager._record_error("云端请求连接失败，将自动重试")  # noqa: SLF001
+
+        self.assertEqual(logs, ["[CloudPlatformAutoSync] 云端事件连接超时，正在自动重连"])
+        self.assertEqual(manager.get_status()["last_error"], "云端请求连接失败，将自动重试")
+
+    def test_event_reconnect_delay_uses_exponential_backoff_with_cap(self):
+        manager = CloudPlatformAutoSync(
+            pull_tasks=lambda: {"ok": True},
+            event_stream_enabled=False,
+            event_reconnect_seconds=5,
+            event_reconnect_max_seconds=30,
+            event_reconnect_jitter_ratio=0,
+        )
+
+        self.assertEqual(manager._event_reconnect_delay(1), 5.0)  # noqa: SLF001
+        self.assertEqual(manager._event_reconnect_delay(2), 10.0)  # noqa: SLF001
+        self.assertEqual(manager._event_reconnect_delay(3), 20.0)  # noqa: SLF001
+        self.assertEqual(manager._event_reconnect_delay(4), 30.0)  # noqa: SLF001
+        self.assertEqual(manager._event_reconnect_delay(8), 30.0)  # noqa: SLF001
+
+    def test_event_reconnect_delay_jitter_does_not_exceed_cap(self):
+        manager = CloudPlatformAutoSync(
+            pull_tasks=lambda: {"ok": True},
+            event_stream_enabled=False,
+            event_reconnect_seconds=5,
+            event_reconnect_max_seconds=30,
+            event_reconnect_jitter_ratio=0.5,
+        )
+
+        with patch("core.cloud_platform_auto_sync.random.uniform", return_value=45.0):
+            self.assertEqual(manager._event_reconnect_delay(8), 30.0)  # noqa: SLF001
+
     def test_logged_in_session_triggers_initial_pull(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = CloudSessionStore(Path(tmpdir) / "session.json")
@@ -44,6 +95,36 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             status = manager.get_status()
             self.assertTrue(status["logged_in"])
             self.assertTrue(status["last_pull_at"])
+
+    def test_logged_in_session_uses_smart_initial_pull_when_supported(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.example.com",
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "user": {"id": 4, "workspace_id": 1, "role": "viewer"},
+                }
+            )
+            calls: list[bool] = []
+            manager = CloudPlatformAutoSync(
+                session_store=store,
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda force=False: calls.append(bool(force)) or {"ok": True},
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            manager.start()
+            try:
+                deadline = time.time() + 2.0
+                while not calls and time.time() < deadline:
+                    time.sleep(0.05)
+            finally:
+                manager.stop()
+
+            self.assertEqual(calls, [False])
 
     def test_outbox_enqueue_wakes_upload_without_retry_delay(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -190,7 +271,7 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             self.assertGreaterEqual(len(pulls), 2)
             self.assertTrue(manager.get_status()["last_event_at"])
 
-    def test_assignment_event_forces_task_pull(self):
+    def test_assignment_event_uses_sync_changes_before_full_pull(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = CloudSessionStore(Path(tmpdir) / "session.json")
             calls: list[bool] = []
@@ -204,7 +285,7 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
 
             manager._pull_now_from_event("assignment_changed")
 
-            self.assertEqual(calls, [True])
+            self.assertEqual(calls, [False])
 
     def test_run_record_event_uses_incremental_pull(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -221,6 +302,44 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             manager._pull_now_from_event("run_record_changed")
 
             self.assertEqual(calls, [False])
+
+    def test_pull_metrics_are_summarized_for_status_ui(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            manager = CloudPlatformAutoSync(
+                session_store=store,
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda force=False: {
+                    "ok": True,
+                    "summary": {
+                        "metrics": {
+                            "mode": "partial_tasks",
+                            "total_ms": 123,
+                            "changed_task_ids": [9],
+                            "received_tasks": 1,
+                        },
+                        "run_records": {
+                            "request_count": 1,
+                            "fetched": 3,
+                            "imported": 2,
+                        },
+                        "task_day_status_events": {
+                            "applied": 1,
+                        },
+                    },
+                },
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            manager._pull_now_from_event("task_changed")
+
+            summary = manager.get_status()["last_pull_summary"]
+            self.assertEqual(summary["mode"], "partial_tasks")
+            self.assertEqual(summary["pulled_task_count"], 1)
+            self.assertEqual(summary["duration_ms"], 123)
+            self.assertEqual(summary["run_record_imported"], 2)
+            self.assertEqual(summary["task_day_status_applied"], 1)
 
 
 if __name__ == "__main__":

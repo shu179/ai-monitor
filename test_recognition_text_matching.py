@@ -621,6 +621,42 @@ class RecognitionTextMatchingTests(unittest.TestCase):
         self.assertEqual(analyzed.get("matched_tasks"), ["立体库品牌"])
         self.assertIn("标题命中核心词", " ".join(analyzed.get("match_reasons", {}).get("立体库品牌", [])))
 
+    def test_article_title_does_not_match_multiple_brands_by_shared_core_only(self):
+        config = {
+            "tasks": [
+                {
+                    "name": "立体库品牌A",
+                    "brand": "品牌A",
+                    "keywords": [
+                        {
+                            "keyword": "立体库厂家",
+                            "brand": "品牌A",
+                            "platforms": ["doubao"],
+                        }
+                    ],
+                },
+                {
+                    "name": "立体库品牌B",
+                    "brand": "品牌B",
+                    "keywords": [
+                        {
+                            "keyword": "立体库厂家",
+                            "brand": "品牌B",
+                            "platforms": ["doubao"],
+                        }
+                    ],
+                },
+            ],
+        }
+
+        analyzed = article_store.analyze_article_matches(
+            "智能制造场景下立体库建设的关键趋势",
+            config,
+        )
+
+        self.assertEqual(analyzed.get("matched_tasks"), [])
+        self.assertIn("缺少明确品牌信号", str(analyzed.get("unmatched_reason") or ""))
+
     def test_article_title_matches_task_by_region_and_industry_tags(self):
         config = {
             "tasks": [

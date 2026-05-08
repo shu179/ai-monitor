@@ -15,6 +15,7 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ from urllib.parse import urlparse
 import requests
 
 from core.app_paths import get_app_root, get_data_root
+from core.file_lock import CrossProcessRLock
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:11434"
@@ -172,7 +174,7 @@ class LocalModelManager:
         with self._lock:
             if self._prepare_thread and self._prepare_thread.is_alive():
                 return
-            now = time.time()
+            now = time.monotonic()
             if now - self._last_prepare_attempt_at < 10:
                 return
             self._last_prepare_attempt_at = now
@@ -297,6 +299,10 @@ class LocalModelManager:
     def _bundle_sync_marker_path(self) -> Path:
         return self._runtime_models_dir().parent / ".bundle_sync_state.json"
 
+    def _bundle_sync_marker_lock_path(self) -> Path:
+        marker_path = self._bundle_sync_marker_path()
+        return marker_path.with_name(f"{marker_path.name}.lock")
+
     def _runtime_models_seed_present(self) -> bool:
         runtime_dir = self._runtime_models_dir()
         return runtime_dir.exists() and (runtime_dir / "manifests").exists() and (runtime_dir / "blobs").exists()
@@ -324,19 +330,28 @@ class LocalModelManager:
 
     def _load_bundle_sync_marker(self) -> dict[str, Any]:
         marker_path = self._bundle_sync_marker_path()
-        try:
-            payload = json.loads(marker_path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-        return payload if isinstance(payload, dict) else {}
+        with CrossProcessRLock(self._bundle_sync_marker_lock_path()):
+            try:
+                payload = json.loads(marker_path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+            return payload if isinstance(payload, dict) else {}
 
     def _save_bundle_sync_marker(self, payload: dict[str, Any]) -> None:
         marker_path = self._bundle_sync_marker_path()
-        marker_path.parent.mkdir(parents=True, exist_ok=True)
-        marker_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        with CrossProcessRLock(self._bundle_sync_marker_lock_path()):
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(marker_path.parent), prefix=f".{marker_path.name}.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False, indent=2)
+                os.replace(tmp, marker_path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
 
     def _can_skip_bundled_models_sync_locked(self, bundled_dir: Path) -> bool:
         if not self._runtime_models_seed_present():
@@ -570,7 +585,7 @@ class LocalModelManager:
         return "当前版本未内置 Ollama 引擎，也没有发现系统已安装的 Ollama"
 
     def _check_health(self, *, force: bool) -> bool:
-        now = time.time()
+        now = time.monotonic()
         if not force and now - self._last_healthcheck_at < 1.5:
             return bool(self._last_tags is not None and not self._last_tags_error)
 
@@ -644,8 +659,8 @@ class LocalModelManager:
         return self._wait_for_service_locked(reason=reason or "start")
 
     def _wait_for_service_locked(self, *, reason: str = "") -> tuple[bool, str]:
-        deadline = time.time() + self._startup_timeout()
-        while time.time() < deadline:
+        deadline = time.monotonic() + self._startup_timeout()
+        while time.monotonic() < deadline:
             self._refresh_process_state_locked()
             if self._check_health(force=True):
                 self._set_status_locked("ready", "本地模型服务已就绪")

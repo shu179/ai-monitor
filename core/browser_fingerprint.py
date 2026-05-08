@@ -12,8 +12,11 @@ import random
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, Any
+
+from .file_lock import CrossProcessRLock
 
 
 class BrowserFingerprint:
@@ -22,21 +25,23 @@ class BrowserFingerprint:
     def __init__(self, user_data_dir: str):
         self.user_data_dir = user_data_dir
         self.config_file = Path(user_data_dir) / ".fingerprint.json"
+        self._lock = CrossProcessRLock(lambda: self._lock_file())
         self.config = self._load_or_generate()
+
+    def _lock_file(self) -> Path:
+        return self.config_file.with_name(f"{self.config_file.name}.lock")
 
     def _load_or_generate(self) -> Dict[str, Any]:
         """加载或生成指纹配置"""
-        if self.config_file.exists():
-            try:
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
+        with self._lock:
+            config = self._load_unlocked()
+            if config:
+                return config
 
-        # 生成新的指纹配置
-        config = self._generate_fingerprint()
-        self._save(config)
-        return config
+            # 生成新的指纹配置
+            config = self._generate_fingerprint()
+            self._save_unlocked(config)
+            return config
 
     def _generate_fingerprint(self) -> Dict[str, Any]:
         """生成一个稳定的指纹配置"""
@@ -199,10 +204,37 @@ class BrowserFingerprint:
 
     def _save(self, config: Dict[str, Any]) -> None:
         """保存指纹配置"""
+        with self._lock:
+            self._save_unlocked(config)
+
+    def _load_unlocked(self) -> Dict[str, Any]:
+        if not self.config_file.exists():
+            return {}
+        try:
+            with open(self.config_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_unlocked(self, config: Dict[str, Any]) -> None:
         try:
             os.makedirs(self.user_data_dir, exist_ok=True)
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
+            fd, tmp = tempfile.mkstemp(
+                dir=str(self.config_file.parent),
+                prefix=f".{self.config_file.name}.",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(config, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, self.config_file)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         except Exception as e:
             print(f"[BrowserFingerprint] 保存指纹配置失败: {e}")
 

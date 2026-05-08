@@ -13,19 +13,19 @@ import hashlib
 import os
 import shutil
 import tempfile
-import threading
 from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 from .app_paths import resolve_app_path
+from .file_lock import CrossProcessRLock
 from .local_account_space import account_scoped_path
 from .time_utils import local_now, local_today
 
 
 STATE_PATH = resolve_app_path("user_data/daily_task_status.json")
-_LOCK = threading.Lock()
+_LOCK = CrossProcessRLock(lambda: _state_lock_file())
 
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"
@@ -192,6 +192,11 @@ def _state_path() -> Path:
     return account_scoped_path("user_data/daily_task_status.json", fallback=resolved_default)
 
 
+def _state_lock_file() -> Path:
+    state_path = _state_path()
+    return state_path.with_name(f"{state_path.name}.lock")
+
+
 def get_state_path() -> Path:
     return _state_path()
 
@@ -250,9 +255,25 @@ def _parse_local_datetime(value: Any) -> datetime | None:
         dt = datetime.fromisoformat(normalized)
     except Exception:
         return None
+    local_tz = local_now().tzinfo
     if dt.tzinfo is None:
-        return dt
-    return dt.astimezone(local_now().tzinfo)
+        return dt.replace(tzinfo=local_tz) if local_tz is not None else dt
+    return dt.astimezone(local_tz) if local_tz is not None else dt.astimezone()
+
+
+def _elapsed_since_local_datetime(value: Any) -> float | None:
+    parsed = _parse_local_datetime(value)
+    if parsed is None:
+        return None
+    try:
+        return (local_now() - parsed).total_seconds()
+    except Exception:
+        return None
+
+
+def _is_stale_running_timestamp(value: Any) -> bool:
+    elapsed_seconds = _elapsed_since_local_datetime(value)
+    return elapsed_seconds is not None and elapsed_seconds >= _RUNNING_STALE_SECONDS
 
 
 def _normalize_status_payload(entry: dict | None, *, allow_manual_test_failure: bool = False) -> dict:
@@ -270,16 +291,13 @@ def _normalize_status_payload(entry: dict | None, *, allow_manual_test_failure: 
         status = STATUS_SEND_FAILED if str(extra.get("task_failure_kind") or "").strip() == "notification" else STATUS_QUERY_FAILED
         normalized["status"] = status
     elif status == STATUS_RUNNING:
-        updated_at = _parse_local_datetime(normalized.get("updated_at"))
-        if updated_at is not None:
-            elapsed_seconds = (local_now() - updated_at).total_seconds()
-            if elapsed_seconds >= _RUNNING_STALE_SECONDS:
-                normalized["status"] = STATUS_QUERY_FAILED
-                normalized["message"] = str(normalized.get("message") or "").strip() or "任务执行超时，等待后续补跑"
-                extra = dict(extra)
-                if not str(extra.get("task_failure_kind") or "").strip():
-                    extra["task_failure_kind"] = "temporary"
-                normalized["extra"] = extra
+        if _is_stale_running_timestamp(normalized.get("updated_at")):
+            normalized["status"] = STATUS_QUERY_FAILED
+            normalized["message"] = str(normalized.get("message") or "").strip() or "任务执行超时，等待后续补跑"
+            extra = dict(extra)
+            if not str(extra.get("task_failure_kind") or "").strip():
+                extra["task_failure_kind"] = "temporary"
+            normalized["extra"] = extra
     elif status not in _VISIBLE_STATUSES:
         normalized["status"] = status or STATUS_PENDING
     return normalized
@@ -662,6 +680,9 @@ def _ensure_pool_shape(pool: dict | None, task: dict | None, target_date: date |
         brand["required_keywords"] = [item["keyword"] for item in required_entries]
     else:
         brand["required_keywords"] = _dedupe_text_list(brand.get("required_keywords"))
+    if _coerce_bool(brand.get("formal_running")) and _is_stale_running_timestamp(brand.get("updated_at")):
+        brand["formal_running"] = False
+        brand["status_message"] = str(brand.get("status_message") or "").strip() or "任务执行超时，等待后续补跑"
 
     keyword_states = {}
     existing_keywords = dict(normalized.get("keywords") or {})

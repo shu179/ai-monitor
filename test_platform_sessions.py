@@ -216,6 +216,28 @@ class PlatformSessionManagerTests(unittest.TestCase):
             _PlatformWorkerProxy.STARTUP_TIMEOUT_SECONDS = previous_timeout
             manager.close_all(reason="test cleanup")
 
+    def test_session_age_and_restart_cooldown_use_monotonic_time(self):
+        manager = PlatformSessionManager(
+            "browser",
+            build_query_execution_policy({}, "browser"),
+            {"doubao": 1},
+        )
+
+        try:
+            with patch("core.platform_sessions.time.monotonic", return_value=100.0):
+                manager.get_or_create("doubao", FakePlatform)
+
+            with patch("core.platform_sessions.time.monotonic", return_value=160.0):
+                snapshot = manager.get_dispatch_snapshot("doubao")
+                self.assertEqual(snapshot["session_age_seconds"], 60.0)
+                manager.restart_session("doubao", reason="test")
+
+            with patch("core.platform_sessions.time.monotonic", return_value=220.0):
+                snapshot = manager.get_dispatch_snapshot("doubao")
+                self.assertEqual(snapshot["restart_cooldown_remaining_seconds"], 540.0)
+        finally:
+            manager.close_all(reason="test cleanup")
+
     def test_worker_close_timeout_reclaims_profile_processes(self):
         holder = {}
         previous_request_timeout = _PlatformWorkerProxy.CLOSE_REQUEST_TIMEOUT_SECONDS

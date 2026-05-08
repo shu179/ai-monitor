@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import tempfile
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +13,7 @@ from core.article_reference_ranking import (
     build_article_reference_bucket_snapshot,
 )
 from core.article_store import get_articles_file_signature
+from core.file_lock import CrossProcessRLock
 from core.history import get_records_file_signature
 from core.local_account_space import account_scoped_path
 from core.time_utils import local_now
@@ -21,7 +21,7 @@ from core.time_utils import local_now
 DEFAULT_INDEX_DIR = resolve_app_path("logs/article_reference_index")
 INDEX_DIR = DEFAULT_INDEX_DIR
 INDEX_FILE_VERSION = 1
-_INDEX_LOCK = threading.RLock()
+_INDEX_LOCK = CrossProcessRLock(lambda: _index_dir() / ".index.lock")
 
 
 def build_reference_index_source_signature(task_name: str = "", task_id: str = "") -> dict[str, Any]:
@@ -34,13 +34,14 @@ def build_reference_index_source_signature(task_name: str = "", task_id: str = "
 
 def get_reference_index_file_signature(task_name: str = "", task_id: str = "") -> tuple[str, int, int]:
     path = _index_path(task_name, task_id)
-    try:
-        stat = path.stat()
-        return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
-    except FileNotFoundError:
-        return (str(path), 0, 0)
-    except Exception:
-        return (str(path), -1, -1)
+    with _INDEX_LOCK:
+        try:
+            stat = path.stat()
+            return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+        except FileNotFoundError:
+            return (str(path), 0, 0)
+        except Exception:
+            return (str(path), -1, -1)
 
 
 def load_reference_index_snapshot(
@@ -49,7 +50,8 @@ def load_reference_index_snapshot(
     *,
     source_signature: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    payload = _load_index_payload(task_name, task_id)
+    with _INDEX_LOCK:
+        payload = _load_index_payload(task_name, task_id)
     if not payload:
         return None
     if str(payload.get("algorithm_version") or "").strip() != ALGORITHM_VERSION:

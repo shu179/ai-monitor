@@ -994,7 +994,7 @@ function estimateCanvasHeightFromAnswerHeight(answerHeight, keyword, includeBadg
   const keywordHeight = includeBadges && keywordText ? estimateLines(keywordText, CARD_WIDTH - CARD_PADDING_X * 2, 15) * 15 * 1.6 + 24 + 28 : 0;
   const messageHeight = answerHeight;
   const cardHeight = cardPaddingY + headerHeight + keywordHeight + messageHeight + chatMarginBottom + footerHeight;
-  return Math.max(MIN_VIEWPORT_HEIGHT, Math.min(22000, Math.ceil((BODY_PADDING_TOP + cardHeight + BODY_PADDING_BOTTOM + 120) * 1.12)));
+  return Math.max(MIN_VIEWPORT_HEIGHT, Math.min(22000, Math.ceil(BODY_PADDING_TOP + cardHeight + BODY_PADDING_BOTTOM + 96)));
 }
 
 function buildLogo(platform) {
@@ -1247,7 +1247,7 @@ async function renderText(payload) {
   }
   const text = normalizeCopiedMarkdownArtifacts(payload.text);
   const pattern = compileBrandPattern(payload.brand);
-  const tokens = md.render(text).trim() ? md.parse(text, {}) : md.parse(" ", {});
+  const tokens = text.trim() ? md.parse(text, {}) : md.parse(" ", {});
   const answerContent = renderBlocks(tokens, 0, tokens.length, pattern, "body");
   const answerHeight = Math.max(44, estimateBlocks(tokens));
   const height = estimateCanvasHeightFromAnswerHeight(answerHeight, payload.keyword, payload.includeBadges !== false);

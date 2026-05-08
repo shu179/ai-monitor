@@ -6,15 +6,12 @@
 
 from __future__ import annotations
 
-import json
 import threading
 import time
-import uuid
-from datetime import datetime
-from pathlib import Path
 from typing import Callable, Optional
 
 from .app_paths import resolve_app_path
+from .batch_test_storage import merge_batch_json, write_batch_json
 from .history import record as record_history
 from .notifier import WeComNotifier
 from .platform_sessions import PlatformSessionManager, build_query_execution_policy
@@ -369,17 +366,14 @@ class BatchTestRunner:
         batch_file = resolve_app_path(f"user_data/batch_tests/{batch_id}.json")
 
         try:
-            with open(batch_file, "r", encoding="utf-8") as f:
-                batch_config = json.load(f)
-
-            batch_config["status"] = status
-            batch_config["updated_at"] = local_now().isoformat()
-
+            updates = {
+                "status": status,
+                "updated_at": local_now().isoformat(),
+            }
             if error:
-                batch_config["error"] = error
+                updates["error"] = error
 
-            with open(batch_file, "w", encoding="utf-8") as f:
-                json.dump(batch_config, f, ensure_ascii=False, indent=2)
+            merge_batch_json(batch_file, updates)
         except Exception:
             pass
 
@@ -388,21 +382,17 @@ class BatchTestRunner:
         batch_file = resolve_app_path(f"user_data/batch_tests/{batch_id}.json")
 
         try:
-            with open(batch_file, "r", encoding="utf-8") as f:
-                batch_config = json.load(f)
-
-            batch_config["progress"] = progress
-            batch_config["updated_at"] = local_now().isoformat()
-
-            with open(batch_file, "w", encoding="utf-8") as f:
-                json.dump(batch_config, f, ensure_ascii=False, indent=2)
+            merge_batch_json(
+                batch_file,
+                {
+                    "progress": progress,
+                    "updated_at": local_now().isoformat(),
+                },
+            )
         except Exception:
             pass
 
     def _save_report(self, batch_id: str, report: dict):
         """保存批量测试报告"""
         report_file = resolve_app_path(f"user_data/batch_tests/{batch_id}_report.json")
-        report_file.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(report_file, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
+        write_batch_json(report_file, report)

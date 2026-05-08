@@ -3,8 +3,8 @@ from __future__ import annotations
 import queue
 import secrets
 import threading
+import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from core.browser_processes import browser_profile_owner_pids, terminate_browser_profile_processes
@@ -330,15 +330,15 @@ def build_session_pool_dispatch_pairs(
 class PlatformSessionState:
     platform_name: str
     platform: Any
-    started_at: datetime
-    expire_at: datetime
+    started_at: float
+    expire_at: float
     max_queries: int
     planned_queries_total: int
     completed_queries: int = 0
-    last_progress_at: datetime | None = None
+    last_progress_at: float | None = None
     consecutive_structural_failures: int = 0
     dirty_after_manual_recovery: bool = False
-    last_query_started_at: datetime | None = None
+    last_query_started_at: float | None = None
 
 
 @dataclass(slots=True)
@@ -625,7 +625,7 @@ class PlatformSessionManager:
             if str(platform).strip()
         }
         self._sessions: dict[str, PlatformSessionState] = {}
-        self._last_restart_at: dict[str, datetime] = {}
+        self._last_restart_at: dict[str, float] = {}
         self._log = logger or (lambda message: None)
         self._lock = threading.RLock()
 
@@ -657,7 +657,7 @@ class PlatformSessionManager:
             except Exception:
                 pass
 
-        now = datetime.now()
+        now = time.monotonic()
         ttl_minutes = self._random_ttl_minutes()
         max_queries = self._random_max_queries()
         platform = _PlatformWorkerProxy(
@@ -669,7 +669,7 @@ class PlatformSessionManager:
             platform_name=key,
             platform=platform,
             started_at=now,
-            expire_at=now + timedelta(minutes=ttl_minutes),
+            expire_at=now + ttl_minutes * 60,
             max_queries=max_queries,
             planned_queries_total=max(0, self.remaining_queries(key)),
             last_progress_at=now,
@@ -690,7 +690,7 @@ class PlatformSessionManager:
         key = str(platform_name or "").strip()
         with self._lock:
             state = self._sessions.get(key)
-            now = datetime.now()
+            now = time.monotonic()
             snapshot = {
                 "platform_name": key,
                 "has_live_session": False,
@@ -707,14 +707,14 @@ class PlatformSessionManager:
                 snapshot["completed_queries"] = int(state.completed_queries or 0)
                 snapshot["consecutive_structural_failures"] = int(state.consecutive_structural_failures or 0)
                 snapshot["dirty_after_manual_recovery"] = bool(state.dirty_after_manual_recovery)
-                snapshot["session_age_seconds"] = max(0.0, float((now - state.started_at).total_seconds()))
+                snapshot["session_age_seconds"] = max(0.0, float(now - state.started_at))
                 if state.last_progress_at is not None:
-                    snapshot["seconds_since_progress"] = max(0.0, float((now - state.last_progress_at).total_seconds()))
+                    snapshot["seconds_since_progress"] = max(0.0, float(now - state.last_progress_at))
             cooldown = max(0, int(self.policy.min_restart_cooldown_minutes or 0))
             if cooldown > 0:
                 last_restart_at = self._last_restart_at.get(key)
                 if last_restart_at is not None:
-                    elapsed = (now - last_restart_at).total_seconds()
+                    elapsed = now - last_restart_at
                     snapshot["restart_cooldown_remaining_seconds"] = max(0.0, cooldown * 60 - float(elapsed))
             return snapshot
 
@@ -722,7 +722,7 @@ class PlatformSessionManager:
         with self._lock:
             state = self._sessions.get(str(platform_name or "").strip())
             if state is not None:
-                state.last_query_started_at = datetime.now()
+                state.last_query_started_at = time.monotonic()
 
     def _consume_query_slot(self, platform_name: str) -> int:
         key = str(platform_name or "").strip()
@@ -750,7 +750,7 @@ class PlatformSessionManager:
         last_restart_at = self._last_restart_at.get(key)
         if last_restart_at is None:
             return True
-        return datetime.now() - last_restart_at >= timedelta(minutes=cooldown)
+        return time.monotonic() - last_restart_at >= cooldown * 60
 
     def _decide_post_query_action(
         self,
@@ -788,11 +788,11 @@ class PlatformSessionManager:
                 return "restart", f"本次查询耗时超过 {self.policy.single_query_timeout_minutes} 分钟"
             return "keep", "单次查询耗时过长但仍在重启冷却期"
 
-        session_age = datetime.now() - state.started_at
+        session_age_seconds = time.monotonic() - state.started_at
         if (
             remaining_queries > 0
             and state.planned_queries_total >= self.policy.min_queries_per_window
-            and session_age >= timedelta(minutes=self.policy.min_queries_window_minutes)
+            and session_age_seconds >= self.policy.min_queries_window_minutes * 60
             and state.completed_queries < self.policy.min_queries_per_window
         ):
             if self._restart_allowed(key):
@@ -808,7 +808,7 @@ class PlatformSessionManager:
                 return "restart", f"会话已完成 {state.completed_queries} 次查询，达到阈值"
             return "keep", "查询数达到阈值但仍在重启冷却期"
 
-        if datetime.now() >= state.expire_at:
+        if time.monotonic() >= state.expire_at:
             if self._restart_allowed(key):
                 return "restart", "会话寿命已到期"
             return "keep", "会话寿命已到但仍在重启冷却期"
@@ -827,12 +827,12 @@ class PlatformSessionManager:
         with self._lock:
             state = self._sessions.get(key)
             previous_progress_at = state.last_progress_at if state is not None else None
-            now = datetime.now()
+            now = time.monotonic()
             remaining = self._consume_query_slot(key)
             progress_gap_exceeded = (
                 previous_progress_at is not None
                 and remaining > 0
-                and now - previous_progress_at >= timedelta(minutes=self.policy.no_progress_timeout_minutes)
+                and now - previous_progress_at >= self.policy.no_progress_timeout_minutes * 60
             )
 
             if state is not None:
@@ -871,7 +871,7 @@ class PlatformSessionManager:
             state = self._sessions.pop(key, None)
             if state is None:
                 return
-            self._last_restart_at[key] = datetime.now()
+            self._last_restart_at[key] = time.monotonic()
             try:
                 state.platform.close()
             except Exception:

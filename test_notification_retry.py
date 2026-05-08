@@ -5,7 +5,14 @@ import unittest
 
 import core.daily_task_state as dts
 import core.cycle_state as cycle_state
+from core.file_lock import CrossProcessRLock
+from core.notification_idempotency import (
+    build_payload_hash,
+    notification_already_sent,
+)
 from core.notification_retry import (
+    _LOCK,
+    get_retry_queue_path,
     clear_retry_queue,
     enqueue_wecom_notification,
     load_retry_queue,
@@ -69,6 +76,31 @@ class NotificationRetryTests(unittest.TestCase):
             },
         }
 
+    def _idempotency(self) -> dict:
+        salt = Path(self._tmpdir.name).name
+        payload_hash = build_payload_hash({
+            "brands": ["品牌R"],
+            "completed_keywords": ["词R"],
+            "supplemented_keywords": ["词R"],
+            "detected_platforms": ["doubao"],
+            "image_count": 1,
+            "test_salt": salt,
+        })
+        return {
+            "webhook_url": "https://example.invalid/webhook/test",
+            "task_id": "task_retry_r",
+            "task_name": "品牌R",
+            "channel": "recognition_detected_images",
+            "run_date": "2026-05-08",
+            "round_id": f"recognition_detected_images:task_retry_r:2026-05-08:{salt}",
+            "payload_hash": payload_hash,
+        }
+
+    def test_retry_queue_uses_cross_process_lock_next_to_queue_file(self) -> None:
+        self.assertIsInstance(_LOCK, CrossProcessRLock)
+        with _LOCK:
+            self.assertTrue(get_retry_queue_path().with_name("notification_retry_queue.json.lock").exists())
+
     def test_enqueue_dedupes_same_notification_payload(self) -> None:
         payload = self._payload()
 
@@ -79,6 +111,14 @@ class NotificationRetryTests(unittest.TestCase):
         self.assertEqual(first["id"], second["id"])
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["attempt_count"], 0)
+
+    def test_enqueue_preserves_notification_idempotency_identity(self) -> None:
+        payload = self._payload()
+        payload["idempotency"] = self._idempotency()
+
+        entry = enqueue_wecom_notification(payload, initial_delay_seconds=0, now=1000)
+
+        self.assertEqual(entry["idempotency"], payload["idempotency"])
 
     def test_retry_success_removes_entry_and_marks_daily_state_success(self) -> None:
         payload = self._payload()
@@ -128,6 +168,45 @@ class NotificationRetryTests(unittest.TestCase):
         cycle_payload = cycle_state.get_cycle_report()
         self.assertEqual((cycle_payload or {})["summary"]["success"], 1)
         self.assertEqual((cycle_payload or {})["task_outcomes"][0]["final_status"], "success")
+
+    def test_retry_success_records_notification_idempotency(self) -> None:
+        payload = self._payload()
+        identity = self._idempotency()
+        payload["idempotency"] = identity
+        enqueue_wecom_notification(payload, initial_delay_seconds=0, now=1000)
+
+        class FakeNotifier:
+            def __init__(self, *args, **kwargs):
+                self.last_error = ""
+
+            def send_detected_images(self, *args, **kwargs):
+                return True
+
+        self.assertFalse(notification_already_sent(**identity))
+        stats = retry_due_notifications(limit=1, notifier_factory=FakeNotifier, now=1000)
+
+        self.assertEqual(stats["succeeded"], 1)
+        self.assertTrue(notification_already_sent(**identity))
+
+    def test_manual_test_retry_success_does_not_record_notification_idempotency(self) -> None:
+        payload = self._payload()
+        identity = self._idempotency()
+        payload["daily_state_source"] = "manual_test"
+        payload["daily_state_scope"] = "test"
+        payload["idempotency"] = identity
+        enqueue_wecom_notification(payload, initial_delay_seconds=0, now=1000)
+
+        class FakeNotifier:
+            def __init__(self, *args, **kwargs):
+                self.last_error = ""
+
+            def send_detected_images(self, *args, **kwargs):
+                return True
+
+        stats = retry_due_notifications(limit=1, notifier_factory=FakeNotifier, now=1000)
+
+        self.assertEqual(stats["succeeded"], 1)
+        self.assertFalse(notification_already_sent(**identity))
 
     def test_retry_failure_keeps_entry_with_backoff(self) -> None:
         enqueue_wecom_notification(self._payload(), initial_delay_seconds=0, now=1000)

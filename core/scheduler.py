@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from copy import deepcopy
 from datetime import date, datetime
 from typing import Callable, Optional
@@ -21,6 +22,7 @@ from .daily_task_state import derive_task_id, get_task_day_status, is_task_sent_
 from .platform_sessions import build_query_execution_policy
 from .scheduler_state import get_entry as get_scheduler_entry
 from .scheduler_state import mark_processed, update_after_run
+from .time_utils import local_now
 
 
 WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -270,7 +272,7 @@ class SmartScheduler:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._state_lock = threading.Lock()  # 保护跨线程访问的共享状态
-        self._task_start_times: dict[str, tuple[datetime, dict]] = {}  # name -> (started_at, unit)
+        self._task_start_times: dict[str, tuple[float, dict]] = {}  # name -> (monotonic_started_at, unit)
         self._timeout_fired: set[str] = set()  # 已触发超时回调的任务名，防重复
         self._watcher_thread: Optional[threading.Thread] = None
         self._on_task_timeout: Optional[Callable] = None
@@ -294,7 +296,7 @@ class SmartScheduler:
             return False
         if bool(task.get("delete_pending")):
             return False
-        current = now or datetime.now()
+        current = now or local_now()
         today = current.date()
 
         # 检查优化时间周期
@@ -317,7 +319,7 @@ class SmartScheduler:
         return current.weekday() in weekdays
 
     def get_task_run_datetime(self, task: dict, current_date: datetime | None = None) -> Optional[datetime]:
-        current = current_date or datetime.now()
+        current = current_date or local_now()
         if not self.should_run_task_today(task, current):
             return None
 
@@ -405,14 +407,14 @@ class SmartScheduler:
             self._stop_event.wait(60)
             if not self._running:
                 break
-            now = datetime.now()
+            now_monotonic = time.monotonic()
             with self._state_lock:
                 snapshot = list(self._task_start_times.items())
                 fired = set(self._timeout_fired)
             for name, (started_at, unit) in snapshot:
                 if name in fired:
                     continue
-                elapsed = (now - started_at).total_seconds()
+                elapsed = now_monotonic - started_at
                 if elapsed >= 1800 and self._on_task_timeout:
                     with self._state_lock:
                         self._timeout_fired.add(name)
@@ -585,7 +587,7 @@ class SmartScheduler:
                     continue
 
                 with self._state_lock:
-                    self._task_start_times[display_name] = (datetime.now(), unit)
+                    self._task_start_times[display_name] = (time.monotonic(), unit)
                 try:
                     print(f"[Scheduler] 执行任务单元: {display_name}")
                     report = executor(unit) or {}
@@ -879,13 +881,12 @@ class SmartScheduler:
         self._refresh_config()
         self._start_timeout_watcher()
 
-        started_at = datetime.now()
         units = self._build_units(tasks)
         print(f"[Scheduler] 调度器启动，共 {len(units)} 个自动任务单元")
 
         while self._running and not self._stop_event.is_set():
             self._refresh_config()
-            now = datetime.now()
+            now = local_now()
             due_units = self._due_units(tasks, now)
             if due_units:
                 self._run_due_modes(
@@ -900,7 +901,7 @@ class SmartScheduler:
                 self._current_mode_label = ""
                 self._current_round_summary = self._empty_round_summary("")
 
-            sleep_seconds = self._next_wakeup_seconds(tasks, datetime.now())
+            sleep_seconds = self._next_wakeup_seconds(tasks, local_now())
             self._stop_event.wait(sleep_seconds)
 
         self._clear_followup_state()
@@ -959,10 +960,10 @@ class SmartScheduler:
         self._followup_event.set()
 
     def get_running_tasks(self) -> dict:
-        now = datetime.now()
+        now_monotonic = time.monotonic()
         with self._state_lock:
             return {
-                name: (now - started_at).total_seconds()
+                name: max(0.0, now_monotonic - started_at)
                 for name, (started_at, _) in self._task_start_times.items()
             }
 
@@ -978,7 +979,7 @@ class SmartScheduler:
 
     def get_status(self) -> dict:
         self._refresh_config()
-        now = datetime.now()
+        now = local_now()
         next_slots = {}
         for weekday in range(7):
             run_time = self.weekly_times.get(str(weekday))

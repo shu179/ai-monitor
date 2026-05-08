@@ -640,9 +640,9 @@ class DeepSeekPlatform(BasePlatform):
             return False
 
     def _wait_for_deep_think_state(self, expected_active: bool, timeout_seconds: float = 1.5):
-        deadline = time.time() + max(0.5, timeout_seconds)
+        deadline = time.monotonic() + max(0.5, timeout_seconds)
         last_state = {"found": False, "active": None, "confidence": "none"}
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             self._raise_if_stop_requested()
             last_state = self._get_deep_think_state()
             if last_state.get("active") is expected_active:

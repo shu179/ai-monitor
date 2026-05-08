@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import time
 from datetime import datetime
 from typing import Any
 
 from .cloud_client import CloudClientError, SurfacedCloudClient
 from .cloud_event_types import (
     EVENT_ARTICLE_REFERENCE,
+    EVENT_ARTICLE_TASK_LINKS,
+    EVENT_ARTICLE_UPSERT,
     EVENT_PROFILE_UPDATE,
     EVENT_RUN_RECORD,
     EVENT_TASK_DAY_STATUS,
@@ -20,6 +24,7 @@ from .time_utils import local_now, local_today, parse_local_date
 
 
 MAX_CLOUD_TEXT_FIELD_LENGTH = 500
+MAX_ARTICLE_PAYLOAD_TEXT_LENGTH = 500
 
 
 def enqueue_profile_update(
@@ -65,6 +70,254 @@ def enqueue_task_day_status(
         payload=clean,
     )
     return queued
+
+
+def article_to_cloud_events(article: dict[str, Any], config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    clean_article = _sanitize_article_for_cloud(article)
+    canonical_url = str(clean_article.get("canonical_url") or "").strip()
+    if not canonical_url:
+        return []
+
+    url_hash = hashlib.sha256(canonical_url.encode("utf-8", errors="ignore")).hexdigest()
+    identity_hash = _cloud_identity_hash()
+    upsert_payload = {
+        "local_article_id": clean_article.get("local_article_id"),
+        "url": canonical_url,
+        "canonical_url": canonical_url,
+        "url_hash": url_hash,
+        "title": clean_article.get("title"),
+        "source": clean_article.get("source"),
+        "media_type": clean_article.get("media_type"),
+        "published_at": clean_article.get("published_at"),
+        "payload": clean_article.get("payload") or {},
+    }
+    upsert_fingerprint = hashlib.sha256(
+        json_stable_dumps(upsert_payload).encode("utf-8", errors="ignore")
+    ).hexdigest()[:16]
+
+    events = [
+        {
+            "event_type": EVENT_ARTICLE_UPSERT,
+            "idempotency_key": f"article:{identity_hash}:{url_hash[:16]}:{upsert_fingerprint}",
+            "payload": upsert_payload,
+        }
+    ]
+
+    link_payload = _article_task_links_payload(article, config, canonical_url=canonical_url, url_hash=url_hash)
+    if link_payload is not None:
+        link_fingerprint = hashlib.sha256(
+            json_stable_dumps(link_payload).encode("utf-8", errors="ignore")
+        ).hexdigest()[:16]
+        events.append(
+            {
+                "event_type": EVENT_ARTICLE_TASK_LINKS,
+                "idempotency_key": f"article-links:{identity_hash}:{url_hash[:16]}:{link_fingerprint}",
+                "payload": link_payload,
+            }
+        )
+    return events
+
+
+def enqueue_article_cloud_sync(
+    article: dict[str, Any],
+    config: dict[str, Any] | None = None,
+    *,
+    outbox: CloudOutbox | None = None,
+) -> list[dict[str, Any]]:
+    events = article_to_cloud_events(article, config)
+    if not events:
+        return []
+    target_outbox = outbox or CloudOutbox()
+    queued_items: list[dict[str, Any]] = []
+    for event in events:
+        queued, _created = target_outbox.enqueue(
+            event_type=event["event_type"],
+            idempotency_key=event["idempotency_key"],
+            payload=event["payload"],
+        )
+        queued_items.append(queued)
+    return queued_items
+
+
+def enqueue_cloud_articles(
+    articles: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    config: dict[str, Any] | None = None,
+    *,
+    outbox: CloudOutbox | None = None,
+    max_articles: int = 5000,
+) -> dict[str, int]:
+    target_outbox = outbox or CloudOutbox()
+    before_total = int(target_outbox.stats().get("total") or 0)
+    scanned = 0
+    candidates = 0
+    for article in list(articles or [])[: max(1, int(max_articles or 5000))]:
+        if not isinstance(article, dict):
+            continue
+        scanned += 1
+        events = article_to_cloud_events(article, config)
+        if not events:
+            continue
+        candidates += 1
+        for event in events:
+            try:
+                target_outbox.enqueue(
+                    event_type=event["event_type"],
+                    idempotency_key=event["idempotency_key"],
+                    payload=event["payload"],
+                )
+            except Exception:
+                continue
+    after_total = int(target_outbox.stats().get("total") or 0)
+    return {
+        "articles": scanned,
+        "candidates": candidates,
+        "queued": max(0, after_total - before_total),
+    }
+
+
+def json_stable_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _cloud_identity_hash() -> str:
+    try:
+        identity = cloud_session_identity(CloudSessionStore().load())
+        identity_key = "|".join([identity["base_url"], identity["workspace_id"], identity["user_id"]])
+    except Exception:
+        identity_key = ""
+    if not identity_key.strip("|"):
+        identity_key = "local"
+    return hashlib.sha256(identity_key.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def _sanitize_article_for_cloud(article: dict[str, Any]) -> dict[str, Any]:
+    source = article if isinstance(article, dict) else {}
+    canonical_url = _article_canonical_url(source)
+    media_name = _cloud_text_field(source.get("media_name") or source.get("source") or source.get("platform"), limit=128)
+    platform = _cloud_text_field(source.get("platform"), limit=128)
+    published_at = _normalize_article_time(source.get("published_at") or source.get("ts"))
+    payload = {
+        "local_article_id": _cloud_text_field(source.get("id"), limit=128),
+        "platform": platform,
+        "media_name": media_name,
+        "account_name": _cloud_text_field(source.get("account_name"), limit=128),
+        "account_url": _cloud_text_field(source.get("account_url"), limit=512),
+        "excerpt": _cloud_text_field(source.get("excerpt"), limit=MAX_ARTICLE_PAYLOAD_TEXT_LENGTH),
+        "imported_at": _cloud_text_field(source.get("imported_at"), limit=64),
+        "fetch_method": _cloud_text_field(source.get("fetch_method"), limit=64),
+        "import_status": _cloud_text_field(source.get("import_status"), limit=32),
+        "import_confirmed_at": _cloud_text_field(source.get("import_confirmed_at"), limit=64),
+    }
+    payload = {key: value for key, value in payload.items() if value not in ("", None, [], {})}
+    return {
+        "local_article_id": _cloud_text_field(source.get("id"), limit=128),
+        "canonical_url": canonical_url,
+        "title": _cloud_text_field(source.get("title"), limit=512),
+        "source": media_name or platform,
+        "media_type": _normalize_article_media_type(source.get("media_type")),
+        "published_at": published_at,
+        "payload": payload,
+    }
+
+
+def _article_task_links_payload(
+    article: dict[str, Any],
+    config: dict[str, Any] | None,
+    *,
+    canonical_url: str,
+    url_hash: str,
+) -> dict[str, Any] | None:
+    source = article if isinstance(article, dict) else {}
+    task_lookup = _cloud_task_lookup(config)
+    matched_task_names = [
+        name
+        for name in (_cloud_text_list(source.get("matched_tasks"), limit=128, max_items=200))
+        if name
+    ]
+    if not matched_task_names:
+        return None
+
+    task_ids: list[int] = []
+    unresolved_task_names: list[str] = []
+    task_name_by_id: dict[str, str] = {}
+    for task_name in matched_task_names:
+        cloud_task_id = task_lookup.get(task_name.lower())
+        if cloud_task_id is None:
+            unresolved_task_names.append(task_name)
+            continue
+        if cloud_task_id not in task_ids:
+            task_ids.append(cloud_task_id)
+            task_name_by_id[str(cloud_task_id)] = task_name
+
+    reason_json: dict[str, Any] = {}
+    raw_reasons = source.get("match_reasons") if isinstance(source.get("match_reasons"), dict) else {}
+    for cloud_task_id_text, task_name in task_name_by_id.items():
+        reasons = _cloud_text_list(raw_reasons.get(task_name), limit=256, max_items=5)
+        if reasons:
+            reason_json[cloud_task_id_text] = reasons
+
+    payload = {
+        "local_article_id": _cloud_text_field(source.get("id"), limit=128),
+        "url": canonical_url,
+        "canonical_url": canonical_url,
+        "url_hash": url_hash,
+        "task_ids": sorted(task_ids),
+        "source": "local_rule",
+        "confidence": 100,
+        "reason_json": reason_json,
+        "replace": True,
+        "partial": bool(unresolved_task_names),
+        "unresolved_task_names": unresolved_task_names[:50],
+    }
+    return payload
+
+
+def _article_canonical_url(article: dict[str, Any]) -> str:
+    raw_url = str((article or {}).get("url") or (article or {}).get("canonical_url") or "").strip()
+    if not raw_url:
+        return ""
+    normalized = normalize_reference_url(raw_url)
+    return normalized or raw_url
+
+
+def _normalize_article_media_type(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "")
+    if text in {"authority", "media", "official"}:
+        return "authority"
+    if text in {"selfmedia", "self", "ugc"}:
+        return "selfmedia"
+    return "selfmedia"
+
+
+def _normalize_article_time(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) == 10:
+        try:
+            datetime.fromisoformat(text)
+            return text
+        except Exception:
+            return text[:64]
+    return _cloud_text_field(_normalize_executed_at(text), limit=64)
+
+
+def _cloud_task_lookup(config: dict[str, Any] | None) -> dict[str, int]:
+    lookup: dict[str, int] = {}
+    for task in (config or {}).get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        cloud_task_id = _normalize_cloud_task_id(task.get("cloud_task_id") or task.get("cloudTaskId"))
+        if cloud_task_id is None:
+            continue
+        task_id = str(task.get("task_id") or "").strip()
+        task_name = str(task.get("name") or task_id).strip()
+        brand = str(task.get("brand") or "").strip()
+        for candidate in (task_name, brand, task_id, f"cloud_{cloud_task_id}", str(cloud_task_id)):
+            key = str(candidate or "").strip().lower()
+            if key and key not in lookup:
+                lookup[key] = cloud_task_id
+    return lookup
 
 
 def history_record_to_run_event(record: dict[str, Any], *, cloud_task_id: Any = None) -> dict[str, Any] | None:
@@ -339,7 +592,7 @@ def flush_cloud_outbox(
     outbox: CloudOutbox | None = None,
     limit: int = 100,
 ) -> dict[str, Any]:
-    started_at = datetime.now().timestamp()
+    started_at = time.monotonic()
     store = session_store or CloudSessionStore()
     session = store.load()
     queue = (outbox or CloudOutbox()).bind_to_session(session)
@@ -449,7 +702,7 @@ def _collapse_profile_update_events(pending: list[dict[str, Any]]) -> tuple[list
 
 def _flush_metrics(started_at: float, event_count: int, accepted_count: int) -> dict[str, int]:
     return {
-        "duration_ms": max(0, int(round((datetime.now().timestamp() - started_at) * 1000))),
+        "duration_ms": max(0, int(round((time.monotonic() - started_at) * 1000))),
         "event_count": max(0, int(event_count or 0)),
         "accepted_count": max(0, int(accepted_count or 0)),
         "request_count": 1 if int(event_count or 0) > 0 else 0,

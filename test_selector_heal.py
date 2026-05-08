@@ -1,5 +1,6 @@
 import unittest
 from copy import deepcopy
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
@@ -299,6 +300,7 @@ class SelectorHealTests(unittest.TestCase):
             self.assertEqual(cache["new_chat_selector"]["selector"], "button.learned")
             self.assertEqual(cache["new_chat_selector"]["source"], "vision")
             self.assertEqual(int(cache["new_chat_selector"]["hit_count"]), 1)
+            self.assertTrue((Path(tempdir) / ".selectors_learned.yaml.lock").exists())
 
             set_learned_selector(tempdir, "new_chat_selector", "button.learned", source="cache_verified")
             cache = load_selector_cache(tempdir)

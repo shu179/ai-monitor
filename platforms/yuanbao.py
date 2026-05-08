@@ -33,6 +33,27 @@ class YuanbaoPlatform(BasePlatform):
     deep_think_selector = "button:has-text('Deep thinking'), div:has-text('Deep thinking'), span:has-text('Deep thinking'), button:has-text('深度思考'), div:has-text('深度思考')"
     _overlay_detection_enabled = False
 
+    @staticmethod
+    def _debug_state_indicates_generation_active(debug_state: dict | None) -> bool:
+        if not isinstance(debug_state, dict):
+            return False
+        return any(
+            bool(debug_state.get(key))
+            for key in ("stop_visible", "loading_visible", "stream_icon_visible")
+        )
+
+    def _allow_text_stable_completion(self, debug_state: dict | None = None) -> bool:
+        """元宝的 done 块很干净，但流式中会只稳定半截；生成态未消失前不走文本稳定兜底。"""
+        if self._debug_state_indicates_generation_active(debug_state):
+            return False
+        if debug_state:
+            return True
+        try:
+            return not self._debug_state_indicates_generation_active(self._get_generation_debug_state())
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return False
+
     def start_new_chat(self) -> None:
         """元宝新建对话：span被nav遮挡，用JS直接触发点击"""
         before = self._conversation_snapshot()
@@ -477,6 +498,92 @@ class YuanbaoPlatform(BasePlatform):
             self._reraise_stop_requested(e)
             return super()._capture_answer_snapshot()
 
+    def _get_stable_answer_text(
+        self,
+        get_text,
+        *,
+        keyword: str = "",
+        brand: str = "",
+        attempts: int = 8,
+        interval: float = 1.0,
+    ) -> tuple[str, bool]:
+        """
+        元宝不自动滚动且 done 块可能先稳定半截。
+        最终补抓必须同时满足：生成态消失、done-only 文本可用、连续两次长度稳定。
+        """
+        best_text = ""
+        best_score = -1
+        stable_inactive_reads = 0
+        last_inactive_compact = ""
+        max_attempts = max(int(attempts or 0), 10)
+
+        for index in range(max_attempts):
+            self._raise_if_stop_requested()
+            try:
+                self.check_for_interruption()
+            except InterruptionDetected:
+                raise
+
+            self._schedule_answer_poll_read(force_scroll=True)
+            wait_seconds = 0.7 if index == 0 else max(0.8, float(interval or 0.0))
+            self._cooperative_sleep(wait_seconds)
+
+            try:
+                snapshot = self._capture_answer_snapshot()
+            except Exception as exc:
+                self._reraise_stop_requested(exc)
+                snapshot = {}
+            captured_text = self._merge_answer_snapshot(
+                snapshot,
+                keyword=keyword,
+                brand=brand,
+            )
+            if captured_text:
+                answer_text = captured_text
+            else:
+                try:
+                    answer_text = get_text() or ""
+                except Exception as exc:
+                    self._reraise_stop_requested(exc)
+                    raise
+
+            compact = self._normalize_compact_text(answer_text)
+            if len(compact) > best_score:
+                best_text = answer_text
+                best_score = len(compact)
+
+            debug_state = {}
+            try:
+                debug_state = self._get_generation_debug_state() or {}
+            except Exception as exc:
+                self._reraise_stop_requested(exc)
+            if self._debug_state_indicates_generation_active(debug_state):
+                stable_inactive_reads = 0
+                last_inactive_compact = ""
+                continue
+
+            if not self.has_usable_answer_text(answer_text, keyword=keyword, brand=brand):
+                stable_inactive_reads = 0
+                last_inactive_compact = compact
+                continue
+
+            if compact and compact == last_inactive_compact:
+                stable_inactive_reads += 1
+            else:
+                stable_inactive_reads = 1
+                last_inactive_compact = compact
+
+            if stable_inactive_reads >= 2:
+                if index > 0:
+                    print(f"[{self.name}] 元宝回答完成后稳定补抓，在第 {index + 1} 次确认后提取成功")
+                return answer_text, True
+
+        if best_text:
+            reason = self.explain_unusable_answer_text(best_text, keyword=keyword, brand=brand) or "yuanbao-final-not-stable"
+            preview = best_text[:300].replace("\n", "\\n")
+            print(f"[{self.name}] 元宝回答最终补抓未稳定: {reason}; 预览: {preview}")
+        return best_text, False
+
     def _get_answer_html(self) -> str:
         """元宝 DOM 复排只保留最终回答 markdown，不回退整段会话容器。"""
         try:
@@ -652,8 +759,8 @@ class YuanbaoPlatform(BasePlatform):
 
     def _wait_for_submit_started(self, before_input: str, timeout: float = 8.0) -> bool:
         before_compact = self._normalize_compact_text(before_input)
-        deadline = time.time() + max(1.0, float(timeout or 0.0))
-        while time.time() < deadline:
+        deadline = time.monotonic() + max(1.0, float(timeout or 0.0))
+        while time.monotonic() < deadline:
             self._raise_if_stop_requested()
             signal = self._has_submit_started_signal()
             if signal:

@@ -7,6 +7,7 @@ import time
 import random
 
 from core.app_paths import resolve_app_dir
+from core.time_utils import local_now
 from .base import BasePlatform, InterruptionDetected
 
 
@@ -182,8 +183,8 @@ class DoubaoPlatform(BasePlatform):
         baseline_result_length = int(before_snapshot.get("resultLength", 0) or 0)
         baseline_container_length = int(before_snapshot.get("containerLength", 0) or 0)
         baseline_keyword_visible = bool(before_snapshot.get("keywordVisible"))
-        deadline = time.time() + max(2.0, timeout)
-        while time.time() < deadline:
+        deadline = time.monotonic() + max(2.0, timeout)
+        while time.monotonic() < deadline:
             self._raise_if_stop_requested()
             self._disable_captcha_pointer_intercept()
             self.check_for_interruption(check_input_visible=False)
@@ -610,10 +611,9 @@ class DoubaoPlatform(BasePlatform):
     def take_long_screenshot(self, rank: int = 0, quality: int = 85, brand: str = "") -> str:
         from PIL import Image
         import io
-        from datetime import datetime
         from core.screenshot_tools import decorate_screenshot
 
-        ts = datetime.now().strftime("%m%d_%H%M%S")
+        ts = local_now().strftime("%m%d_%H%M%S")
         screenshots_dir = resolve_app_dir("screenshots")
         filename = screenshots_dir / f"{self.name}_{ts}.jpg"
         preview_png, preview_boxes, preview_scale = self._capture_brand_preview(brand)
@@ -796,8 +796,8 @@ class DoubaoPlatform(BasePlatform):
         expected = self._normalize_compact_text(expected_text)
         if not expected:
             return True
-        deadline = time.time() + max(1.0, timeout)
-        while time.time() < deadline:
+        deadline = time.monotonic() + max(1.0, timeout)
+        while time.monotonic() < deadline:
             self._raise_if_stop_requested()
             current = self._normalize_compact_text(self._read_input_value())
             if current == expected or expected in current:
@@ -1594,8 +1594,8 @@ class DoubaoPlatform(BasePlatform):
 
     def _wait_mode_menu_open(self, timeout_ms: int = 2500) -> bool:
         try:
-            deadline = time.time() + max(0.5, timeout_ms / 1000.0)
-            while time.time() < deadline:
+            deadline = time.monotonic() + max(0.5, timeout_ms / 1000.0)
+            while time.monotonic() < deadline:
                 self._raise_if_stop_requested()
                 if self.page.evaluate("""() => {
                     const norm = (value) => String(value || '').replace(/\\s+/g, ' ').trim();

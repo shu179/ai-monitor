@@ -72,10 +72,10 @@ def prepare_local_runtime(
             "local_model": status,
         }
 
-    deadline = time.time() + max(5, int(timeout_seconds or 0))
+    deadline = time.monotonic() + max(5, int(timeout_seconds or 0))
     last_message = str(message or status.get("status_message") or "").strip()
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         status = manager.get_status()
         status_name = str(status.get("status") or "").strip()
         if bool(status.get("healthy")) and target_model in list(status.get("models") or []):

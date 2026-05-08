@@ -12,9 +12,14 @@ import time
 import os
 import random
 import threading
-from datetime import datetime
 from typing import Optional
 from urllib.parse import parse_qs, urlsplit
+
+from .time_utils import local_now
+
+
+def _notification_now_text() -> str:
+    return local_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def is_valid_wecom_webhook(webhook_url: str) -> bool:
@@ -33,7 +38,7 @@ def send_scheduler_test_message(webhook_url: str, *, send_interval: int = 1) -> 
         cooldown_minutes=0,
         send_interval=max(1, int(send_interval or 1)),
     )
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    current_time = _notification_now_text()
     content = "\n".join([
         "【自动监控通知测试】",
         f"时间：{current_time}",
@@ -92,12 +97,12 @@ class WeComNotifier:
             float(self._last_send_time or 0),
             float(self._shared_last_post.get(key, 0) or 0),
         )
-        elapsed = time.time() - last_sent
+        elapsed = time.monotonic() - last_sent
         if elapsed < self.send_interval:
             time.sleep(self.send_interval - elapsed)
 
     def _mark_post_sent_unlocked(self) -> None:
-        sent_at = time.time()
+        sent_at = time.monotonic()
         self._last_send_time = sent_at
         key = str(self.webhook_url or "").strip()
         self._shared_last_post[key] = sent_at
@@ -118,7 +123,7 @@ class WeComNotifier:
         """
         self.last_skip_reason = ""
         key = self._cooldown_key(platform, brand, keyword)
-        current_time = time.time()
+        current_time = time.monotonic()
         with self._shared_lock:
             last_time = self._shared_last_sent.get(key, 0)
 
@@ -132,7 +137,7 @@ class WeComNotifier:
 
     def _mark_sent(self, platform: str, brand: str, keyword: str = "") -> None:
         """发送成功后调用，更新冷却时间戳，并清理已过期的历史记录。"""
-        sent_at = time.time()
+        sent_at = time.monotonic()
         key = self._cooldown_key(platform, brand, keyword)
         with self._shared_lock:
             self._shared_last_sent[key] = sent_at
@@ -154,7 +159,7 @@ class WeComNotifier:
         body_references: list[dict] | None = None,
         greeting: str = "🎯 品牌监控报告",
     ) -> str:
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current_time = _notification_now_text()
         normalized_brands = [str(item).strip() for item in (brands or []) if str(item).strip()]
         normalized_keywords = [str(item).strip() for item in (keywords or []) if str(item).strip()]
         lines = [
@@ -618,7 +623,7 @@ class WeComNotifier:
 
     def get_status(self) -> dict:
         """获取通知器状态（用于调试）"""
-        current_time = time.time()
+        current_time = time.monotonic()
         active_cooldowns = []
 
         with self._shared_lock:

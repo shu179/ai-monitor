@@ -20,6 +20,7 @@ from .history import (
     is_manual_test_failure_record,
     is_success_record,
 )
+from .time_utils import local_now, local_today
 
 
 REPORT_DIR = resolve_app_path("reports")
@@ -28,7 +29,8 @@ REPORT_DIR = resolve_app_path("reports")
 def generate_period_report(config: dict, period: str = "weekly") -> dict:
     days = 7 if period == "weekly" else 30
     period_label = "周报" if period == "weekly" else "月报"
-    since = date.today() - timedelta(days=days - 1)
+    today = local_today()
+    since = today - timedelta(days=days - 1)
 
     task_stats = []
     overall_total = 0
@@ -106,7 +108,7 @@ def generate_period_report(config: dict, period: str = "weekly") -> dict:
     lines = [
         f"AI 品牌监控{period_label}",
         "",
-        f"统计周期: {since.isoformat()} 至 {date.today().isoformat()}",
+        f"统计周期: {since.isoformat()} 至 {today.isoformat()}",
         f"总检测次数: {overall_total}",
         f"命中次数: {overall_success}",
         f"整体提及率: {overall_rate}%",
@@ -144,9 +146,9 @@ def generate_period_report(config: dict, period: str = "weekly") -> dict:
     image_path = render_report_card(
         title=f"品牌提及率{period_label}",
         lines=lines,
-        output_path=str(REPORT_DIR / f"{period}_{date.today().isoformat()}.jpg"),
+        output_path=str(REPORT_DIR / f"{period}_{today.isoformat()}.jpg"),
     )
-    text_path = REPORT_DIR / f"{period}_{date.today().isoformat()}.txt"
+    text_path = REPORT_DIR / f"{period}_{today.isoformat()}.txt"
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     text_path.write_text(text, encoding="utf-8")
 
@@ -181,7 +183,8 @@ def render_report_card(title: str, lines: list[str], output_path: str) -> str:
     draw = ImageDraw.Draw(temp_img)
     y = padding_y
     y += _text_height(draw, title, title_font) + 10
-    y += _text_height(draw, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), meta_font) + 18
+    rendered_at = local_now().strftime("%Y-%m-%d %H:%M:%S")
+    y += _text_height(draw, rendered_at, meta_font) + 18
     for line in lines[2:]:
         y += _text_height(draw, line, body_font) + line_gap
     height = max(420, y + padding_y)
@@ -190,7 +193,7 @@ def render_report_card(title: str, lines: list[str], output_path: str) -> str:
     draw = ImageDraw.Draw(img)
     draw.rounded_rectangle((18, 18, width - 18, height - 18), radius=26, fill="#111827", outline="#334155", width=2)
     draw.text((padding_x, padding_y), title, fill="#E5EEF8", font=title_font)
-    draw.text((padding_x, padding_y + 54), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), fill="#94A3B8", font=meta_font)
+    draw.text((padding_x, padding_y + 54), rendered_at, fill="#94A3B8", font=meta_font)
 
     cursor_y = padding_y + 96
     for idx, line in enumerate(lines[2:], start=2):

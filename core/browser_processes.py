@@ -208,11 +208,11 @@ def browser_profile_process_tree_is_orphaned(profile_path: str | Path) -> bool:
 
 
 def wait_for_pids_exit(pids: list[int], timeout_seconds: float) -> bool:
-    deadline = time.time() + max(0.0, float(timeout_seconds or 0.0))
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds or 0.0))
     remaining = [int(pid) for pid in (pids or []) if isinstance(pid, int) and pid > 0]
     if not remaining:
         return True
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         alive = [pid for pid in remaining if pid_is_alive(pid)]
         if not alive:
             return True

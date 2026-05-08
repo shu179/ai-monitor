@@ -9,15 +9,15 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import threading
 
 from .app_paths import resolve_app_path
+from .file_lock import CrossProcessRLock
 from .local_account_space import account_scoped_path
 from .time_utils import local_now
 
 
 STATE_PATH = resolve_app_path("user_data/runtime_state.json")
-_LOCK = threading.Lock()
+_LOCK = CrossProcessRLock(lambda: _state_lock_file())
 
 
 def _default_state() -> dict:
@@ -67,6 +67,11 @@ def _state_path():
     if STATE_PATH != resolved_default:
         return STATE_PATH
     return account_scoped_path("user_data/runtime_state.json", fallback=resolved_default)
+
+
+def _state_lock_file():
+    state_path = _state_path()
+    return state_path.parent / f".{state_path.name}.lock"
 
 
 def get_runtime_state() -> dict:

@@ -4738,7 +4738,7 @@ def open_main_window(scheduler=None, notifier=None, config=None, config_path="co
 if __name__ == "__main__":
     from core import SmartScheduler, ensure_config_task_ids
     from core.recognition import ClipboardRecognitionManager
-    from main import run_task_group
+    from core.task_executor import run_task_group
 
     try:
         cfg = load_yaml_config(resolve_app_path("config.yaml"))

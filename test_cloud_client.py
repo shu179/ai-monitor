@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import requests
 
 from core.cloud_client import CloudClientError, SurfacedCloudClient, iter_sse_events
 
@@ -28,6 +29,37 @@ class FakeErrorResponse:
         }
 
 
+class FakeValidationErrorResponse:
+    status_code = 422
+    text = '{"detail":[{"type":"string_too_long","loc":["query","last_event_id"],"msg":"String should have at most 256 characters","ctx":{"max_length":256}}]}'
+    content = text.encode("utf-8")
+
+    def json(self):
+        return {
+            "detail": [
+                {
+                    "type": "string_too_long",
+                    "loc": ["query", "last_event_id"],
+                    "msg": "String should have at most 256 characters",
+                    "ctx": {"max_length": 256},
+                }
+            ]
+        }
+
+
+class FakeStreamResponse:
+    status_code = 200
+    content = b""
+    text = ""
+
+    def iter_lines(self, decode_unicode: bool = False):
+        del decode_unicode
+        return iter(["event: heartbeat", "data: {}", ""])
+
+    def close(self):
+        pass
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -41,6 +73,24 @@ class FakeErrorSession(FakeSession):
     def request(self, method: str, url: str, **kwargs):
         self.calls.append({"method": method, "url": url, **kwargs})
         return FakeErrorResponse()
+
+
+class FakeValidationErrorSession(FakeSession):
+    def request(self, method: str, url: str, **kwargs):
+        self.calls.append({"method": method, "url": url, **kwargs})
+        return FakeValidationErrorResponse()
+
+
+class FakeStreamSession(FakeSession):
+    def request(self, method: str, url: str, **kwargs):
+        self.calls.append({"method": method, "url": url, **kwargs})
+        return FakeStreamResponse()
+
+
+class FakeTimeoutSession(FakeSession):
+    def request(self, method: str, url: str, **kwargs):
+        self.calls.append({"method": method, "url": url, **kwargs})
+        raise requests.ReadTimeout("HTTPSConnectionPool(host='api.example.com', port=443): Read timed out.")
 
 
 class CloudClientTests(unittest.TestCase):
@@ -64,6 +114,42 @@ class CloudClientTests(unittest.TestCase):
             client.create_admin_user("access-token", {"username": "张三"})
 
         self.assertEqual(str(caught.exception), "账号名已被使用，建议使用张三01")
+
+    def test_validation_error_detail_list_is_summarized(self):
+        session = FakeValidationErrorSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        with self.assertRaises(CloudClientError) as caught:
+            list(client.stream_events("access-token"))
+
+        self.assertEqual(str(caught.exception), "云端参数校验失败：last_event_id 超出长度限制")
+
+    def test_stream_events_skips_oversized_last_event_id_query(self):
+        session = FakeStreamSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        events = list(client.stream_events("access-token", last_event_id="x" * 300))
+
+        self.assertEqual(events[0]["event"], "heartbeat")
+        self.assertIsNone(session.calls[0]["params"])
+
+    def test_request_timeout_error_is_short_and_user_readable(self):
+        session = FakeTimeoutSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        with self.assertRaises(CloudClientError) as caught:
+            client.list_tasks("access-token")
+
+        self.assertEqual(str(caught.exception), "云端请求超时，将自动重试")
+
+    def test_event_stream_timeout_error_is_short_and_user_readable(self):
+        session = FakeTimeoutSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        with self.assertRaises(CloudClientError) as caught:
+            list(client.stream_events("access-token"))
+
+        self.assertEqual(str(caught.exception), "云端事件连接超时，正在自动重连")
 
     def test_register_admin_posts_public_auth_payload(self):
         session = FakeSession()

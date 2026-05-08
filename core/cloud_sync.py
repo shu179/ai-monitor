@@ -219,7 +219,7 @@ class CloudSyncManager:
         endpoint_url = str(sync_cfg.get("endpoint_url", "") or "").strip()
         if not endpoint_url:
             return
-        self._last_pull_started_at = time.time()
+        self._last_pull_started_at = time.monotonic()
         params = {"device_id": str(sync_cfg.get("device_id", "") or "").strip()}
         try:
             response = self._session.get(
@@ -286,7 +286,7 @@ class CloudSyncManager:
             self._update_status(pending_local_change=False)
             return
 
-        self._last_push_started_at = time.time()
+        self._last_push_started_at = time.monotonic()
         request_payload = {
             "device_id": str(sync_cfg.get("device_id", "") or "").strip(),
             "bundle": bundle,
@@ -359,12 +359,12 @@ class CloudSyncManager:
                 if (
                     pending_local_change
                     and bool(sync_cfg.get("push_on_local_change", True))
-                    and (time.time() - self._last_push_started_at >= retry_window)
+                    and (time.monotonic() - self._last_push_started_at >= retry_window)
                 ):
                     self._push_once(sync_cfg, reason="local_change")
 
                 interval_seconds = int(sync_cfg.get("sync_interval_seconds", _DEFAULT_INTERVAL_SECONDS))
-                now_ts = time.time()
+                now_ts = time.monotonic()
                 if now_ts - self._last_pull_started_at >= interval_seconds:
                     self._pull_once(sync_cfg, reason="interval")
             else:

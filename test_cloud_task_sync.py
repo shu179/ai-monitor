@@ -32,6 +32,7 @@ class FakeTaskClient:
         self.run_records_by_task = run_records_by_task or {}
         self.task_day_status_events_by_task = task_day_status_events_by_task or {}
         self.list_tokens: list[str] = []
+        self.list_by_ids_calls: list[tuple[str, tuple[int, ...]]] = []
         self.list_deleted_tokens: list[str] = []
         self.run_record_calls: list[tuple[str, int, int]] = []
         self.task_day_status_calls: list[tuple[str, dict[int, int], int]] = []
@@ -43,6 +44,11 @@ class FakeTaskClient:
             self.fail_once_401 = False
             raise CloudClientError("expired", status_code=401)
         return self.tasks
+
+    def list_tasks_by_ids(self, access_token: str, task_ids: list[int]) -> list[dict]:
+        normalized_ids = tuple(int(task_id) for task_id in task_ids)
+        self.list_by_ids_calls.append((access_token, normalized_ids))
+        return [task for task in self.tasks if int(task.get("id") or 0) in normalized_ids]
 
     def list_deleted_tasks(self, access_token: str) -> list[dict]:
         self.list_deleted_tokens.append(access_token)
@@ -152,6 +158,47 @@ class SyncChangesTaskDayStatusClient(FakeTaskClient):
             "run_record_max_ids": {},
             "task_day_status_task_ids": [9],
             "task_day_status_max_ids": {9: 21},
+            "reference_changed": False,
+        }
+
+
+class SyncChangesTaskConfigClient(FakeTaskClient):
+    def __init__(
+        self,
+        tasks: list[dict],
+        *,
+        changed_task_ids: list[int],
+        run_records_by_task: dict[int, list[dict]] | None = None,
+        deleted_tasks: list[dict] | None = None,
+    ) -> None:
+        super().__init__(tasks, deleted_tasks=deleted_tasks, run_records_by_task=run_records_by_task)
+        self.changed_task_ids = changed_task_ids
+        self.sync_changes_calls: list[dict] = []
+
+    def sync_changes(
+        self,
+        access_token: str,
+        *,
+        known_snapshot: dict | None = None,
+        task_cursors: dict[int, int] | None = None,
+        task_day_status_cursors: dict[int, int] | None = None,
+    ) -> dict:
+        self.sync_changes_calls.append({
+            "access_token": access_token,
+            "known_snapshot": known_snapshot or {},
+            "task_cursors": task_cursors or {},
+            "task_day_status_cursors": task_day_status_cursors or {},
+        })
+        return {
+            "snapshot": {"task_updated_at": "2026-05-06T00:00:00+00:00", "task_count": 2},
+            "event_id": "task-change",
+            "events": ["task_changed"],
+            "full_task_pull_required": True,
+            "changed_task_ids": self.changed_task_ids,
+            "run_record_task_ids": [],
+            "run_record_max_ids": {},
+            "task_day_status_task_ids": [],
+            "task_day_status_max_ids": {},
             "reference_changed": False,
         }
 
@@ -272,7 +319,7 @@ class CloudTaskSyncTests(unittest.TestCase):
         viewer = next(task for task in config["tasks"] if task.get("cloud_task_id") == 6)
         self.assertFalse(revoked["enabled"])
         self.assertEqual(revoked["cloud_access_level"], "revoked")
-        self.assertFalse(viewer["enabled"])
+        self.assertTrue(viewer["enabled"])
         self.assertEqual(viewer["cloud_access_level"], "view")
 
     def test_deleted_cloud_task_moves_local_task_to_recycle_bin(self):
@@ -388,6 +435,138 @@ class CloudTaskSyncTests(unittest.TestCase):
             self.assertEqual(client.list_tokens, ["old-access", "new-access"])
             self.assertEqual(store.load()["access_token"], "new-access")
             self.assertEqual(config["tasks"][0]["cloud_task_id"], 1)
+
+    def test_task_config_change_pulls_only_changed_task_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.example.com",
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+                }
+            )
+            client = SyncChangesTaskConfigClient(
+                [
+                    {
+                        "id": 9,
+                        "workspace_id": 1,
+                        "task_key": "brand-updated",
+                        "name": "更新品牌",
+                        "brand": "更新品牌",
+                        "config_json": {"keywords": ["新词"], "platforms": ["kimi"]},
+                        "config_version": 2,
+                        "enabled": True,
+                        "access_level": "operate",
+                    },
+                    {
+                        "id": 10,
+                        "workspace_id": 1,
+                        "task_key": "brand-unchanged",
+                        "name": "未变品牌",
+                        "brand": "未变品牌",
+                        "config_json": {"keywords": ["旧词"], "platforms": ["doubao"]},
+                        "config_version": 1,
+                        "enabled": True,
+                        "access_level": "operate",
+                    },
+                ],
+                changed_task_ids=[9],
+            )
+            config = {
+                "cloud_platform_sync": {
+                    "event_snapshot": {
+                        "task_updated_at": "2026-05-05T00:00:00+00:00",
+                        "task_count": 2,
+                    },
+                },
+                "tasks": [
+                    {
+                        "task_id": "cloud_9",
+                        "name": "更新品牌",
+                        "brand": "更新品牌",
+                        "cloud_task_id": 9,
+                        "cloud_workspace_id": 1,
+                        "cloud_base_url": "https://api.example.com",
+                        "cloud_config_version": 1,
+                        "cloud_access_level": "operate",
+                        "keywords": [{"keyword": "旧词", "platforms": ["doubao"]}],
+                    },
+                    {
+                        "task_id": "cloud_10",
+                        "name": "未变品牌",
+                        "brand": "未变品牌",
+                        "cloud_task_id": 10,
+                        "cloud_workspace_id": 1,
+                        "cloud_base_url": "https://api.example.com",
+                        "cloud_config_version": 1,
+                        "cloud_access_level": "operate",
+                        "keywords": [{"keyword": "旧词", "platforms": ["doubao"]}],
+                    },
+                ],
+            }
+
+            result = pull_cloud_tasks_into_config(config, client=client, session_store=store)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(client.list_tokens, [])
+            self.assertEqual(client.list_by_ids_calls, [("access", (9,))])
+            self.assertEqual(result["summary"]["metrics"]["mode"], "partial_tasks")
+            self.assertEqual(config["tasks"][0]["cloud_config_version"], 2)
+            self.assertEqual(config["tasks"][0]["keywords"][0]["keyword"], "新词")
+            self.assertEqual(config["tasks"][1]["cloud_access_level"], "operate")
+            self.assertEqual(config["tasks"][1]["keywords"][0]["keyword"], "旧词")
+
+    def test_assignment_revocation_marks_only_changed_task_revoked(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.example.com",
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+                }
+            )
+            client = SyncChangesTaskConfigClient([], changed_task_ids=[9])
+            config = {
+                "cloud_platform_sync": {
+                    "event_snapshot": {"assignment_event_id": 3, "task_count": 2},
+                },
+                "tasks": [
+                    {
+                        "task_id": "cloud_9",
+                        "name": "被撤销品牌",
+                        "brand": "被撤销品牌",
+                        "enabled": True,
+                        "cloud_task_id": 9,
+                        "cloud_workspace_id": 1,
+                        "cloud_base_url": "https://api.example.com",
+                        "cloud_access_level": "operate",
+                    },
+                    {
+                        "task_id": "cloud_10",
+                        "name": "保留品牌",
+                        "brand": "保留品牌",
+                        "enabled": True,
+                        "cloud_task_id": 10,
+                        "cloud_workspace_id": 1,
+                        "cloud_base_url": "https://api.example.com",
+                        "cloud_access_level": "operate",
+                    },
+                ],
+            }
+
+            result = pull_cloud_tasks_into_config(config, client=client, session_store=store)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(client.list_by_ids_calls, [("access", (9,))])
+            self.assertEqual(result["summary"]["revoked"], 1)
+            self.assertEqual(config["tasks"][0]["cloud_access_level"], "revoked")
+            self.assertFalse(config["tasks"][0]["enabled"])
+            self.assertEqual(config["tasks"][1]["cloud_access_level"], "operate")
+            self.assertTrue(config["tasks"][1]["enabled"])
 
     def test_pull_imports_cloud_run_records_for_trend_history(self):
         with tempfile.TemporaryDirectory() as tmpdir:

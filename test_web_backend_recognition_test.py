@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+from datetime import timedelta
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -10,6 +13,7 @@ from web_backend import (
     _validate_browser_target_url,
 )
 from core.app_paths import resolve_app_path
+from core.time_utils import local_now
 
 
 class FakeRecognitionManager:
@@ -113,6 +117,44 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _resolve_safe_browser_profile_dir("/tmp/surfaced-outside-profile")
 
+    def test_browser_auth_sessions_are_pruned_after_ttl(self):
+        runtime = AppRuntime()
+        old_time = (local_now() - timedelta(hours=7)).isoformat(timespec="seconds")
+        fresh_time = local_now().isoformat(timespec="seconds")
+        runtime._browser_auth_sessions = {
+            "doubao": {
+                "platform": None,
+                "opened_at": old_time,
+                "profile_path": "/tmp/doubao-auth",
+                "external_in_use": True,
+            },
+            "kimi": {
+                "platform": None,
+                "opened_at": fresh_time,
+                "profile_path": "/tmp/kimi-auth",
+                "external_in_use": True,
+            },
+        }
+
+        with patch.object(runtime, "_terminate_browser_profile_processes", return_value=True) as terminate:
+            runtime._prune_browser_auth_sessions()
+
+        self.assertNotIn("doubao", runtime._browser_auth_sessions)
+        self.assertIn("kimi", runtime._browser_auth_sessions)
+        terminate.assert_called_once_with("/tmp/doubao-auth", graceful_timeout=8.0, force=True)
+
+    def test_recent_external_browser_auth_session_can_be_alive_without_pid(self):
+        runtime = AppRuntime()
+        session = {
+            "platform": None,
+            "opened_at": local_now().isoformat(timespec="seconds"),
+            "profile_path": "/tmp/doubao-auth",
+            "external_in_use": True,
+        }
+
+        with patch.object(runtime, "_is_browser_profile_in_use", return_value=True):
+            self.assertTrue(runtime._is_browser_auth_session_alive(session))
+
     def test_sync_recognition_mode_does_not_autostart_listener(self):
         runtime = AppRuntime()
         runtime._recognition_manager = FakeRecognitionManager(running=False, has_tasks=True)
@@ -121,6 +163,55 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
 
         self.assertFalse(runtime._recognition_manager.started)
         self.assertFalse(runtime._recognition_manager.get_runtime_status()["running"])
+
+    def test_terminal_test_runs_are_pruned_after_ttl(self):
+        runtime = AppRuntime()
+        old_time = (local_now() - timedelta(hours=7)).isoformat(timespec="seconds")
+        fresh_time = local_now().isoformat(timespec="seconds")
+        with runtime._test_run_lock:
+            runtime._test_runs["old-run"] = {
+                "runId": "old-run",
+                "status": "success",
+                "finishedAt": old_time,
+                "updatedAt": old_time,
+            }
+            runtime._test_runs["active-run"] = {
+                "runId": "active-run",
+                "status": "running",
+                "updatedAt": fresh_time,
+            }
+            runtime._test_run_cancel_events["old-run"] = Mock()
+
+        result = runtime.get_test_run_status("old-run")
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("old-run", runtime._test_runs)
+        self.assertNotIn("old-run", runtime._test_run_cancel_events)
+        self.assertIn("active-run", runtime._test_runs)
+
+    def test_search_file_caches_prune_missing_and_stale_entries(self):
+        runtime = AppRuntime()
+        old_time = (local_now() - timedelta(days=2)).isoformat(timespec="seconds")
+        fresh_time = local_now().isoformat(timespec="seconds")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fresh_path = Path(tmpdir) / "fresh.xlsx"
+            stale_path = Path(tmpdir) / "stale.xlsx"
+            fresh_path.write_bytes(b"fresh")
+            stale_path.write_bytes(b"stale")
+            with runtime._lock:
+                runtime._search_uploads = {
+                    "fresh": {"path": str(fresh_path), "uploaded_at": fresh_time},
+                    "stale": {"path": str(stale_path), "uploaded_at": old_time},
+                    "missing": {"path": str(Path(tmpdir) / "missing.xlsx"), "uploaded_at": fresh_time},
+                }
+                runtime._search_outputs = {
+                    "fresh-output": {"path": str(fresh_path), "created_at": fresh_time},
+                    "stale-output": {"path": str(stale_path), "created_at": old_time},
+                }
+                runtime._prune_search_file_caches_locked()
+
+        self.assertEqual(sorted(runtime._search_uploads.keys()), ["fresh"])
+        self.assertEqual(sorted(runtime._search_outputs.keys()), ["fresh-output"])
 
     def test_default_recognition_manager_records_batches_and_summarizes_on_round_complete(self):
         runtime = AppRuntime()

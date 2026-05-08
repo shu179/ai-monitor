@@ -8,18 +8,32 @@ from pathlib import Path
 from typing import Any
 
 from .app_paths import resolve_app_path
+from .file_lock import CrossProcessRLock
 from .local_account_space import account_profile_dir_from_session, account_scoped_path
 from .time_utils import local_now
 
 DEFAULT_CLOUD_OUTBOX_PATH = resolve_app_path("user_data/cloud_outbox.json")
+DEFAULT_MAX_ITEMS = 10_000
+DEFAULT_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_MAX_SENT_ITEMS = 1_000
 
 
 class CloudOutbox:
     _change_event = threading.Event()
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        max_items: int | None = None,
+        max_bytes: int | None = None,
+        max_sent_items: int | None = None,
+    ) -> None:
         self._explicit_path = Path(path) if path is not None else None
-        self._lock = threading.RLock()
+        self._lock = CrossProcessRLock(lambda: self._lock_path())
+        self._max_items = max(1, int(max_items or DEFAULT_MAX_ITEMS))
+        self._max_bytes = max(1024, int(max_bytes or DEFAULT_MAX_BYTES))
+        self._max_sent_items = max(0, int(DEFAULT_MAX_SENT_ITEMS if max_sent_items is None else max_sent_items))
 
     @property
     def path(self) -> Path:
@@ -34,10 +48,18 @@ class CloudOutbox:
             return DEFAULT_CLOUD_OUTBOX_PATH
         return profile_dir / "user_data/cloud_outbox.json"
 
+    def _lock_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}.lock")
+
     def bind_to_session(self, session: dict[str, Any] | None) -> "CloudOutbox":
         if self._explicit_path is not None:
             return self
-        return CloudOutbox(self.path_for_session(session))
+        return CloudOutbox(
+            self.path_for_session(session),
+            max_items=self._max_items,
+            max_bytes=self._max_bytes,
+            max_sent_items=self._max_sent_items,
+        )
 
     @classmethod
     def notify_changed(cls) -> None:
@@ -110,6 +132,8 @@ class CloudOutbox:
             items = self._load_locked()
             for item in items:
                 if str(item.get("idempotency_key") or "") in keys:
+                    if _outbox_status(item) == "sent":
+                        continue
                     item["status"] = "failed"
                     item["updated_at"] = now
                     item["last_error"] = str(message or "上传失败").strip()
@@ -141,10 +165,17 @@ class CloudOutbox:
 
     def _save_locked(self, items: list[dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        compacted_items, dropped_count = self._compact_items(items)
+        if dropped_count:
+            print(
+                "[CloudOutbox] 本地队列超过容量上限，"
+                f"已清理最旧事件 {dropped_count} 条: {self.path}"
+            )
+        serialized = json.dumps(compacted_items, ensure_ascii=False, indent=2, sort_keys=True)
         fd, tmp_path = tempfile.mkstemp(dir=str(self.path.parent), prefix=".cloud_outbox_", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(items, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write(serialized)
             os.replace(tmp_path, self.path)
         except BaseException:
             try:
@@ -152,3 +183,90 @@ class CloudOutbox:
             except OSError:
                 pass
             raise
+
+    def _compact_items(self, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+        compacted = [dict(item) for item in items if isinstance(item, dict)]
+        dropped = 0
+
+        sent_count = sum(1 for item in compacted if _outbox_status(item) == "sent")
+        if sent_count > self._max_sent_items:
+            dropped += self._drop_oldest_by_count(
+                compacted,
+                sent_count - self._max_sent_items,
+                lambda item: _outbox_status(item) == "sent",
+            )
+
+        if len(compacted) > self._max_items:
+            dropped += self._drop_oldest_by_count(
+                compacted,
+                len(compacted) - self._max_items,
+                lambda item: _outbox_status(item) == "sent",
+            )
+
+        while len(compacted) > self._max_items and len(compacted) > 1:
+            index = self._oldest_index(compacted, lambda item: True)
+            if index is None:
+                break
+            compacted.pop(index)
+            dropped += 1
+
+        if self._encoded_size(compacted) > self._max_bytes:
+            dropped += self._drop_oldest_until_size(
+                compacted,
+                lambda item: _outbox_status(item) == "sent",
+            )
+        if self._encoded_size(compacted) > self._max_bytes:
+            dropped += self._drop_oldest_until_size(compacted, lambda item: True)
+
+        return compacted, dropped
+
+    @staticmethod
+    def _encoded_size(items: list[dict[str, Any]]) -> int:
+        return len(json.dumps(items, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"))
+
+    @staticmethod
+    def _drop_oldest_by_count(items: list[dict[str, Any]], count: int, predicate) -> int:
+        if count <= 0 or not items:
+            return 0
+        indexes = [
+            index
+            for _, index in sorted(
+                (_outbox_sort_key(item), index)
+                for index, item in enumerate(items)
+                if predicate(item)
+            )
+        ][:count]
+        for index in sorted(indexes, reverse=True):
+            items.pop(index)
+        return len(indexes)
+
+    def _drop_oldest_until_size(self, items: list[dict[str, Any]], predicate) -> int:
+        dropped = 0
+        while len(items) > 1 and self._encoded_size(items) > self._max_bytes:
+            index = self._oldest_index(items, predicate)
+            if index is None:
+                break
+            items.pop(index)
+            dropped += 1
+        return dropped
+
+    @staticmethod
+    def _oldest_index(items: list[dict[str, Any]], predicate) -> int | None:
+        candidates: list[tuple[str, int]] = []
+        for index, item in enumerate(items):
+            try:
+                if predicate(item):
+                    candidates.append((_outbox_sort_key(item), index))
+            except Exception:
+                continue
+        if not candidates:
+            return None
+        return min(candidates)[1]
+
+
+def _outbox_status(item: dict[str, Any]) -> str:
+    return str(item.get("status") or "pending").strip() or "pending"
+
+
+def _outbox_sort_key(item: dict[str, Any]) -> str:
+    return str(item.get("created_at") or item.get("updated_at") or "").strip()

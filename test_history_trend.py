@@ -4,6 +4,7 @@ import random
 import tempfile
 import unittest
 
+from core.file_lock import CrossProcessRLock
 import core.history as history
 
 
@@ -16,6 +17,33 @@ class HistoryTrendSeriesTests(unittest.TestCase):
     def tearDown(self) -> None:
         history.HISTORY_DIR = self._original_history_dir
         self._tmpdir.cleanup()
+
+    def test_history_lock_uses_cross_process_lock_in_history_dir(self) -> None:
+        lock_key = "任务/锁"
+        lock = history._get_lock(lock_key)
+
+        self.assertIsInstance(lock, CrossProcessRLock)
+        with lock:
+            lock_path = history._history_lock_file(lock_key)
+            self.assertTrue(lock_path.exists())
+            self.assertTrue(str(lock_path).startswith(str(history.HISTORY_DIR)))
+
+    def test_history_lock_cache_prunes_old_unheld_locks(self) -> None:
+        original_locks = history._locks
+        original_max_locks = history._MAX_LOCKS
+        history._locks = {}
+        history._MAX_LOCKS = 4
+        self.addCleanup(setattr, history, "_locks", original_locks)
+        self.addCleanup(setattr, history, "_MAX_LOCKS", original_max_locks)
+
+        held_lock = history._get_lock("held-lock")
+        with held_lock:
+            for index in range(8):
+                history._get_lock(f"dynamic-task-{index}")
+
+            self.assertIn("held-lock", history._locks)
+            self.assertIn("dynamic-task-7", history._locks)
+            self.assertLessEqual(len(history._locks), history._MAX_LOCKS)
 
     def test_no_run_days_hold_previous_zone_and_do_not_advance_failure_count(self) -> None:
         task_name = "趋势区间测试"

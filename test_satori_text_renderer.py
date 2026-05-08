@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +23,11 @@ class FakeSatoriRenderer:
 
 
 class SatoriTextRendererTests(unittest.TestCase):
+    def test_render_timestamp_uses_configured_local_time(self):
+        now = datetime(2026, 5, 8, 10, 20, 30, tzinfo=timezone(timedelta(hours=8), "CST"))
+        with patch.object(html_renderer, "local_now", return_value=now):
+            self.assertEqual(html_renderer._render_timestamp(), "2026.05.08 10:20:30 CST")
+
     def test_text_render_uses_satori_fast_path_when_available(self):
         fake_renderer = FakeSatoriRenderer()
         with tempfile.TemporaryDirectory() as tmp_dir:

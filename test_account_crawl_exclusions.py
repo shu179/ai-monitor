@@ -6,6 +6,7 @@ import unittest
 import core.account_crawler as account_crawler
 import core.article_store as article_store
 import core.sync_service as sync_service
+from core.file_lock import CrossProcessRLock
 
 
 class AccountCrawlExclusionTests(unittest.TestCase):
@@ -80,6 +81,49 @@ class AccountCrawlExclusionTests(unittest.TestCase):
         )
         self.assertEqual(status, "added")
         self.assertIsNotNone(stored)
+
+    def test_account_crawl_state_uses_cross_process_lock_file(self) -> None:
+        self.assertIsInstance(account_crawler._lock, CrossProcessRLock)  # noqa: SLF001
+
+        account_crawler._write_state({"accounts": {}})
+
+        expected_lock_file = account_crawler.ACCOUNT_CRAWL_STATE_FILE.with_name(".account_crawl_state.json.lock")
+        self.assertTrue(expected_lock_file.exists())
+
+    def test_account_crawl_state_merge_preserves_other_accounts(self) -> None:
+        account_crawler._write_state({
+            "accounts": {
+                "other-account": {
+                    "last_status": "success",
+                    "last_added_count": 3,
+                }
+            },
+            "rsshub_success_bases": {"rss": "https://rsshub.old"},
+        })
+        account_crawler._merge_and_write_state_after_crawl(  # noqa: SLF001
+            {
+                "accounts": {
+                    "current-account": {
+                        "last_status": "error",
+                        "last_added_count": 0,
+                    }
+                },
+                "rsshub_success_bases": {"sohu": "https://rsshub.new"},
+                "last_manual_run_at": "2026-05-09 10:00:00",
+            },
+            accounts=[{"id": "current-account"}],
+            trigger="manual",
+            summary={"excluded_count": 2, "excluded_links": [{"url": "https://example.com/a"}]},
+        )
+
+        stored = account_crawler._read_state()
+
+        self.assertEqual(stored["accounts"]["other-account"]["last_added_count"], 3)
+        self.assertEqual(stored["accounts"]["current-account"]["last_status"], "error")
+        self.assertEqual(stored["rsshub_success_bases"]["rss"], "https://rsshub.old")
+        self.assertEqual(stored["rsshub_success_bases"]["sohu"], "https://rsshub.new")
+        self.assertEqual(stored["last_manual_run_at"], "2026-05-09 10:00:00")
+        self.assertEqual(stored["last_excluded_count"], 2)
 
     def test_account_crawl_keeps_media_name_and_stores_account_name(self) -> None:
         account = {

@@ -16,7 +16,6 @@ import re
 import threading
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
@@ -27,6 +26,7 @@ import yaml
 
 from core.app_paths import resolve_app_path
 from core.local_model_manager import get_local_model_manager
+from core.time_utils import local_today
 
 
 REQUEST_TIMEOUT = 60
@@ -1543,7 +1543,7 @@ def _build_messages(
 
 def _build_system_prompt(platform: str, native_search: bool, deep_think: bool = False) -> str:
     base = SEARCH_STYLE_PROMPTS.get(platform, "请像该平台网页端回答一样输出。")
-    freshness = datetime.now().strftime("%Y-%m-%d")
+    freshness = local_today().isoformat()
     deep_think_hint = (
         " 请先充分思考、拆解问题，再给出结论与依据。"
         if deep_think else

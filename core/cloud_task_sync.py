@@ -111,6 +111,7 @@ def pull_cloud_tasks_into_config(
 
     change_run_task_ids = _normalize_int_list(changes.get("run_record_task_ids")) if isinstance(changes, dict) else []
     change_status_task_ids = _normalize_int_list(changes.get("task_day_status_task_ids")) if isinstance(changes, dict) else []
+    changed_task_ids = _normalize_int_list(changes.get("changed_task_ids")) if isinstance(changes, dict) else []
     change_events = _normalize_event_names(changes.get("events")) if isinstance(changes, dict) else []
     run_change_without_task_ids = EVENT_RUN_RECORD_CHANGED in change_events and not change_run_task_ids
     status_change_without_task_ids = EVENT_TASK_DAY_STATUS_CHANGED in change_events and not change_status_task_ids
@@ -181,6 +182,123 @@ def pull_cloud_tasks_into_config(
         return {
             "ok": True,
             "message": "云端任务已拉取" if run_changed or status_changed or state_changed else "云端任务无变化",
+            "summary": summary,
+        }
+
+    can_pull_changed_tasks = (
+        not force_full
+        and isinstance(changes, dict)
+        and bool(changes.get("full_task_pull_required"))
+        and bool(changed_task_ids)
+        and hasattr(target_client, "list_tasks_by_ids")
+    )
+    if can_pull_changed_tasks:
+        active_access_token = access_token
+        try:
+            task_pull_started_at = time.perf_counter()
+            cloud_tasks, session = _list_tasks_by_ids_with_refresh(
+                target_client,
+                store,
+                session,
+                task_ids=changed_task_ids,
+                base_url=base_url,
+                access_token=active_access_token,
+                refresh_token=refresh_token,
+            )
+            active_access_token = str(session.get("access_token") or active_access_token).strip()
+            deleted_cloud_tasks, session = _list_deleted_tasks_best_effort(
+                target_client,
+                store,
+                session,
+                base_url=base_url,
+                access_token=active_access_token,
+                refresh_token=str(session.get("refresh_token") or refresh_token).strip(),
+            )
+            metrics["task_pull_ms"] = _elapsed_ms(task_pull_started_at)
+            active_access_token = str(session.get("access_token") or active_access_token).strip()
+            if cloud_session_identity_key(store.load()) != initial_identity_key:
+                raise CloudSessionChangedError("云端账号已切换，本次拉取已中止")
+        except (CloudClientError, CloudSessionChangedError) as exc:
+            return {"ok": False, "message": str(exc), "summary": _empty_summary()}
+
+        summary = merge_cloud_tasks_into_config(
+            config,
+            cloud_tasks,
+            deleted_cloud_tasks=deleted_cloud_tasks,
+            cloud_user=session.get("user") if isinstance(session.get("user"), dict) else {},
+            base_url=base_url,
+            disable_missing=False,
+            missing_cloud_task_ids=changed_task_ids,
+        )
+        summary["changes"] = _summarize_changes(changes)
+        run_pull_task_ids = _unique_ints([*changed_task_ids, *change_run_task_ids])
+        status_pull_task_ids = _unique_ints([*changed_task_ids, *change_status_task_ids])
+        run_started_at = time.perf_counter()
+        run_summary = pull_cloud_run_records_into_history(
+            target_client,
+            active_access_token,
+            config,
+            [{"id": task_id} for task_id in run_pull_task_ids],
+            deleted_cloud_tasks=deleted_cloud_tasks,
+            session_store=store,
+            session=session,
+            base_url=base_url,
+            refresh_token=str(session.get("refresh_token") or refresh_token).strip(),
+        ) if run_pull_task_ids else _empty_run_summary()
+        metrics["run_pull_ms"] = _elapsed_ms(run_started_at)
+        status_started_at = time.perf_counter()
+        status_summary = pull_cloud_task_day_status_events_into_state(
+            target_client,
+            active_access_token,
+            config,
+            [{"id": task_id} for task_id in status_pull_task_ids],
+            session_store=store,
+            session=session,
+            base_url=base_url,
+            refresh_token=str(session.get("refresh_token") or refresh_token).strip(),
+        ) if status_pull_task_ids else _empty_task_day_status_summary()
+        metrics["task_day_status_pull_ms"] = _elapsed_ms(status_started_at)
+        if cloud_session_identity_key(store.load()) != initial_identity_key:
+            return {"ok": False, "message": "云端账号已切换，本次拉取已中止", "summary": _empty_summary()}
+        summary["run_records"] = run_summary
+        summary["task_day_status_events"] = status_summary
+        if int(run_summary.get("state_updated") or 0):
+            summary["state_updated"] = int(summary.get("state_updated") or 0) + int(run_summary.get("state_updated") or 0)
+        if int(status_summary.get("state_updated") or 0):
+            summary["state_updated"] = int(summary.get("state_updated") or 0) + int(status_summary.get("state_updated") or 0)
+        cached_state_updates = _refresh_visible_cloud_task_day_statuses_from_history(config)
+        if cached_state_updates:
+            summary["state_updated"] = int(summary.get("state_updated") or 0) + cached_state_updates
+        _update_cloud_sync_snapshot(config, changes.get("snapshot"), summary)
+        metrics["mode"] = "partial_tasks"
+        metrics["total_ms"] = _elapsed_ms(started_at)
+        metrics["changed_task_ids"] = changed_task_ids
+        metrics["run_record_task_ids"] = run_pull_task_ids
+        metrics["task_day_status_task_ids"] = status_pull_task_ids
+        metrics["received_tasks"] = int(summary.get("received") or 0)
+        metrics["deleted_tasks"] = int(summary.get("deleted") or 0)
+        summary["metrics"] = metrics
+        changed = (
+            int(summary.get("added") or 0)
+            + int(summary.get("updated") or 0)
+            + int(summary.get("revoked") or 0)
+            + int(summary.get("deleted") or 0)
+            + int(summary.get("deleted_backups") or 0)
+            + int(summary.get("deleted_pending") or 0)
+            + int(summary.get("state_updated") or 0)
+        )
+        run_changed = (
+            int(run_summary.get("imported") or 0)
+            + int(run_summary.get("cursor_updates") or 0)
+            + int(run_summary.get("backfilled") or 0)
+        )
+        status_changed = (
+            int(status_summary.get("applied") or 0)
+            + int(status_summary.get("cursor_updates") or 0)
+        )
+        return {
+            "ok": True,
+            "message": "云端任务已拉取" if changed or run_changed or status_changed else "云端任务无变化",
             "summary": summary,
         }
 
@@ -821,6 +939,7 @@ def merge_cloud_tasks_into_config(
     base_url: str = "",
     match_by_name: bool = True,
     disable_missing: bool = True,
+    missing_cloud_task_ids: list[int] | set[int] | tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     purge_expired_deleted_tasks(config)
     if not isinstance(config.get("tasks"), list):
@@ -878,7 +997,8 @@ def merge_cloud_tasks_into_config(
         summary["matched_by"][match_reason] = int(summary["matched_by"].get(match_reason) or 0) + 1
         summary["task_ids"].append(cloud_task_id)
 
-    if disable_missing:
+    scoped_missing_cloud_ids = set(_unique_ints(list(missing_cloud_task_ids or [])))
+    if disable_missing or scoped_missing_cloud_ids:
         visible_cloud_ids = set(summary["task_ids"])
         next_local_tasks: list[dict[str, Any]] = []
         tombstone_cloud_ids = _local_deleted_cloud_ids(config)
@@ -920,6 +1040,9 @@ def merge_cloud_tasks_into_config(
             if existing_cloud_id is None or existing_cloud_id in visible_cloud_ids:
                 next_local_tasks.append(task)
                 continue
+            if not disable_missing and existing_cloud_id not in scoped_missing_cloud_ids:
+                next_local_tasks.append(task)
+                continue
             if not _same_cloud_scope(task, base_url=base_url, workspace_id=workspace_id):
                 next_local_tasks.append(task)
                 continue
@@ -942,6 +1065,8 @@ def merge_cloud_tasks_into_config(
         for cloud_task in deleted_items:
             cloud_task_id = _normalize_int(cloud_task.get("id"))
             if cloud_task_id is None or cloud_task_id in active_cloud_ids or cloud_task_id in tombstone_cloud_ids:
+                continue
+            if not disable_missing and cloud_task_id not in scoped_missing_cloud_ids:
                 continue
             backup_task = _merge_one_cloud_task(
                 cloud_task,
@@ -982,6 +1107,27 @@ def _list_tasks_with_refresh(
         access_token=access_token,
         refresh_token=refresh_token,
         operation=client.list_tasks,
+    )
+
+
+def _list_tasks_by_ids_with_refresh(
+    client: SurfacedCloudClient,
+    store: CloudSessionStore,
+    session: dict[str, Any],
+    *,
+    task_ids: list[int],
+    base_url: str,
+    access_token: str,
+    refresh_token: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    return _cloud_request_with_refresh(
+        client,
+        store,
+        session,
+        base_url=base_url,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        operation=lambda token: client.list_tasks_by_ids(token, task_ids),
     )
 
 
@@ -1057,7 +1203,9 @@ def _merge_one_cloud_task(
     task = copy.deepcopy(existing) if isinstance(existing, dict) else _default_local_task()
     task["name"] = str(cloud_task.get("name") or task.get("name") or cloud_task.get("brand") or "").strip()
     task["brand"] = str(cloud_task.get("brand") or task.get("brand") or task.get("name") or "").strip()
-    task["enabled"] = cloud_enabled and access_level in {"admin", "operate"}
+    # A viewer can see the task but cannot execute it; execution permission is
+    # enforced by the local runtime role checks, not by hiding the task as disabled.
+    task["enabled"] = cloud_enabled and access_level in {"admin", "operate", "view"}
 
     for key in SAFE_LOCAL_TASK_CONFIG_KEYS:
         if key in local_task_config:
@@ -1340,8 +1488,12 @@ def _normalize_int(value: Any) -> int | None:
 def _normalize_int_list(value: Any) -> list[int]:
     if not isinstance(value, list):
         return []
-    result = []
-    seen = set()
+    return _unique_ints(value)
+
+
+def _unique_ints(value: list[Any]) -> list[int]:
+    result: list[int] = []
+    seen: set[int] = set()
     for item in value:
         normalized = _normalize_int(item)
         if normalized is None or normalized in seen:

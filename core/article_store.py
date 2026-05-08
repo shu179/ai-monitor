@@ -13,15 +13,17 @@ import json
 import os
 import re
 import tempfile
-import threading
 import uuid
 from datetime import datetime
 from difflib import SequenceMatcher
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from .app_paths import resolve_app_path
+from .file_lock import CrossProcessRLock
 from .history import normalize_platform_id
 from .local_account_space import account_scoped_path
+from .time_utils import local_now
 
 DEFAULT_ARTICLES_FILE = resolve_app_path("logs/articles.json")
 DEFAULT_DOMAIN_OVERRIDES_FILE = resolve_app_path("logs/domain_overrides.json")
@@ -32,6 +34,9 @@ ARTICLES_FILE = DEFAULT_ARTICLES_FILE
 DOMAIN_OVERRIDES_FILE = DEFAULT_DOMAIN_OVERRIDES_FILE
 DOMAIN_MEDIA_NAMES_FILE = DEFAULT_DOMAIN_MEDIA_NAMES_FILE
 EXCLUDED_ARTICLE_URLS_FILE = DEFAULT_EXCLUDED_ARTICLE_URLS_FILE
+
+MAX_REFERENCE_EVENTS_PER_TASK = 500
+MAX_EXCLUDED_ARTICLE_URLS = 5000
 
 # 权威媒体域名白名单（内置初始值，可通过手动切换覆盖）
 AUTHORITY_DOMAINS: set = {
@@ -147,7 +152,20 @@ SELF_MEDIA_PATH_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("jianshu.com", ("/p/",)),
 )
 
-_lock = threading.RLock()
+def _article_store_lock_file() -> Path:
+    articles_path = _articles_file()
+    return articles_path.with_name("article_store.lock")
+
+
+_lock = CrossProcessRLock(_article_store_lock_file)
+
+
+def _article_now_minute_text() -> str:
+    return local_now().strftime("%Y-%m-%d %H:%M")
+
+
+def _article_now_second_text() -> str:
+    return local_now().strftime("%Y-%m-%d %H:%M:%S")
 
 _MEDIA_NAME_BY_DOMAIN_SUFFIX: dict[str, str] = {
     "mp.weixin.qq.com": "微信公众号",
@@ -807,6 +825,29 @@ def _coerce_non_negative_int(value, default: int = 0) -> int:
     return max(0, parsed)
 
 
+def _safe_capacity(value, default: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(0, parsed)
+
+
+def _trim_reference_events_for_storage(events: list[dict]) -> tuple[list[dict], bool]:
+    capacity = _safe_capacity(MAX_REFERENCE_EVENTS_PER_TASK, 500)
+    if capacity <= 0 or len(events) <= capacity:
+        return events, False
+    indexed_events = list(enumerate(events))
+    indexed_events.sort(
+        key=lambda item: (
+            str((item[1] or {}).get("referenced_at") or ""),
+            item[0],
+        )
+    )
+    kept = [event for _, event in indexed_events[-capacity:]]
+    return kept, True
+
+
 def _max_timestamp_text(left: str, right: str) -> str:
     left_text = str(left or "").strip()
     right_text = str(right or "").strip()
@@ -955,10 +996,14 @@ def _normalize_reference_hit(
             cleaned_events.append(event)
 
         if cleaned_events:
+            total_event_count = len(cleaned_events)
+            cleaned_events, trimmed = _trim_reference_events_for_storage(cleaned_events)
             normalized["events"] = cleaned_events
-            normalized["count"] = max(count, len(cleaned_events))
+            normalized["count"] = max(count, total_event_count)
             if latest_time:
                 normalized["last_referenced_at"] = latest_time
+            if trimmed:
+                normalized["events_compacted"] = True
         else:
             normalized.pop("events", None)
     else:
@@ -1024,7 +1069,7 @@ def _normalize_article_entry(entry: dict) -> tuple[dict, bool]:
 
     imported_at = str(normalized.get("imported_at") or normalized.get("created_at") or "").strip()
     if not imported_at:
-        imported_at = str(normalized.get("ts", "") or "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M")
+        imported_at = str(normalized.get("ts", "") or "").strip() or _article_now_minute_text()
     if imported_at != normalized.get("imported_at", ""):
         normalized["imported_at"] = imported_at
         changed = True
@@ -1192,15 +1237,16 @@ def should_auto_save_media_type(url_or_domain: str, media_type: str, media_name:
 # ---------------------------------------------------------------------------
 
 def _load_domain_overrides() -> dict:
-    path = _domain_overrides_file()
-    try:
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    return {}
+    with _lock:
+        path = _domain_overrides_file()
+        try:
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        return {}
 
 
 def _save_domain_overrides(overrides: dict) -> None:
@@ -1225,15 +1271,16 @@ def _save_domain_overrides(overrides: dict) -> None:
 
 
 def _load_domain_media_names() -> dict:
-    path = _domain_media_names_file()
-    try:
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    return {}
+    with _lock:
+        path = _domain_media_names_file()
+        try:
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        return {}
 
 
 def _save_domain_media_names(media_names: dict) -> None:
@@ -1374,27 +1421,29 @@ def save_domain_override(domain: str, media_type: str, force: bool = False) -> N
 # ---------------------------------------------------------------------------
 
 def _load_articles() -> list:
-    path = _articles_file()
-    try:
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, list):
-                return []
-            normalized_articles = []
-            changed = False
-            for article in data:
-                if not isinstance(article, dict):
-                    continue
-                normalized, item_changed = _normalize_article_entry(article)
-                normalized_articles.append(normalized)
-                changed = changed or item_changed
-            if changed:
-                _save_articles(normalized_articles)
-            return normalized_articles
-    except Exception:
-        pass
-    return []
+    with _lock:
+        path = _articles_file()
+        try:
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, list):
+                    return []
+                normalized_articles = []
+                changed = False
+                for article in data:
+                    if not isinstance(article, dict):
+                        changed = True
+                        continue
+                    normalized, item_changed = _normalize_article_entry(article)
+                    normalized_articles.append(normalized)
+                    changed = changed or item_changed
+                if changed:
+                    _save_articles(normalized_articles)
+                return normalized_articles
+        except Exception:
+            pass
+        return []
 
 
 def _save_articles(articles: list) -> None:
@@ -1485,15 +1534,45 @@ def _sort_articles_for_display(articles: list) -> list:
 
 
 def _load_excluded_article_urls() -> dict:
-    path = _excluded_article_urls_file()
-    try:
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    return {}
+    with _lock:
+        path = _excluded_article_urls_file()
+        try:
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        return {}
+
+
+def _trim_excluded_article_urls_for_storage(excluded_urls: dict) -> tuple[dict, bool]:
+    if not isinstance(excluded_urls, dict):
+        return {}, True
+    capacity = _safe_capacity(MAX_EXCLUDED_ARTICLE_URLS, 5000)
+    if capacity <= 0:
+        return {}, bool(excluded_urls)
+    if len(excluded_urls) <= capacity:
+        return excluded_urls, False
+    indexed_items = [
+        (index, key, value)
+        for index, (key, value) in enumerate(excluded_urls.items())
+        if str(key or "").strip()
+    ]
+    indexed_items.sort(
+        key=lambda item: (
+            _excluded_article_url_sort_text(item[2]),
+            item[0],
+        )
+    )
+    kept_items = indexed_items[-capacity:]
+    return {key: value for _, key, value in kept_items}, True
+
+
+def _excluded_article_url_sort_text(value) -> str:
+    if not isinstance(value, dict):
+        return ""
+    return str(value.get("updated_at") or value.get("excluded_at") or "")
 
 
 def _save_excluded_article_urls(excluded_urls: dict) -> None:
@@ -1523,7 +1602,7 @@ def exclude_article_url(url: str, *, title: str = "", source: str = "manual_dele
     if not normalized_url:
         return None
 
-    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_text = _article_now_second_text()
     with _lock:
         excluded_urls = _load_excluded_article_urls()
         existing = dict(excluded_urls.get(normalized_url) or {})
@@ -1539,6 +1618,7 @@ def exclude_article_url(url: str, *, title: str = "", source: str = "manual_dele
         except Exception:
             existing["count"] = 1
         excluded_urls[normalized_url] = existing
+        excluded_urls, _ = _trim_excluded_article_urls_for_storage(excluded_urls)
         _save_excluded_article_urls(excluded_urls)
         return dict(existing)
 
@@ -1602,14 +1682,15 @@ def add_article(entry: dict) -> dict:
     """
     entry = dict(entry)
     entry.setdefault("id", uuid.uuid4().hex)
-    entry.setdefault("ts", datetime.now().strftime("%Y-%m-%d %H:%M"))
+    now_text = _article_now_minute_text()
+    entry.setdefault("ts", now_text)
     entry.setdefault("url", "")
     entry.setdefault("title", "")
     entry.setdefault("platform", "")
     entry.setdefault("media_name", "")
     entry.setdefault("media_type", "selfmedia")
     entry.setdefault("excerpt", "")
-    entry.setdefault("imported_at", datetime.now().strftime("%Y-%m-%d %H:%M"))
+    entry.setdefault("imported_at", now_text)
     entry.setdefault("matched_tasks", [])
     entry.setdefault("match_reasons", {})
     entry.setdefault("unmatched_reason", "")
@@ -1631,6 +1712,103 @@ def add_article(entry: dict) -> dict:
                 excluded_urls.pop(normalized_url, None)
                 _save_excluded_article_urls(excluded_urls)
     return entry
+
+
+def bulk_upsert_articles(entries: list[dict] | tuple[dict, ...]) -> list[dict]:
+    """Create or update multiple article records with a single articles.json write."""
+    prepared_entries = [dict(entry) for entry in (entries or []) if isinstance(entry, dict)]
+    if not prepared_entries:
+        return []
+
+    now_text = _article_now_minute_text()
+    results: list[dict] = []
+    with _lock:
+        articles = _load_articles()
+        index_by_id = {
+            str(article.get("id", "")).strip(): index
+            for index, article in enumerate(articles)
+            if str(article.get("id", "")).strip()
+        }
+        index_by_url = {
+            normalize_article_url(article.get("url", "")): index
+            for index, article in enumerate(articles)
+            if normalize_article_url(article.get("url", ""))
+        }
+        restored_urls: set[str] = set()
+
+        for raw_entry in prepared_entries:
+            entry = dict(raw_entry)
+            article_id = str(entry.get("id", "") or "").strip()
+            normalized_url = normalize_article_url(entry.get("url", ""))
+            target_index = index_by_id.get(article_id) if article_id else None
+            if target_index is None and normalized_url:
+                target_index = index_by_url.get(normalized_url)
+
+            if target_index is None:
+                entry.setdefault("id", uuid.uuid4().hex)
+                entry.setdefault("ts", now_text)
+                entry.setdefault("url", "")
+                entry.setdefault("title", "")
+                entry.setdefault("platform", "")
+                entry.setdefault("media_name", "")
+                entry.setdefault("media_type", "selfmedia")
+                entry.setdefault("excerpt", "")
+                entry.setdefault("imported_at", now_text)
+                entry.setdefault("matched_tasks", [])
+                entry.setdefault("match_reasons", {})
+                entry.setdefault("unmatched_reason", "")
+                entry.setdefault("fetch_method", "html")
+                normalized, _ = _normalize_article_entry(entry)
+                articles.append(normalized)
+                target_index = len(articles) - 1
+            else:
+                merged = dict(articles[target_index])
+                merged.update(entry)
+                merged["id"] = articles[target_index].get("id", merged.get("id", "")) or article_id or uuid.uuid4().hex
+                if "ts" not in entry or not str(entry.get("ts") or "").strip():
+                    merged["ts"] = articles[target_index].get("ts", merged.get("ts", ""))
+                merged.setdefault("url", "")
+                merged.setdefault("title", "")
+                merged.setdefault("platform", "")
+                merged.setdefault("media_name", "")
+                merged.setdefault("media_type", "selfmedia")
+                merged.setdefault("excerpt", "")
+                merged.setdefault(
+                    "imported_at",
+                    articles[target_index].get("imported_at", "")
+                    or articles[target_index].get("created_at", "")
+                    or articles[target_index].get("ts", "")
+                    or now_text,
+                )
+                merged.setdefault("matched_tasks", [])
+                merged.setdefault("match_reasons", {})
+                merged.setdefault("unmatched_reason", "")
+                merged.setdefault("fetch_method", "html")
+                normalized, _ = _normalize_article_entry(merged)
+                articles[target_index] = normalized
+
+            final_item = articles[target_index]
+            final_id = str(final_item.get("id", "") or "").strip()
+            final_url = normalize_article_url(final_item.get("url", ""))
+            if final_id:
+                index_by_id[final_id] = target_index
+            if final_url:
+                index_by_url[final_url] = target_index
+                restored_urls.add(final_url)
+            results.append(dict(final_item))
+
+        _save_articles(articles)
+        if restored_urls:
+            excluded_urls = _load_excluded_article_urls()
+            changed_exclusions = False
+            for normalized_url in restored_urls:
+                if normalized_url in excluded_urls:
+                    excluded_urls.pop(normalized_url, None)
+                    changed_exclusions = True
+            if changed_exclusions:
+                _save_excluded_article_urls(excluded_urls)
+
+    return results
 
 
 def update_article(article_id: str, patch: dict) -> dict | None:
@@ -1661,7 +1839,7 @@ def update_article(article_id: str, patch: dict) -> dict | None:
                 article.get("imported_at", "")
                 or article.get("created_at", "")
                 or article.get("ts", "")
-                or datetime.now().strftime("%Y-%m-%d %H:%M"),
+                or _article_now_minute_text(),
             )
             merged.setdefault("matched_tasks", [])
             merged.setdefault("match_reasons", {})
@@ -1810,6 +1988,104 @@ def get_articles_file_signature() -> tuple[str, int, int]:
         return (str(path), -1, -1)
 
 
+def _safe_positive_int(value) -> int | None:
+    try:
+        number = int(str(value or "").strip())
+    except Exception:
+        return None
+    return number if number > 0 else None
+
+
+def _is_cloud_downloaded_article(article: dict) -> bool:
+    if not isinstance(article, dict):
+        return False
+    return (
+        str(article.get("fetch_method") or "").strip() == "cloud"
+        or _safe_positive_int(article.get("cloud_article_id")) is not None
+        or bool(str(article.get("cloud_url_hash") or "").strip())
+    )
+
+
+def prune_cloud_articles_by_visible_task_ids(
+    visible_cloud_task_ids: list[int] | set[int] | tuple[int, ...],
+    *,
+    visible_cloud_article_ids: list[int] | set[int] | tuple[int, ...] | None = None,
+    visible_cloud_url_hashes: list[str] | set[str] | tuple[str, ...] | None = None,
+) -> dict:
+    """Keep cloud-downloaded articles on disk; UI visibility is filtered at read time."""
+    visible_ids = {
+        int(task_id)
+        for task_id in visible_cloud_task_ids or []
+        if _safe_positive_int(task_id) is not None
+    }
+    article_scope_enabled = visible_cloud_article_ids is not None or visible_cloud_url_hashes is not None
+    visible_article_ids = {
+        int(article_id)
+        for article_id in visible_cloud_article_ids or []
+        if _safe_positive_int(article_id) is not None
+    }
+    visible_url_hashes = {
+        str(url_hash or "").strip()
+        for url_hash in visible_cloud_url_hashes or []
+        if str(url_hash or "").strip()
+    }
+    with _lock:
+        articles = _load_articles()
+        kept: list[dict] = []
+        removed = 0
+        pruned_links = 0
+        for article in articles:
+            if not _is_cloud_downloaded_article(article):
+                kept.append(article)
+                continue
+            if article_scope_enabled:
+                cloud_article_id = _safe_positive_int(article.get("cloud_article_id"))
+                cloud_url_hash = str(article.get("cloud_url_hash") or "").strip()
+                in_visible_article_scope = (
+                    (cloud_article_id is not None and cloud_article_id in visible_article_ids)
+                    or (cloud_url_hash and cloud_url_hash in visible_url_hashes)
+                )
+                if not in_visible_article_scope:
+                    next_article = dict(article)
+                    original_task_ids = [
+                        task_id
+                        for task_id in (_safe_positive_int(item) for item in article.get("cloud_task_ids") or [])
+                        if task_id is not None
+                    ]
+                    hidden_task_ids = [task_id for task_id in original_task_ids if task_id not in visible_ids]
+                    if hidden_task_ids != original_task_ids or article.get("matched_tasks") or article.get("match_reasons"):
+                        next_article["cloud_task_ids"] = hidden_task_ids
+                        next_article["matched_tasks"] = []
+                        next_article["match_reasons"] = {}
+                        next_article["unmatched_reason"] = "云端文章当前不在当前账号可见范围"
+                        pruned_links += 1
+                    kept.append(next_article)
+                    continue
+            cloud_task_ids = [
+                task_id
+                for task_id in (_safe_positive_int(item) for item in article.get("cloud_task_ids") or [])
+                if task_id is not None
+            ]
+            visible_article_task_ids = [task_id for task_id in cloud_task_ids if task_id in visible_ids]
+            if not visible_article_task_ids:
+                kept.append(article)
+                continue
+            if visible_article_task_ids != cloud_task_ids:
+                next_article = dict(article)
+                next_article["cloud_task_ids"] = visible_article_task_ids
+                kept.append(next_article)
+                pruned_links += 1
+                continue
+            kept.append(article)
+        if removed or pruned_links:
+            _save_articles(kept)
+        return {
+            "removed": removed,
+            "pruned_links": pruned_links,
+            "remaining": len(kept),
+        }
+
+
 def export_article_store_bundle() -> dict:
     """导出文章存储及站点记忆数据。"""
     with _lock:
@@ -1838,14 +2114,15 @@ def import_article_store_bundle(bundle: dict | None, *, mode: str = "merge") -> 
             return None
         item = dict(raw_item)
         item.setdefault("id", uuid.uuid4().hex)
-        item.setdefault("ts", datetime.now().strftime("%Y-%m-%d %H:%M"))
+        now_text = _article_now_minute_text()
+        item.setdefault("ts", now_text)
         item.setdefault("url", "")
         item.setdefault("title", "")
         item.setdefault("platform", "")
         item.setdefault("media_name", "")
         item.setdefault("media_type", "selfmedia")
         item.setdefault("excerpt", "")
-        item.setdefault("imported_at", datetime.now().strftime("%Y-%m-%d %H:%M"))
+        item.setdefault("imported_at", now_text)
         item.setdefault("matched_tasks", [])
         item.setdefault("match_reasons", {})
         item.setdefault("unmatched_reason", "")
@@ -1958,6 +2235,7 @@ def import_article_store_bundle(bundle: dict | None, *, mode: str = "merge") -> 
             next_excluded_urls = dict(_load_excluded_article_urls())
             next_excluded_urls.update(normalized_excluded_urls)
 
+        next_excluded_urls, _ = _trim_excluded_article_urls_for_storage(next_excluded_urls)
         _save_articles(next_articles)
         _save_domain_overrides(next_overrides)
         _save_domain_media_names(next_media_names)
@@ -2137,7 +2415,7 @@ def mark_articles_referenced_by_urls(
 
     url_set = set(normalized_urls)
     reference_source = str(source or "recognition").strip() or "recognition"
-    reference_time = str(referenced_at or "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    reference_time = str(referenced_at or "").strip() or _article_now_second_text()
     normalized_platform = normalize_platform_id(platform)
 
     matched_articles = []
@@ -2220,12 +2498,15 @@ def mark_articles_referenced_by_urls(
                     count = 0
                 if added_event:
                     count += 1
+                events, trimmed_events = _trim_reference_events_for_storage(events)
                 hit.update({
                     "last_referenced_at": _max_timestamp_text(str(hit.get("last_referenced_at") or ""), reference_time) if added_event else str(hit.get("last_referenced_at") or "").strip(),
                     "source": reference_source,
                     "count": max(count, 0),
                     "events": events,
                 })
+                if trimmed_events:
+                    hit["events_compacted"] = True
                 reference_hits[task_name] = hit
 
             article["referenced_tasks"] = referenced_tasks
@@ -2774,18 +3055,36 @@ def analyze_article_matches(title: str, config: dict, article: dict | None = Non
         matched = [task_name]
         match_reasons[task_name] = reasons[:3] or ["标题命中任务关键词"]
     else:
-        explicit_candidates = [
+        brand_signal_candidates = [
             item for item in candidates
             if (
                 item.get("title_brand_hits")
-                or item.get("title_keyword_hits")
-                or item.get("title_tag_hits", {}).get("industry")
                 or item.get("excerpt_brand_hits")
                 or item.get("meta_brand_hits")
             )
         ]
-        selected = explicit_candidates or candidates
-        shared_core = not explicit_candidates
+        selected = brand_signal_candidates
+        if not selected:
+            keyword_hit_counts: dict[str, int] = {}
+            for item in candidates:
+                for keyword in (item.get("title_keyword_hits") or []):
+                    normalized_keyword = _normalize_match_text(str(keyword or ""))
+                    if normalized_keyword:
+                        keyword_hit_counts[normalized_keyword] = keyword_hit_counts.get(normalized_keyword, 0) + 1
+            selected = [
+                item for item in candidates
+                if any(
+                    keyword_hit_counts.get(_normalize_match_text(str(keyword or "")), 0) == 1
+                    for keyword in (item.get("title_keyword_hits") or [])
+                )
+            ]
+        if not selected:
+            candidate_names = [
+                str(item.get("task_name") or "").strip()
+                for item in candidates
+                if str(item.get("task_name") or "").strip()
+            ]
+            unmatched_reason = f"标题命中了多个候选品牌线索，但缺少明确品牌信号：{'、'.join(candidate_names[:3])}"
         for item in selected:
             task_name = str(item.get("task_name") or "").strip()
             reasons = [str(reason or "").strip() for reason in (item.get("title_reasons") or []) if str(reason or "").strip()]
@@ -2795,22 +3094,21 @@ def analyze_article_matches(title: str, config: dict, article: dict | None = Non
                 reasons.append(f"正文摘录提到品牌“{_format_term_list(excerpt_brand_hits, 1)}”")
             elif meta_brand_hits:
                 reasons.append(f"来源信息提到品牌“{_format_term_list(meta_brand_hits, 1)}”")
-            elif shared_core:
-                reasons.append("与其他品牌共享核心词，按标题一并归类")
             matched.append(task_name)
             match_reasons[task_name] = reasons[:3] or ["标题命中任务关键词"]
 
     if not matched:
-        if candidates:
-            core_candidates = [
-                str(item.get("task_name") or "").strip()
-                for item in candidates
-                if str(item.get("task_name") or "").strip()
-            ]
-            if core_candidates:
-                unmatched_reason = f"标题命中了核心词，但未定位到明确品牌：{'、'.join(core_candidates[:3])}"
-        else:
-            unmatched_reason = "未命中品牌名或关键词，暂未归类"
+        if not unmatched_reason:
+            if candidates:
+                core_candidates = [
+                    str(item.get("task_name") or "").strip()
+                    for item in candidates
+                    if str(item.get("task_name") or "").strip()
+                ]
+                if core_candidates:
+                    unmatched_reason = f"标题命中了候选品牌线索，但未定位到明确品牌：{'、'.join(core_candidates[:3])}"
+            else:
+                unmatched_reason = "未命中品牌名或关键词，暂未归类"
 
     return {
         "matched_tasks": matched,
@@ -2846,15 +3144,25 @@ def build_article_export_keyword_order(config: dict | None, task_name: str = "")
         current_task_name = str(task.get("name", "") or "").strip()
         if scoped_task_name and current_task_name != scoped_task_name:
             continue
-        terms = _task_keyword_terms(task) or ([current_task_name] if current_task_name else [])
-        for term in terms:
+        for term in _task_keyword_terms(task):
             if term and term not in order:
                 order[term] = len(order)
     return order
 
 
+def _export_keyword_matches_title(title: str, keyword: str) -> bool:
+    normalized_title = _normalize_match_text(title)
+    normalized_keyword = _normalize_match_text(keyword)
+    if not normalized_title or not normalized_keyword:
+        return False
+    if normalized_keyword in normalized_title:
+        return True
+    segments = [seg for seg in _build_match_segments(keyword) if len(seg) >= 2 or re.search(r"[a-z]", seg)]
+    return len(segments) >= 2 and _ordered_segments_match(normalized_title, segments)
+
+
 def resolve_article_export_keywords(article: dict, config: dict | None, task_name: str = "") -> list[str]:
-    """Resolve keyword category labels for article exports."""
+    """Resolve export keyword labels from user-configured task keywords only."""
     fields = _build_match_fields(str((article or {}).get("title", "") or ""), article)
     matched_tasks = [
         str(name or "").strip()
@@ -2875,46 +3183,66 @@ def resolve_article_export_keywords(article: dict, config: dict | None, task_nam
         elif matched_task_set and current_task_name not in matched_task_set:
             continue
 
-        task_brand = str(task.get("brand", "") or "").strip()
-        brand_terms = _dedupe_texts(
-            [task_brand]
-            + [
-                str((entry or {}).get("brand", "") or "").strip()
-                for entry in (task.get("keywords", []) or [])
-                if isinstance(entry, dict)
-            ]
-        )
         task_labels: list[str] = []
-        keyword_terms = _task_keyword_terms(task)
-        normalized_title = _normalize_match_text(fields["title"])
-        for keyword in keyword_terms:
-            derived_terms = [keyword]
-            derived_terms.extend(_extract_core_keyword_texts(keyword, task=task))
-            derived_terms.extend(_extract_provider_subject_terms(keyword))
-            derived_terms.extend(_remove_brand_terms_from_keyword(keyword, brand_terms))
-            normalized_terms = [
-                _normalize_match_text(term)
-                for term in _dedupe_texts(derived_terms)
-                if _normalize_match_text(term)
-            ]
-            if any(term in normalized_title for term in normalized_terms):
+        for keyword in _task_keyword_terms(task):
+            if _export_keyword_matches_title(fields["title"], keyword):
                 task_labels.append(keyword)
-        if not task_labels:
-            for keyword in keyword_terms:
-                derived_terms = [keyword]
-                derived_terms.extend(_extract_core_keyword_texts(keyword, task=task))
-                derived_terms.extend(_extract_provider_subject_terms(keyword))
-                derived_terms.extend(_remove_brand_terms_from_keyword(keyword, brand_terms))
-                if any(_keyword_theme_matches_title(fields["title"], term) for term in _dedupe_texts(derived_terms)):
-                    task_labels.append(keyword)
-                    break
-        if not task_labels and current_task_name in matched_task_set:
-            task_labels.append(current_task_name)
         for label in task_labels:
             if label and label not in labels:
                 labels.append(label)
 
     return labels
+
+
+def _article_match_config_signature(config: dict | None) -> str:
+    tasks: list[dict[str, object]] = []
+    for task in (config or {}).get("tasks", []) or []:
+        if not isinstance(task, dict):
+            continue
+        keywords: list[dict[str, str]] = []
+        raw_keywords = task.get("keywords", [])
+        if not raw_keywords and task.get("keyword"):
+            raw_keywords = [{"keyword": task.get("keyword")}]
+        for entry in raw_keywords or []:
+            if not isinstance(entry, dict):
+                continue
+            keywords.append({
+                "keyword": str(entry.get("keyword", "") or "").strip(),
+                "brand": str(entry.get("brand", "") or "").strip(),
+            })
+        tasks.append({
+            "name": str(task.get("name", "") or "").strip(),
+            "brand": str(task.get("brand", "") or "").strip(),
+            "keywords": keywords,
+            "industry_tags": [
+                str(term or "").strip()
+                for term in (task.get("industry_tags") or [])
+                if str(term or "").strip()
+            ],
+            "region_tags": [
+                str(term or "").strip()
+                for term in (task.get("region_tags") or [])
+                if str(term or "").strip()
+            ],
+        })
+    payload = json.dumps(tasks, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _article_match_signature(article: dict, config_signature: str) -> str:
+    fields = _build_match_fields(str((article or {}).get("title", "") or ""), article)
+    payload = {
+        "version": 2,
+        "config": config_signature,
+        "fields": fields,
+        "excluded_tasks": sorted(
+            str(name or "").strip()
+            for name in ((article or {}).get("excluded_tasks") or [])
+            if str(name or "").strip()
+        ),
+    }
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def refresh_article_matches(config: dict) -> list:
@@ -2927,6 +3255,7 @@ def refresh_article_matches(config: dict) -> list:
         for task in (config.get("tasks", []) or [])
         if str(task.get("name", "") or "").strip()
     }
+    config_signature = _article_match_config_signature(config)
 
     with _lock:
         articles = _load_articles()
@@ -2937,12 +3266,36 @@ def refresh_article_matches(config: dict) -> list:
                 for name in (article.get("excluded_tasks") or [])
                 if str(name or "").strip()
             }
+            raw_matched = [
+                str(name or "").strip()
+                for name in (article.get("matched_tasks") or [])
+                if str(name or "").strip()
+            ]
             stored = [
                 str(name or "").strip()
                 for name in (article.get("matched_tasks") or [])
                 if str(name or "").strip() in valid_task_names
                 and str(name or "").strip() not in excluded_task_names
             ]
+            existing_reasons = article.get("match_reasons") if isinstance(article.get("match_reasons"), dict) else {}
+            current_signature = _article_match_signature(article, config_signature)
+            if str(article.get("_match_signature") or "") == current_signature:
+                match_reasons = {
+                    task_name: existing_reasons.get(task_name) or ["保留历史归类"]
+                    for task_name in stored
+                }
+                unmatched_reason = "" if stored else str(article.get("unmatched_reason", "") or "").strip()
+                if (
+                    stored != raw_matched
+                    or match_reasons != existing_reasons
+                    or unmatched_reason != str(article.get("unmatched_reason", "") or "").strip()
+                ):
+                    article["matched_tasks"] = stored
+                    article["match_reasons"] = match_reasons
+                    article["unmatched_reason"] = unmatched_reason
+                    changed = True
+                continue
+
             analyzed = analyze_article_matches(article.get("title", ""), config, article=article)
             inferred = [
                 str(name or "").strip()
@@ -2973,10 +3326,12 @@ def refresh_article_matches(config: dict) -> list:
                 merged != list(article.get("matched_tasks") or [])
                 or match_reasons != dict(article.get("match_reasons") or {})
                 or unmatched_reason != str(article.get("unmatched_reason", "") or "").strip()
+                or str(article.get("_match_signature") or "") != current_signature
             ):
                 article["matched_tasks"] = merged
                 article["match_reasons"] = match_reasons
                 article["unmatched_reason"] = unmatched_reason
+                article["_match_signature"] = current_signature
                 changed = True
         if changed:
             _save_articles(articles)

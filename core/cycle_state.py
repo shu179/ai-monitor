@@ -10,17 +10,18 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import threading
 from copy import deepcopy
 from datetime import date
+from pathlib import Path
 
 from .app_paths import resolve_app_path
+from .file_lock import CrossProcessRLock
 from .local_account_space import account_scoped_path
 from .time_utils import local_now, local_today
 
 
 STATE_PATH = resolve_app_path("user_data/scheduler_cycle_state.json")
-_LOCK = threading.Lock()
+_LOCK = CrossProcessRLock(lambda: _state_lock_file())
 
 
 def _today_text(target_date: date | None = None) -> str:
@@ -191,6 +192,11 @@ def _state_path():
     if STATE_PATH != resolved_default:
         return STATE_PATH
     return account_scoped_path("user_data/scheduler_cycle_state.json", fallback=resolved_default)
+
+
+def _state_lock_file() -> Path:
+    state_path = _state_path()
+    return state_path.with_name(f"{state_path.name}.lock")
 
 
 def _prune(data: dict, keep_days: int = 45) -> dict:

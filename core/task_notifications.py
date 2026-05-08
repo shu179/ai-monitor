@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from core.notification_idempotency import (
+    build_payload_hash,
+    notification_already_sent,
+    record_notification_sent,
+)
 from core.task_results import (
     collect_unique_screenshot_paths,
     count_task_queries,
@@ -7,6 +12,7 @@ from core.task_results import (
     make_query_result_key,
     result_has_usable_screenshot,
 )
+from core.time_utils import local_today
 
 
 def record_diagnostic(
@@ -90,6 +96,7 @@ def build_notification_result(
 def send_fixed_screenshot_task_notification(
     *,
     task_name: str,
+    task_id: str = '',
     notifier,
     selected_results: list,
     fixed_screenshot_target: int,
@@ -134,6 +141,26 @@ def send_fixed_screenshot_task_notification(
         f"[Main] 固定截图任务组「{task_name}」入选 {len(effective_results)} 条，"
         f"准备发送 {len(screenshot_paths)} 张截图"
     )
+    idempotency = _build_task_notification_idempotency(
+        notifier=notifier,
+        task_id=task_id,
+        task_name=task_name,
+        channel='fixed_screenshot',
+        payload={
+            'brands': [item.get('brand', '') for item in effective_results],
+            'keywords': [item.get('keyword', '') for item in effective_results],
+            'platforms': [item.get('platform', '') for item in effective_results],
+            'screenshot_count': len(screenshot_paths),
+            'fixed_screenshot_target': fixed_screenshot_target,
+        },
+    )
+    if _notification_already_sent(idempotency):
+        print(f"[Main] 固定截图任务组「{task_name}」本轮通知已发送过，跳过重复发送")
+        return build_notification_result(
+            attempted=False,
+            success=True,
+            found_results=len(screenshot_paths),
+        )
     ok = notifier.send_detected_images(
         task_name=task_name,
         brands=[item.get('brand', '') for item in effective_results],
@@ -154,6 +181,8 @@ def send_fixed_screenshot_task_notification(
             category='notification',
             details={'selected_result_count': len(effective_results), 'screenshot_count': len(screenshot_paths)},
         )
+    else:
+        _record_notification_sent(idempotency)
     return build_notification_result(
         attempted=True,
         success=ok,
@@ -182,6 +211,25 @@ def send_single_query_task_notification(
 
     first_hit = found_results[0]
     print(f"[Main] 单查询任务组「{task_name}」首次识别到品牌，发送截图通知")
+    idempotency = _build_task_notification_idempotency(
+        notifier=notifier,
+        task_id=task_id,
+        task_name=task_name,
+        channel='single_query',
+        payload={
+            'brand': first_hit.get('brand', ''),
+            'keyword': first_hit.get('keyword', ''),
+            'platform': first_hit.get('platform', ''),
+            'rank': first_hit.get('rank', 99),
+        },
+    )
+    if not force_notify and _notification_already_sent(idempotency):
+        print(f"[Main] 单查询任务组「{task_name}」本轮通知已发送过，跳过重复发送")
+        return build_notification_result(
+            attempted=False,
+            success=True,
+            found_results=len(found_results),
+        )
     ok = notifier.send(
         platform=first_hit['platform'],
         keyword=first_hit['keyword'],
@@ -209,6 +257,8 @@ def send_single_query_task_notification(
             category='notification',
             details={'screenshot': first_hit.get('screenshot')},
         )
+    else:
+        _record_notification_sent(idempotency)
     return build_notification_result(
         attempted=True,
         success=ok,
@@ -220,12 +270,33 @@ def send_single_query_task_notification(
 def send_multi_query_task_notification(
     *,
     task_name: str,
+    task_id: str = '',
     notifier,
     all_results: list,
     found_results: list,
     query_count: int,
 ) -> dict:
     print(f"[Main] 多查询任务组「{task_name}」命中 {len(found_results)}/{query_count}，发送汇总通知")
+    idempotency = _build_task_notification_idempotency(
+        notifier=notifier,
+        task_id=task_id,
+        task_name=task_name,
+        channel='multi_query_summary',
+        payload={
+            'brands': [item.get('brand', '') for item in found_results],
+            'keywords': [item.get('keyword', '') for item in all_results],
+            'platforms': [item.get('platform', '') for item in all_results],
+            'found_count': len(found_results),
+            'query_count': query_count,
+        },
+    )
+    if _notification_already_sent(idempotency):
+        print(f"[Main] 多查询任务组「{task_name}」本轮通知已发送过，跳过重复发送")
+        return build_notification_result(
+            attempted=False,
+            success=True,
+            found_results=len(found_results),
+        )
     ok = notifier.send_summary(task_name=task_name, results=all_results)
     if not ok:
         first_hit = found_results[0]
@@ -238,6 +309,8 @@ def send_multi_query_task_notification(
             category='notification',
             details={'result_count': len(found_results)},
         )
+    else:
+        _record_notification_sent(idempotency)
     return build_notification_result(
         attempted=True,
         success=ok,
@@ -264,6 +337,7 @@ def send_task_notifications(
 
     found_results = [r for r in all_results if r['rank'] != 99]
     task_name = task.get('name', default_brand)
+    task_id = str(task.get('_scheduler_original_task_id') or task.get('task_id') or '').strip()
     fixed_screenshot_enabled = bool(task.get('fixed_screenshot_enabled', False))
     selected_results = [r for r in (selected_results or []) if r.get('rank', 99) != 99]
     query_count = expected_query_count or count_task_queries(keywords, default_brand)
@@ -306,6 +380,7 @@ def send_task_notifications(
     if fixed_screenshot_enabled:
         return send_fixed_screenshot_task_notification(
             task_name=task_name,
+            task_id=task_id,
             notifier=notifier,
             selected_results=selected_results,
             fixed_screenshot_target=fixed_screenshot_target,
@@ -315,7 +390,7 @@ def send_task_notifications(
     if query_count <= 1:
         return send_single_query_task_notification(
             task_name=task_name,
-            task_id=str(task.get('_scheduler_original_task_id') or task.get('task_id') or '').strip(),
+            task_id=task_id,
             notifier=notifier,
             found_results=found_results,
             force_notify=force_notify,
@@ -323,11 +398,43 @@ def send_task_notifications(
 
     return send_multi_query_task_notification(
         task_name=task_name,
+        task_id=task_id,
         notifier=notifier,
         all_results=all_results,
         found_results=found_results,
         query_count=query_count,
     )
+
+
+def _build_task_notification_idempotency(
+    *,
+    notifier,
+    task_id: str,
+    task_name: str,
+    channel: str,
+    payload: dict,
+) -> dict:
+    webhook_url = str(getattr(notifier, 'webhook_url', '') or '').strip()
+    payload_hash = build_payload_hash(payload)
+    run_date = str((payload or {}).get('run_date') or '').strip() or local_today().isoformat()
+    round_id = f"{channel}:{task_id or task_name}:{run_date or 'today'}"
+    return {
+        'webhook_url': webhook_url,
+        'task_id': str(task_id or '').strip(),
+        'task_name': str(task_name or '').strip(),
+        'channel': str(channel or '').strip(),
+        'run_date': run_date,
+        'round_id': round_id,
+        'payload_hash': payload_hash,
+    }
+
+
+def _notification_already_sent(identity: dict) -> bool:
+    return notification_already_sent(**identity)
+
+
+def _record_notification_sent(identity: dict) -> None:
+    record_notification_sent(**identity)
 
 
 _record_diagnostic = record_diagnostic

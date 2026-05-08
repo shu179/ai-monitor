@@ -26,6 +26,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 from core.app_paths import resolve_app_dir, resolve_app_path
 from core.browser_runtime import resolve_system_browser_executable
+from core.time_utils import local_now
 
 _PLATFORM_LABELS = {
     'local_model': '本地模型',
@@ -157,7 +158,7 @@ def render_html_to_screenshot(
         )
 
     rendered_html_body = _highlight_brand_mentions_in_html(html_body, brand)
-    timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S CST")
+    timestamp = _render_timestamp()
     style_block = _build_font_face_block() + "\n" + _load_style_block()
     full_html = (
         _load_html_template()
@@ -184,8 +185,15 @@ def render_html_to_screenshot(
 
 
 def _build_default_screenshot_path(platform: str) -> str:
-    ts = datetime.now().strftime("%m%d_%H%M%S")
+    ts = local_now().strftime("%m%d_%H%M%S")
     return str(resolve_app_dir("screenshots") / f"{platform}_api_{ts}.jpg")
+
+
+def _render_timestamp() -> str:
+    now = local_now()
+    suffix = str(now.tzname() or "").strip()
+    timestamp = now.strftime("%Y.%m.%d %H:%M:%S")
+    return f"{timestamp} {suffix}".strip()
 
 
 def _load_html_template() -> str:
@@ -353,7 +361,7 @@ def _render_text_to_screenshot_with_satori(
         "brand": str(brand or ""),
         "outputPath": str(tmp_png),
         "includeBadges": bool(include_badges),
-        "timestamp": datetime.now().strftime("%Y.%m.%d %H:%M:%S CST"),
+        "timestamp": _render_timestamp(),
         "logoDataUri": _get_platform_logo_data_uri(platform),
         "scale": _resolve_satori_render_scale(),
     }

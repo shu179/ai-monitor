@@ -59,6 +59,60 @@ class ArticleStatsTests(unittest.TestCase):
         self.assertEqual(result["today_total"], 1)
         self.assertEqual(len(result["articles"]), 3)
 
+    def test_article_list_dedupes_repeated_urls(self):
+        service = _article_service([
+            {
+                "id": "first",
+                "url": "https://example.com/news/a?utm_source=x",
+                "title": "第一条",
+                "media_type": "selfmedia",
+                "matched_tasks": ["品牌A"],
+                "published_at": "2024-03-04",
+                "ts": "2024-03-04",
+            },
+            {
+                "id": "second",
+                "url": "https://www.example.com/news/a",
+                "title": "重复链接",
+                "media_type": "selfmedia",
+                "matched_tasks": ["品牌B"],
+                "published_at": "2024-03-04",
+                "ts": "2024-03-04",
+            },
+        ])
+
+        result = service.get_articles_filtered(limit=20)
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(len(result["articles"]), 1)
+        self.assertEqual(result["articles"][0]["matchedTasks"], ["品牌A", "品牌B"])
+
+    def test_article_list_fills_missing_url_from_matching_article(self):
+        service = _article_service([
+            {
+                "id": "without-link",
+                "url": "",
+                "title": "同一篇报道",
+                "media_name": "示例媒体",
+                "media_type": "selfmedia",
+                "published_at": "2024-03-04",
+                "ts": "2024-03-04",
+            },
+            {
+                "id": "with-link",
+                "url": "https://example.com/same",
+                "title": "同一篇报道",
+                "media_name": "示例媒体",
+                "media_type": "selfmedia",
+                "published_at": "2024-03-04",
+                "ts": "2024-03-04",
+            },
+        ])
+
+        result = service.get_articles_filtered(limit=20)
+
+        self.assertEqual(result["articles"][0]["url"], "https://example.com/same")
+
 
 if __name__ == "__main__":
     unittest.main()

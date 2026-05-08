@@ -5,6 +5,11 @@ import time
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from core.notification_idempotency import (
+    build_payload_hash,
+    notification_already_sent,
+    record_notification_sent,
+)
 from core.cycle_state import (
     get_cycle_report,
     mark_cycle_success_notified,
@@ -13,7 +18,7 @@ from core.cycle_state import (
 )
 from core.daily_task_state import SOURCE_MODE_TEST
 from core.notifier import WeComNotifier
-from core.time_utils import local_now
+from core.time_utils import local_now, local_today
 
 
 _PLATFORM_LABELS = {
@@ -105,6 +110,33 @@ class SchedulerWebhookReporter:
             print(f"[Main] 调度通知发送失败: {notifier.last_error or '未知错误'}")
         return ok
 
+    def _build_idempotency(self, channel: str, payload: dict, *, round_id: str = "") -> dict:
+        webhook_url = _get_scheduler_notification_webhook(self._get_config())
+        if not webhook_url or not str(channel or '').strip():
+            return {}
+        run_date = str((payload or {}).get('date') or '').strip() or local_today().isoformat()
+        payload_hash = build_payload_hash(payload or {})
+        return {
+            'webhook_url': webhook_url,
+            'task_id': str((payload or {}).get('task_id') or '').strip(),
+            'task_name': str((payload or {}).get('task_name') or '').strip(),
+            'channel': str(channel or '').strip(),
+            'run_date': run_date,
+            'round_id': str(round_id or '').strip() or f"{channel}:{run_date}:{payload_hash[:16]}",
+            'payload_hash': payload_hash,
+        }
+
+    def _send_text_once(self, content: str, identity: dict | None) -> bool:
+        idempotency = identity if isinstance(identity, dict) else {}
+        if idempotency:
+            if notification_already_sent(**idempotency):
+                print(f"[Main] 调度通知已发送过，跳过重复发送: {idempotency.get('channel', '')}")
+                return True
+        ok = self._send_text(content)
+        if ok and idempotency:
+            record_notification_sent(**idempotency)
+        return ok
+
     def _notification_policy(self) -> tuple[int, int]:
         notify_cfg = (self._get_config() or {}).get('default_notification', {}) or {}
         try:
@@ -143,7 +175,7 @@ class SchedulerWebhookReporter:
         group_key: str,
         force: bool = False,
     ) -> tuple[bool, int]:
-        now = time.time()
+        now = time.monotonic()
         threshold, ttl_seconds = self._notification_policy()
         with self._issue_lock:
             last_sent = self._recent_issue_keys.get(issue_key, 0)
@@ -277,7 +309,16 @@ class SchedulerWebhookReporter:
         if str(payload.get('all_success_notified_at') or '').strip():
             return False
 
-        ok = self._send_text("\n".join(self._build_all_success_lines(payload)))
+        identity = self._build_idempotency(
+            'scheduler_all_success',
+            {
+                'date': str(payload.get('date') or '').strip(),
+                'summary': dict(summary),
+                'task_outcomes': list(payload.get('task_outcomes') or []),
+            },
+            round_id=f"scheduler_all_success:{str(payload.get('date') or local_today().isoformat()).strip()}",
+        )
+        ok = self._send_text_once("\n".join(self._build_all_success_lines(payload)), identity)
         if ok:
             marked = mark_cycle_success_notified()
             if isinstance(marked, dict):
@@ -311,7 +352,17 @@ class SchedulerWebhookReporter:
         else:
             lines.append("失败任务：无")
         lines.append("请留意是否需要继续后续模式或人工介入处理。")
-        return self._send_text("\n".join(lines))
+        identity = self._build_idempotency(
+            'scheduler_mode_summary',
+            {
+                'date': local_today().isoformat(),
+                'mode': str(round_payload.get('mode') or '').strip(),
+                'mode_label': mode_label,
+                'summary': dict(summary),
+                'reports': list(reports),
+            },
+        )
+        return self._send_text_once("\n".join(lines), identity)
 
     def send_cycle_summary(self, cycle_payload: dict) -> bool:
         saved_payload = save_cycle_report(cycle_payload)
@@ -320,7 +371,17 @@ class SchedulerWebhookReporter:
             header="【自动监控整轮汇总】",
         )
         lines.append("本轮自动调度已结束，请按结果安排后续处理。")
-        summary_sent = self._send_text("\n".join(lines))
+        identity = self._build_idempotency(
+            'scheduler_cycle_summary',
+            {
+                'date': str(saved_payload.get('date') or '').strip(),
+                'scheduled_time': str(saved_payload.get('scheduled_time') or '').strip(),
+                'summary': dict(saved_payload.get('summary') or {}),
+                'task_outcomes': list(saved_payload.get('task_outcomes') or []),
+                'executed_rounds': list(saved_payload.get('executed_rounds') or []),
+            },
+        )
+        summary_sent = self._send_text_once("\n".join(lines), identity)
         self._maybe_send_all_success_notification(saved_payload)
         return summary_sent
 
@@ -481,7 +542,16 @@ class SchedulerWebhookReporter:
             lines.append("仍未成功：无")
         if current_summary and int(current_summary.get('failed', 0) or 0) <= 0:
             lines.append("当前整轮已全部成功。")
-        return self._send_text("\n".join(lines))
+        identity = self._build_idempotency(
+            'scheduler_recognition_round_summary',
+            {
+                'date': local_today().isoformat(),
+                'events': list(events),
+                'summary': current_summary,
+                'failed_lines': list(failed_lines),
+            },
+        )
+        return self._send_text_once("\n".join(lines), identity)
 
     def handle_status_event(self, status: str, message: str) -> bool:
         if str(status or '').strip() != 'error':
@@ -561,7 +631,25 @@ class SchedulerWebhookReporter:
             lines.append(f"连续失败次数：{max(1, int(streak_count or 0))}")
         lines.append(f"问题：{normalized_message}")
         lines.append("请尽快查看后台运行状态并决定是否人工处理。")
-        return self._send_text("\n".join(lines))
+        _, ttl_seconds = self._notification_policy()
+        bucket_seconds = max(60, int(ttl_seconds or 60))
+        bucket = int(time.time() // bucket_seconds)
+        identity = self._build_idempotency(
+            'scheduler_issue',
+            {
+                'date': local_today().isoformat(),
+                'title': str(title or '').strip(),
+                'task_name': str(task_name or '').strip(),
+                'mode': str(mode or '').strip(),
+                'keyword': str(keyword or '').strip(),
+                'platform': str(platform or '').strip(),
+                'brand': str(brand or '').strip(),
+                'message': normalized_message,
+                'bucket': bucket,
+            },
+            round_id=f"scheduler_issue:{group_key}:{bucket}",
+        )
+        return self._send_text_once("\n".join(lines), identity)
 
     def handle_issue_payload(self, payload: dict) -> bool:
         return self.send_issue(

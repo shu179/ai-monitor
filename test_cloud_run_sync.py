@@ -8,6 +8,8 @@ from unittest.mock import patch
 from core.cloud_client import CloudClientError
 from core.cloud_outbox import CloudOutbox
 from core.cloud_run_sync import (
+    article_to_cloud_events,
+    enqueue_article_cloud_sync,
     enqueue_recent_cloud_run_records_from_history,
     enqueue_run_record_from_history,
     enqueue_task_day_status,
@@ -92,6 +94,71 @@ class AccountSwitchDuringUploadClient:
 
 
 class CloudRunSyncTests(unittest.TestCase):
+    def test_article_to_cloud_events_uploads_metadata_and_task_links(self):
+        article = {
+            "id": "article-1",
+            "url": "http://www.example.com/a?utm_source=test",
+            "title": "即搜AI 入选武汉 GEO 优化公司",
+            "platform": "微信公众号",
+            "media_name": "武汉观察",
+            "media_type": "selfmedia",
+            "published_at": "2026-05-06",
+            "excerpt": "摘要" * 300,
+            "answer_text": "本地运行回答不应该进入文章云端事件",
+            "matched_tasks": ["即搜AI"],
+            "match_reasons": {"即搜AI": ["标题包含品牌名"]},
+        }
+        config = {"tasks": [{"name": "即搜AI", "brand": "即搜AI", "task_id": "cloud_42", "cloud_task_id": 42}]}
+
+        events = article_to_cloud_events(article, config)
+
+        self.assertEqual([event["event_type"] for event in events], ["article_upsert", "article_task_links"])
+        upsert = events[0]["payload"]
+        self.assertEqual(upsert["canonical_url"], "https://example.com/a")
+        self.assertEqual(upsert["title"], "即搜AI 入选武汉 GEO 优化公司")
+        self.assertEqual(upsert["payload"]["local_article_id"], "article-1")
+        self.assertLessEqual(len(upsert["payload"]["excerpt"]), 500)
+        self.assertNotIn("answer_text", upsert["payload"])
+
+        links = events[1]["payload"]
+        self.assertEqual(links["task_ids"], [42])
+        self.assertFalse(links["partial"])
+        self.assertTrue(links["replace"])
+        self.assertEqual(links["reason_json"]["42"], ["标题包含品牌名"])
+
+    def test_article_to_cloud_events_skips_empty_links_and_keeps_partial_links(self):
+        config = {"tasks": [{"name": "即搜AI", "cloud_task_id": 42}]}
+
+        clear_events = article_to_cloud_events(
+            {"id": "article-2", "url": "https://example.com/clear", "matched_tasks": []},
+            config,
+        )
+        self.assertEqual([event["event_type"] for event in clear_events], ["article_upsert"])
+
+        partial_events = article_to_cloud_events(
+            {"id": "article-3", "url": "https://example.com/partial", "matched_tasks": ["还没上云的品牌"]},
+            config,
+        )
+        self.assertEqual(partial_events[1]["payload"]["task_ids"], [])
+        self.assertTrue(partial_events[1]["payload"]["partial"])
+        self.assertEqual(partial_events[1]["payload"]["unresolved_task_names"], ["还没上云的品牌"])
+
+    def test_enqueue_article_cloud_sync_dedupes_by_payload_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outbox = CloudOutbox(Path(tmpdir) / "outbox.json")
+            article = {
+                "id": "article-1",
+                "url": "https://example.com/a",
+                "title": "即搜AI",
+                "matched_tasks": ["即搜AI"],
+            }
+            config = {"tasks": [{"name": "即搜AI", "cloud_task_id": 42}]}
+
+            enqueue_article_cloud_sync(article, config, outbox=outbox)
+            enqueue_article_cloud_sync(article, config, outbox=outbox)
+
+            self.assertEqual(outbox.stats()["pending"], 2)
+
     def test_history_record_to_run_event_requires_cloud_task_id_and_omits_screenshot(self):
         record = {
             "id": "history-1",

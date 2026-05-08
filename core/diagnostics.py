@@ -10,19 +10,19 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import threading
 import uuid
-from datetime import datetime
 
 from .app_paths import resolve_app_path
+from .file_lock import CrossProcessRLock
 from .local_account_space import account_scoped_path
+from .time_utils import local_now
 
 
 DEFAULT_DIAGNOSTICS_PATH = resolve_app_path("logs/diagnostics.json")
 DIAGNOSTICS_PATH = DEFAULT_DIAGNOSTICS_PATH
 MAX_EVENTS = 500
 
-_LOCK = threading.Lock()
+_LOCK = CrossProcessRLock(lambda: _diagnostics_lock_file())
 
 
 def record_event(
@@ -42,7 +42,7 @@ def record_event(
     diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
     event = {
         "id": uuid.uuid4().hex,
-        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": local_now().strftime("%Y-%m-%d %H:%M:%S"),
         "level": str(level or "error").strip() or "error",
         "category": str(category or "general").strip() or "general",
         "message": str(message or "").strip(),
@@ -89,7 +89,7 @@ def resolve_event(event_id: str, note: str = "") -> bool:
             if str(item.get("id", "")).strip() != event_id:
                 continue
             item["resolved"] = True
-            item["resolved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            item["resolved_at"] = local_now().strftime("%Y-%m-%d %H:%M:%S")
             item["resolved_note"] = str(note or "").strip()
             changed = True
             break
@@ -161,6 +161,11 @@ def _diagnostics_path():
     if DIAGNOSTICS_PATH != resolved_default:
         return DIAGNOSTICS_PATH
     return account_scoped_path("logs/diagnostics.json", fallback=resolved_default)
+
+
+def _diagnostics_lock_file():
+    diagnostics_path = _diagnostics_path()
+    return diagnostics_path.parent / f".{diagnostics_path.name}.lock"
 
 
 def get_diagnostics_path():

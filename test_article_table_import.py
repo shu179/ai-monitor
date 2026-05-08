@@ -7,6 +7,13 @@ import threading
 import unittest
 
 import core.article_store as article_store
+from backend_lib.article_service import (
+    _ARTICLE_IMPORT_BATCHES_LOCK,
+    _article_import_batches_lock_file,
+    _load_article_import_batches_file,
+    _save_article_import_batches_file,
+)
+from core.file_lock import CrossProcessRLock
 from web_backend import (
     ArticleImportBatchStore,
     ArticleService,
@@ -117,6 +124,31 @@ class ArticleTableImportTests(unittest.TestCase):
         self.assertEqual(len(pending["batches"]), 1)
         self.assertEqual(pending["batches"][0]["import_id"], result["import_id"])
 
+    def test_import_batch_store_merge_uses_cross_process_lock(self) -> None:
+        self.assertIsInstance(_ARTICLE_IMPORT_BATCHES_LOCK, CrossProcessRLock)
+        _save_article_import_batches_file({
+            "existing": {
+                "id": "existing",
+                "file_name": "existing.xlsx",
+                "article_ids": ["article-a"],
+                "status": "pending",
+            }
+        })
+
+        store = ArticleImportBatchStore({
+            "new": {
+                "id": "new",
+                "file_name": "new.xlsx",
+                "article_ids": ["article-b"],
+                "status": "pending",
+            }
+        })
+        store.save(merge_existing=True)
+        loaded = _load_article_import_batches_file()
+
+        self.assertEqual(set(loaded), {"existing", "new"})
+        self.assertTrue(_article_import_batches_lock_file().exists())
+
     def test_import_media_type_keeps_self_media(self) -> None:
         self.assertEqual(
             _normalize_article_import_media_type("自媒体", "https://example.com/a", "示例媒体"),
@@ -205,6 +237,23 @@ class ArticleTableImportTests(unittest.TestCase):
 
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["url"], "https://example.com/hyperlink")
+
+    def test_import_uses_title_hyperlink_as_article_url(self) -> None:
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "来源媒体", "发布时间"])
+        worksheet.append(["品牌A 标题带链接报道", "示例媒体", "2024-01-09"])
+        worksheet["A2"].hyperlink = "https://example.com/title-hyperlink"
+        output = BytesIO()
+        workbook.save(output)
+
+        items, _ = _extract_article_import_items("标题超链接.xlsx", output.getvalue())
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["title"], "品牌A 标题带链接报道")
+        self.assertEqual(items[0]["url"], "https://example.com/title-hyperlink")
 
     def test_import_self_media_name_is_stored_as_account_name(self) -> None:
         from openpyxl import Workbook

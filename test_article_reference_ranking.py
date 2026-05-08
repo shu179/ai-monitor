@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import core.article_reference_index as article_reference_index
 import core.article_store as article_store
+from core.file_lock import CrossProcessRLock
 import core.history as history
 from backend_lib.article_reference_service import ArticleReferenceService
 
@@ -133,6 +134,11 @@ class ArticleReferenceRankingTests(unittest.TestCase):
                 "extra": {"references": [{"url": "https://example.com/news/a"}]},
             },
         ]
+
+    def test_reference_index_uses_cross_process_lock_in_index_dir(self):
+        self.assertIsInstance(article_reference_index._INDEX_LOCK, CrossProcessRLock)
+        with article_reference_index._INDEX_LOCK:
+            self.assertTrue((article_reference_index.INDEX_DIR / ".index.lock").exists())
 
     def test_ranking_dedupes_record_urls_and_uses_detected_recognition_platforms(self):
         self._write_records(self._base_records())

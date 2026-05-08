@@ -140,6 +140,7 @@ from core.account_crawler import (
 )
 from core.article_store import (
     export_article_store_bundle,
+    get_articles,
     get_articles_file_path,
     get_excluded_article_urls,
     refresh_article_matches,
@@ -167,12 +168,15 @@ from core.browser_platform_factory import (
     normalize_browser_platform_name,
 )
 from core.browser_runtime import resolve_system_browser_executable
+from core.batch_test_storage import merge_batch_json, read_batch_json, write_batch_json
 from core.cloud_sync import CloudSyncManager
 from core.cloud_client import CloudClientError, SurfacedCloudClient
-from core.cloud_event_types import EVENT_PROFILE_UPDATE, FORCE_SEND_SOURCE
+from core.cloud_event_types import EVENT_ARTICLE_CHANGED, EVENT_PROFILE_UPDATE, FORCE_SEND_SOURCE
+from core.cloud_article_sync import pull_cloud_articles_into_store
 from core.cloud_outbox import CloudOutbox
 from core.cloud_platform_auto_sync import CloudPlatformAutoSync
 from core.cloud_run_sync import (
+    enqueue_cloud_articles,
     enqueue_profile_update,
     enqueue_recent_cloud_run_records_from_history,
     enqueue_task_day_status,
@@ -194,6 +198,7 @@ from core.local_account_space import (
     current_account_config_path,
     ensure_account_space,
     ensure_current_account_space,
+    merge_profile_meta,
 )
 from core.profile_assets import (
     is_profile_avatar_url,
@@ -242,9 +247,11 @@ from core.platform_sessions import (
 )
 from core.quick_todos import normalize_quick_todos
 from core.runtime_state import set_auto_resume_monitoring, should_auto_resume_monitoring
+from core.scheduler_notifications import SchedulerWebhookReporter
 from core.scheduler_state import get_entry as get_scheduler_state_entry
 from core.screenshot_tools import get_decoration_theme, get_default_decoration_theme
 from core.sync_service import apply_sync_bundle, build_sync_bundle
+from core.task_executor import run_task_group
 from core.time_utils import local_now, local_today
 from core.task_recycle_bin import (
     deleted_task_snapshots,
@@ -276,6 +283,9 @@ from platforms.api_client import (
 )
 
 TASKS_FULL_CACHE_TTL_SECONDS = 3.0
+TEST_RUN_TERMINAL_TTL_SECONDS = 6 * 60 * 60
+SEARCH_FILE_CACHE_TTL_SECONDS = 24 * 60 * 60
+BROWSER_AUTH_SESSION_TTL_SECONDS = 6 * 60 * 60
 
 
 # 前端和后端平台 ID 可能不一致，做双向映射
@@ -369,6 +379,7 @@ GET_EXACT_RUNTIME_METHODS = {
     "/api/cloud/status": "get_cloud_status",
     "/api/cloud/admin/tasks": "list_cloud_admin_tasks",
     "/api/cloud/admin/users": "list_cloud_admin_users",
+    "/api/cloud/admin/article-classification-jobs": "list_cloud_article_classification_jobs",
     "/api/cloud-sync/status": "get_cloud_sync_status",
     "/api/local-model/status": "get_local_model_status",
     "/api/account-crawling/exclusions": "get_account_crawl_exclusions",
@@ -424,6 +435,8 @@ POST_JSON_RUNTIME_METHODS = {
     "/api/cloud/admin/sync-task": "sync_cloud_admin_task",
     "/api/cloud/admin/delete-task": "delete_cloud_admin_task",
     "/api/cloud/admin/restore-task": "restore_cloud_admin_task",
+    "/api/cloud/admin/resolve-article-classification-job": "resolve_cloud_article_classification_job",
+    "/api/cloud/admin/ignore-article-classification-job": "ignore_cloud_article_classification_job",
     "/api/articles": "import_article",
     "/api/account-crawling/run": "run_account_article_crawl",
     "/api/account-crawling/exclusions/restore": "restore_account_crawl_exclusions",
@@ -746,6 +759,31 @@ def _reject_invalid_session_token(handler: BaseHTTPRequestHandler) -> None:
     received = _request_session_token(handler)
     if not expected or not received or not secrets.compare_digest(expected, received):
         raise _RequestRejected(HTTPStatus.UNAUTHORIZED, "invalid session token")
+
+
+def _runtime_timestamp_age_seconds(value: Any, *, now: datetime | None = None) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    current = now or local_now()
+    try:
+        if timestamp.tzinfo is None:
+            current = current.replace(tzinfo=None)
+        elif current.tzinfo is None:
+            current = local_now()
+        else:
+            timestamp = timestamp.astimezone(current.tzinfo)
+        return max(0.0, (current - timestamp).total_seconds())
+    except Exception:
+        return None
+
+
+def _local_iso_seconds() -> str:
+    return local_now().isoformat(timespec="seconds")
 
 
 def _normalize_batch_id(batch_id: Any) -> str:
@@ -1795,6 +1833,10 @@ class AppRuntime:
         self._context_snapshot_lock = threading.RLock()
         self._article_cache_lock = threading.RLock()
         self._synced_articles_cache: dict[str, Any] | None = None
+        self._article_cloud_enqueue_lock = threading.RLock()
+        self._last_article_cloud_enqueue_key: tuple[Any, ...] | None = None
+        self._article_cloud_enqueue_requested = False
+        self._article_cloud_enqueue_thread: threading.Thread | None = None
         self._pending_delete_processing_lock = threading.RLock()
         self._cloud_status_validation_lock = threading.RLock()
         self._cloud_status_validated_identity = ""
@@ -1835,8 +1877,6 @@ class AppRuntime:
         self._directory_picker_callback: Any | None = None
         self.session_token = secrets.token_urlsafe(32)
         try:
-            from main import SchedulerWebhookReporter
-
             self._scheduler_reporter = SchedulerWebhookReporter(self.load_config)
         except Exception:
             self._scheduler_reporter = None
@@ -1981,8 +2021,7 @@ class AppRuntime:
             meta["ordinary_account_isolated_role"] = role
             meta["ordinary_account_isolated_user_id"] = user.get("id")
             try:
-                meta_path.parent.mkdir(parents=True, exist_ok=True)
-                meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+                merge_profile_meta(profile_dir, meta)
             except Exception:
                 pass
 
@@ -2037,13 +2076,127 @@ class AppRuntime:
             self.article_reference_service.invalidate_cache()
         except Exception:
             pass
+        self._schedule_cloud_articles_snapshot()
+
+    def _schedule_cloud_articles_snapshot(self) -> None:
+        with self._article_cloud_enqueue_lock:
+            self._article_cloud_enqueue_requested = True
+            if self._article_cloud_enqueue_thread and self._article_cloud_enqueue_thread.is_alive():
+                return
+            self._article_cloud_enqueue_thread = threading.Thread(
+                target=self._run_cloud_articles_snapshot_worker,
+                name="cloud-article-snapshot-enqueue",
+                daemon=True,
+            )
+            self._article_cloud_enqueue_thread.start()
+
+    def _run_cloud_articles_snapshot_worker(self) -> None:
+        while True:
+            with self._article_cloud_enqueue_lock:
+                if not self._article_cloud_enqueue_requested:
+                    self._article_cloud_enqueue_thread = None
+                    return
+                self._article_cloud_enqueue_requested = False
+            self._enqueue_cloud_articles_snapshot()
+            with self._article_cloud_enqueue_lock:
+                if not self._article_cloud_enqueue_requested:
+                    self._article_cloud_enqueue_thread = None
+                    return
+
+    def _enqueue_cloud_articles_snapshot(self, config: dict[str, Any] | None = None) -> None:
+        try:
+            session = CloudSessionStore().load()
+            user = session.get("user") if isinstance(session.get("user"), dict) else {}
+            role = str(user.get("role") or "").strip()
+            if role == "viewer" or not str(session.get("access_token") or "").strip():
+                return
+
+            resolved_config = config or self.config_provider.load()
+            articles = self._get_cloud_article_upload_snapshot(resolved_config, session=session)
+            snapshot_key = (
+                cloud_session_identity_key(session),
+                self._article_store_version_key(),
+                self._article_cloud_task_map_key(resolved_config),
+            )
+            with self._article_cloud_enqueue_lock:
+                if self._last_article_cloud_enqueue_key == snapshot_key:
+                    return
+
+            result = enqueue_cloud_articles(articles, resolved_config)
+            with self._article_cloud_enqueue_lock:
+                self._last_article_cloud_enqueue_key = snapshot_key
+            queued = int((result or {}).get("queued") or 0)
+            if queued > 0:
+                print(f"[WebBackend] 文章云端同步已入队: articles={result.get('articles', 0)}, queued={queued}")
+        except Exception as exc:
+            print(f"[WebBackend] 文章云端同步入队失败，将等待下次本地变更重试: {exc}")
+
+    def _get_cloud_article_upload_snapshot(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        session: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return local article candidates for cloud upload without UI visibility filtering."""
+        resolved_config = config or self.config_provider.load()
+        session_payload = session if isinstance(session, dict) else CloudSessionStore().load()
+        articles = _apply_articles_account_context(
+            refresh_article_matches(resolved_config),
+            resolved_config,
+        )
+        if self._is_ordinary_cloud_session(session_payload):
+            visible_names, visible_cloud_task_names = self._visible_article_task_scope(resolved_config)
+            visible_task_name_set = set(visible_names)
+            visible_cloud_task_id_set = set(visible_cloud_task_names.keys())
+            scoped_articles: list[dict[str, Any]] = []
+            for article in articles:
+                if not isinstance(article, dict):
+                    continue
+                item = dict(article)
+                item["matched_tasks"] = [
+                    task_name
+                    for task_name in (
+                        str(name or "").strip()
+                        for name in (item.get("matched_tasks") or [])
+                    )
+                    if task_name and task_name in visible_task_name_set
+                ]
+                raw_reasons = item.get("match_reasons") if isinstance(item.get("match_reasons"), dict) else {}
+                item["match_reasons"] = {
+                    task_name: raw_reasons.get(task_name, [])
+                    for task_name in item["matched_tasks"]
+                }
+                if isinstance(item.get("cloud_task_ids"), list):
+                    item["cloud_task_ids"] = [
+                        task_id
+                        for task_id in (_safe_int(raw_task_id, 0) for raw_task_id in item.get("cloud_task_ids") or [])
+                        if task_id > 0 and task_id in visible_cloud_task_id_set
+                    ]
+                scoped_articles.append(item)
+            return scoped_articles
+        return articles
+
+    @staticmethod
+    def _article_cloud_task_map_key(config: dict[str, Any] | None) -> str:
+        items: list[dict[str, Any]] = []
+        for task in (config or {}).get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            items.append({
+                "task_id": str(task.get("task_id") or "").strip(),
+                "name": str(task.get("name") or "").strip(),
+                "brand": str(task.get("brand") or "").strip(),
+                "cloud_task_id": _safe_int(task.get("cloud_task_id") or task.get("cloudTaskId"), 0),
+            })
+        try:
+            return json.dumps(items, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            return ""
 
     @staticmethod
     def _article_store_version_key() -> tuple[str, int, int]:
         try:
-            from core import article_store as article_store_module
-
-            path = article_store_module.ARTICLES_FILE
+            path = get_articles_file_path()
             try:
                 stat = path.stat()
                 return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
@@ -2064,6 +2217,98 @@ class AppRuntime:
         except Exception:
             return ""
 
+    @staticmethod
+    def _article_visibility_session_key(session: dict[str, Any] | None) -> tuple[str, str]:
+        return (
+            cloud_session_identity_key(session),
+            AppRuntime._cloud_role(session),
+        )
+
+    @staticmethod
+    def _is_ordinary_cloud_session(session: dict[str, Any] | None) -> bool:
+        if not isinstance(session, dict):
+            return False
+        role = AppRuntime._cloud_role(session)
+        if not role or role == "admin":
+            return False
+        return bool(str(session.get("access_token") or "").strip())
+
+    @staticmethod
+    def _visible_article_task_scope(config: dict[str, Any] | None) -> tuple[set[str], dict[int, str]]:
+        visible_names: set[str] = set()
+        visible_cloud_task_names: dict[int, str] = {}
+        for task in (config or {}).get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            if bool(task.get("delete_pending")):
+                continue
+            access_level = str(task.get("cloud_access_level") or "").strip().lower()
+            if access_level == "revoked":
+                continue
+            task_name = str(task.get("name") or "").strip()
+            brand_name = str(task.get("brand") or "").strip()
+            fallback_id = str(task.get("task_id") or derive_task_id(task)).strip()
+            display_name = task_name or brand_name or fallback_id
+            if not display_name:
+                continue
+            for candidate in (task_name, brand_name, fallback_id):
+                text = str(candidate or "").strip()
+                if text:
+                    visible_names.add(text)
+            cloud_task_id = _safe_int(task.get("cloud_task_id") or task.get("cloudTaskId"), 0)
+            if cloud_task_id > 0:
+                visible_cloud_task_names[cloud_task_id] = display_name
+        return visible_names, visible_cloud_task_names
+
+    def _filter_articles_for_current_cloud_visibility(
+        self,
+        articles: list[dict[str, Any]],
+        config: dict[str, Any] | None,
+        *,
+        session: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        session_payload = session if isinstance(session, dict) else CloudSessionStore().load()
+        if not self._is_ordinary_cloud_session(session_payload):
+            return articles
+
+        visible_names, visible_cloud_task_names = self._visible_article_task_scope(config)
+        if not visible_names and not visible_cloud_task_names:
+            return []
+
+        visible_articles: list[dict[str, Any]] = []
+        for article in articles:
+            if not isinstance(article, dict):
+                continue
+
+            visible_matched: list[str] = []
+            cloud_task_ids = [
+                _safe_int(item, 0)
+                for item in (article.get("cloud_task_ids") or [])
+            ]
+            for cloud_task_id in cloud_task_ids:
+                task_name = visible_cloud_task_names.get(cloud_task_id)
+                if task_name and task_name not in visible_matched:
+                    visible_matched.append(task_name)
+
+            for raw_name in article.get("matched_tasks") or []:
+                task_name = str(raw_name or "").strip()
+                if task_name and task_name in visible_names and task_name not in visible_matched:
+                    visible_matched.append(task_name)
+
+            if not visible_matched:
+                continue
+
+            item = dict(article)
+            item["matched_tasks"] = visible_matched
+            raw_reasons = item.get("match_reasons") if isinstance(item.get("match_reasons"), dict) else {}
+            item["match_reasons"] = {
+                task_name: raw_reasons.get(task_name, ["云端可见品牌关联"])
+                for task_name in visible_matched
+            }
+            item["unmatched_reason"] = ""
+            visible_articles.append(item)
+        return visible_articles
+
     def _is_browser_auth_session_alive(self, session: dict[str, Any] | None) -> bool:
         if not isinstance(session, dict):
             return False
@@ -2075,9 +2320,8 @@ class AppRuntime:
             opened_at = str(session.get("opened_at") or "").strip()
             if opened_at and profile_path:
                 try:
-                    opened_time = datetime.fromisoformat(opened_at)
                     if (
-                        (datetime.now() - opened_time).total_seconds() <= 8
+                        (_runtime_timestamp_age_seconds(opened_at) or 0.0) <= 8
                         and self._is_browser_profile_in_use(profile_path)
                     ):
                         return True
@@ -2095,6 +2339,27 @@ class AppRuntime:
         except Exception as exc:
             print(f"[WebBackend] 检查浏览器登录会话状态失败: {exc}")
             return False
+
+    @staticmethod
+    def _browser_auth_session_age_seconds(session: dict[str, Any] | None) -> float | None:
+        if not isinstance(session, dict):
+            return None
+        return _runtime_timestamp_age_seconds(session.get("opened_at"))
+
+    def _prune_browser_auth_sessions(self) -> None:
+        expired_platforms: list[str] = []
+        with self._browser_auth_lock:
+            for platform_name, session in list(self._browser_auth_sessions.items()):
+                age = self._browser_auth_session_age_seconds(session)
+                if age is not None and age > BROWSER_AUTH_SESSION_TTL_SECONDS:
+                    expired_platforms.append(platform_name)
+        for platform_name in expired_platforms:
+            self._close_browser_auth_session(
+                platform_name,
+                reason="登录窗口超过保留时间自动清理",
+                graceful_timeout=8.0,
+                force=True,
+            )
 
     @staticmethod
     def _pid_is_alive(pid: int) -> bool:
@@ -2487,9 +2752,9 @@ class AppRuntime:
                 ).encode("utf-8")
                 sock.sendall(self._websocket_frame(0x1, message))
 
-                deadline = time.time() + max(0.2, float(timeout or 1.5))
+                deadline = time.monotonic() + max(0.2, float(timeout or 1.5))
                 fragments: list[bytes] = []
-                while time.time() < deadline:
+                while time.monotonic() < deadline:
                     opcode, fin, payload = self._websocket_recv_frame(sock)
                     if opcode == 0x8:
                         return None
@@ -2590,8 +2855,8 @@ class AppRuntime:
         return True
 
     def _wait_recognition_browser_ready(self, *, timeout_seconds: float = 8.0) -> bool:
-        deadline = time.time() + max(0.5, float(timeout_seconds or 0.0))
-        while time.time() < deadline:
+        deadline = time.monotonic() + max(0.5, float(timeout_seconds or 0.0))
+        while time.monotonic() < deadline:
             if self._recognition_browser_is_alive():
                 return True
             time.sleep(0.2)
@@ -3197,7 +3462,7 @@ return changedCount
         with self._browser_auth_lock:
             self._browser_auth_sessions[normalized] = {
                 "platform": None,
-                "opened_at": datetime.now().isoformat(timespec="seconds"),
+                "opened_at": local_now().isoformat(timespec="seconds"),
                 "profile_id": str(profile_id or "").strip(),
                 "profile_path": str(profile_path or "").strip(),
                 "pid": int(pid) if isinstance(pid, int) and pid > 0 else None,
@@ -3210,6 +3475,7 @@ return changedCount
         return "正在现有的浏览器会话中打开" in text or "Opening in existing browser session" in text
 
     def get_browser_auth(self) -> dict[str, Any]:
+        self._prune_browser_auth_sessions()
         snapshots = get_browser_auth_snapshot(BROWSER_PLATFORM_IDS)
         with self._browser_auth_lock:
             for platform_name in list(self._browser_auth_sessions.keys()):
@@ -3302,6 +3568,7 @@ return changedCount
             return {"ok": False, "message": f"打开登录窗口失败：{exc}", "browser_auth": self.get_browser_auth()}
 
     def browser_auth_action(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._prune_browser_auth_sessions()
         normalized_payload = payload or {}
         action = str(normalized_payload.get("action") or "").strip()
         platform_name = str(normalized_payload.get("platform") or "").strip()
@@ -3544,7 +3811,7 @@ return changedCount
         if _has_pending_profile_update_for_session(session):
             return
 
-        now_ts = time.time()
+        now_ts = time.monotonic()
         with self._cloud_status_validation_lock:
             if (
                 not force
@@ -3720,10 +3987,148 @@ return changedCount
         user = session.get("user") if isinstance(session.get("user"), dict) else {}
         if str(user.get("role") or "").strip() != "admin":
             return {"ok": False, "message": "当前云端账号不是管理员", "tasks": [], "cloud": self.get_cloud_status().get("cloud")}
-        ok, tasks, message = self._cloud_request_with_refresh(lambda client, token: client.list_admin_tasks(token))
+        local_snapshots = self._cloud_task_ensure_snapshots()
+
+        def operation(client: SurfacedCloudClient, token: str) -> dict[str, Any]:
+            return self._ensure_local_admin_tasks_in_cloud(client, token, local_snapshots)
+
+        ok, payload, message = self._cloud_request_with_refresh(operation)
         if not ok:
             return {"ok": False, "message": message or "云端任务获取失败", "tasks": [], "cloud": self.get_cloud_status().get("cloud")}
+        if isinstance(payload, dict):
+            local_updates = payload.get("local_updates") if isinstance(payload.get("local_updates"), list) else []
+            if local_updates:
+                self._apply_cloud_task_local_updates(local_updates)
+            tasks = payload.get("tasks")
+        else:
+            tasks = []
         return {"ok": True, "message": "云端任务已刷新", "tasks": tasks if isinstance(tasks, list) else [], "cloud": self.get_cloud_status().get("cloud")}
+
+    def _cloud_task_ensure_snapshots(self) -> list[dict[str, Any]]:
+        with self._lock:
+            config = self.load_config()
+            tasks = list(config.get("tasks", []) or [])
+        snapshots: list[dict[str, Any]] = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            if bool(task.get("delete_pending")):
+                continue
+            if str(task.get("cloud_access_level") or "").strip().lower() == "revoked":
+                continue
+            local_task_id = str(task.get("task_id") or derive_task_id(task)).strip()
+            if not local_task_id:
+                continue
+            snapshots.append({
+                "local_task_id": local_task_id,
+                "cloud_task_id": _safe_int(task.get("cloud_task_id") or task.get("cloudTaskId"), 0),
+                "task_key": self._cloud_task_key_for_local_task(task, local_task_id),
+                "payload": {
+                    "name": str(task.get("name") or task.get("brand") or local_task_id).strip(),
+                    "brand": str(task.get("brand") or task.get("name") or local_task_id).strip(),
+                    "config_json": self._build_cloud_config_from_local_task(task),
+                    "enabled": bool(task.get("enabled", True)),
+                },
+                "operator_user_id": _safe_int(task.get("cloud_assigned_operator_user_id"), 0),
+            })
+        return snapshots
+
+    def _ensure_local_admin_tasks_in_cloud(
+        self,
+        client: SurfacedCloudClient,
+        token: str,
+        local_snapshots: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        remote_tasks = client.list_admin_tasks(token)
+        if not isinstance(remote_tasks, list):
+            remote_tasks = []
+        remote_by_id = {
+            _safe_int(task.get("id") if isinstance(task, dict) else 0, 0): task
+            for task in remote_tasks
+            if isinstance(task, dict) and _safe_int(task.get("id"), 0) > 0
+        }
+        remote_by_key = {
+            str(task.get("task_key") or "").strip(): task
+            for task in remote_tasks
+            if isinstance(task, dict) and str(task.get("task_key") or "").strip()
+        }
+        local_updates: list[dict[str, Any]] = []
+        changed_remote = False
+        for snapshot in local_snapshots:
+            local_task_id = str(snapshot.get("local_task_id") or "").strip()
+            task_key = str(snapshot.get("task_key") or "").strip()
+            if not local_task_id or not task_key:
+                continue
+            cloud_task_id = _safe_int(snapshot.get("cloud_task_id"), 0)
+            saved_task = remote_by_id.get(cloud_task_id) if cloud_task_id > 0 else None
+            if saved_task is None:
+                saved_task = remote_by_key.get(task_key)
+            if saved_task is None:
+                payload = dict(snapshot.get("payload") if isinstance(snapshot.get("payload"), dict) else {})
+                saved_task = client.create_admin_task(token, {"task_key": task_key, **payload})
+                changed_remote = True
+                saved_task_id = _safe_int(saved_task.get("id") if isinstance(saved_task, dict) else 0, 0)
+                operator_user_id = _safe_int(snapshot.get("operator_user_id"), 0)
+                if saved_task_id > 0 and operator_user_id > 0:
+                    client.assign_admin_task_member(
+                        token,
+                        saved_task_id,
+                        user_id=operator_user_id,
+                        access_level="operate",
+                        note="同步本地品牌任务",
+                    )
+            if not isinstance(saved_task, dict):
+                continue
+            saved_task_id = _safe_int(saved_task.get("id"), 0)
+            if saved_task_id <= 0:
+                continue
+            if cloud_task_id != saved_task_id or task_key != str(saved_task.get("task_key") or "").strip():
+                local_updates.append({
+                    "local_task_id": local_task_id,
+                    "task": saved_task,
+                })
+        if changed_remote:
+            remote_tasks = client.list_admin_tasks(token)
+            if not isinstance(remote_tasks, list):
+                remote_tasks = []
+        return {"tasks": remote_tasks, "local_updates": local_updates}
+
+    def _apply_cloud_task_local_updates(self, updates: list[dict[str, Any]]) -> None:
+        if not updates:
+            return
+        updates_by_local_id = {
+            str(item.get("local_task_id") or "").strip(): item.get("task")
+            for item in updates
+            if isinstance(item, dict) and isinstance(item.get("task"), dict)
+        }
+        updates_by_local_id = {key: value for key, value in updates_by_local_id.items() if key}
+        if not updates_by_local_id:
+            return
+        with self._lock:
+            config = self.load_config()
+            tasks = config.get("tasks", []) or []
+            changed = False
+            for task in tasks:
+                if not isinstance(task, dict):
+                    continue
+                local_task_id = str(task.get("task_id") or derive_task_id(task)).strip()
+                saved_task = updates_by_local_id.get(local_task_id)
+                if not isinstance(saved_task, dict):
+                    continue
+                before = dict(task)
+                task["cloud_task_id"] = _safe_int(saved_task.get("id"), _safe_int(task.get("cloud_task_id"), 0))
+                task["cloud_task_key"] = str(saved_task.get("task_key") or task.get("cloud_task_key") or "").strip()
+                task["cloud_workspace_id"] = _safe_int(saved_task.get("workspace_id"), _safe_int(task.get("cloud_workspace_id"), 0))
+                task["cloud_config_version"] = _safe_int(saved_task.get("config_version"), _safe_int(task.get("cloud_config_version"), 1))
+                task["cloud_access_level"] = "admin"
+                task["cloud_synced_at"] = _local_iso_seconds()
+                if task != before:
+                    changed = True
+            if changed:
+                config["tasks"] = tasks
+                self.save_config(config)
+                self._invalidate_tasks_full_cache()
+                self._invalidate_article_cache()
 
     def list_cloud_admin_users(self) -> dict[str, Any]:
         session = CloudSessionStore().load()
@@ -3734,6 +4139,88 @@ return changedCount
         if not ok:
             return {"ok": False, "message": message or "云端账号获取失败", "users": [], "cloud": self.get_cloud_status().get("cloud")}
         return {"ok": True, "message": "云端账号已刷新", "users": users if isinstance(users, list) else [], "cloud": self.get_cloud_status().get("cloud")}
+
+    def list_cloud_article_classification_jobs(self) -> dict[str, Any]:
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return {"ok": False, "message": "当前云端账号不是管理员", "jobs": [], "cloud": self.get_cloud_status().get("cloud")}
+        ok, jobs, message = self._cloud_request_with_refresh(
+            lambda client, token: client.list_admin_article_classification_jobs(token, status="unresolved", limit=200)
+        )
+        if not ok:
+            return {"ok": False, "message": message or "未归类文章获取失败", "jobs": [], "cloud": self.get_cloud_status().get("cloud")}
+        return {
+            "ok": True,
+            "message": "未归类文章已刷新",
+            "jobs": jobs if isinstance(jobs, list) else [],
+            "cloud": self.get_cloud_status().get("cloud"),
+        }
+
+    def _refresh_cloud_articles_after_classification_change(self) -> dict[str, Any]:
+        try:
+            with self._lock:
+                config = self.load_config()
+                summary = pull_cloud_articles_into_store(config, force_full=False)
+                if summary.get("ok") and int(summary.get("state_updated") or 0):
+                    self.save_config(config)
+            if summary.get("ok") and (
+                int(summary.get("imported") or 0)
+                or int(summary.get("updated") or 0)
+                or int(summary.get("pruned") or 0)
+                or int(summary.get("pruned_links") or 0)
+            ):
+                self._invalidate_article_cache()
+            return summary
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    def resolve_cloud_article_classification_job(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return {"ok": False, "message": "当前云端账号不是管理员", "cloud": self.get_cloud_status().get("cloud")}
+        job_id = _safe_int(request_payload.get("job_id") or request_payload.get("jobId"), 0)
+        task_id = _safe_int(request_payload.get("task_id") or request_payload.get("taskId"), 0)
+        if job_id <= 0 or task_id <= 0:
+            return {"ok": False, "message": "请选择文章和归属品牌", "cloud": self.get_cloud_status().get("cloud")}
+        reason = str(request_payload.get("reason") or "管理员归类未归类文章").strip()
+        ok, job, message = self._cloud_request_with_refresh(
+            lambda client, token: client.resolve_admin_article_classification_job(token, job_id, task_id=task_id, reason=reason)
+        )
+        if not ok:
+            return {"ok": False, "message": message or "文章归类失败", "cloud": self.get_cloud_status().get("cloud")}
+        article_summary = self._refresh_cloud_articles_after_classification_change()
+        return {
+            "ok": True,
+            "message": "文章已归类",
+            "job": job if isinstance(job, dict) else {},
+            "articles": article_summary,
+            "cloud": self.get_cloud_status().get("cloud"),
+        }
+
+    def ignore_cloud_article_classification_job(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        session = CloudSessionStore().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return {"ok": False, "message": "当前云端账号不是管理员", "cloud": self.get_cloud_status().get("cloud")}
+        job_id = _safe_int(request_payload.get("job_id") or request_payload.get("jobId"), 0)
+        if job_id <= 0:
+            return {"ok": False, "message": "缺少未归类文章 ID", "cloud": self.get_cloud_status().get("cloud")}
+        reason = str(request_payload.get("reason") or "管理员忽略未归类文章").strip()
+        ok, job, message = self._cloud_request_with_refresh(
+            lambda client, token: client.ignore_admin_article_classification_job(token, job_id, reason=reason)
+        )
+        if not ok:
+            return {"ok": False, "message": message or "文章忽略失败", "cloud": self.get_cloud_status().get("cloud")}
+        return {
+            "ok": True,
+            "message": "文章已忽略",
+            "job": job if isinstance(job, dict) else {},
+            "cloud": self.get_cloud_status().get("cloud"),
+        }
 
     def create_cloud_admin_user(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
@@ -3877,7 +4364,7 @@ return changedCount
             base_url=base_url,
             token_pair=token_pair,
         )
-        pull_result = self.pull_cloud_tasks({})
+        pull_result = self.pull_cloud_tasks({"force": False})
         message = "云端登录成功"
         if isinstance(pull_result, dict) and pull_result.get("ok"):
             message = str(pull_result.get("message") or message)
@@ -3928,7 +4415,7 @@ return changedCount
             base_url=base_url,
             token_pair=token_pair,
         )
-        pull_result = self.pull_cloud_tasks({})
+        pull_result = self.pull_cloud_tasks({"force": False})
         next_message = message
         if isinstance(pull_result, dict) and pull_result.get("ok"):
             next_message = str(pull_result.get("message") or next_message)
@@ -4030,8 +4517,18 @@ return changedCount
             with self._lock:
                 config = self.load_config()
             session_outbox = CloudOutbox().bind_to_session(CloudSessionStore().load())
-            metrics = enqueue_recent_cloud_run_records_from_history(config, outbox=session_outbox, days=7)
-            return {"ok": True, **metrics}
+            run_metrics = enqueue_recent_cloud_run_records_from_history(config, outbox=session_outbox, days=7)
+            article_metrics = enqueue_cloud_articles(
+                self._get_cloud_article_upload_snapshot(config),
+                config,
+                outbox=session_outbox,
+            )
+            return {
+                "ok": True,
+                **run_metrics,
+                "run_records": run_metrics,
+                "articles_sync": article_metrics,
+            }
         except Exception as exc:
             return {"ok": False, "message": f"本地运行历史恢复失败：{exc}"}
 
@@ -4049,21 +4546,42 @@ return changedCount
                     if isinstance(summary.get("task_day_status_events"), dict)
                     else {}
                 )
-                changed = (
+                task_config_changed = (
                     int(summary.get("added") or 0)
                     + int(summary.get("updated") or 0)
                     + int(summary.get("revoked") or 0)
                     + int(summary.get("deleted") or 0)
                     + int(summary.get("deleted_backups") or 0)
                     + int(summary.get("deleted_pending") or 0)
+                )
+                change_summary = summary.get("changes") if isinstance(summary.get("changes"), dict) else {}
+                change_events = [
+                    str(item or "").strip()
+                    for item in (change_summary.get("events") if isinstance(change_summary.get("events"), list) else [])
+                ]
+                article_summary = pull_cloud_articles_into_store(
+                    config,
+                    force_full=force_full or task_config_changed > 0 or EVENT_ARTICLE_CHANGED in change_events,
+                )
+                summary["articles"] = article_summary
+                changed = (
+                    task_config_changed
                     + int(summary.get("state_updated") or 0)
                     + int(run_summary.get("cursor_updates") or 0)
                     + int(run_summary.get("backfilled") or 0)
                     + int(status_summary.get("cursor_updates") or 0)
+                    + int(article_summary.get("state_updated") or 0)
                 )
                 if changed:
                     self.save_config(config)
-                if changed or int(run_summary.get("imported") or 0):
+                if (
+                    changed
+                    or int(run_summary.get("imported") or 0)
+                    or int(article_summary.get("imported") or 0)
+                    or int(article_summary.get("updated") or 0)
+                    or int(article_summary.get("pruned") or 0)
+                    or int(article_summary.get("pruned_links") or 0)
+                ):
                     self._invalidate_tasks_full_cache()
                     self._invalidate_article_cache()
         if result.get("ok"):
@@ -4190,7 +4708,7 @@ return changedCount
                     task["cloud_assigned_operator_username"] = str(saved_task.get("assigned_operator_username") or task.get("cloud_assigned_operator_username") or "").strip()
                 else:
                     task["cloud_assigned_operator_username"] = ""
-                task["cloud_synced_at"] = datetime.now().isoformat(timespec="seconds")
+                task["cloud_synced_at"] = _local_iso_seconds()
                 tasks[index] = task
                 break
             config["tasks"] = tasks
@@ -4378,8 +4896,6 @@ return changedCount
     def _execute_scheduled_task(self, task: dict) -> dict:
         if self._is_cloud_viewer_account():
             return {"ok": False, "message": "浏览账号仅可查看管理员分配的数据，不能运行任务"}
-        from main import run_task_group
-
         config = self.load_config()
         default_notification = config.get("default_notification", {}) or {}
         result = run_task_group(
@@ -4682,6 +5198,8 @@ return changedCount
                 account_ids=account_ids,
                 trigger=trigger,
             )
+            if int(result.get("added_count") or 0) > 0 or int(result.get("duplicate_count") or 0) > 0:
+                self._invalidate_article_cache()
             print(
                 "[WebBackend] 账号文章抓取完成",
                 {
@@ -4791,9 +5309,11 @@ return changedCount
     def _get_synced_articles(self, config: dict | None = None) -> list[dict[str, Any]]:
         """返回已按当前任务配置刷新归属关系的文章列表。"""
         resolved_config = config or self.load_config()
+        session = CloudSessionStore().load()
         cache_key = (
             self._article_store_version_key(),
             self._article_match_config_key(resolved_config),
+            self._article_visibility_session_key(session),
         )
         with self._article_cache_lock:
             cache = self._synced_articles_cache
@@ -4804,9 +5324,15 @@ return changedCount
                 refresh_article_matches(resolved_config),
                 resolved_config,
             )
+            articles = self._filter_articles_for_current_cloud_visibility(
+                articles,
+                resolved_config,
+                session=session,
+            )
             final_key = (
                 self._article_store_version_key(),
                 cache_key[1],
+                cache_key[2],
             )
             self._synced_articles_cache = {
                 "key": final_key,
@@ -5130,6 +5656,12 @@ return changedCount
         with self._lock:
             return self._snapshot_locked()
 
+    def session_snapshot(self) -> dict:
+        return {
+            "ok": True,
+            "session": _build_snapshot_session(self.session_token, SESSION_TOKEN_HEADER),
+        }
+
     def _snapshot_locked(self) -> dict:
         config, _ = self._ensure_context_snapshots()
         self._sync_recognition_mode(config)
@@ -5140,7 +5672,7 @@ return changedCount
             config.get("scheduler", {}),
         )
         active_mode = str(config.get("detection_mode", "browser") or "browser").strip()
-        today = datetime.now().date().isoformat()
+        today = local_today().isoformat()
 
         today_records: list[dict] = []
         platform_counter: Counter[str] = Counter()
@@ -5301,11 +5833,9 @@ return changedCount
             return {"queued": False, "message": "已有任务正在执行"}
 
         def worker() -> None:
-            from main import run_task_group
-
             with self._lock:
                 self._last_run = {
-                    "startedAt": datetime.now().isoformat(timespec="seconds"),
+                    "startedAt": _local_iso_seconds(),
                     "status": "running",
                     "items": [],
                 }
@@ -5332,8 +5862,8 @@ return changedCount
             except Exception as exc:
                 with self._lock:
                     self._last_run = {
-                        "startedAt": self._last_run.get("startedAt") if self._last_run else datetime.now().isoformat(timespec="seconds"),
-                        "finishedAt": datetime.now().isoformat(timespec="seconds"),
+                        "startedAt": self._last_run.get("startedAt") if self._last_run else _local_iso_seconds(),
+                        "finishedAt": _local_iso_seconds(),
                         "status": "failed",
                         "items": [{"taskName": "初始化", "ok": False, "error": str(exc)}],
                     }
@@ -5377,8 +5907,8 @@ return changedCount
 
             with self._lock:
                 self._last_run = {
-                    "startedAt": self._last_run.get("startedAt") if self._last_run else datetime.now().isoformat(timespec="seconds"),
-                    "finishedAt": datetime.now().isoformat(timespec="seconds"),
+                    "startedAt": self._last_run.get("startedAt") if self._last_run else _local_iso_seconds(),
+                    "finishedAt": _local_iso_seconds(),
                     "status": "done",
                     "items": items,
                 }
@@ -5701,7 +6231,7 @@ return changedCount
             return {"ok": False, "message": "请先填写 API Key"}
         if not model:
             return {"ok": False, "message": "请先填写模型名"}
-        t0 = _time.time()
+        t0 = _time.monotonic()
         try:
             text = send_platform_chat_messages(
                 platform_id, api_key, model,
@@ -5710,7 +6240,7 @@ return changedCount
                     {"role": "user", "content": '这是一条接口连通性测试。请只回复"测试成功"。'},
                 ],
             )
-            latency = int((_time.time() - t0) * 1000)
+            latency = int((_time.monotonic() - t0) * 1000)
             platforms_cfg = config.get("platforms", {}) or {}
             platform_cfg = platforms_cfg.get(platform_id, {})
             if not isinstance(platform_cfg, dict):
@@ -5733,7 +6263,7 @@ return changedCount
             return {"ok": True, "message": str(text).strip(), "latency_ms": latency}
         except Exception as exc:
             from ui.api_config import _classify_test_exception
-            latency = int((_time.time() - t0) * 1000)
+            latency = int((_time.monotonic() - t0) * 1000)
             platforms_cfg = config.get("platforms", {}) or {}
             platform_cfg = platforms_cfg.get(platform_id, {})
             if not isinstance(platform_cfg, dict):
@@ -6014,7 +6544,6 @@ return changedCount
 
     def get_task_monthly_stats(self, task_id: str) -> dict:
         """返回某任务过去6个月每月的文章数，用于品牌柱状图。"""
-        from datetime import date
         # 找到 task_name
         config = self.load_config()
         tasks = list(config.get("tasks", []) or [])
@@ -6034,7 +6563,7 @@ return changedCount
             task_articles = []
 
         # 按月统计文章数，过去6个月
-        today = date.today()
+        today = local_today()
         months = []
         for i in range(5, -1, -1):
             m = today.month - i
@@ -6203,8 +6732,6 @@ return changedCount
         blocked = self._viewer_execution_block_response()
         if blocked:
             return blocked
-        from main import run_task_group
-
         config = self.load_config()
         target_task = None
         for task in config.get("tasks", []) or []:
@@ -6286,7 +6813,42 @@ return changedCount
             if not state:
                 return
             state.update(patch)
-            state["updatedAt"] = datetime.now().isoformat(timespec="seconds")
+            state["updatedAt"] = _local_iso_seconds()
+
+    def _prune_test_runs_locked(self) -> None:
+        now = local_now()
+        terminal_statuses = {"success", "failed", "cancelled"}
+        expired: list[str] = []
+        for run_id, state in list(self._test_runs.items()):
+            status = str((state or {}).get("status") or "").strip()
+            if status not in terminal_statuses:
+                continue
+            timestamp = (
+                (state or {}).get("finishedAt")
+                or (state or {}).get("updatedAt")
+                or (state or {}).get("startedAt")
+            )
+            age = _runtime_timestamp_age_seconds(timestamp, now=now)
+            if age is not None and age > TEST_RUN_TERMINAL_TTL_SECONDS:
+                expired.append(run_id)
+        for run_id in expired:
+            self._test_runs.pop(run_id, None)
+            self._test_run_cancel_events.pop(run_id, None)
+
+    def _prune_search_file_caches_locked(self) -> None:
+        now = local_now()
+        for cache, timestamp_key in (
+            (self._search_uploads, "uploaded_at"),
+            (self._search_outputs, "created_at"),
+        ):
+            expired: list[str] = []
+            for item_id, item in list(cache.items()):
+                path = Path(str((item or {}).get("path") or ""))
+                age = _runtime_timestamp_age_seconds((item or {}).get(timestamp_key), now=now)
+                if not path.exists() or (age is not None and age > SEARCH_FILE_CACHE_TTL_SECONDS):
+                    expired.append(item_id)
+            for item_id in expired:
+                cache.pop(item_id, None)
 
     def _resolve_test_run_failure_context(
         self,
@@ -6386,7 +6948,7 @@ return changedCount
             cancel_event.set()
             state["cancelRequested"] = True
             state["message"] = "正在中断测试任务..."
-            state["updatedAt"] = datetime.now().isoformat(timespec="seconds")
+            state["updatedAt"] = _local_iso_seconds()
             return {
                 "ok": True,
                 "runId": run_id,
@@ -6395,6 +6957,7 @@ return changedCount
             }
 
     def _get_active_test_run_block_reason_locked(self) -> str:
+        self._prune_test_runs_locked()
         for state in self._test_runs.values():
             status = str((state or {}).get("status") or "").strip()
             if status in {"queued", "running"}:
@@ -6483,8 +7046,8 @@ return changedCount
             "currentPlatform": "",
             "message": "测试准备中",
             "result": "",
-            "startedAt": datetime.now().isoformat(timespec="seconds"),
-            "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            "startedAt": _local_iso_seconds(),
+            "updatedAt": _local_iso_seconds(),
             "finishedAt": "",
             "errorMessage": "",
             "failureDetails": [],
@@ -6570,7 +7133,7 @@ return changedCount
                     "finalAnswerChars": int(metrics.get("final_answer_chars") or 0),
                     "finalCompactChars": int(metrics.get("final_compact_chars") or 0),
                     "durationSeconds": float(metrics.get("duration_seconds") or 0.0),
-                    "recordedAt": datetime.now().isoformat(timespec="seconds"),
+                    "recordedAt": _local_iso_seconds(),
                 }
                 with self._test_run_lock:
                     state = self._test_runs.get(run_id)
@@ -6579,7 +7142,7 @@ return changedCount
                     diagnostics = list(state.get("pollDiagnostics") or [])
                     diagnostics.append(item)
                     state["pollDiagnostics"] = diagnostics[-50:]
-                    state["updatedAt"] = datetime.now().isoformat(timespec="seconds")
+                    state["updatedAt"] = _local_iso_seconds()
                 return
             if stage == "query_done":
                 completed_queries = int(payload.get("completed_queries") or 0)
@@ -6615,11 +7178,10 @@ return changedCount
                     "hitQueries": int(payload.get("hit_queries") or 0),
                     "message": detail_message,
                     "result": resolved_result,
-                    "finishedAt": datetime.now().isoformat(timespec="seconds"),
+                    "finishedAt": _local_iso_seconds(),
                 })
 
         def _worker() -> None:
-            from main import run_task_group
             session_manager = self._create_query_session_manager(
                 [target_task],
                 config,
@@ -6658,7 +7220,7 @@ return changedCount
                         "result": "cancelled",
                         "errorMessage": error_message,
                         "failureDetails": self._build_test_run_failure_details(report),
-                        "finishedAt": datetime.now().isoformat(timespec="seconds"),
+                        "finishedAt": _local_iso_seconds(),
                         "report": report,
                     })
                 elif task_success:
@@ -6675,7 +7237,7 @@ return changedCount
                         "sendableSuccessCount": 0,
                         "actualScreenshotCount": 0,
                         "canForceSendSuccess": False,
-                        "finishedAt": datetime.now().isoformat(timespec="seconds"),
+                        "finishedAt": _local_iso_seconds(),
                         "report": report,
                     })
                 else:
@@ -6698,7 +7260,7 @@ return changedCount
                         "errorMessage": error_message,
                         "failureDetails": self._build_test_run_failure_details(report),
                         **self._build_test_run_force_send_snapshot(target_task),
-                        "finishedAt": datetime.now().isoformat(timespec="seconds"),
+                        "finishedAt": _local_iso_seconds(),
                         "report": report,
                     })
             except Exception as exc:
@@ -6715,7 +7277,7 @@ return changedCount
                     "errorMessage": str(exc),
                     "failureDetails": [],
                     **self._build_test_run_force_send_snapshot(target_task),
-                    "finishedAt": datetime.now().isoformat(timespec="seconds"),
+                    "finishedAt": _local_iso_seconds(),
                 })
             finally:
                 with self._test_run_lock:
@@ -6728,6 +7290,7 @@ return changedCount
 
     def get_test_run_status(self, run_id: str) -> dict:
         with self._test_run_lock:
+            self._prune_test_runs_locked()
             state = self._test_runs.get(run_id)
             if not state:
                 return {"ok": False, "message": "未找到测试任务"}
@@ -6784,9 +7347,7 @@ return changedCount
         batch_file = _batch_test_file_path(batch_id)
         if batch_file is None:
             return {"ok": False, "message": "批量测试 ID 无效"}
-        batch_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(batch_file, "w", encoding="utf-8") as f:
-            json.dump(batch_config, f, ensure_ascii=False, indent=2)
+        write_batch_json(batch_file, batch_config)
 
         print(f"[WebBackend] 批量测试配置已保存: {batch_file}")
 
@@ -6820,8 +7381,7 @@ return changedCount
             return {"ok": False, "message": "未找到批量测试任务"}
 
         try:
-            with open(batch_file, "r", encoding="utf-8") as f:
-                batch_config = json.load(f)
+            batch_config = read_batch_json(batch_file)
 
             progress_data = batch_config.get("progress") or {}
             status = batch_config.get("status", "pending")
@@ -6850,8 +7410,7 @@ return changedCount
             return {"ok": False, "message": "报告尚未生成"}
 
         try:
-            with open(report_file, "r", encoding="utf-8") as f:
-                report = json.load(f)
+            report = read_batch_json(report_file)
 
             return {"ok": True, "report": report}
         except Exception as e:
@@ -6867,14 +7426,13 @@ return changedCount
             return {"ok": False, "message": "未找到批量测试任务"}
 
         try:
-            with open(batch_file, "r", encoding="utf-8") as f:
-                batch_config = json.load(f)
-
-            batch_config["status"] = "cancelled"
-            batch_config["updated_at"] = local_now().isoformat()
-
-            with open(batch_file, "w", encoding="utf-8") as f:
-                json.dump(batch_config, f, ensure_ascii=False, indent=2)
+            merge_batch_json(
+                batch_file,
+                {
+                    "status": "cancelled",
+                    "updated_at": local_now().isoformat(),
+                },
+            )
 
             return {"ok": True, "message": "已请求取消"}
         except Exception as e:
@@ -7430,6 +7988,7 @@ return changedCount
             "uploaded_at": local_now().isoformat(timespec="seconds"),
         }
         with self._lock:
+            self._prune_search_file_caches_locked()
             self._search_uploads[file_id] = item
         return {"ok": True, "file": item}
 
@@ -7476,6 +8035,7 @@ return changedCount
             return {"ok": False, "message": "请在输入里写明品牌，例如：确认丸美品牌排名"}
 
         with self._lock:
+            self._prune_search_file_caches_locked()
             upload = dict(self._search_uploads.get(file_id) or {})
         input_path = Path(str(upload.get("path") or ""))
         if not upload or not input_path.exists():
@@ -7495,6 +8055,7 @@ return changedCount
 
         output_id = uuid4().hex
         with self._lock:
+            self._prune_search_file_caches_locked()
             self._search_outputs[output_id] = {
                 "id": output_id,
                 "name": output_path.name,
@@ -7515,6 +8076,7 @@ return changedCount
 
     def get_search_output_file(self, output_id: str) -> dict[str, Any] | None:
         with self._lock:
+            self._prune_search_file_caches_locked()
             item = dict(self._search_outputs.get(output_id) or {})
         path = Path(str(item.get("path") or ""))
         if not item or not path.exists() or not path.is_file():
@@ -8234,7 +8796,7 @@ return changedCount
                     "sendableSuccessCount": actual_screenshot_count,
                     "actualScreenshotCount": actual_screenshot_count,
                     "canForceSendSuccess": False,
-                    "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                    "updatedAt": _local_iso_seconds(),
                 })
         return {
             "ok": True,
@@ -9191,10 +9753,9 @@ return changedCount
         task_id_set = set(str(tid).strip() for tid in task_ids)
 
         def worker() -> None:
-            from main import run_task_group
             with self._lock:
                 self._last_run = {
-                    "startedAt": datetime.now().isoformat(timespec="seconds"),
+                    "startedAt": _local_iso_seconds(),
                     "status": "running",
                     "items": [],
                 }
@@ -9221,8 +9782,8 @@ return changedCount
             except Exception as exc:
                 with self._lock:
                     self._last_run = {
-                        "startedAt": self._last_run.get("startedAt") if self._last_run else datetime.now().isoformat(timespec="seconds"),
-                        "finishedAt": datetime.now().isoformat(timespec="seconds"),
+                        "startedAt": self._last_run.get("startedAt") if self._last_run else _local_iso_seconds(),
+                        "finishedAt": _local_iso_seconds(),
                         "status": "failed",
                         "items": [{"taskName": "初始化", "ok": False, "error": str(exc)}],
                     }
@@ -9247,8 +9808,8 @@ return changedCount
                 items.append({"taskName": "资源清理", "ok": False, "error": str(exc)})
             with self._lock:
                 self._last_run = {
-                    "startedAt": self._last_run.get("startedAt") if self._last_run else datetime.now().isoformat(timespec="seconds"),
-                    "finishedAt": datetime.now().isoformat(timespec="seconds"),
+                    "startedAt": self._last_run.get("startedAt") if self._last_run else _local_iso_seconds(),
+                    "finishedAt": _local_iso_seconds(),
                     "status": "done",
                     "items": items,
                 }
@@ -9363,6 +9924,9 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/api/session":
+            _json_response(self, self.runtime.session_snapshot())
+            return
         if path.startswith("/api/bootstrap"):
             _json_response(self, self.runtime.snapshot())
             return

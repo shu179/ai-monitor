@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
-import threading
-from datetime import datetime
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 from uuid import uuid4
 
 from core.app_paths import resolve_app_dir, resolve_app_path
 from core.browser_processes import is_browser_profile_in_use
+from core.file_lock import CrossProcessRLock
+from core.time_utils import local_now
 
 BROWSER_AUTH_PLATFORM_IDS: tuple[str, ...] = (
     "doubao",
@@ -24,7 +26,7 @@ BROWSER_AUTH_PLATFORM_IDS: tuple[str, ...] = (
 
 _METADATA_PATH = resolve_app_path("user_data/browser_auth_profiles.json")
 _PROFILE_ROOT = resolve_app_dir("user_data/browser_auth_profiles")
-_LOCK = threading.RLock()
+_LOCK = CrossProcessRLock(lambda: _metadata_lock_file())
 
 _SAFE_BROWSER_CACHE_RELATIVE_PATHS: tuple[str, ...] = (
     "BrowserMetrics",
@@ -49,7 +51,7 @@ _SAFE_BROWSER_CACHE_RELATIVE_PATHS: tuple[str, ...] = (
 
 
 def _now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return local_now().isoformat(timespec="seconds")
 
 
 def _normalize_platform_name(platform_name: str) -> str:
@@ -58,26 +60,40 @@ def _normalize_platform_name(platform_name: str) -> str:
 
 
 def _load_metadata() -> dict[str, Any]:
-    if not _METADATA_PATH.exists():
-        return {"platforms": {}}
-    try:
-        payload = json.loads(_METADATA_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"platforms": {}}
-    if not isinstance(payload, dict):
-        return {"platforms": {}}
-    platforms = payload.get("platforms")
-    if not isinstance(platforms, dict):
-        payload["platforms"] = {}
-    return payload
+    with _LOCK:
+        if not _METADATA_PATH.exists():
+            return {"platforms": {}}
+        try:
+            payload = json.loads(_METADATA_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {"platforms": {}}
+        if not isinstance(payload, dict):
+            return {"platforms": {}}
+        platforms = payload.get("platforms")
+        if not isinstance(platforms, dict):
+            payload["platforms"] = {}
+        return payload
 
 
 def _save_metadata(metadata: dict[str, Any]) -> None:
-    _METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _METADATA_PATH.write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    with _LOCK:
+        _METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(_METADATA_PATH.parent), prefix=f".{_METADATA_PATH.name}.", suffix=".tmp")
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, _METADATA_PATH)
+        except BaseException:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+
+
+def _metadata_lock_file() -> Path:
+    return _METADATA_PATH.with_name(f".{_METADATA_PATH.name}.lock")
 
 
 def _platform_bucket(metadata: dict[str, Any], platform_name: str) -> dict[str, Any]:
@@ -629,7 +645,7 @@ def create_fresh_browser_auth_profile(
         now = _now_iso()
         profiles[profile_id] = {
             "id": profile_id,
-            "label": str(label or f"新环境 {datetime.now().strftime('%m-%d %H:%M')}").strip(),
+            "label": str(label or f"新环境 {local_now().strftime('%m-%d %H:%M')}").strip(),
             "relative_path": relative_path,
             "created_at": now,
             "updated_at": now,

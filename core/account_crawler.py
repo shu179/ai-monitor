@@ -24,6 +24,7 @@ from xml.etree import ElementTree
 import requests
 
 from core.app_paths import resolve_app_path
+from core.file_lock import CrossProcessRLock
 from core.local_account_space import account_scoped_path
 from core.article_store import (
     add_article,
@@ -35,6 +36,7 @@ from core.article_store import (
     resolve_media_name,
     update_article,
 )
+from core.time_utils import local_now, local_today
 
 ACCOUNT_CRAWL_STATE_FILE = resolve_app_path("logs/account_crawl_state.json")
 DEFAULT_RSSHUB_BASE_URL = "https://rsshub.app"
@@ -60,7 +62,7 @@ SOHU_BROWSER_MAX_PAGES = 10
 SOHU_BROWSER_PAGE_SIZE = 20
 ACCOUNT_BROWSER_TIMEOUT_MS = 30000
 
-_lock = threading.Lock()
+_lock = CrossProcessRLock(lambda: _state_lock_file())
 _account_browser_lock = threading.Lock()
 _rsshub_success_cache: dict[str, str] = {}
 
@@ -199,42 +201,48 @@ SOHU_FEED_CONTAINER_KEYS = (
 
 
 def _now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return _local_naive_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _article_ts_now() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+    return local_today().isoformat()
+
+
+def _local_naive_now() -> datetime:
+    return local_now().replace(tzinfo=None)
 
 
 def _read_state() -> dict[str, Any]:
-    state_path = _state_path()
-    try:
-        if state_path.exists():
-            with open(state_path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    return {}
+    with _lock:
+        state_path = _state_path()
+        try:
+            if state_path.exists():
+                with open(state_path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        return {}
 
 
 def _write_state(state: dict[str, Any]) -> None:
-    state_path = _state_path()
-    try:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(state_path.parent), suffix=".tmp")
+    with _lock:
+        state_path = _state_path()
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(state, handle, ensure_ascii=False, indent=2)
-            os.replace(tmp, state_path)
-        except BaseException:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(state_path.parent), suffix=".tmp")
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-    except Exception as exc:
-        print(f"[AccountCrawler] 写入状态失败: {exc}")
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(state, handle, ensure_ascii=False, indent=2)
+                os.replace(tmp, state_path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except Exception as exc:
+            print(f"[AccountCrawler] 写入状态失败: {exc}")
 
 
 def _state_path() -> Path:
@@ -242,6 +250,11 @@ def _state_path() -> Path:
     if ACCOUNT_CRAWL_STATE_FILE != resolved_default:
         return ACCOUNT_CRAWL_STATE_FILE
     return account_scoped_path("logs/account_crawl_state.json", fallback=resolved_default)
+
+
+def _state_lock_file() -> Path:
+    state_path = _state_path()
+    return state_path.parent / f".{state_path.name}.lock"
 
 
 def _ensure_url_scheme(url: str) -> str:
@@ -365,7 +378,7 @@ def should_run_scheduled_crawl(config: dict[str, Any] | None) -> bool:
     last_run = _parse_state_datetime(state.get("last_auto_run_at"))
     if last_run is None:
         return True
-    return datetime.now() - last_run >= timedelta(minutes=int(settings["frequency_minutes"]))
+    return _local_naive_now() - last_run >= timedelta(minutes=int(settings["frequency_minutes"]))
 
 
 def _parse_state_datetime(value: Any) -> datetime | None:
@@ -519,7 +532,12 @@ def crawl_account_articles(
         state["last_manual_run_at"] = _now_text()
     state["last_excluded_count"] = int(summary.get("excluded_count") or 0)
     state["last_excluded_links"] = list(summary.get("excluded_links") or [])[:20]
-    _write_state(state)
+    _merge_and_write_state_after_crawl(
+        state,
+        accounts=accounts,
+        trigger=trigger,
+        summary=summary,
+    )
 
     failed_count = sum(1 for item in summary["results"] if not item.get("ok"))
     excluded_suffix = f"，已排除 {summary['excluded_count']} 篇" if summary["excluded_count"] else ""
@@ -1362,7 +1380,7 @@ def _rsshub_base_score(
 
 def _rsshub_base_in_cooldown(health: dict[str, Any]) -> bool:
     disabled_until = _parse_state_datetime(health.get("disabled_until"))
-    return bool(disabled_until and disabled_until > datetime.now())
+    return bool(disabled_until and disabled_until > _local_naive_now())
 
 
 def _preferred_rsshub_bases(settings: dict[str, Any], *, platform: str = "", account_id: str = "") -> list[str]:
@@ -1399,6 +1417,46 @@ def _remember_runtime_rsshub_success(platform: str, base_url: str, *, account_id
             _rsshub_success_cache[f"account:{account_key}"] = normalized
         if platform_key:
             _rsshub_success_cache[f"platform:{platform_key}"] = normalized
+
+
+def _merge_and_write_state_after_crawl(
+    state: dict[str, Any],
+    *,
+    accounts: list[dict[str, Any]],
+    trigger: str,
+    summary: dict[str, Any],
+) -> None:
+    with _lock:
+        latest = _read_state()
+        latest_accounts = latest.setdefault("accounts", {})
+        crawled_account_ids = [
+            str(account.get("id") or "").strip()
+            for account in accounts
+            if str(account.get("id") or "").strip()
+        ]
+        source_accounts = state.get("accounts") if isinstance(state.get("accounts"), dict) else {}
+        for account_id in crawled_account_ids:
+            account_state = source_accounts.get(account_id)
+            if isinstance(account_state, dict):
+                latest_accounts[account_id] = dict(account_state)
+
+        for key in ("rsshub_success_bases", "account_rsshub_success_bases", "rsshub_health"):
+            source_bucket = state.get(key) if isinstance(state.get(key), dict) else {}
+            if not source_bucket:
+                continue
+            target_bucket = latest.setdefault(key, {})
+            if isinstance(target_bucket, dict):
+                target_bucket.update(source_bucket)
+            else:
+                latest[key] = dict(source_bucket)
+
+        if trigger == "auto":
+            latest["last_auto_run_at"] = str(state.get("last_auto_run_at") or _now_text())
+        else:
+            latest["last_manual_run_at"] = str(state.get("last_manual_run_at") or _now_text())
+        latest["last_excluded_count"] = int(summary.get("excluded_count") or 0)
+        latest["last_excluded_links"] = list(summary.get("excluded_links") or [])[:20]
+        _write_state(latest)
 
 
 def _build_rsshub_attempt(
@@ -1457,7 +1515,9 @@ def _apply_rsshub_attempt_to_state(state: dict[str, Any], attempt: dict[str, Any
     health["last_error"] = str(attempt.get("error") or "").strip()[:300]
     cooldown_minutes = _rsshub_cooldown_minutes(status_code, consecutive_failures)
     if cooldown_minutes > 0:
-        health["disabled_until"] = (datetime.now() + timedelta(minutes=cooldown_minutes)).strftime("%Y-%m-%d %H:%M:%S")
+        health["disabled_until"] = (
+            _local_naive_now() + timedelta(minutes=cooldown_minutes)
+        ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _rsshub_cooldown_minutes(status_code: int, consecutive_failures: int) -> int:

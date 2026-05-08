@@ -24,10 +24,12 @@ from backend_lib.config_provider import RuntimeConfigProvider
 from core.app_paths import resolve_app_path
 from core.article_store import (
     analyze_article_matches,
+    bulk_upsert_articles,
     confirm_article_import_batch,
     extract_domain,
     get_articles_file_path,
     get_articles,
+    normalize_article_url,
     resolve_article_export_keywords,
     resolve_article_source,
     save_domain_media_name,
@@ -36,6 +38,7 @@ from core.article_store import (
     update_media_type as update_article_media_type,
 )
 from core.daily_task_state import derive_task_id
+from core.file_lock import CrossProcessRLock
 from core.local_account_space import account_scoped_path
 from core.time_utils import local_now, local_today, parse_local_date
 
@@ -135,11 +138,105 @@ def _article_to_api(
     return payload
 
 
+def _merge_unique_texts(left: Any, right: Any) -> list[str]:
+    result: list[str] = []
+    for values in (left, right):
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in result:
+                result.append(text)
+    return result
+
+
+def _merge_article_for_duplicate_url(base: dict[str, Any], duplicate: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key in ("matched_tasks", "referenced_tasks", "cloud_task_ids"):
+        merged[key] = _merge_unique_texts(merged.get(key), duplicate.get(key))
+
+    base_reasons = merged.get("match_reasons") if isinstance(merged.get("match_reasons"), dict) else {}
+    duplicate_reasons = duplicate.get("match_reasons") if isinstance(duplicate.get("match_reasons"), dict) else {}
+    if base_reasons or duplicate_reasons:
+        next_reasons: dict[str, list[str]] = {}
+        for task_name in set(base_reasons.keys()) | set(duplicate_reasons.keys()):
+            next_reasons[str(task_name)] = _merge_unique_texts(
+                base_reasons.get(task_name),
+                duplicate_reasons.get(task_name),
+            )
+        merged["match_reasons"] = next_reasons
+
+    base_hits = merged.get("reference_hits") if isinstance(merged.get("reference_hits"), dict) else {}
+    duplicate_hits = duplicate.get("reference_hits") if isinstance(duplicate.get("reference_hits"), dict) else {}
+    if duplicate_hits:
+        merged["reference_hits"] = {**base_hits, **duplicate_hits}
+
+    for key in ("url", "title", "media_name", "platform", "published_at", "ts"):
+        if not str(merged.get(key) or "").strip() and str(duplicate.get(key) or "").strip():
+            merged[key] = duplicate.get(key)
+    return merged
+
+
+def _article_url_fingerprint(article: dict[str, Any]) -> str:
+    title = re.sub(r"\s+", " ", str(article.get("title") or "").strip()).lower()
+    source = re.sub(
+        r"\s+",
+        " ",
+        str(article.get("media_name") or article.get("source") or article.get("platform") or "").strip(),
+    ).lower()
+    published = str(article.get("published_at") or article.get("published") or article.get("ts") or "").strip()[:10]
+    if not title or not source:
+        return ""
+    return "|".join([title, source, published])
+
+
+def _dedupe_articles_by_url(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    index_by_url: dict[str, int] = {}
+    url_by_fingerprint: dict[str, str] = {}
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        normalized_url = normalize_article_url(str(article.get("url") or ""))
+        fingerprint = _article_url_fingerprint(article)
+        if normalized_url and fingerprint and fingerprint not in url_by_fingerprint:
+            url_by_fingerprint[fingerprint] = str(article.get("url") or "").strip()
+
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        item = dict(article)
+        normalized_url = normalize_article_url(str(item.get("url") or ""))
+        if not normalized_url:
+            fallback_url = url_by_fingerprint.get(_article_url_fingerprint(item), "")
+            if fallback_url:
+                item["url"] = fallback_url
+                normalized_url = normalize_article_url(fallback_url)
+        if not normalized_url:
+            deduped.append(item)
+            continue
+        existing_index = index_by_url.get(normalized_url)
+        if existing_index is None:
+            index_by_url[normalized_url] = len(deduped)
+            deduped.append(item)
+            continue
+        deduped[existing_index] = _merge_article_for_duplicate_url(deduped[existing_index], item)
+    return deduped
+
+
 def _article_import_batches_path() -> Path:
     return account_scoped_path(
         "logs/article_import_batches.json",
         fallback=resolve_app_path("logs/article_import_batches.json"),
     )
+
+
+_ARTICLE_IMPORT_BATCHES_LOCK = CrossProcessRLock(lambda: _article_import_batches_lock_file())
+
+
+def _article_import_batches_lock_file() -> Path:
+    path = _article_import_batches_path()
+    return path.with_name(f".{path.name}.lock")
 
 
 def _normalize_article_import_batch(batch: Any) -> dict[str, Any] | None:
@@ -177,52 +274,65 @@ def _normalize_article_import_batch(batch: Any) -> dict[str, Any] | None:
 
 
 def _load_article_import_batches_file() -> dict[str, dict[str, Any]]:
-    path = _article_import_batches_path()
-    try:
-        if not path.exists():
-            return {}
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return {}
-
-    raw_batches = data.get("batches") if isinstance(data, dict) else data
-    if isinstance(raw_batches, dict):
-        iterable = raw_batches.values()
-    elif isinstance(raw_batches, list):
-        iterable = raw_batches
-    else:
-        iterable = []
-    batches: dict[str, dict[str, Any]] = {}
-    for item in iterable:
-        batch = _normalize_article_import_batch(item)
-        if batch and batch.get("status") == "pending":
-            batches[str(batch["id"])] = batch
-    return batches
-
-
-def _save_article_import_batches_file(batches: dict[str, dict[str, Any]]) -> None:
-    path = _article_import_batches_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "updated_at": local_now().isoformat(timespec="seconds"),
-        "batches": [
-            batch
-            for batch in batches.values()
-            if isinstance(batch, dict) and str(batch.get("status") or "pending") == "pending"
-        ],
-    }
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except BaseException:
+    with _ARTICLE_IMPORT_BATCHES_LOCK:
+        path = _article_import_batches_path()
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+            if not path.exists():
+                return {}
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return {}
+
+        raw_batches = data.get("batches") if isinstance(data, dict) else data
+        if isinstance(raw_batches, dict):
+            iterable = raw_batches.values()
+        elif isinstance(raw_batches, list):
+            iterable = raw_batches
+        else:
+            iterable = []
+        batches: dict[str, dict[str, Any]] = {}
+        for item in iterable:
+            batch = _normalize_article_import_batch(item)
+            if batch and batch.get("status") == "pending":
+                batches[str(batch["id"])] = batch
+        return batches
+
+
+def _save_article_import_batches_file(
+    batches: dict[str, dict[str, Any]],
+    *,
+    merge_existing: bool = False,
+) -> None:
+    with _ARTICLE_IMPORT_BATCHES_LOCK:
+        path = _article_import_batches_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pending_batches = {
+            str(batch.get("id") or import_id): batch
+            for import_id, batch in batches.items()
+            if isinstance(batch, dict)
+            and str(batch.get("id") or import_id).strip()
+            and str(batch.get("status") or "pending") == "pending"
+        }
+        if merge_existing:
+            existing = _load_article_import_batches_file()
+            existing.update(pending_batches)
+            pending_batches = existing
+        payload = {
+            "updated_at": local_now().isoformat(timespec="seconds"),
+            "batches": list(pending_batches.values()),
+        }
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 class ArticleImportBatchStore:
@@ -244,8 +354,8 @@ class ArticleImportBatchStore:
             self._loaded = True
         return self._batches
 
-    def save(self) -> None:
-        _save_article_import_batches_file(self.get_batches())
+    def save(self, *, merge_existing: bool = False) -> None:
+        _save_article_import_batches_file(self.get_batches(), merge_existing=merge_existing)
 
     def reset(self) -> None:
         self._batches = {}
@@ -467,6 +577,7 @@ class ArticleService:
             type_map = {"media": "authority", "self-media": "selfmedia"}
             target = type_map.get(media_type, media_type)
             articles = [article for article in articles if article.get("media_type") == target]
+        articles = _dedupe_articles_by_url(articles)
         total = len(articles)
         today = local_today()
         today_total = sum(1 for article in articles if _article_published_date(article) == today)
@@ -598,12 +709,8 @@ class ArticleService:
 
         try:
             from core.article_store import (
-                add_article as store_add_article,
                 classify_article_media_type,
-                find_article_by_url,
-                normalize_article_url,
                 resolve_media_name,
-                update_article as store_update_article,
             )
 
             raw_items, details = _extract_article_import_items(original_name, data)
@@ -623,6 +730,13 @@ class ArticleService:
             duplicate_count = 0
             skipped_count = 0
             seen_keys: set[str] = set()
+            existing_by_url = {
+                normalize_article_url(str(article.get("url") or "")): article
+                for article in get_articles()
+                if isinstance(article, dict) and normalize_article_url(str(article.get("url") or ""))
+            }
+            pending_upserts: list[dict[str, Any]] = []
+            pending_kinds: list[str] = []
 
             mutable_import_fields = (
                 "url",
@@ -742,7 +856,7 @@ class ArticleService:
                     "unmatched_reason": analyzed.get("unmatched_reason", "") or "",
                 })
 
-                existing_article = find_article_by_url(normalized_url) if normalized_url else None
+                existing_article = existing_by_url.get(normalized_url) if normalized_url else None
                 if existing_article:
                     candidate_article = dict(existing_article)
                     candidate_article.update({
@@ -778,18 +892,25 @@ class ArticleService:
                     if not values_changed(existing_article, candidate_article):
                         duplicate_count += 1
                         continue
-                    updated_article = store_update_article(str(existing_article.get("id") or ""), candidate_article) or candidate_article
+                    candidate_article["id"] = str(existing_article.get("id") or "").strip()
                     updated_articles.append({
                         "id": str(existing_article.get("id") or "").strip(),
                         "before": copy.deepcopy(existing_article),
                     })
-                    imported_articles.append(updated_article)
+                    pending_upserts.append(candidate_article)
+                    pending_kinds.append("update")
                     continue
 
-                article = store_add_article(draft_article)
-                article_id = str(article.get("id") or "").strip()
-                if article_id:
-                    imported_ids.append(article_id)
+                pending_upserts.append(draft_article)
+                pending_kinds.append("create")
+
+            if pending_upserts:
+                stored_articles = bulk_upsert_articles(pending_upserts)
+                for kind, article in zip(pending_kinds, stored_articles):
+                    if kind == "create":
+                        article_id = str(article.get("id") or "").strip()
+                        if article_id:
+                            imported_ids.append(article_id)
                     imported_articles.append(article)
 
             if not imported_ids and not updated_articles:
@@ -818,7 +939,7 @@ class ArticleService:
             with self._lock:
                 batches = self._import_batch_store.get_batches()
                 batches[import_id] = batch
-                self._import_batch_store.save()
+                self._import_batch_store.save(merge_existing=True)
             self._invalidate_article_cache()
 
             return {

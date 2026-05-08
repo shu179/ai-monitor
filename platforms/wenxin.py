@@ -626,16 +626,16 @@ class WenxinPlatform(BasePlatform):
             get_text = self._get_answer_text
 
         self._begin_answer_capture(keyword=keyword, brand=brand)
-        start_time = time.time()
+        start_time = time.monotonic()
         last_text = ""
         stable_count = 0
-        while time.time() - start_time < timeout:
+        while time.monotonic() - start_time < timeout:
             self._raise_if_stop_requested()
             try:
                 self.check_for_interruption()
             except InterruptionDetected:
                 print(f"[{self.name}] 人工干预完成，继续等待当前回答生成...")
-                start_time = time.time()
+                start_time = time.monotonic()
                 stable_count = 0
                 last_text = ""
                 self._cooperative_sleep(2)
@@ -643,7 +643,7 @@ class WenxinPlatform(BasePlatform):
 
             self._schedule_answer_poll_read()
             page_text = get_text() or ""
-            elapsed = time.time() - start_time
+            elapsed = time.monotonic() - start_time
             if elapsed < min_wait:
                 last_text = page_text
                 self._cooperative_sleep(1)

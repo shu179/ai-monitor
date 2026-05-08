@@ -17,7 +17,6 @@ import threading
 import unicodedata
 from dataclasses import dataclass, field
 from abc import ABC
-from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urlparse
@@ -235,21 +234,21 @@ class BasePlatform(ABC):
             raise SchedulerStopRequested(self.last_error) from exc
 
     def _cooperative_sleep(self, seconds: float, interval: float = 0.1) -> None:
-        deadline = time.time() + max(0.0, float(seconds or 0.0))
+        deadline = time.monotonic() + max(0.0, float(seconds or 0.0))
         while True:
             self._raise_if_stop_requested()
-            remaining = deadline - time.time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
             time.sleep(min(interval, remaining))
 
     def _wait_for_page_selector(self, selector: str, timeout_ms: int) -> None:
-        deadline = time.time() + max(0.1, timeout_ms / 1000.0)
+        deadline = time.monotonic() + max(0.1, timeout_ms / 1000.0)
         last_error = None
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             self._raise_if_stop_requested()
             try:
-                remaining_ms = max(100, min(500, int((deadline - time.time()) * 1000)))
+                remaining_ms = max(100, min(500, int((deadline - time.monotonic()) * 1000)))
                 self.page.wait_for_selector(selector, timeout=remaining_ms)
                 self._raise_if_stop_requested()
                 return
@@ -335,8 +334,8 @@ class BasePlatform(ABC):
 
     def _wait_until_new_chat_ready(self, before: dict, timeout: float = 6.0) -> bool:
         """Generic confirmation that a new-chat click really moved to a new session."""
-        deadline = time.time() + max(1.0, float(timeout or 0))
-        while time.time() < deadline:
+        deadline = time.monotonic() + max(1.0, float(timeout or 0))
+        while time.monotonic() < deadline:
             self._raise_if_stop_requested()
             current = self._conversation_snapshot()
             if self._new_chat_transition_ready(before, current):
@@ -412,12 +411,12 @@ class BasePlatform(ABC):
             pass
 
     def _wait_for_locator(self, locator, timeout_ms: int) -> None:
-        deadline = time.time() + max(0.1, timeout_ms / 1000.0)
+        deadline = time.monotonic() + max(0.1, timeout_ms / 1000.0)
         last_error = None
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             self._raise_if_stop_requested()
             try:
-                remaining_ms = max(100, min(500, int((deadline - time.time()) * 1000)))
+                remaining_ms = max(100, min(500, int((deadline - time.monotonic()) * 1000)))
                 locator.wait_for(timeout=remaining_ms)
                 self._raise_if_stop_requested()
                 return
@@ -429,12 +428,12 @@ class BasePlatform(ABC):
         raise TimeoutError("等待定位元素超时")
 
     def _click_locator(self, locator, timeout_ms: int = 5000, **kwargs) -> None:
-        deadline = time.time() + max(0.1, timeout_ms / 1000.0)
+        deadline = time.monotonic() + max(0.1, timeout_ms / 1000.0)
         last_error = None
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             self._raise_if_stop_requested()
             try:
-                remaining_ms = max(200, min(800, int((deadline - time.time()) * 1000)))
+                remaining_ms = max(200, min(800, int((deadline - time.monotonic()) * 1000)))
                 # 增强：点击前模拟鼠标悬停
                 try:
                     locator.hover(timeout=min(1000, remaining_ms // 2))
@@ -835,9 +834,9 @@ class BasePlatform(ABC):
         self._external_browser_port = port
 
         endpoint = f"http://127.0.0.1:{port}"
-        deadline = time.time() + 15.0
+        deadline = time.monotonic() + 15.0
         last_error: Exception | None = None
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             try:
                 if process.poll() is not None:
                     raise RuntimeError("Chrome 启动后立即退出")
@@ -1118,7 +1117,7 @@ class BasePlatform(ABC):
         self._answer_poll_metrics = {
             "enabled": enabled,
             "platform": self.name,
-            "started_at": time.time(),
+            "started_at": time.monotonic(),
             "keyword_chars": len(str(keyword or "")),
             "brand_chars": len(str(brand or "")),
             "poll_schedules": 0,
@@ -1241,8 +1240,9 @@ class BasePlatform(ABC):
         text = str(final_text or self.last_answer_text or "")
         metrics["finished"] = True
         metrics["outcome"] = str(outcome or "").strip() or "unknown"
-        started_at = float(metrics.get("started_at", time.time()) or time.time())
-        metrics["duration_seconds"] = round(max(0.0, time.time() - started_at), 2)
+        now = time.monotonic()
+        started_at = float(metrics.get("started_at", now) or now)
+        metrics["duration_seconds"] = round(max(0.0, now - started_at), 2)
         metrics["final_answer_chars"] = len(text)
         metrics["final_compact_chars"] = len(self._normalize_compact_text(text))
         metrics["keyword_chars"] = len(str(keyword or ""))
@@ -2468,7 +2468,7 @@ class BasePlatform(ABC):
 
         overlay_state = {"matched": False}
         if self._overlay_detection_enabled:
-            now = time.time()
+            now = time.monotonic()
             last_scan = float(getattr(self, "_last_interruption_overlay_scan_at", 0.0) or 0.0)
             interval = float(getattr(self, "_interruption_overlay_scan_interval_seconds", 8.0) or 8.0)
             cached_state = {}
@@ -2565,9 +2565,9 @@ class BasePlatform(ABC):
         timeout_seconds: float = 12.0,
         check_input_visible: bool = True,
     ) -> dict:
-        deadline = time.time() + max(1.0, float(timeout_seconds or 0.0))
+        deadline = time.monotonic() + max(1.0, float(timeout_seconds or 0.0))
         last_state = self._collect_interruption_state(check_input_visible=check_input_visible)
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             self._raise_if_stop_requested()
             last_state = self._collect_interruption_state(check_input_visible=check_input_visible)
             if self._is_interruption_cleared(last_state):
@@ -2829,8 +2829,8 @@ class BasePlatform(ABC):
         expected = self._normalize_compact_text(expected_text)
         if not expected:
             return True
-        deadline = time.time() + max(1.0, float(timeout or 0.0))
-        while time.time() < deadline:
+        deadline = time.monotonic() + max(1.0, float(timeout or 0.0))
+        while time.monotonic() < deadline:
             self._raise_if_stop_requested()
             current = self._normalize_compact_text(self._read_input_value())
             if current == expected or expected in current:
@@ -2840,8 +2840,8 @@ class BasePlatform(ABC):
 
     def _wait_for_submit_started(self, before_input: str, timeout: float = 8.0) -> bool:
         before_compact = self._normalize_compact_text(before_input)
-        deadline = time.time() + max(1.0, float(timeout or 0.0))
-        while time.time() < deadline:
+        deadline = time.monotonic() + max(1.0, float(timeout or 0.0))
+        while time.monotonic() < deadline:
             self._raise_if_stop_requested()
             signal = self._has_submit_started_signal()
             if signal:
@@ -2892,9 +2892,9 @@ class BasePlatform(ABC):
         return None
 
     def _wait_for_submit_start_signal(self, timeout: float = 4.0) -> bool:
-        deadline = time.time() + max(0.5, float(timeout or 0.0))
+        deadline = time.monotonic() + max(0.5, float(timeout or 0.0))
         supported = False
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             self._raise_if_stop_requested()
             try:
                 signal = self._has_submit_started_signal()
@@ -3339,7 +3339,7 @@ class BasePlatform(ABC):
         return current
 
     def _begin_answer_capture(self, *, keyword: str = "", brand: str = "") -> None:
-        self._answer_capture_session = AnswerCaptureSession(started_at=time.time())
+        self._answer_capture_session = AnswerCaptureSession(started_at=time.monotonic())
         self._reset_answer_read_controls()
         self._reset_answer_poll_metrics(keyword=keyword, brand=brand)
 
@@ -3360,7 +3360,7 @@ class BasePlatform(ABC):
             "blocks": blocks,
             "raw_text": text,
             "raw_html": html_body,
-            "captured_at": time.time(),
+            "captured_at": time.monotonic(),
         }
 
     def _choose_better_answer_html(
@@ -3412,7 +3412,7 @@ class BasePlatform(ABC):
         if session is None:
             return ""
 
-        now = time.time()
+        now = time.monotonic()
         root_key = str(payload.get("root_key") or "").strip()
         if root_key:
             session.root_key = root_key
@@ -3635,7 +3635,7 @@ class BasePlatform(ABC):
         return best_text, False
 
     def is_generation_complete(self, page_text: str, start_time: float) -> bool:
-        """DOM-based completion check. Subclasses override with platform-specific JS."""
+        """DOM-based completion check. ``start_time`` is a monotonic timestamp."""
         return False
 
     def _poll_until_complete(self, brand: str, on_rank, get_text=None, timeout: int = 180, min_wait: int = 8, keyword: str = "") -> None:
@@ -3653,7 +3653,7 @@ class BasePlatform(ABC):
                     self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 return self.page.evaluate("() => document.body.innerText") or ""
         self._begin_answer_capture(keyword=keyword, brand=brand)
-        start_time = time.time()
+        start_time = time.monotonic()
         last_text = ""
         stable_count = 0
         dom_fail_count = 0  # 连续DOM检测失败次数，用于降级到文本稳定判断
@@ -3688,14 +3688,14 @@ class BasePlatform(ABC):
                 self._reraise_stop_requested(exc)
                 raise
 
-        while time.time() - start_time < timeout:
+        while time.monotonic() - start_time < timeout:
             self._raise_if_stop_requested()
             # 每次轮询前检测人机识别/弹窗
             try:
                 self.check_for_interruption()
             except InterruptionDetected:
                 print(f"[{self.name}] 人工干预完成，继续等待当前回答生成...")
-                start_time = time.time()
+                start_time = time.monotonic()
                 stable_count = 0
                 dom_fail_count = 0
                 dom_pending_count = 0
@@ -3703,7 +3703,7 @@ class BasePlatform(ABC):
                 self._cooperative_sleep(2)
                 continue
 
-            elapsed = time.time() - start_time
+            elapsed = time.monotonic() - start_time
             last_text_before_poll = last_text
             fresh_text_read = False
             try:
@@ -4230,7 +4230,7 @@ class BasePlatform(ABC):
         import io
         from core.screenshot_tools import decorate_screenshot
 
-        ts = datetime.now().strftime("%m%d_%H%M%S")
+        ts = local_now().strftime("%m%d_%H%M%S")
         screenshots_dir = resolve_app_dir("screenshots")
         filename = screenshots_dir / f"{self.name}_{ts}.jpg"
 
@@ -4294,7 +4294,7 @@ class BasePlatform(ABC):
         """提取回答 DOM，本地复排后直接截图。"""
         from platforms.html_renderer import render_html_to_screenshot, render_text_to_screenshot
 
-        ts = datetime.now().strftime("%m%d_%H%M%S")
+        ts = local_now().strftime("%m%d_%H%M%S")
         screenshots_dir = resolve_app_dir("screenshots")
         filename = screenshots_dir / f"{self.name}_{ts}_dom.jpg"
 
@@ -4350,7 +4350,7 @@ class BasePlatform(ABC):
             "highlight_count": 0,
             "preview_available": False,
             "render_mode": "dom",
-            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "generated_at": local_now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         print(f"[{self.name}] DOM 复排截图已保存: {screenshot}")
         return str(screenshot)

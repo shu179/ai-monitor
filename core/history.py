@@ -15,6 +15,7 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 
 from .app_paths import resolve_app_path
+from .file_lock import CrossProcessRLock
 from .local_account_space import account_scoped_path
 from .time_utils import local_now, local_today, parse_local_date
 
@@ -69,7 +70,7 @@ _STRUCTURAL_ERROR_PATTERNS = (
 
 # 本次启动后遇到的无数据天数计数（程序重启自动重置）
 _startup_missing_count: dict = {}  # task_name -> int
-_locks: dict = {}
+_locks: dict[str, CrossProcessRLock] = {}
 _locks_mutex = threading.Lock()
 _MAX_LOCKS = 500  # 锁字典的最大容量，超出时清理最旧的 25%
 
@@ -908,16 +909,19 @@ def get_brand_trend_series(
         start_candidates.append(launch_start_date)
     series_start = min(window_start, min(start_candidates))
     date_list = [series_start + timedelta(days=i) for i in range((today - series_start).days + 1)]
-    cache = _load_brand_trend_cache(task_name, brand_names, task_id=task_id)
-    generated_items, effective_recorded_dates = _build_display_rate_items(
-        task_name,
-        records,
-        date_list=date_list,
-        existing_items=cache.get("items") or [],
-        seed_namespace=_brand_trend_cache_key(task_name, brand_names, task_id=task_id),
-        launch_start_date=launch_start_date,
-    )
-    _save_brand_trend_cache(task_name, brand_names, generated_items, task_id=task_id)
+    cache_key = _brand_trend_cache_key(task_name, brand_names, task_id=task_id)
+    cache_lock = _get_lock(f"{cache_key}__trend_cache")
+    with cache_lock:
+        cache = _load_brand_trend_cache(task_name, brand_names, task_id=task_id)
+        generated_items, effective_recorded_dates = _build_display_rate_items(
+            task_name,
+            records,
+            date_list=date_list,
+            existing_items=cache.get("items") or [],
+            seed_namespace=cache_key,
+            launch_start_date=launch_start_date,
+        )
+        _save_brand_trend_cache(task_name, brand_names, generated_items, task_id=task_id)
     values_by_date = {
         str(item.get("date") or ""): item.get("rate")
         for item in generated_items
@@ -1496,13 +1500,34 @@ def get_history_dir() -> Path:
     return _history_dir()
 
 
-def _get_lock(task_name: str) -> threading.Lock:
+def _history_lock_file(lock_key: str) -> Path:
+    return _history_dir() / ".locks" / f"{_safe_name(lock_key)}.lock"
+
+
+def _get_lock(task_name: str) -> CrossProcessRLock:
+    lock_key = str(task_name or "__default__").strip() or "__default__"
     with _locks_mutex:
-        lock = _locks.get(task_name)
+        lock = _locks.pop(lock_key, None)
         if lock is None:
-            lock = threading.Lock()
-            _locks[task_name] = lock
+            lock = CrossProcessRLock(lambda key=lock_key: _history_lock_file(key))
+        _locks[lock_key] = lock
+        _prune_lock_cache_locked()
         return lock
+
+
+def _prune_lock_cache_locked() -> None:
+    capacity = max(1, int(_MAX_LOCKS or 1))
+    if len(_locks) <= capacity:
+        return
+
+    target_size = max(1, int(capacity * 0.75))
+    for key in list(_locks.keys()):
+        if len(_locks) <= target_size:
+            break
+        lock = _locks.get(key)
+        if lock is not None and getattr(lock, "_depth", 0) > 0:
+            continue
+        _locks.pop(key, None)
 
 
 def _load(path: Path) -> list:

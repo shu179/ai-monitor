@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Callable
 
 from .app_paths import resolve_app_path
+from .file_lock import CrossProcessRLock
+from .notification_idempotency import (
+    build_payload_hash,
+    record_notification_sent,
+)
 from .notifier import WeComNotifier, is_valid_wecom_webhook
 
 
@@ -24,7 +29,7 @@ DEFAULT_MAX_ATTEMPTS = 10
 DEFAULT_WORKER_INTERVAL_SECONDS = 60
 DEFAULT_WORKER_LIMIT_PER_TICK = 1
 
-_LOCK = threading.RLock()
+_LOCK = CrossProcessRLock(lambda: _retry_queue_lock_path())
 _ACTIVE_RETRY_IDS: set[str] = set()
 _WORKER_LOCK = threading.Lock()
 _WORKER: "NotificationRetryWorker | None" = None
@@ -32,6 +37,11 @@ _WORKER: "NotificationRetryWorker | None" = None
 
 def get_retry_queue_path() -> Path:
     return resolve_app_path("user_data/notification_retry_queue.json")
+
+
+def _retry_queue_lock_path() -> Path:
+    path = get_retry_queue_path()
+    return path.with_name(f"{path.name}.lock")
 
 
 def load_retry_queue(*, include_inactive: bool = False) -> list[dict]:
@@ -262,7 +272,10 @@ def _normalize_payload(
         },
         "send_args": normalized_send_args,
         "task": _json_safe(payload.get("task") or {}),
+        "idempotency": _normalize_idempotency(payload.get("idempotency")),
     }
+    if not entry["idempotency"]:
+        entry["idempotency"] = _build_retry_idempotency(entry)
     entry["dedupe_key"] = _build_dedupe_key(entry)
     return entry
 
@@ -330,6 +343,7 @@ def _retry_one(
         body_references=list(send_args.get("body_references") or []),
     )
     if ok:
+        _record_notification_idempotency(entry)
         _remove_entry(entry)
         _mark_daily_state_success(entry)
         print(
@@ -508,6 +522,64 @@ def _record_retry_event(entry: dict, error: str, *, final: bool) -> None:
         )
     except Exception:
         pass
+
+
+def _record_notification_idempotency(entry: dict) -> None:
+    if str((entry or {}).get("daily_state_source") or "").strip() == "manual_test":
+        return
+    identity = entry.get("idempotency") if isinstance(entry.get("idempotency"), dict) else {}
+    if not identity:
+        identity = _build_retry_idempotency(entry)
+    if not identity:
+        return
+    try:
+        record_notification_sent(**identity)
+    except Exception as exc:
+        print(f"[NotificationRetry] 补发成功后写入通知幂等失败: {exc}")
+
+
+def _normalize_idempotency(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    identity = {
+        "webhook_url": str(value.get("webhook_url") or "").strip(),
+        "task_id": str(value.get("task_id") or "").strip(),
+        "task_name": str(value.get("task_name") or "").strip(),
+        "channel": str(value.get("channel") or "").strip(),
+        "run_date": str(value.get("run_date") or "").strip(),
+        "round_id": str(value.get("round_id") or "").strip(),
+        "payload_hash": str(value.get("payload_hash") or "").strip(),
+    }
+    if not identity["webhook_url"] or not identity["channel"]:
+        return {}
+    return identity
+
+
+def _build_retry_idempotency(entry: dict) -> dict:
+    send_args = dict(entry.get("send_args") or {})
+    notifier = dict(entry.get("notifier") or {})
+    task = entry.get("task") if isinstance(entry.get("task"), dict) else {}
+    webhook_url = str(notifier.get("webhook_url") or "").strip()
+    task_id = str(entry.get("task_id") or task.get("task_id") or "").strip()
+    task_name = str(entry.get("task_name") or send_args.get("task_name") or "").strip()
+    channel = "recognition_detected_images"
+    payload_hash = build_payload_hash({
+        "brands": list(send_args.get("brands") or []),
+        "completed_keywords": list(send_args.get("completed_keywords") or []),
+        "supplemented_keywords": list(send_args.get("supplemented_keywords") or []),
+        "detected_platforms": list(send_args.get("detected_platforms") or []),
+        "image_count": len(send_args.get("screenshot_paths") or []),
+    })
+    run_date = str(entry.get("run_date") or "").strip() or str(entry.get("created_at") or "")[:10]
+    return _normalize_idempotency({
+        "webhook_url": webhook_url,
+        "task_id": task_id,
+        "task_name": task_name,
+        "channel": channel,
+        "run_date": run_date,
+        "round_id": f"{channel}:{task_id or task_name}:{run_date or 'today'}",
+        "payload_hash": payload_hash,
+    })
 
 
 def _build_dedupe_key(entry: dict) -> str:

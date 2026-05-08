@@ -1,9 +1,13 @@
+import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import core.daily_task_state as dts
+from core.file_lock import CrossProcessRLock
 
 
 TASK = {
@@ -32,6 +36,37 @@ class DailyTaskStateTests(unittest.TestCase):
         else:
             os.environ["AIBRANDMONITOR_DATA_DIR"] = self._original_data_dir
         self._tmpdir.cleanup()
+
+    def test_daily_state_uses_cross_process_lock_next_to_state_file(self) -> None:
+        self.assertIsInstance(dts._LOCK, CrossProcessRLock)
+        with dts._LOCK:
+            self.assertTrue(dts.STATE_PATH.with_name("daily_task_status.json.lock").exists())
+
+    def test_stale_running_state_with_naive_timestamp_is_recovered(self) -> None:
+        task = {
+            "name": "品牌Stale",
+            "brand": "品牌Stale",
+            "task_id": "task_stale",
+            "keywords": [
+                {"keyword": "词Stale", "brand": "品牌Stale", "platforms": ["doubao"], "mode": "browser"},
+            ],
+        }
+        dts.write_task_status(task, status=dts.STATUS_RUNNING, source="auto", message="", extra={})
+        state = json.loads(dts.STATE_PATH.read_text(encoding="utf-8"))
+        key = dts._make_day_key(task)
+        state[key]["official"]["updated_at"] = "2026-05-08T09:00:00"
+        state[key]["pool"]["brand"]["updated_at"] = "2026-05-08T09:00:00"
+        state[key]["pool"]["brand"]["formal_running"] = True
+        dts.STATE_PATH.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+        now = datetime(2026, 5, 8, 9, 31, tzinfo=timezone(timedelta(hours=8)))
+        with patch("core.daily_task_state.local_now", return_value=now):
+            status = dts.get_task_day_status(task)
+
+        self.assertEqual(status["official_status"], dts.STATUS_QUERY_FAILED)
+        self.assertEqual(status["brand_status"], "gap")
+        self.assertFalse(status["formal_running"])
+        self.assertIn("超时", status["message"])
 
     def test_formal_gap_then_test_fill_then_sent(self) -> None:
         dts.start_formal_task_run(TASK, source="auto", message="running")

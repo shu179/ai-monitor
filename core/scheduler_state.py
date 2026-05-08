@@ -12,16 +12,16 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import threading
 from datetime import date
 
 from .app_paths import resolve_app_path
+from .file_lock import CrossProcessRLock
 from .local_account_space import account_scoped_path
 from .time_utils import local_now, local_today
 
 
 STATE_PATH = resolve_app_path("user_data/scheduler_state.json")
-_LOCK = threading.Lock()
+_LOCK = CrossProcessRLock(lambda: _state_lock_file())
 
 
 def _now_text() -> str:
@@ -92,6 +92,11 @@ def _state_path():
     if STATE_PATH != resolved_default:
         return STATE_PATH
     return account_scoped_path("user_data/scheduler_state.json", fallback=resolved_default)
+
+
+def _state_lock_file():
+    state_path = _state_path()
+    return state_path.with_name(f"{state_path.name}.lock")
 
 
 def get_state_path():
@@ -201,6 +206,9 @@ def update_after_run(
                 recent_failures = int(entry.get("recent_auto_failures") or 0)
                 if recent_failures > 0:
                     entry["recent_auto_failures"] = recent_failures - 1
+                structural_failures = int(entry.get("structural_failures") or 0)
+                if structural_failures > 0:
+                    entry["structural_failures"] = structural_failures - 1
             data[unit_id] = entry
             _save_all(data)
             return dict(entry)

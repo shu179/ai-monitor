@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import os
 import tempfile
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from core.file_lock import CrossProcessRLock
+from core.time_utils import local_now
+
 
 def _cache_path(profile_dir: str | os.PathLike[str]) -> Path:
     base = Path(profile_dir).expanduser()
     return base / "selectors_learned.yaml"
+
+
+def _cache_lock_path(profile_dir: str | os.PathLike[str]) -> Path:
+    path = _cache_path(profile_dir)
+    return path.parent / f".{path.name}.lock"
 
 
 def load_selector_cache(profile_dir: str | os.PathLike[str]) -> dict[str, dict[str, Any]]:
@@ -51,28 +58,30 @@ def set_learned_selector(
     if not field or not selector_text:
         return ""
 
-    path = _cache_path(profile_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing = load_selector_cache(profile_dir)
-    previous = str((existing.get(field) or {}).get("selector") or "").strip()
-    current = dict(existing.get(field) or {})
-    current["selector"] = selector_text
-    current["source"] = str(source or "").strip() or "vision"
-    current["note"] = str(note or "").strip()
-    current["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    current["hit_count"] = int(current.get("hit_count") or 0) + 1
-    existing[field] = current
+    lock = CrossProcessRLock(lambda: _cache_lock_path(profile_dir))
+    with lock:
+        path = _cache_path(profile_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = load_selector_cache(profile_dir)
+        previous = str((existing.get(field) or {}).get("selector") or "").strip()
+        current = dict(existing.get(field) or {})
+        current["selector"] = selector_text
+        current["source"] = str(source or "").strip() or "vision"
+        current["note"] = str(note or "").strip()
+        current["updated_at"] = local_now().isoformat(timespec="seconds")
+        current["hit_count"] = int(current.get("hit_count") or 0) + 1
+        existing[field] = current
 
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            yaml.safe_dump(existing, handle, allow_unicode=True, sort_keys=False)
-        os.replace(tmp_path, path)
-    except BaseException:
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+        tmp_path = Path(tmp_name)
         try:
-            tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(existing, handle, allow_unicode=True, sort_keys=False)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
     return previous

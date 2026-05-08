@@ -1045,7 +1045,7 @@ class TaskConfigDialog:
                 _root = str(_Path(__file__).parent.parent)
                 if _root not in sys.path:
                     sys.path.insert(0, _root)
-                from main import run_task_group
+                from core.task_executor import run_task_group
                 print("\n" + "="*50)
                 print(f"开始测试运行: {task['name']}")
                 print("="*50)

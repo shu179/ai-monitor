@@ -1,6 +1,9 @@
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -50,6 +53,78 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         else:
             os.environ["AIBRANDMONITOR_DATA_DIR"] = self._original_data_dir
         self._tmpdir.cleanup()
+
+    def test_clipboard_image_timeout_seconds_is_clamped(self) -> None:
+        low = ClipboardRecognitionManager(
+            config_getter=lambda: {"recognition": {"clipboard_image_timeout_seconds": 0.01}}
+        )
+        high = ClipboardRecognitionManager(
+            config_getter=lambda: {"recognition": {"clipboard_image_timeout_seconds": 99}}
+        )
+
+        self.assertEqual(low._clipboard_image_timeout_seconds(), 0.5)
+        self.assertEqual(high._clipboard_image_timeout_seconds(), 30.0)
+
+    def test_clipboard_image_grab_timeout_does_not_block_poll_thread(self) -> None:
+        manager = ClipboardRecognitionManager(
+            config_getter=lambda: {"recognition": {"clipboard_image_timeout_seconds": 0.05}}
+        )
+        started = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def slow_grabclipboard():
+            nonlocal calls
+            calls += 1
+            started.set()
+            release.wait(timeout=2)
+            return object()
+
+        try:
+            with patch("core.recognition.ImageGrab.grabclipboard", side_effect=slow_grabclipboard):
+                start = time.perf_counter()
+                clip = manager._grab_clipboard_image_source()
+                elapsed = time.perf_counter() - start
+
+                self.assertIsNone(clip)
+                self.assertLess(elapsed, 1.0)
+                self.assertTrue(started.is_set())
+                self.assertTrue(manager._clipboard_grab_inflight)
+
+                self.assertIsNone(manager._grab_clipboard_image_source())
+                self.assertEqual(calls, 1)
+        finally:
+            release.set()
+            deadline = time.monotonic() + 1.0
+            while manager._clipboard_grab_inflight and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        self.assertFalse(manager._clipboard_grab_inflight)
+
+    def test_runtime_idle_seconds_use_monotonic_clock(self) -> None:
+        manager = ClipboardRecognitionManager(config_getter=lambda: {})
+        manager._last_image_seen_at = datetime.now() + timedelta(days=1)
+        manager._last_image_seen_monotonic = time.monotonic() - 75.0
+
+        status = manager.get_runtime_status(include_overview=False)
+
+        self.assertGreaterEqual(status["idle_seconds"], 74.0)
+        self.assertLess(status["idle_seconds"], 76.0)
+        self.assertEqual(status["idle_minutes"], 1.3)
+
+    def test_import_runtime_state_restores_monotonic_from_wall_clock(self) -> None:
+        manager = ClipboardRecognitionManager(config_getter=lambda: {})
+        exported_at = datetime.now() - timedelta(seconds=45)
+
+        manager.import_runtime_state({
+            "last_image_seen_at": exported_at,
+            "work_started": True,
+        })
+
+        elapsed = manager._last_image_elapsed_seconds()
+        self.assertIsNotNone(elapsed)
+        self.assertGreaterEqual(elapsed, 44.0)
+        self.assertLess(elapsed, 46.0)
 
     def test_pending_statuses_follow_daily_pool_keyword_state(self) -> None:
         pending = self.manager._get_pending_entry_statuses(TASK["guide_keywords"][0], dict(TASK))
@@ -634,6 +709,9 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["last_error"], "offline")
         self.assertEqual(entries[0]["send_args"]["completed_keywords"], ["词R"])
+        self.assertEqual(entries[0]["idempotency"]["task_id"], "task_r_send_retry")
+        self.assertEqual(entries[0]["idempotency"]["channel"], "recognition_detected_images")
+        self.assertTrue(entries[0]["idempotency"]["payload_hash"])
         self.assertTrue(Path(entries[0]["send_args"]["screenshot_paths"][0]).exists())
         self.assertEqual(status.get("status"), "send_failed")
         self.assertEqual(retry_extra.get("retry_queue_id"), entries[0]["id"])
@@ -1085,6 +1163,7 @@ class RecognitionDailyPoolTests(unittest.TestCase):
                     "enabled": True,
                     "recognition_enabled": True,
                     "recognition_batch_size": 2,
+                    "weekdays": [0, 1, 2, 3, 4, 5, 6],
                     "keywords": [
                         {
                             "keyword": "标头炸串",

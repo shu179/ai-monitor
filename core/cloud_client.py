@@ -165,6 +165,22 @@ class SurfacedCloudClient:
         payload = self._request("GET", "/api/v1/tasks", access_token=access_token)
         return payload if isinstance(payload, list) else []
 
+    def list_tasks_by_ids(self, access_token: str, task_ids: list[int]) -> list[dict[str, Any]]:
+        params: list[tuple[str, str]] = []
+        seen: set[int] = set()
+        for raw_task_id in task_ids or []:
+            task_id = int(raw_task_id or 0)
+            if task_id <= 0 or task_id in seen:
+                continue
+            seen.add(task_id)
+            params.append(("ids", str(task_id)))
+            if len(params) >= 200:
+                break
+        if not params:
+            return []
+        payload = self._request("GET", "/api/v1/tasks", access_token=access_token, params=params)
+        return payload if isinstance(payload, list) else []
+
     def list_admin_tasks(self, access_token: str) -> list[dict[str, Any]]:
         payload = self._request("GET", "/api/v1/admin/tasks", access_token=access_token)
         return payload if isinstance(payload, list) else []
@@ -263,6 +279,58 @@ class SurfacedCloudClient:
         )
         return response if isinstance(response, dict) else {}
 
+    def list_admin_article_classification_jobs(
+        self,
+        access_token: str,
+        *,
+        status: str = "unresolved",
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            "/api/v1/admin/articles/classification-jobs",
+            access_token=access_token,
+            params={
+                "status": str(status or "unresolved").strip()[:32] or "unresolved",
+                "limit": int(limit or 200),
+            },
+        )
+        return payload if isinstance(payload, list) else []
+
+    def resolve_admin_article_classification_job(
+        self,
+        access_token: str,
+        job_id: int,
+        *,
+        task_id: int,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            f"/api/v1/admin/articles/classification-jobs/{int(job_id)}/resolve",
+            access_token=access_token,
+            json_body={
+                "task_id": int(task_id),
+                "reason": str(reason or "").strip() or None,
+            },
+        )
+        return response if isinstance(response, dict) else {}
+
+    def ignore_admin_article_classification_job(
+        self,
+        access_token: str,
+        job_id: int,
+        *,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            f"/api/v1/admin/articles/classification-jobs/{int(job_id)}/ignore",
+            access_token=access_token,
+            json_body={"reason": str(reason or "").strip() or None},
+        )
+        return response if isinstance(response, dict) else {}
+
     def task_run_records(
         self,
         access_token: str,
@@ -344,6 +412,28 @@ class SurfacedCloudClient:
             events[task_id] = [item for item in raw_items if isinstance(item, dict)]
         return events
 
+    def task_articles(
+        self,
+        access_token: str,
+        *,
+        updated_after: str = "",
+        updated_after_id: int = 0,
+        limit: int = 5000,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": int(limit or 5000)}
+        cursor = str(updated_after or "").strip()
+        if cursor:
+            params["updated_after"] = cursor
+            if int(updated_after_id or 0) > 0:
+                params["updated_after_id"] = int(updated_after_id or 0)
+        response = self._request(
+            "GET",
+            "/api/v1/tasks/articles",
+            access_token=access_token,
+            params=params,
+        )
+        return response if isinstance(response, dict) else {"articles": [], "count": 0, "max_updated_at": "", "max_article_id": 0}
+
     def stream_events(
         self,
         access_token: str,
@@ -362,8 +452,9 @@ class SurfacedCloudClient:
             "Authorization": f"Bearer {token}",
         }
         params: dict[str, Any] = {}
-        if str(last_event_id or "").strip():
-            params["last_event_id"] = str(last_event_id or "").strip()
+        safe_last_event_id = str(last_event_id or "").strip()
+        if safe_last_event_id and len(safe_last_event_id) <= 256:
+            params["last_event_id"] = safe_last_event_id
 
         try:
             response = self._session.request(
@@ -375,7 +466,7 @@ class SurfacedCloudClient:
                 timeout=(min(10.0, self.timeout_seconds), max(15.0, float(read_timeout_seconds or 75.0))),
             )
         except requests.RequestException as exc:
-            raise CloudClientError(f"云端事件连接失败：{exc}") from exc
+            raise CloudClientError(_format_request_exception("云端事件连接", exc)) from exc
 
         try:
             body = None
@@ -383,8 +474,11 @@ class SurfacedCloudClient:
                 body = _decode_response_body(response)
                 message = _extract_error_message(body) or f"云端事件连接失败：HTTP {response.status_code}"
                 raise CloudClientError(message, status_code=response.status_code, response_body=body)
-            for event in iter_sse_events(response.iter_lines(decode_unicode=True)):
-                yield event
+            try:
+                for event in iter_sse_events(response.iter_lines(decode_unicode=True)):
+                    yield event
+            except requests.RequestException as exc:
+                raise CloudClientError(_format_request_exception("云端事件连接", exc)) from exc
         finally:
             try:
                 response.close()
@@ -398,7 +492,7 @@ class SurfacedCloudClient:
         *,
         access_token: str = "",
         json_body: dict[str, Any] | None = None,
-        params: dict[str, Any] | None = None,
+        params: dict[str, Any] | list[tuple[str, str]] | None = None,
     ) -> Any:
         if not self.base_url:
             raise CloudClientError("未配置云端地址")
@@ -419,7 +513,7 @@ class SurfacedCloudClient:
                 timeout=self.timeout_seconds,
             )
         except requests.RequestException as exc:
-            raise CloudClientError(f"云端请求失败：{exc}") from exc
+            raise CloudClientError(_format_request_exception("云端请求", exc)) from exc
 
         body = _decode_response_body(response)
         if response.status_code >= 400:
@@ -446,12 +540,52 @@ def _extract_error_message(body: Any) -> str:
             message = detail.get("message")
             if isinstance(message, str):
                 return message
+        if isinstance(detail, list):
+            return _format_validation_errors(detail)
         if detail:
             return str(detail)
         message = body.get("message")
         if isinstance(message, str):
             return message
     return ""
+
+
+def _format_request_exception(prefix: str, exc: requests.RequestException) -> str:
+    text = str(exc or "")
+    if isinstance(exc, (requests.ReadTimeout, requests.Timeout)) or "read timed out" in text.lower():
+        if "事件" in str(prefix or ""):
+            return f"{prefix}超时，正在自动重连"
+        return f"{prefix}超时，将自动重试"
+    if isinstance(exc, requests.ConnectionError):
+        if str(prefix or "").endswith("连接"):
+            return f"{prefix}失败，将自动重试"
+        return f"{prefix}连接失败，将自动重试"
+    return f"{prefix}失败：{exc}"
+
+
+def _format_validation_errors(errors: list[Any]) -> str:
+    messages: list[str] = []
+    for error in errors[:3]:
+        if not isinstance(error, dict):
+            continue
+        loc = error.get("loc")
+        field = ""
+        if isinstance(loc, list) and loc:
+            field = str(loc[-1] or "").strip()
+        error_type = str(error.get("type") or "").strip().lower()
+        msg = str(error.get("msg") or "").strip()
+        msg_lower = msg.lower()
+        if field and (
+            "too long" in msg_lower
+            or error_type == "string_too_long"
+            or ("at most" in msg_lower and "character" in msg_lower)
+        ):
+            messages.append(f"{field} 超出长度限制")
+        elif field and msg:
+            messages.append(f"{field}：{msg}")
+        elif msg:
+            messages.append(msg)
+    return f"云端参数校验失败：{'；'.join(messages)}" if messages else "云端参数校验失败"
 
 
 def iter_sse_events(lines: Iterable[str | bytes]) -> Iterator[dict[str, Any]]:
