@@ -128,15 +128,8 @@ def enqueue_article_cloud_sync(
     if not events:
         return []
     target_outbox = outbox or CloudOutbox()
-    queued_items: list[dict[str, Any]] = []
-    for event in events:
-        queued, _created = target_outbox.enqueue(
-            event_type=event["event_type"],
-            idempotency_key=event["idempotency_key"],
-            payload=event["payload"],
-        )
-        queued_items.append(queued)
-    return queued_items
+    result = target_outbox.enqueue_many(events)
+    return list(result.get("items") or [])
 
 
 def enqueue_cloud_articles(
@@ -147,9 +140,9 @@ def enqueue_cloud_articles(
     max_articles: int = 5000,
 ) -> dict[str, int]:
     target_outbox = outbox or CloudOutbox()
-    before_total = int(target_outbox.stats().get("total") or 0)
     scanned = 0
     candidates = 0
+    events_to_enqueue: list[dict[str, Any]] = []
     for article in list(articles or [])[: max(1, int(max_articles or 5000))]:
         if not isinstance(article, dict):
             continue
@@ -158,20 +151,19 @@ def enqueue_cloud_articles(
         if not events:
             continue
         candidates += 1
-        for event in events:
-            try:
-                target_outbox.enqueue(
-                    event_type=event["event_type"],
-                    idempotency_key=event["idempotency_key"],
-                    payload=event["payload"],
-                )
-            except Exception:
-                continue
-    after_total = int(target_outbox.stats().get("total") or 0)
+        events_to_enqueue.extend(events)
+    try:
+        enqueue_result = target_outbox.enqueue_many(events_to_enqueue)
+    except Exception:
+        enqueue_result = {"created": 0, "requested": len(events_to_enqueue), "dropped": {"total": 0, "active": 0, "sent": 0}}
+    dropped = enqueue_result.get("dropped") if isinstance(enqueue_result.get("dropped"), dict) else {}
     return {
         "articles": scanned,
         "candidates": candidates,
-        "queued": max(0, after_total - before_total),
+        "events": len(events_to_enqueue),
+        "queued": max(0, int(enqueue_result.get("created") or 0)),
+        "dropped": max(0, int((dropped or {}).get("total") or 0)),
+        "dropped_active": max(0, int((dropped or {}).get("active") or 0)),
     }
 
 

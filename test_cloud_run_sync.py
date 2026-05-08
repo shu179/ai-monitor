@@ -10,6 +10,7 @@ from core.cloud_outbox import CloudOutbox
 from core.cloud_run_sync import (
     article_to_cloud_events,
     enqueue_article_cloud_sync,
+    enqueue_cloud_articles,
     enqueue_recent_cloud_run_records_from_history,
     enqueue_run_record_from_history,
     enqueue_task_day_status,
@@ -158,6 +159,29 @@ class CloudRunSyncTests(unittest.TestCase):
             enqueue_article_cloud_sync(article, config, outbox=outbox)
 
             self.assertEqual(outbox.stats()["pending"], 2)
+
+    def test_enqueue_cloud_articles_batches_outbox_writes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outbox = CloudOutbox(Path(tmpdir) / "outbox.json")
+            articles = [
+                {
+                    "id": f"article-{index}",
+                    "url": f"https://example.com/{index}",
+                    "title": "即搜AI",
+                    "matched_tasks": ["即搜AI"],
+                }
+                for index in range(3)
+            ]
+            config = {"tasks": [{"name": "即搜AI", "cloud_task_id": 42}]}
+
+            result = enqueue_cloud_articles(articles, config, outbox=outbox)
+            duplicate_result = enqueue_cloud_articles(articles, config, outbox=outbox)
+
+            self.assertEqual(result["articles"], 3)
+            self.assertEqual(result["events"], 6)
+            self.assertEqual(result["queued"], 6)
+            self.assertEqual(duplicate_result["queued"], 0)
+            self.assertEqual(outbox.stats()["pending"], 6)
 
     def test_history_record_to_run_event_requires_cloud_task_id_and_omits_screenshot(self):
         record = {

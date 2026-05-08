@@ -1,6 +1,8 @@
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 from core.file_lock import CrossProcessRLock
@@ -101,6 +103,32 @@ class CloudOutboxCompactionTests(unittest.TestCase):
 
             pending_keys = [item["idempotency_key"] for item in outbox.pending(limit=10)]
             self.assertEqual(pending_keys, ["event-2", "event-3"])
+
+    def test_enqueue_many_dedupes_and_writes_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outbox = CloudOutbox(Path(tmpdir) / "outbox.json")
+            result = outbox.enqueue_many([
+                {"event_type": "run", "idempotency_key": "event-1", "payload": {"n": 1}},
+                {"event_type": "run", "idempotency_key": "event-2", "payload": {"n": 2}},
+                {"event_type": "run", "idempotency_key": "event-1", "payload": {"n": 1}},
+            ])
+
+            self.assertEqual(result["created"], 2)
+            self.assertEqual(result["requested"], 3)
+            self.assertEqual(outbox.stats()["pending"], 2)
+
+    def test_sent_retention_compaction_is_quiet(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outbox = CloudOutbox(Path(tmpdir) / "outbox.json", max_sent_items=1)
+            outbox.enqueue(event_type="run", idempotency_key="event-1", payload={"n": 1})
+            outbox.enqueue(event_type="run", idempotency_key="event-2", payload={"n": 2})
+            stdout = StringIO()
+
+            with redirect_stdout(stdout):
+                outbox.mark_sent(["event-1", "event-2"])
+
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(outbox.stats(), {"total": 1, "pending": 0, "failed": 0, "sent": 1})
 
 
 if __name__ == "__main__":

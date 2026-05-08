@@ -98,6 +98,63 @@ class CloudOutbox:
             self.notify_changed()
             return dict(item), True
 
+    def enqueue_many(self, events: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> dict[str, Any]:
+        """Enqueue multiple events with one read-modify-write of the outbox file."""
+        normalized_events: list[dict[str, Any]] = []
+        for event in events or []:
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("event_type") or "").strip()
+            idempotency_key = str(event.get("idempotency_key") or "").strip()
+            if not event_type or not idempotency_key:
+                raise ValueError("event_type and idempotency_key are required")
+            normalized_events.append({
+                "event_type": event_type,
+                "idempotency_key": idempotency_key,
+                "payload": dict(event.get("payload") or {}),
+            })
+        if not normalized_events:
+            return {"items": [], "created": 0, "requested": 0, "dropped": {"total": 0, "active": 0, "sent": 0}}
+
+        with self._lock:
+            items = self._load_locked()
+            by_key = {
+                str(item.get("idempotency_key") or ""): item
+                for item in items
+                if str(item.get("idempotency_key") or "").strip()
+            }
+            queued_items: list[dict[str, Any]] = []
+            created = 0
+            now = local_now().isoformat(timespec="seconds")
+            for event in normalized_events:
+                existing = by_key.get(event["idempotency_key"])
+                if existing is not None:
+                    queued_items.append(dict(existing))
+                    continue
+                item = {
+                    "event_type": event["event_type"],
+                    "idempotency_key": event["idempotency_key"],
+                    "payload": dict(event.get("payload") or {}),
+                    "status": "pending",
+                    "attempts": 0,
+                    "created_at": now,
+                    "updated_at": now,
+                    "last_error": "",
+                }
+                items.append(item)
+                by_key[event["idempotency_key"]] = item
+                queued_items.append(dict(item))
+                created += 1
+            dropped = self._save_locked(items) if created else {"total": 0, "active": 0, "sent": 0}
+            if created:
+                self.notify_changed()
+            return {
+                "items": queued_items,
+                "created": created,
+                "requested": len(normalized_events),
+                "dropped": dropped,
+            }
+
     def pending(self, *, limit: int = 100) -> list[dict[str, Any]]:
         safe_limit = min(max(int(limit or 100), 1), 500)
         with self._lock:
@@ -163,13 +220,14 @@ class CloudOutbox:
             return []
         return [item for item in data if isinstance(item, dict)]
 
-    def _save_locked(self, items: list[dict[str, Any]]) -> None:
+    def _save_locked(self, items: list[dict[str, Any]]) -> dict[str, int]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        compacted_items, dropped_count = self._compact_items(items)
-        if dropped_count:
+        compacted_items, dropped = self._compact_items(items)
+        active_dropped = int(dropped.get("active") or 0)
+        if active_dropped:
             print(
                 "[CloudOutbox] 本地队列超过容量上限，"
-                f"已清理最旧事件 {dropped_count} 条: {self.path}"
+                f"已清理最旧未发送事件 {active_dropped} 条: {self.path}"
             )
         serialized = json.dumps(compacted_items, ensure_ascii=False, indent=2, sort_keys=True)
         fd, tmp_path = tempfile.mkstemp(dir=str(self.path.parent), prefix=".cloud_outbox_", suffix=".tmp")
@@ -177,6 +235,7 @@ class CloudOutbox:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(serialized)
             os.replace(tmp_path, self.path)
+            return dropped
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -184,39 +243,48 @@ class CloudOutbox:
                 pass
             raise
 
-    def _compact_items(self, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    def _compact_items(self, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
         compacted = [dict(item) for item in items if isinstance(item, dict)]
-        dropped = 0
+        dropped = {"total": 0, "active": 0, "sent": 0}
+
+        def _add_dropped(total: int, active: int) -> None:
+            dropped["total"] += int(total or 0)
+            dropped["active"] += int(active or 0)
+            dropped["sent"] = max(0, dropped["total"] - dropped["active"])
 
         sent_count = sum(1 for item in compacted if _outbox_status(item) == "sent")
         if sent_count > self._max_sent_items:
-            dropped += self._drop_oldest_by_count(
+            total, active = self._drop_oldest_by_count(
                 compacted,
                 sent_count - self._max_sent_items,
                 lambda item: _outbox_status(item) == "sent",
             )
+            _add_dropped(total, active)
 
         if len(compacted) > self._max_items:
-            dropped += self._drop_oldest_by_count(
+            total, active = self._drop_oldest_by_count(
                 compacted,
                 len(compacted) - self._max_items,
                 lambda item: _outbox_status(item) == "sent",
             )
+            _add_dropped(total, active)
 
         while len(compacted) > self._max_items and len(compacted) > 1:
             index = self._oldest_index(compacted, lambda item: True)
             if index is None:
                 break
-            compacted.pop(index)
-            dropped += 1
+            item = compacted.pop(index)
+            _add_dropped(1, 0 if _outbox_status(item) == "sent" else 1)
 
         if self._encoded_size(compacted) > self._max_bytes:
-            dropped += self._drop_oldest_until_size(
+            total, active = self._drop_oldest_until_size(
                 compacted,
                 lambda item: _outbox_status(item) == "sent",
             )
+            _add_dropped(total, active)
         if self._encoded_size(compacted) > self._max_bytes:
-            dropped += self._drop_oldest_until_size(compacted, lambda item: True)
+            total, active = self._drop_oldest_until_size(compacted, lambda item: True)
+            _add_dropped(total, active)
 
         return compacted, dropped
 
@@ -225,9 +293,9 @@ class CloudOutbox:
         return len(json.dumps(items, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"))
 
     @staticmethod
-    def _drop_oldest_by_count(items: list[dict[str, Any]], count: int, predicate) -> int:
+    def _drop_oldest_by_count(items: list[dict[str, Any]], count: int, predicate) -> tuple[int, int]:
         if count <= 0 or not items:
-            return 0
+            return 0, 0
         indexes = [
             index
             for _, index in sorted(
@@ -236,19 +304,23 @@ class CloudOutbox:
                 if predicate(item)
             )
         ][:count]
+        active = sum(1 for index in indexes if _outbox_status(items[index]) != "sent")
         for index in sorted(indexes, reverse=True):
             items.pop(index)
-        return len(indexes)
+        return len(indexes), active
 
-    def _drop_oldest_until_size(self, items: list[dict[str, Any]], predicate) -> int:
+    def _drop_oldest_until_size(self, items: list[dict[str, Any]], predicate) -> tuple[int, int]:
         dropped = 0
+        active = 0
         while len(items) > 1 and self._encoded_size(items) > self._max_bytes:
             index = self._oldest_index(items, predicate)
             if index is None:
                 break
-            items.pop(index)
+            item = items.pop(index)
             dropped += 1
-        return dropped
+            if _outbox_status(item) != "sent":
+                active += 1
+        return dropped, active
 
     @staticmethod
     def _oldest_index(items: list[dict[str, Any]], predicate) -> int | None:
