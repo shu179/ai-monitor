@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -41,13 +42,14 @@ def notification_already_sent(
     if not key:
         return False
     try:
-        with _connect() as conn:
-            _ensure_schema(conn)
-            row = conn.execute(
-                "SELECT 1 FROM notification_sends WHERE idempotency_key = ? LIMIT 1",
-                (key,),
-            ).fetchone()
-            return row is not None
+        with closing(_connect()) as conn:
+            with conn:
+                _ensure_schema(conn)
+                row = conn.execute(
+                    "SELECT 1 FROM notification_sends WHERE idempotency_key = ? LIMIT 1",
+                    (key,),
+                ).fetchone()
+                return row is not None
     except Exception as exc:
         print(f"[NotificationIdempotency] 查询通知幂等记录失败: {exc}")
         return False
@@ -76,35 +78,36 @@ def record_notification_sent(
         return
     try:
         sent_at = local_now().isoformat(timespec="seconds")
-        with _connect() as conn:
-            _ensure_schema(conn)
-            _prune_old_rows(conn)
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO notification_sends (
-                    idempotency_key,
-                    webhook_hash,
-                    task_id,
-                    task_name,
-                    channel,
-                    run_date,
-                    round_id,
-                    payload_hash,
-                    sent_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    key,
-                    _webhook_hash(webhook_url),
-                    str(task_id or "").strip(),
-                    str(task_name or "").strip(),
-                    str(channel or "").strip(),
-                    _run_date(run_date),
-                    str(round_id or "").strip(),
-                    str(payload_hash or "").strip(),
-                    sent_at,
-                ),
-            )
+        with closing(_connect()) as conn:
+            with conn:
+                _ensure_schema(conn)
+                _prune_old_rows(conn)
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_sends (
+                        idempotency_key,
+                        webhook_hash,
+                        task_id,
+                        task_name,
+                        channel,
+                        run_date,
+                        round_id,
+                        payload_hash,
+                        sent_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        _webhook_hash(webhook_url),
+                        str(task_id or "").strip(),
+                        str(task_name or "").strip(),
+                        str(channel or "").strip(),
+                        _run_date(run_date),
+                        str(round_id or "").strip(),
+                        str(payload_hash or "").strip(),
+                        sent_at,
+                    ),
+                )
     except Exception as exc:
         print(f"[NotificationIdempotency] 写入通知幂等记录失败: {exc}")
 

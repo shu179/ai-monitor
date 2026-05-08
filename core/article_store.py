@@ -8,11 +8,13 @@
 - 提供关键词→任务组匹配、文章数统计等查询接口
 """
 
+import copy
 import hashlib
 import json
 import os
 import re
 import tempfile
+import time
 import uuid
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -23,20 +25,27 @@ from .app_paths import resolve_app_path
 from .file_lock import CrossProcessRLock
 from .history import normalize_platform_id
 from .local_account_space import account_scoped_path
+from .sqlite_json_store import MISSING, SQLiteJsonDocumentStore
 from .time_utils import local_now
 
 DEFAULT_ARTICLES_FILE = resolve_app_path("logs/articles.json")
 DEFAULT_DOMAIN_OVERRIDES_FILE = resolve_app_path("logs/domain_overrides.json")
 DEFAULT_DOMAIN_MEDIA_NAMES_FILE = resolve_app_path("logs/domain_media_names.json")
 DEFAULT_EXCLUDED_ARTICLE_URLS_FILE = resolve_app_path("logs/excluded_article_urls.json")
+DEFAULT_LOCAL_STORE_DB_FILE = resolve_app_path("logs/local_store.sqlite3")
 
 ARTICLES_FILE = DEFAULT_ARTICLES_FILE
 DOMAIN_OVERRIDES_FILE = DEFAULT_DOMAIN_OVERRIDES_FILE
 DOMAIN_MEDIA_NAMES_FILE = DEFAULT_DOMAIN_MEDIA_NAMES_FILE
 EXCLUDED_ARTICLE_URLS_FILE = DEFAULT_EXCLUDED_ARTICLE_URLS_FILE
+LOCAL_STORE_DB_FILE = DEFAULT_LOCAL_STORE_DB_FILE
 
 MAX_REFERENCE_EVENTS_PER_TASK = 500
 MAX_EXCLUDED_ARTICLE_URLS = 5000
+STORAGE_BACKEND_ENV = "AIBRANDMONITOR_STORAGE_BACKEND"
+SMALL_DOCUMENT_CACHE_TTL_SECONDS = 1.0
+
+_small_document_cache: dict[str, tuple[float, object]] = {}
 
 # 权威媒体域名白名单（内置初始值，可通过手动切换覆盖）
 AUTHORITY_DOMAINS: set = {
@@ -314,6 +323,118 @@ def get_domain_media_names_file_path() -> Path:
 
 def get_excluded_article_urls_file_path() -> Path:
     return _excluded_article_urls_file()
+
+
+def _local_store_db_file() -> Path:
+    if LOCAL_STORE_DB_FILE != DEFAULT_LOCAL_STORE_DB_FILE:
+        return LOCAL_STORE_DB_FILE
+    return account_scoped_path("logs/local_store.sqlite3", fallback=DEFAULT_LOCAL_STORE_DB_FILE)
+
+
+def _sqlite_storage_enabled() -> bool:
+    backend = os.environ.get(STORAGE_BACKEND_ENV, "").strip().lower()
+    return backend in {"sqlite", "sqlite3", "db", "database"}
+
+
+def _sqlite_store() -> SQLiteJsonDocumentStore:
+    return SQLiteJsonDocumentStore(_local_store_db_file())
+
+
+def _read_json_path(path: Path, default):
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(default, list):
+                return data if isinstance(data, list) else []
+            if isinstance(default, dict):
+                return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return [] if isinstance(default, list) else {}
+
+
+def _write_json_path(path: Path, payload, label: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        print(f"[ArticleStore] 写入 {label} 失败: {e}")
+
+
+def _load_json_document(doc_key: str, path: Path, default, *, use_sqlite: bool):
+    if use_sqlite and _sqlite_storage_enabled():
+        try:
+            store = _sqlite_store()
+            data = store.load(doc_key, MISSING)
+            if data is MISSING:
+                data = _read_json_path(path, default)
+                if data:
+                    store.save(doc_key, data)
+        except Exception as e:
+            print(f"[ArticleStore] 读取 {doc_key} SQLite 失败，回退 JSON: {e}")
+            data = _read_json_path(path, default)
+        if isinstance(default, list):
+            return data if isinstance(data, list) else []
+        if isinstance(default, dict):
+            return data if isinstance(data, dict) else {}
+        return data
+    return _read_json_path(path, default)
+
+
+def _load_small_json_document(doc_key: str, path: Path, default, *, use_sqlite: bool):
+    now = time.monotonic()
+    cached = _small_document_cache.get(doc_key)
+    if cached is not None and now - cached[0] <= SMALL_DOCUMENT_CACHE_TTL_SECONDS:
+        return copy.deepcopy(cached[1])
+    data = _load_json_document(doc_key, path, default, use_sqlite=use_sqlite)
+    _small_document_cache[doc_key] = (now, copy.deepcopy(data))
+    return data
+
+
+def _invalidate_json_document_cache(doc_key: str) -> None:
+    _small_document_cache.pop(doc_key, None)
+
+
+def _save_json_document(doc_key: str, path: Path, payload, *, use_sqlite: bool, label: str) -> None:
+    if use_sqlite and _sqlite_storage_enabled():
+        try:
+            _sqlite_store().save(doc_key, payload)
+            _invalidate_json_document_cache(doc_key)
+            return
+        except Exception as e:
+            print(f"[ArticleStore] 写入 {label} SQLite 失败，回退 JSON: {e}")
+    _write_json_path(path, payload, label)
+    _invalidate_json_document_cache(doc_key)
+
+
+def _json_document_signature(doc_key: str, path: Path, *, use_sqlite: bool) -> tuple[str, int, int]:
+    if use_sqlite and _sqlite_storage_enabled():
+        try:
+            store = _sqlite_store()
+            if store.exists(doc_key):
+                return store.signature(doc_key)
+        except Exception as e:
+            print(f"[ArticleStore] 读取 {doc_key} SQLite 签名失败，回退 JSON: {e}")
+    try:
+        stat = path.stat()
+        return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    except FileNotFoundError:
+        return (str(path), 0, 0)
+    except Exception:
+        return (str(path), -1, -1)
 
 _MEDIA_NAME_ALIASES: dict[str, str] = {
     "头条": "今日头条",
@@ -1238,70 +1359,42 @@ def should_auto_save_media_type(url_or_domain: str, media_type: str, media_name:
 
 def _load_domain_overrides() -> dict:
     with _lock:
-        path = _domain_overrides_file()
-        try:
-            if path.exists():
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:
-            pass
-        return {}
+        return _load_small_json_document(
+            "article_store/domain_overrides",
+            _domain_overrides_file(),
+            {},
+            use_sqlite=DOMAIN_OVERRIDES_FILE == DEFAULT_DOMAIN_OVERRIDES_FILE,
+        )
 
 
 def _save_domain_overrides(overrides: dict) -> None:
-    path = _domain_overrides_file()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(path.parent), suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(overrides, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-    except Exception as e:
-        print(f"[ArticleStore] 写入 domain_overrides 失败: {e}")
+    _save_json_document(
+        "article_store/domain_overrides",
+        _domain_overrides_file(),
+        overrides,
+        use_sqlite=DOMAIN_OVERRIDES_FILE == DEFAULT_DOMAIN_OVERRIDES_FILE,
+        label="domain_overrides",
+    )
 
 
 def _load_domain_media_names() -> dict:
     with _lock:
-        path = _domain_media_names_file()
-        try:
-            if path.exists():
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:
-            pass
-        return {}
+        return _load_small_json_document(
+            "article_store/domain_media_names",
+            _domain_media_names_file(),
+            {},
+            use_sqlite=DOMAIN_MEDIA_NAMES_FILE == DEFAULT_DOMAIN_MEDIA_NAMES_FILE,
+        )
 
 
 def _save_domain_media_names(media_names: dict) -> None:
-    path = _domain_media_names_file()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(path.parent), suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(media_names, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-    except Exception as e:
-        print(f"[ArticleStore] 写入 domain_media_names 失败: {e}")
+    _save_json_document(
+        "article_store/domain_media_names",
+        _domain_media_names_file(),
+        media_names,
+        use_sqlite=DOMAIN_MEDIA_NAMES_FILE == DEFAULT_DOMAIN_MEDIA_NAMES_FILE,
+        label="domain_media_names",
+    )
 
 
 def save_domain_media_name(domain: str, media_name: str, force: bool = False) -> None:
@@ -1422,49 +1515,34 @@ def save_domain_override(domain: str, media_type: str, force: bool = False) -> N
 
 def _load_articles() -> list:
     with _lock:
-        path = _articles_file()
-        try:
-            if path.exists():
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, list):
-                    return []
-                normalized_articles = []
-                changed = False
-                for article in data:
-                    if not isinstance(article, dict):
-                        changed = True
-                        continue
-                    normalized, item_changed = _normalize_article_entry(article)
-                    normalized_articles.append(normalized)
-                    changed = changed or item_changed
-                if changed:
-                    _save_articles(normalized_articles)
-                return normalized_articles
-        except Exception:
-            pass
-        return []
+        data = _load_json_document(
+            "article_store/articles",
+            _articles_file(),
+            [],
+            use_sqlite=ARTICLES_FILE == DEFAULT_ARTICLES_FILE,
+        )
+        normalized_articles = []
+        changed = False
+        for article in data:
+            if not isinstance(article, dict):
+                changed = True
+                continue
+            normalized, item_changed = _normalize_article_entry(article)
+            normalized_articles.append(normalized)
+            changed = changed or item_changed
+        if changed:
+            _save_articles(normalized_articles)
+        return normalized_articles
 
 
 def _save_articles(articles: list) -> None:
-    path = _articles_file()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(path.parent), suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(articles, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-    except Exception as e:
-        print(f"[ArticleStore] 写入 articles.json 失败: {e}")
+    _save_json_document(
+        "article_store/articles",
+        _articles_file(),
+        articles,
+        use_sqlite=ARTICLES_FILE == DEFAULT_ARTICLES_FILE,
+        label="articles.json",
+    )
 
 
 def _article_sort_timestamp(value) -> int:
@@ -1535,15 +1613,12 @@ def _sort_articles_for_display(articles: list) -> list:
 
 def _load_excluded_article_urls() -> dict:
     with _lock:
-        path = _excluded_article_urls_file()
-        try:
-            if path.exists():
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:
-            pass
-        return {}
+        return _load_small_json_document(
+            "article_store/excluded_article_urls",
+            _excluded_article_urls_file(),
+            {},
+            use_sqlite=EXCLUDED_ARTICLE_URLS_FILE == DEFAULT_EXCLUDED_ARTICLE_URLS_FILE,
+        )
 
 
 def _trim_excluded_article_urls_for_storage(excluded_urls: dict) -> tuple[dict, bool]:
@@ -1576,24 +1651,13 @@ def _excluded_article_url_sort_text(value) -> str:
 
 
 def _save_excluded_article_urls(excluded_urls: dict) -> None:
-    path = _excluded_article_urls_file()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(path.parent), suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(excluded_urls, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-    except Exception as e:
-        print(f"[ArticleStore] 写入 excluded_article_urls 失败: {e}")
+    _save_json_document(
+        "article_store/excluded_article_urls",
+        _excluded_article_urls_file(),
+        excluded_urls,
+        use_sqlite=EXCLUDED_ARTICLE_URLS_FILE == DEFAULT_EXCLUDED_ARTICLE_URLS_FILE,
+        label="excluded_article_urls",
+    )
 
 
 def exclude_article_url(url: str, *, title: str = "", source: str = "manual_delete") -> dict | None:
@@ -1978,14 +2042,11 @@ def get_articles() -> list:
 
 def get_articles_file_signature() -> tuple[str, int, int]:
     """Return a cheap source signature for the article store file."""
-    path = _articles_file()
-    try:
-        stat = path.stat()
-        return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
-    except FileNotFoundError:
-        return (str(path), 0, 0)
-    except Exception:
-        return (str(path), -1, -1)
+    return _json_document_signature(
+        "article_store/articles",
+        _articles_file(),
+        use_sqlite=ARTICLES_FILE == DEFAULT_ARTICLES_FILE,
+    )
 
 
 def _safe_positive_int(value) -> int | None:

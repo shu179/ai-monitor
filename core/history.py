@@ -17,10 +17,16 @@ from pathlib import Path
 from .app_paths import resolve_app_path
 from .file_lock import CrossProcessRLock
 from .local_account_space import account_scoped_path
+from .sqlite_json_store import MISSING, SQLiteJsonDocumentStore
 from .time_utils import local_now, local_today, parse_local_date
 
-HISTORY_DIR = resolve_app_path("logs/history")
+DEFAULT_HISTORY_DIR = resolve_app_path("logs/history")
+DEFAULT_LOCAL_STORE_DB_FILE = resolve_app_path("logs/local_store.sqlite3")
+
+HISTORY_DIR = DEFAULT_HISTORY_DIR
+LOCAL_STORE_DB_FILE = DEFAULT_LOCAL_STORE_DB_FILE
 MAX_RECORDS = 500  # 每个任务最多保留原始记录数
+STORAGE_BACKEND_ENV = "AIBRANDMONITOR_STORAGE_BACKEND"
 
 _PLATFORM_ID_ALIASES: dict[str, str] = {
     "豆包": "doubao",
@@ -73,6 +79,144 @@ _startup_missing_count: dict = {}  # task_name -> int
 _locks: dict[str, CrossProcessRLock] = {}
 _locks_mutex = threading.Lock()
 _MAX_LOCKS = 500  # 锁字典的最大容量，超出时清理最旧的 25%
+
+
+def _local_store_db_file() -> Path:
+    if LOCAL_STORE_DB_FILE != DEFAULT_LOCAL_STORE_DB_FILE:
+        return LOCAL_STORE_DB_FILE
+    return account_scoped_path("logs/local_store.sqlite3", fallback=DEFAULT_LOCAL_STORE_DB_FILE)
+
+
+def _sqlite_storage_enabled() -> bool:
+    backend = os.environ.get(STORAGE_BACKEND_ENV, "").strip().lower()
+    return backend in {"sqlite", "sqlite3", "db", "database"}
+
+
+def _history_uses_sqlite() -> bool:
+    return HISTORY_DIR == DEFAULT_HISTORY_DIR and _sqlite_storage_enabled()
+
+
+def _sqlite_store() -> SQLiteJsonDocumentStore:
+    return SQLiteJsonDocumentStore(_local_store_db_file())
+
+
+def _history_doc_key(path: Path) -> str:
+    try:
+        relative = Path(path).relative_to(_history_dir())
+    except ValueError:
+        relative = Path(path).name
+    return f"history/{Path(relative).as_posix()}"
+
+
+def _read_json_path(path: Path, default):
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(default, list):
+                return data if isinstance(data, list) else []
+            if isinstance(default, dict):
+                return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return [] if isinstance(default, list) else {}
+
+
+def _load_json_document(path: Path, default):
+    if _history_uses_sqlite():
+        doc_key = _history_doc_key(path)
+        try:
+            store = _sqlite_store()
+            data = store.load(doc_key, MISSING)
+            if data is MISSING:
+                data = _read_json_path(path, default)
+                if data:
+                    store.save(doc_key, data)
+        except Exception as e:
+            print(f"[History] 读取 SQLite 失败，回退 JSON {path}: {e}")
+            data = _read_json_path(path, default)
+        if isinstance(default, list):
+            return data if isinstance(data, list) else []
+        if isinstance(default, dict):
+            return data if isinstance(data, dict) else {}
+        return data
+    return _read_json_path(path, default)
+
+
+def _save_json_document(path: Path, data) -> None:
+    if _history_uses_sqlite():
+        try:
+            _sqlite_store().save(_history_doc_key(path), data)
+            return
+        except Exception as e:
+            print(f"[History] 写入 SQLite 失败，回退 JSON {path}: {e}")
+    _write_json_path(path, data)
+
+
+def _write_json_path(path: Path, data) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        print(f"[History] 写入失败 {path}: {e}")
+
+
+def _history_document_exists(storage_key: str) -> bool:
+    path = _task_file(storage_key)
+    if _history_uses_sqlite():
+        try:
+            if _sqlite_store().exists(_history_doc_key(path)):
+                return True
+        except Exception as e:
+            print(f"[History] 查询 SQLite 文档失败，回退 JSON {path}: {e}")
+    return path.exists()
+
+
+def _history_document_signature(path: Path) -> tuple[str, int, int]:
+    if _history_uses_sqlite():
+        try:
+            store = _sqlite_store()
+            doc_key = _history_doc_key(path)
+            if store.exists(doc_key):
+                return store.signature(doc_key)
+        except Exception as e:
+            print(f"[History] 读取 SQLite 签名失败，回退 JSON {path}: {e}")
+    try:
+        stat = path.stat()
+        return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    except FileNotFoundError:
+        return (str(path), 0, 0)
+    except Exception:
+        return (str(path), -1, -1)
+
+
+def _iter_history_json_filenames() -> list[str]:
+    filenames: set[str] = set()
+    history_dir = _history_dir()
+    if history_dir.exists():
+        filenames.update(path.name for path in history_dir.glob("*.json"))
+    if _history_uses_sqlite():
+        prefix = "history/"
+        try:
+            keys = _sqlite_store().list_keys(prefix)
+        except Exception as e:
+            print(f"[History] 列出 SQLite 历史失败，回退 JSON: {e}")
+            keys = []
+        for key in keys:
+            filename = key.removeprefix(prefix)
+            if filename.endswith(".json") and "/" not in filename:
+                filenames.add(filename)
+    return sorted(filenames)
 
 
 # ---------------------------------------------------------------------------
@@ -295,13 +439,7 @@ def get_records_file_signature(
     signatures: list[tuple[str, int, int]] = []
     for key in _history_read_targets(task_id=task_id, task_name=task_name, include_legacy=include_legacy):
         path = _task_file(key)
-        try:
-            stat = path.stat()
-            signatures.append((str(path), int(stat.st_mtime_ns), int(stat.st_size)))
-        except FileNotFoundError:
-            signatures.append((str(path), 0, 0))
-        except Exception:
-            signatures.append((str(path), -1, -1))
+        signatures.append(_history_document_signature(path))
     return tuple(signatures)
 
 
@@ -819,11 +957,12 @@ def _compute_rates_locked(task_name: str, records: list):
 def get_all_task_names() -> list:
     """返回所有有历史记录的任务名列表"""
     history_dir = _history_dir()
-    if not history_dir.exists():
+    if not history_dir.exists() and not _history_uses_sqlite():
         return []
     names = []
     seen_names: set[str] = set()
-    for f in history_dir.glob("*.json"):
+    for filename in _iter_history_json_filenames():
+        f = history_dir / filename
         if f.stem.endswith("_rates") or f.stem.endswith("_periods") or "_trend_" in f.stem:
             continue
         records = _load(f)
@@ -975,10 +1114,11 @@ def get_pending_reviews(limit: int = 200) -> list[dict]:
     items = []
     seen_ids: set[str] = set()
     history_dir = _history_dir()
-    if not history_dir.exists():
+    if not history_dir.exists() and not _history_uses_sqlite():
         return items
 
-    for path in history_dir.glob("*.json"):
+    for filename in _iter_history_json_filenames():
+        path = history_dir / filename
         if path.stem.endswith("_rates"):
             continue
         task_name = path.stem
@@ -1265,6 +1405,16 @@ def _brand_trend_cache_file(task_name: str, brands: list[str] | None, *, task_id
 
 def _load_brand_trend_cache(task_name: str, brands: list[str] | None, *, task_id: str = "") -> dict:
     path = _brand_trend_cache_file(task_name, brands, task_id=task_id)
+    if _history_uses_sqlite():
+        data = _load_json_document(path, {})
+        if isinstance(data, dict):
+            return data or {
+                "version": 1,
+                "task_id": str(task_id or "").strip(),
+                "task_name": task_name,
+                "brands": _normalize_brand_names(brands),
+                "items": [],
+            }
     try:
         if path.exists():
             with open(path, "r", encoding="utf-8") as f:
@@ -1284,7 +1434,6 @@ def _load_brand_trend_cache(task_name: str, brands: list[str] | None, *, task_id
 
 def _save_brand_trend_cache(task_name: str, brands: list[str] | None, items: list[dict], *, task_id: str = "") -> None:
     path = _brand_trend_cache_file(task_name, brands, task_id=task_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": 1,
         "task_id": str(task_id or "").strip(),
@@ -1292,6 +1441,10 @@ def _save_brand_trend_cache(task_name: str, brands: list[str] | None, items: lis
         "brands": _normalize_brand_names(brands),
         "items": items,
     }
+    if _history_uses_sqlite():
+        _save_json_document(path, payload)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
         try:
@@ -1386,7 +1539,7 @@ def _history_read_targets(*, task_id: str = "", task_name: str = "", include_leg
     primary = _history_storage_key(task_id=normalized_task_id, task_name=task_name)
     if primary:
         targets.append(primary)
-    if normalized_task_id and _task_file(normalized_task_id).exists():
+    if normalized_task_id and _history_document_exists(normalized_task_id):
         return targets
     legacy = str(task_name or "").strip()
     if include_legacy and legacy and legacy not in targets:
@@ -1490,10 +1643,9 @@ def _safe_name(task_name: str) -> str:
 
 
 def _history_dir() -> Path:
-    resolved_default = resolve_app_path("logs/history")
-    if HISTORY_DIR != resolved_default:
+    if HISTORY_DIR != DEFAULT_HISTORY_DIR:
         return HISTORY_DIR
-    return account_scoped_path("logs/history", fallback=resolved_default)
+    return account_scoped_path("logs/history", fallback=DEFAULT_HISTORY_DIR)
 
 
 def get_history_dir() -> Path:
@@ -1531,32 +1683,11 @@ def _prune_lock_cache_locked() -> None:
 
 
 def _load(path: Path) -> list:
-    if not path.exists():
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    return _load_json_document(path, [])
 
 
 def _save(path: Path, data: list):
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-    except Exception as e:
-        print(f"[History] 写入失败 {path}: {e}")
+    _save_json_document(path, data)
 
 
 def _normalize_record(record: dict, task_name: str = "", task_id: str = "") -> dict:

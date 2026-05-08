@@ -24,6 +24,7 @@ import sys
 import threading
 import tempfile
 import time
+import traceback
 from collections import Counter
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
@@ -9904,6 +9905,26 @@ class WebRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         return
 
+    def _send_internal_error(self, exc: Exception) -> None:
+        method = str(getattr(self, "command", "") or "").strip() or "REQUEST"
+        print(f"[WebBackend] {method} {self.path} 处理失败: {exc}")
+        traceback.print_exc()
+        try:
+            _json_response(
+                self,
+                {
+                    "ok": False,
+                    "message": "服务端处理请求失败，请查看后端日志",
+                    "error": exc.__class__.__name__,
+                    "detail": str(exc),
+                },
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return
+        except Exception as response_exc:
+            print(f"[WebBackend] 返回错误响应失败: {response_exc}")
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         try:
             _reject_disallowed_request(self)
@@ -9922,56 +9943,59 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         except _RequestRejected as exc:
             _json_response(self, {"ok": False, "message": exc.message}, status=exc.status)
             return
-        parsed = urlparse(self.path)
-        path = parsed.path
-        if path == "/api/session":
-            _json_response(self, self.runtime.session_snapshot())
-            return
-        if path.startswith("/api/bootstrap"):
-            _json_response(self, self.runtime.snapshot())
-            return
-        if path.startswith("/api/config"):
-            _json_response(self, {"config": _sanitize_config_for_api(self.runtime.load_config())})
-            return
-        if path.startswith("/api/status"):
-            _json_response(self, self.runtime.snapshot())
-            return
-        if path.startswith("/api/assets/profile/avatar"):
-            asset = self.runtime.get_profile_avatar_asset()
-            if asset is None:
-                _text_response(self, "avatar not found", status=HTTPStatus.NOT_FOUND)
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == "/api/session":
+                _json_response(self, self.runtime.session_snapshot())
                 return
-            data, content_type = asset
-            _bytes_response(self, data, content_type=content_type)
-            return
-        if path == "/api/search/download-file":
-            qs = parse_qs(parsed.query)
-            output_id = (qs.get("id", [""])[0] or "").strip()
-            item = self.runtime.get_search_output_file(output_id)
-            if not item:
-                _text_response(self, "file not found", status=HTTPStatus.NOT_FOUND)
+            if path.startswith("/api/bootstrap"):
+                _json_response(self, self.runtime.snapshot())
                 return
-            _download_file_response(self, Path(str(item["path"])), str(item["name"]))
-            return
-        if path == "/api/recognition/status":
-            qs = parse_qs(parsed.query)
-            compact = str((qs.get("compact", [""])[0] or "")).strip().lower() in {"1", "true", "yes"}
-            passive = str((qs.get("passive", [""])[0] or "")).strip().lower() in {"1", "true", "yes"}
-            _json_response(self, self.runtime.get_recognition_status(compact=compact, passive=passive))
-            return
-        exact_method_name = GET_EXACT_RUNTIME_METHODS.get(path)
-        if exact_method_name:
-            if path in GET_EXACT_SESSION_TOKEN_REQUIRED_PATHS:
-                try:
-                    _reject_invalid_session_token(self)
-                except _RequestRejected as exc:
-                    _json_response(self, {"ok": False, "message": exc.message}, status=exc.status)
+            if path.startswith("/api/config"):
+                _json_response(self, {"config": _sanitize_config_for_api(self.runtime.load_config())})
+                return
+            if path.startswith("/api/status"):
+                _json_response(self, self.runtime.snapshot())
+                return
+            if path.startswith("/api/assets/profile/avatar"):
+                asset = self.runtime.get_profile_avatar_asset()
+                if asset is None:
+                    _text_response(self, "avatar not found", status=HTTPStatus.NOT_FOUND)
                     return
-            _json_response(self, getattr(self.runtime, exact_method_name)())
-            return
-        if self._handle_get_api_route(parsed, path):
-            return
-        self._serve_static(path)
+                data, content_type = asset
+                _bytes_response(self, data, content_type=content_type)
+                return
+            if path == "/api/search/download-file":
+                qs = parse_qs(parsed.query)
+                output_id = (qs.get("id", [""])[0] or "").strip()
+                item = self.runtime.get_search_output_file(output_id)
+                if not item:
+                    _text_response(self, "file not found", status=HTTPStatus.NOT_FOUND)
+                    return
+                _download_file_response(self, Path(str(item["path"])), str(item["name"]))
+                return
+            if path == "/api/recognition/status":
+                qs = parse_qs(parsed.query)
+                compact = str((qs.get("compact", [""])[0] or "")).strip().lower() in {"1", "true", "yes"}
+                passive = str((qs.get("passive", [""])[0] or "")).strip().lower() in {"1", "true", "yes"}
+                _json_response(self, self.runtime.get_recognition_status(compact=compact, passive=passive))
+                return
+            exact_method_name = GET_EXACT_RUNTIME_METHODS.get(path)
+            if exact_method_name:
+                if path in GET_EXACT_SESSION_TOKEN_REQUIRED_PATHS:
+                    try:
+                        _reject_invalid_session_token(self)
+                    except _RequestRejected as exc:
+                        _json_response(self, {"ok": False, "message": exc.message}, status=exc.status)
+                        return
+                _json_response(self, getattr(self.runtime, exact_method_name)())
+                return
+            if self._handle_get_api_route(parsed, path):
+                return
+            self._serve_static(path)
+        except Exception as exc:
+            self._send_internal_error(exc)
 
     def _handle_get_api_route(self, parsed, path: str) -> bool:
         if path == "/api/dashboard/trend":
@@ -10067,6 +10091,8 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             self._do_POST()
         except _RequestRejected as exc:
             _json_response(self, {"ok": False, "message": exc.message}, status=exc.status)
+        except Exception as exc:
+            self._send_internal_error(exc)
 
     def _do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -10170,6 +10196,8 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             self._do_PUT()
         except _RequestRejected as exc:
             _json_response(self, {"ok": False, "message": exc.message}, status=exc.status)
+        except Exception as exc:
+            self._send_internal_error(exc)
 
     def _do_PUT(self) -> None:
         parsed = urlparse(self.path)
@@ -10212,6 +10240,8 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             self._do_DELETE()
         except _RequestRejected as exc:
             _json_response(self, {"ok": False, "message": exc.message}, status=exc.status)
+        except Exception as exc:
+            self._send_internal_error(exc)
 
     def _do_DELETE(self) -> None:
         parsed = urlparse(self.path)
