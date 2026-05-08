@@ -21,6 +21,7 @@ ACCOUNT_PROFILE_ROOT = get_data_root() / "user_data" / "cloud_profiles"
 ACCOUNT_SCOPED_RELATIVE_PATHS = (
     "config.yaml",
     "config.local.yaml",
+    "logs/local_store.sqlite3",
     "logs/history",
     "logs/articles.json",
     "logs/article_import_batches.json",
