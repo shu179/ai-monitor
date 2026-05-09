@@ -389,6 +389,68 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
         self.assertTrue(parsed["ok"])
         self.assertEqual(parsed["modes"]["sqlite_shadow"]["request_count"], 6)
 
+    def test_stress_history_writes_command_prints_report(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_stress(
+            db_path,
+            *,
+            max_workers,
+            task_count,
+            records_per_task,
+            imports_per_task,
+            review_every,
+            max_records,
+            fd_growth_limit,
+        ):
+            calls.append((
+                db_path,
+                max_workers,
+                task_count,
+                records_per_task,
+                imports_per_task,
+                review_every,
+                max_records,
+                fd_growth_limit,
+            ))
+            return {
+                "ok": True,
+                "write_summary": {"recorded": 12},
+                "checks": {"records": {"ok": True}},
+            }
+
+        cli.stress_history_shadow_writes = fake_stress
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "stress-history-writes",
+                "--db-path",
+                "shadow.sqlite3",
+                "--workers",
+                "3",
+                "--task-count",
+                "5",
+                "--records-per-task",
+                "11",
+                "--imports-per-task",
+                "4",
+                "--review-every",
+                "2",
+                "--max-records",
+                "30",
+                "--fd-growth-limit",
+                "1",
+                "--compact",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [("shadow.sqlite3", 3, 5, 11, 4, 2, 30, 1)])
+        parsed = json.loads(output.getvalue())
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["write_summary"]["recorded"], 12)
+
 
 if __name__ == "__main__":
     unittest.main()

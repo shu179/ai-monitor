@@ -81,6 +81,7 @@ _STRUCTURAL_ERROR_PATTERNS = (
 _startup_missing_count: dict = {}  # task_name -> int
 _locks: dict[str, CrossProcessRLock] = {}
 _locks_mutex = threading.Lock()
+_structured_shadow_write_lock = threading.RLock()
 _MAX_LOCKS = 500  # 锁字典的最大容量，超出时清理最旧的 25%
 
 
@@ -177,7 +178,8 @@ def _shadow_append_history_record(storage_key: str, entry: dict) -> None:
     if not _history_structured_shadow_writes_enabled():
         return
     try:
-        _structured_shadow_store().append_history_record(storage_key, entry, max_records=MAX_RECORDS)
+        with _structured_shadow_write_lock:
+            _structured_shadow_store().append_history_record(storage_key, entry, max_records=MAX_RECORDS)
     except Exception as e:
         print(f"[History] 写入结构化 SQLite 影子历史失败 {storage_key}: {e}")
 
@@ -186,7 +188,8 @@ def _shadow_replace_history_records(storage_key: str, records: list[dict]) -> No
     if not _history_structured_shadow_writes_enabled():
         return
     try:
-        _structured_shadow_store().import_history_records(storage_key, records, replace=True)
+        with _structured_shadow_write_lock:
+            _structured_shadow_store().import_history_records(storage_key, records, replace=True)
     except Exception as e:
         print(f"[History] 替换结构化 SQLite 影子历史失败 {storage_key}: {e}")
 
@@ -201,13 +204,14 @@ def _shadow_apply_history_review(
     if not _history_structured_shadow_writes_enabled():
         return
     try:
-        _structured_shadow_store().apply_history_review(
-            storage_keys,
-            record_id,
-            status,
-            note,
-            reviewed_at=reviewed_at,
-        )
+        with _structured_shadow_write_lock:
+            _structured_shadow_store().apply_history_review(
+                storage_keys,
+                record_id,
+                status,
+                note,
+                reviewed_at=reviewed_at,
+            )
     except Exception as e:
         print(f"[History] 更新结构化 SQLite 影子复核失败 {record_id}: {e}")
 

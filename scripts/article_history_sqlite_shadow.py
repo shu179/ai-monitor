@@ -8,6 +8,7 @@ import contextlib
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +30,7 @@ from core.article_history_sqlite_mirror import (
     compare_history_records,
     compare_history_task_reads,
     default_shadow_db_path,
+    load_json_history_sources,
     rebuild_shadow_store,
     verify_shadow_store,
 )
@@ -243,6 +245,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Ask /api/articles to include export keyword fields in the stressed payload.",
     )
+    history_write_stress_parser = subparsers.add_parser(
+        "stress-history-writes",
+        parents=[common],
+        help="Stress isolated JSON history writes with structured SQLite shadow writes enabled.",
+    )
+    history_write_stress_parser.add_argument(
+        "--task-count",
+        type=int,
+        default=8,
+        help="Number of isolated tasks to write concurrently.",
+    )
+    history_write_stress_parser.add_argument(
+        "--records-per-task",
+        type=int,
+        default=40,
+        help="Number of record() writes per task.",
+    )
+    history_write_stress_parser.add_argument(
+        "--imports-per-task",
+        type=int,
+        default=5,
+        help="Number of import_records() rows per task.",
+    )
+    history_write_stress_parser.add_argument(
+        "--review-every",
+        type=int,
+        default=4,
+        help="Approve every Nth successful generated record. Non-positive disables reviews.",
+    )
+    history_write_stress_parser.add_argument(
+        "--max-records",
+        type=int,
+        default=500,
+        help="Temporary history.MAX_RECORDS value for the isolated stress run.",
+    )
+    history_write_stress_parser.add_argument(
+        "--fd-growth-limit",
+        type=int,
+        default=4,
+        help="Maximum allowed open fd growth during the isolated stress run. Negative disables the check.",
+    )
     return parser.parse_args(argv)
 
 
@@ -311,6 +354,18 @@ def main(argv: list[str] | None = None) -> int:
             max_failed_requests=args.max_failed_requests,
             max_mismatches=args.max_mismatches,
             mode=args.mode,
+        )
+        ok = bool(result.get("ok"))
+    elif args.command == "stress-history-writes":
+        result = stress_history_shadow_writes(
+            args.db_path,
+            max_workers=args.workers,
+            task_count=args.task_count,
+            records_per_task=args.records_per_task,
+            imports_per_task=args.imports_per_task,
+            review_every=args.review_every,
+            max_records=args.max_records,
+            fd_growth_limit=args.fd_growth_limit,
         )
         ok = bool(result.get("ok"))
     else:
@@ -386,6 +441,268 @@ def _compact_history_compare_result(result: dict[str, Any]) -> dict[str, Any]:
     else:
         compact["rebuild"] = rebuild
     return compact
+
+
+def stress_history_shadow_writes(
+    db_path: str | Path | None = None,
+    *,
+    max_workers: int | None = None,
+    task_count: int = 8,
+    records_per_task: int = 40,
+    imports_per_task: int = 5,
+    review_every: int = 4,
+    max_records: int = 500,
+    fd_growth_limit: int = 4,
+) -> dict[str, Any]:
+    """Stress isolated runtime history writes while mirroring to structured SQLite."""
+    from core import history as history_module
+
+    resolved_task_count = max(1, min(100, int(task_count or 1)))
+    resolved_records_per_task = max(0, min(2000, int(records_per_task or 0)))
+    resolved_imports_per_task = max(0, min(2000, int(imports_per_task or 0)))
+    resolved_review_every = int(review_every or 0)
+    resolved_max_records = max(1, min(10000, int(max_records or 500)))
+    worker_count = _bounded_worker_count(resolved_task_count, max_workers=max_workers)
+    fd_before = _open_fd_count()
+    started_at = time.perf_counter()
+
+    with tempfile.TemporaryDirectory(prefix="ai-monitor-history-shadow-") as tmpdir:
+        root = Path(tmpdir)
+        stress_db_path = Path(db_path) if db_path is not None else root / "logs" / "article_history_shadow.sqlite3"
+        config = {
+            "tasks": [
+                {"task_id": f"stress_task_{index:03d}", "name": f"压测任务{index:03d}"}
+                for index in range(resolved_task_count)
+            ],
+        }
+        with _patched_history_write_environment(history_module, root, stress_db_path, resolved_max_records):
+            if worker_count <= 1:
+                write_summaries = [
+                    _run_history_write_stress_task(
+                        history_module,
+                        task,
+                        task_index=index,
+                        records_per_task=resolved_records_per_task,
+                        imports_per_task=resolved_imports_per_task,
+                        review_every=resolved_review_every,
+                    )
+                    for index, task in enumerate(config["tasks"])
+                ]
+            else:
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    write_summaries = list(executor.map(
+                        lambda item: _run_history_write_stress_task(
+                            history_module,
+                            item[1],
+                            task_index=item[0],
+                            records_per_task=resolved_records_per_task,
+                            imports_per_task=resolved_imports_per_task,
+                            review_every=resolved_review_every,
+                        ),
+                        enumerate(config["tasks"]),
+                    ))
+            source = load_json_history_sources(max_workers=worker_count)
+            records_report = compare_history_records(
+                stress_db_path,
+                source=source,
+                max_workers=worker_count,
+                limit=50,
+                sample_pages=3,
+                rebuild=False,
+            )
+            reads_report = compare_history_task_reads(
+                stress_db_path,
+                config=config,
+                source=source,
+                max_workers=worker_count,
+                limit=50,
+                sample_pages=3,
+                rebuild=False,
+            )
+            derived_report = compare_history_derived_views(
+                stress_db_path,
+                source=source,
+                max_workers=worker_count,
+                pending_limit=200,
+                rebuild=False,
+            )
+
+    fd_after = _open_fd_count()
+    fd_growth = None if fd_before is None or fd_after is None else fd_after - fd_before
+    fd_ok = fd_growth_limit < 0 or fd_growth is None or fd_growth <= int(fd_growth_limit)
+    failed_checks = [
+        name
+        for name, report in (
+            ("records", records_report),
+            ("task_reads", reads_report),
+            ("derived_views", derived_report),
+        )
+        if not bool(report.get("ok"))
+    ]
+    if not fd_ok:
+        failed_checks.append("fd_growth")
+    return {
+        "ok": not failed_checks,
+        "db_path": str(stress_db_path),
+        "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        "workers": worker_count,
+        "task_count": resolved_task_count,
+        "records_per_task": resolved_records_per_task,
+        "imports_per_task": resolved_imports_per_task,
+        "review_every": resolved_review_every,
+        "max_records": resolved_max_records,
+        "write_summary": _history_write_summary(write_summaries),
+        "fd": {
+            "before": fd_before,
+            "after": fd_after,
+            "growth": fd_growth,
+            "growth_limit": fd_growth_limit,
+            "ok": fd_ok,
+        },
+        "failed_checks": failed_checks,
+        "checks": {
+            "records": _history_guard_summary(records_report),
+            "task_reads": _history_guard_summary(reads_report),
+            "derived_views": _history_guard_summary(derived_report),
+        },
+    }
+
+
+def _bounded_worker_count(item_count: int, *, max_workers: int | None) -> int:
+    if item_count <= 1:
+        return 1
+    if max_workers is not None:
+        return max(1, min(item_count, int(max_workers or 1)))
+    cpu_count = os.cpu_count() or 2
+    return max(1, min(item_count, cpu_count, 8))
+
+
+@contextlib.contextmanager
+def _patched_history_write_environment(history_module: Any, root: Path, db_path: Path, max_records: int):
+    original = {
+        "DEFAULT_HISTORY_DIR": history_module.DEFAULT_HISTORY_DIR,
+        "HISTORY_DIR": history_module.HISTORY_DIR,
+        "LOCAL_STORE_DB_FILE": history_module.LOCAL_STORE_DB_FILE,
+        "HISTORY_SHADOW_DB_FILE": history_module.HISTORY_SHADOW_DB_FILE,
+        "MAX_RECORDS": history_module.MAX_RECORDS,
+    }
+    history_dir = root / "logs" / "history"
+    local_store = root / "logs" / "local_store.sqlite3"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    history_module.DEFAULT_HISTORY_DIR = history_dir
+    history_module.HISTORY_DIR = history_dir
+    history_module.LOCAL_STORE_DB_FILE = local_store
+    history_module.HISTORY_SHADOW_DB_FILE = db_path
+    history_module.MAX_RECORDS = max_records
+    try:
+        with (
+            _temporary_env(history_module.STORAGE_BACKEND_ENV, None),
+            _temporary_env(history_module.STRUCTURED_SHADOW_WRITE_ENV, "1"),
+        ):
+            yield
+    finally:
+        history_module.DEFAULT_HISTORY_DIR = original["DEFAULT_HISTORY_DIR"]
+        history_module.HISTORY_DIR = original["HISTORY_DIR"]
+        history_module.LOCAL_STORE_DB_FILE = original["LOCAL_STORE_DB_FILE"]
+        history_module.HISTORY_SHADOW_DB_FILE = original["HISTORY_SHADOW_DB_FILE"]
+        history_module.MAX_RECORDS = original["MAX_RECORDS"]
+
+
+def _run_history_write_stress_task(
+    history_module: Any,
+    task: dict[str, Any],
+    *,
+    task_index: int,
+    records_per_task: int,
+    imports_per_task: int,
+    review_every: int,
+) -> dict[str, Any]:
+    task_id = str(task.get("task_id") or "").strip()
+    task_name = str(task.get("name") or "").strip()
+    written_ids: list[str] = []
+    reviewed_ids: list[str] = []
+    for record_index in range(records_per_task):
+        success = record_index % 5 != 0
+        rank = (record_index % 3) + 1 if success else 99
+        entry = history_module.record(
+            task_name,
+            "doubao",
+            f"关键词{task_index:03d}-{record_index:04d}",
+            f"品牌{task_index % 3}",
+            rank,
+            success,
+            {
+                "execution_source": "history_sqlite_stress",
+                "highlight_count": 1 if success else 0,
+            },
+            task_id=task_id,
+        )
+        written_ids.append(str(entry.get("id") or ""))
+        if success and review_every > 0 and record_index % review_every == 0:
+            if history_module.apply_review(task_name, entry.get("id", ""), "approved", "stress-ok", task_id=task_id):
+                reviewed_ids.append(str(entry.get("id") or ""))
+
+    import_entries = [
+        {
+            "id": f"import_{task_index:03d}_{import_index:04d}",
+            "ts": f"2024-02-{(import_index % 28) + 1:02d} 09:{task_index % 60:02d}",
+            "task_id": task_id,
+            "task_name": task_name,
+            "platform": "doubao",
+            "keyword": f"导入词{task_index:03d}-{import_index:04d}",
+            "brand": f"品牌{task_index % 3}",
+            "rank": 1 if import_index % 2 == 0 else 99,
+            "success": import_index % 2 == 0,
+            "review_status": "pending" if import_index % 2 == 0 else "",
+            "execution_source": "history_sqlite_stress_import",
+        }
+        for import_index in range(imports_per_task)
+    ]
+    imported = history_module.import_records(task_name, import_entries, task_id=task_id)
+    return {
+        "task_id": task_id,
+        "task_name": task_name,
+        "recorded": len(written_ids),
+        "reviewed": len(reviewed_ids),
+        "import_requested": len(import_entries),
+        "imported": imported,
+    }
+
+
+def _history_write_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "tasks": len(items),
+        "recorded": sum(int(item.get("recorded") or 0) for item in items),
+        "reviewed": sum(int(item.get("reviewed") or 0) for item in items),
+        "import_requested": sum(int(item.get("import_requested") or 0) for item in items),
+        "imported": sum(int(item.get("imported") or 0) for item in items),
+    }
+
+
+def _history_guard_summary(report: dict[str, Any]) -> dict[str, Any]:
+    queries = [item for item in (report.get("queries") or []) if isinstance(item, dict)]
+    views = [item for item in (report.get("views") or []) if isinstance(item, dict)]
+    keys = report.get("keys") if isinstance(report.get("keys"), dict) else {}
+    summary: dict[str, Any] = {
+        "ok": bool(report.get("ok")),
+        "failed_count": int(report.get("failed_count") or 0),
+    }
+    if report.get("storage_key_count") is not None:
+        summary["storage_key_count"] = report.get("storage_key_count")
+    if report.get("query_count") is not None:
+        summary["query_count"] = report.get("query_count")
+    if report.get("view_count") is not None:
+        summary["view_count"] = report.get("view_count")
+    if keys:
+        summary["key_mismatches"] = keys.get("mismatches") or []
+    failed_queries = [str(item.get("name") or "") for item in queries if not bool(item.get("ok"))]
+    failed_views = [str(item.get("name") or "") for item in views if not bool(item.get("ok"))]
+    if failed_queries:
+        summary["failed_queries"] = failed_queries
+    if failed_views:
+        summary["failed_views"] = failed_views
+    return summary
 
 
 def compare_article_api_pages(
