@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.article_history_sqlite_mirror import rebuild_shadow_store, verify_shadow_store
+from core.article_history_sqlite_mirror import compare_article_pages, rebuild_shadow_store, verify_shadow_store
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -31,30 +31,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--workers",
         type=int,
         default=None,
-        help="Maximum parallel workers for reading history JSON files.",
-    )
-    common.add_argument(
-        "--tail-limit",
-        type=int,
-        default=20,
-        help="Number of tail records per history file to compare during verification.",
+        help="Maximum parallel workers for JSON reads or article page comparisons.",
     )
     common.add_argument(
         "--compact",
         action="store_true",
         help="Print compact JSON instead of indented JSON.",
     )
+    verify_common = argparse.ArgumentParser(add_help=False)
+    verify_common.add_argument(
+        "--tail-limit",
+        type=int,
+        default=20,
+        help="Number of tail records per history file to compare during verification.",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser(
         "rebuild",
-        parents=[common],
+        parents=[common, verify_common],
         help="Rebuild the shadow SQLite DB from JSON and verify it.",
     )
     subparsers.add_parser(
         "verify",
-        parents=[common],
+        parents=[common, verify_common],
         help="Verify an existing shadow SQLite DB against JSON.",
+    )
+    compare_parser = subparsers.add_parser(
+        "compare-articles",
+        parents=[common],
+        help="Compare JSON article pages with the SQLite shadow article index.",
+    )
+    compare_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Number of article IDs to compare per query.",
+    )
+    compare_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Rebuild the SQLite shadow article index before comparing.",
     )
     return parser.parse_args(argv)
 
@@ -68,6 +85,14 @@ def main(argv: list[str] | None = None) -> int:
             verify_tail_limit=args.tail_limit,
         )
         ok = bool(result.get("verification", {}).get("ok"))
+    elif args.command == "compare-articles":
+        result = compare_article_pages(
+            args.db_path,
+            max_workers=args.workers,
+            limit=args.limit,
+            rebuild=bool(args.rebuild),
+        )
+        ok = bool(result.get("ok"))
     else:
         result = verify_shadow_store(
             args.db_path,

@@ -69,6 +69,39 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
         self.assertFalse(parsed["ok"])
         self.assertEqual(parsed["articles"]["sqlite_total"], 0)
 
+    def test_compare_articles_command_prints_report_and_returns_failure_on_mismatch(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_compare(db_path, *, max_workers, limit, rebuild):
+            calls.append((db_path, max_workers, limit, rebuild))
+            return {
+                "ok": False,
+                "failed_count": 1,
+                "queries": [{"name": "all", "mismatches": ["total"]}],
+            }
+
+        cli.compare_article_pages = fake_compare
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "compare-articles",
+                "--db-path",
+                "shadow.sqlite3",
+                "--workers",
+                "3",
+                "--limit",
+                "25",
+                "--rebuild",
+            ])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(calls, [("shadow.sqlite3", 3, 25, True)])
+        parsed = json.loads(output.getvalue())
+        self.assertFalse(parsed["ok"])
+        self.assertEqual(parsed["queries"][0]["mismatches"], ["total"])
+
 
 if __name__ == "__main__":
     unittest.main()

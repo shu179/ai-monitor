@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 from . import article_store, history
 from .app_paths import resolve_app_path
 from .article_history_sqlite_store import ArticleHistorySQLiteStore
-from .local_account_space import account_scoped_path
+from .config_watcher import load_config
+from .local_account_space import account_scoped_path, current_account_config_path
+from .time_utils import local_today, parse_local_date
 
 
 DEFAULT_SHADOW_DB_FILE = resolve_app_path("logs/article_history_shadow.sqlite3")
@@ -123,6 +127,91 @@ def verify_shadow_store(
     }
 
 
+def compare_article_pages(
+    db_path: str | Path | None = None,
+    *,
+    config: dict[str, Any] | None = None,
+    articles: list[dict[str, Any]] | None = None,
+    limit: int = 50,
+    max_workers: int | None = None,
+    rebuild: bool = False,
+) -> dict[str, Any]:
+    target_db_path = Path(db_path) if db_path is not None else default_shadow_db_path()
+    resolved_config = config if config is not None else _load_current_config()
+    source_articles = articles if articles is not None else article_store.refresh_article_matches(resolved_config)
+    normalized_articles = [item for item in source_articles if isinstance(item, dict)]
+    resolved_limit = max(1, min(500, int(limit or 50)))
+    queries = build_article_compare_queries(resolved_config)
+
+    store = ArticleHistorySQLiteStore(
+        target_db_path,
+        normalize_article_url=article_store.normalize_article_url,
+    )
+    rebuild_result = None
+    if rebuild:
+        rebuild_result = store.import_articles(normalized_articles, replace=True)
+
+    worker_count = _article_compare_worker_count(queries, max_workers=max_workers)
+    if worker_count <= 1:
+        results = [
+            _compare_article_query(
+                store,
+                normalized_articles,
+                query,
+                limit=resolved_limit,
+            )
+            for query in queries
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(executor.map(
+                lambda query: _compare_article_query(
+                    store,
+                    normalized_articles,
+                    query,
+                    limit=resolved_limit,
+                ),
+                queries,
+            ))
+
+    failed = [item for item in results if not bool(item.get("ok"))]
+    return {
+        "ok": not failed,
+        "db_path": str(target_db_path),
+        "limit": resolved_limit,
+        "workers": worker_count,
+        "query_count": len(results),
+        "failed_count": len(failed),
+        "rebuild": rebuild_result,
+        "queries": results,
+    }
+
+
+def build_article_compare_queries(config: dict[str, Any] | None) -> list[dict[str, str]]:
+    queries: list[dict[str, str]] = [{"name": "all", "task_name": "", "media_type": ""}]
+    media_types = (("media", "authority"), ("self-media", "selfmedia"))
+    for public_media_type, _storage_media_type in media_types:
+        queries.append({
+            "name": f"media:{public_media_type}",
+            "task_name": "",
+            "media_type": public_media_type,
+        })
+
+    for task_name in _article_compare_task_names(config):
+        queries.append({
+            "name": f"task:{task_name}",
+            "task_name": task_name,
+            "media_type": "",
+        })
+        for public_media_type, _storage_media_type in media_types:
+            queries.append({
+                "name": f"task:{task_name}|media:{public_media_type}",
+                "task_name": task_name,
+                "media_type": public_media_type,
+            })
+    return queries
+
+
 def load_json_source(*, max_workers: int | None = None) -> dict[str, Any]:
     return {
         "articles": article_store.get_articles(),
@@ -168,6 +257,214 @@ def _history_read_worker_count(files: list[Path], *, max_workers: int | None) ->
         return max(1, min(len(files), int(max_workers or 1)))
     cpu_count = os.cpu_count() or 2
     return max(1, min(len(files), cpu_count, 8))
+
+
+def _load_current_config() -> dict[str, Any]:
+    try:
+        return load_config(str(current_account_config_path()))
+    except Exception:
+        return {}
+
+
+def _compare_article_query(
+    store: ArticleHistorySQLiteStore,
+    articles: list[dict[str, Any]],
+    query: dict[str, str],
+    *,
+    limit: int,
+) -> dict[str, Any]:
+    media_type = str(query.get("media_type") or "").strip()
+    storage_media_type = _storage_media_type(media_type)
+    task_name = str(query.get("task_name") or "").strip()
+    json_page = _json_article_page(articles, media_type=media_type, task_name=task_name, limit=limit)
+    sqlite_page = store.get_article_page(
+        limit=limit,
+        task_name=task_name,
+        media_type=storage_media_type,
+    )
+    sqlite_today_total = store.get_article_today_count(
+        local_today().isoformat(),
+        task_name=task_name,
+        media_type=storage_media_type,
+    )
+    sqlite_ids = [
+        str(item.get("id") or "").strip()
+        for item in (sqlite_page.get("items") or [])
+        if isinstance(item, dict)
+    ]
+    mismatches: list[str] = []
+    if int(json_page["total"]) != int(sqlite_page.get("total") or 0):
+        mismatches.append("total")
+    if int(json_page["today_total"]) != int(sqlite_today_total):
+        mismatches.append("today_total")
+    if list(json_page["ids"]) != sqlite_ids:
+        mismatches.append("article_ids")
+    return {
+        "ok": not mismatches,
+        "name": str(query.get("name") or ""),
+        "query": {
+            "task_name": task_name,
+            "media_type": media_type,
+        },
+        "mismatches": mismatches,
+        "json": {
+            "total": json_page["total"],
+            "today_total": json_page["today_total"],
+            "ids": json_page["ids"],
+        },
+        "sqlite": {
+            "total": int(sqlite_page.get("total") or 0),
+            "today_total": int(sqlite_today_total),
+            "ids": sqlite_ids,
+        },
+    }
+
+
+def _json_article_page(
+    articles: list[dict[str, Any]],
+    *,
+    media_type: str,
+    task_name: str,
+    limit: int,
+) -> dict[str, Any]:
+    filtered = list(articles)
+    if task_name:
+        filtered = [article for article in filtered if task_name in (article.get("matched_tasks") or [])]
+    storage_media_type = _storage_media_type(media_type)
+    if storage_media_type:
+        filtered = [article for article in filtered if article.get("media_type") == storage_media_type]
+    deduped = _dedupe_articles_by_url(filtered)
+    today = local_today()
+    today_total = sum(1 for article in deduped if _article_published_date(article) == today)
+    return {
+        "total": len(deduped),
+        "today_total": today_total,
+        "ids": [
+            str(article.get("id") or "").strip()
+            for article in deduped[:limit]
+        ],
+    }
+
+
+def _article_compare_task_names(config: dict[str, Any] | None) -> list[str]:
+    names: list[str] = []
+    for task in (config or {}).get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        if bool(task.get("delete_pending")):
+            continue
+        task_name = str(task.get("name") or "").strip()
+        if task_name and task_name not in names:
+            names.append(task_name)
+    return names
+
+
+def _article_compare_worker_count(queries: list[dict[str, str]], *, max_workers: int | None) -> int:
+    if len(queries) <= 1:
+        return 1
+    if max_workers is not None:
+        return max(1, min(len(queries), int(max_workers or 1)))
+    cpu_count = os.cpu_count() or 2
+    return max(1, min(len(queries), cpu_count, 8))
+
+
+def _storage_media_type(media_type: str) -> str:
+    return {
+        "media": "authority",
+        "self-media": "selfmedia",
+    }.get(str(media_type or "").strip(), str(media_type or "").strip())
+
+
+def _article_published_date(article: dict[str, Any]) -> date | None:
+    published_at = article.get("published_at")
+    if published_at:
+        return parse_local_date(published_at)
+    if str(article.get("fetch_method", "") or "").strip() == "manual_table_import":
+        return None
+    return parse_local_date(article.get("ts"))
+
+
+def _dedupe_articles_by_url(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    index_by_url: dict[str, int] = {}
+    url_by_fingerprint: dict[str, str] = {}
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        normalized_url = article_store.normalize_article_url(str(article.get("url") or ""))
+        fingerprint = _article_url_fingerprint(article)
+        if normalized_url and fingerprint and fingerprint not in url_by_fingerprint:
+            url_by_fingerprint[fingerprint] = str(article.get("url") or "").strip()
+
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        item = dict(article)
+        normalized_url = article_store.normalize_article_url(str(item.get("url") or ""))
+        if not normalized_url:
+            fallback_url = url_by_fingerprint.get(_article_url_fingerprint(item), "")
+            if fallback_url:
+                item["url"] = fallback_url
+                normalized_url = article_store.normalize_article_url(fallback_url)
+        if not normalized_url:
+            deduped.append(item)
+            continue
+        existing_index = index_by_url.get(normalized_url)
+        if existing_index is None:
+            index_by_url[normalized_url] = len(deduped)
+            deduped.append(item)
+            continue
+        deduped[existing_index] = _merge_duplicate_article(deduped[existing_index], item)
+    return deduped
+
+
+def _article_url_fingerprint(article: dict[str, Any]) -> str:
+    title = re.sub(r"\s+", " ", str(article.get("title") or "").strip()).lower()
+    source = re.sub(
+        r"\s+",
+        " ",
+        str(article.get("media_name") or article.get("source") or article.get("platform") or "").strip(),
+    ).lower()
+    published = str(article.get("published_at") or article.get("published") or article.get("ts") or "").strip()[:10]
+    if not title or not source:
+        return ""
+    return "|".join([title, source, published])
+
+
+def _merge_duplicate_article(base: dict[str, Any], duplicate: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key in ("matched_tasks", "referenced_tasks", "cloud_task_ids"):
+        merged[key] = _merge_unique_texts(merged.get(key), duplicate.get(key))
+    base_reasons = merged.get("match_reasons") if isinstance(merged.get("match_reasons"), dict) else {}
+    duplicate_reasons = duplicate.get("match_reasons") if isinstance(duplicate.get("match_reasons"), dict) else {}
+    if base_reasons or duplicate_reasons:
+        next_reasons: dict[str, list[str]] = {}
+        for task_name in set(base_reasons.keys()) | set(duplicate_reasons.keys()):
+            next_reasons[str(task_name)] = _merge_unique_texts(
+                base_reasons.get(task_name),
+                duplicate_reasons.get(task_name),
+            )
+        merged["match_reasons"] = next_reasons
+    base_hits = merged.get("reference_hits") if isinstance(merged.get("reference_hits"), dict) else {}
+    duplicate_hits = duplicate.get("reference_hits") if isinstance(duplicate.get("reference_hits"), dict) else {}
+    if duplicate_hits:
+        merged["reference_hits"] = {**base_hits, **duplicate_hits}
+    for key in ("url", "title", "media_name", "platform", "published_at", "ts"):
+        if not str(merged.get(key) or "").strip() and str(duplicate.get(key) or "").strip():
+            merged[key] = duplicate.get(key)
+    return merged
+
+
+def _merge_unique_texts(left: Any, right: Any) -> list[str]:
+    result: list[str] = []
+    for values in (left, right):
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in result:
+                result.append(text)
+    return result
 
 
 def _read_history_file(path: Path) -> tuple[str, list[dict[str, Any]]]:

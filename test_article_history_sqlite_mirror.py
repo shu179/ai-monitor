@@ -8,6 +8,8 @@ from pathlib import Path
 import core.article_store as article_store
 import core.history as history
 from core.article_history_sqlite_mirror import (
+    build_article_compare_queries,
+    compare_article_pages,
     load_json_history_sources,
     rebuild_shadow_store,
     verify_shadow_store,
@@ -146,6 +148,93 @@ class ArticleHistorySQLiteMirrorTests(unittest.TestCase):
         self.assertEqual(sorted(sources.keys()), ["task-a", "task-b"])
         self.assertEqual([record["id"] for record in sources["task-a"]], ["r1"])
         self.assertEqual([record["id"] for record in sources["task-b"]], ["r2"])
+
+    def test_build_article_compare_queries_includes_task_and_media_combinations(self) -> None:
+        queries = build_article_compare_queries({
+            "tasks": [
+                {"name": "品牌A"},
+                {"name": "品牌B"},
+                {"name": "品牌A"},
+                {"name": "删除中", "delete_pending": True},
+            ],
+        })
+
+        names = [query["name"] for query in queries]
+        self.assertIn("all", names)
+        self.assertIn("media:media", names)
+        self.assertIn("media:self-media", names)
+        self.assertIn("task:品牌A", names)
+        self.assertIn("task:品牌A|media:media", names)
+        self.assertIn("task:品牌B|media:self-media", names)
+        self.assertNotIn("task:删除中", names)
+
+    def test_compare_article_pages_reports_matching_json_and_sqlite_pages(self) -> None:
+        articles = [
+            {
+                "id": "article-b",
+                "url": "https://example.com/b",
+                "title": "品牌B 新闻",
+                "media_name": "示例自媒体",
+                "media_type": "selfmedia",
+                "published_at": "2024-01-03",
+                "matched_tasks": ["品牌A", "品牌B"],
+            },
+            {
+                "id": "article-a",
+                "url": "https://example.com/a",
+                "title": "品牌A 新闻",
+                "media_name": "示例媒体",
+                "media_type": "authority",
+                "published_at": "2024-01-02",
+                "matched_tasks": ["品牌A"],
+            },
+        ]
+        db_path = Path(self._tmpdir.name) / "shadow.sqlite3"
+        store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+        store.import_articles(articles, replace=True)
+
+        result = compare_article_pages(
+            db_path,
+            config={"tasks": [{"name": "品牌A"}, {"name": "品牌B"}]},
+            articles=articles,
+            limit=10,
+            max_workers=2,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["failed_count"], 0)
+        self.assertGreaterEqual(result["query_count"], 5)
+        by_name = {item["name"]: item for item in result["queries"]}
+        self.assertEqual(by_name["all"]["json"]["ids"], ["article-b", "article-a"])
+        self.assertEqual(by_name["task:品牌B"]["json"]["ids"], ["article-b"])
+        self.assertEqual(by_name["task:品牌A|media:media"]["json"]["ids"], ["article-a"])
+
+    def test_compare_article_pages_reports_mismatches(self) -> None:
+        articles = [
+            {
+                "id": "article-a",
+                "url": "https://example.com/a",
+                "title": "品牌A 新闻",
+                "media_type": "authority",
+                "published_at": "2024-01-02",
+                "matched_tasks": ["品牌A"],
+            },
+        ]
+        db_path = Path(self._tmpdir.name) / "shadow.sqlite3"
+        ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url).initialize()
+
+        result = compare_article_pages(
+            db_path,
+            config={"tasks": [{"name": "品牌A"}]},
+            articles=articles,
+            limit=10,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertGreater(result["failed_count"], 0)
+        by_name = {item["name"]: item for item in result["queries"]}
+        self.assertIn("total", by_name["all"]["mismatches"])
+        self.assertIn("article_ids", by_name["all"]["mismatches"])
 
     def _write_articles(self, articles: list[dict]) -> None:
         article_store.ARTICLES_FILE.write_text(
