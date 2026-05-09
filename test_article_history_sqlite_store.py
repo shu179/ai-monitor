@@ -84,6 +84,54 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             search_page = store.get_article_page(search="更新")
             self.assertEqual([item["id"] for item in search_page["items"]], ["article-old"])
 
+    def test_article_page_order_matches_runtime_display_sort_tiebreakers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(
+                Path(tmpdir) / "local_store.sqlite3",
+                normalize_article_url=normalize_article_url,
+            )
+
+            store.import_articles(
+                [
+                    {
+                        "id": "article-a",
+                        "url": "https://example.com/a",
+                        "title": "A",
+                        "published_at": "2024-01-03",
+                        "imported_at": "2024-01-03 09:00",
+                    },
+                    {
+                        "id": "article-b",
+                        "url": "https://example.com/b",
+                        "title": "B",
+                        "published_at": "2024-01-03",
+                        "imported_at": "2024-01-03 10:00",
+                    },
+                    {
+                        "id": "article-c",
+                        "url": "https://example.com/c",
+                        "title": "C",
+                        "published_at": "2024-01-03",
+                        "imported_at": "2024-01-03 10:00",
+                    },
+                    {
+                        "id": "article-d",
+                        "url": "https://example.com/d",
+                        "title": "D",
+                        "published_at": "2024-01-02",
+                        "imported_at": "2024-01-04 12:00",
+                    },
+                ],
+                replace=True,
+            )
+
+            page = store.get_article_page(limit=10)
+
+            self.assertEqual(
+                [item["id"] for item in page["items"]],
+                ["article-c", "article-b", "article-a", "article-d"],
+            )
+
     def test_import_history_records_dedupes_by_storage_key_and_record_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -53,11 +55,15 @@ class ArticleHistorySQLiteStore:
                     imported_at TEXT NOT NULL DEFAULT '',
                     ts TEXT NOT NULL DEFAULT '',
                     fetch_method TEXT NOT NULL DEFAULT '',
+                    sort_published_ts INTEGER NOT NULL DEFAULT 0,
+                    sort_imported_ts INTEGER NOT NULL DEFAULT 0,
                     raw_json TEXT NOT NULL,
                     updated_at_ns INTEGER NOT NULL
                 )
                 """
             )
+            self._ensure_column(conn, "articles", "sort_published_ts", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "articles", "sort_imported_ts", "INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS article_task_links (
@@ -94,6 +100,10 @@ class ArticleHistorySQLiteStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_articles_display_time "
                 "ON articles(published_at DESC, ts DESC, imported_at DESC, id DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_articles_sort_time "
+                "ON articles(sort_published_ts DESC, sort_imported_ts DESC, id DESC)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_articles_media_type "
@@ -148,13 +158,15 @@ class ArticleHistorySQLiteStore:
                 existed = existing_id is not None
                 article["id"] = target_id
                 raw_json = self._json_dumps(article)
+                sort_published_ts, sort_imported_ts = self._article_sort_key(article)
                 conn.execute(
                     """
                     INSERT INTO articles(
                         id, normalized_url, title, media_name, media_type,
-                        published_at, imported_at, ts, fetch_method, raw_json, updated_at_ns
+                        published_at, imported_at, ts, fetch_method,
+                        sort_published_ts, sort_imported_ts, raw_json, updated_at_ns
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         normalized_url = excluded.normalized_url,
                         title = excluded.title,
@@ -164,6 +176,8 @@ class ArticleHistorySQLiteStore:
                         imported_at = excluded.imported_at,
                         ts = excluded.ts,
                         fetch_method = excluded.fetch_method,
+                        sort_published_ts = excluded.sort_published_ts,
+                        sort_imported_ts = excluded.sort_imported_ts,
                         raw_json = excluded.raw_json,
                         updated_at_ns = excluded.updated_at_ns
                     """,
@@ -177,6 +191,8 @@ class ArticleHistorySQLiteStore:
                         self._date_text(article.get("imported_at") or article.get("created_at")),
                         self._date_text(article.get("ts")),
                         self._text(article.get("fetch_method")),
+                        sort_published_ts,
+                        sort_imported_ts,
                         raw_json,
                         updated_at_ns,
                     ),
@@ -230,7 +246,8 @@ class ArticleHistorySQLiteStore:
                 FROM articles a
                 {where_sql}
                 ORDER BY
-                    COALESCE(NULLIF(a.published_at, ''), NULLIF(a.ts, ''), NULLIF(a.imported_at, '')) DESC,
+                    a.sort_published_ts DESC,
+                    a.sort_imported_ts DESC,
                     a.id DESC
                 LIMIT ? OFFSET ?
                 """,
@@ -643,3 +660,74 @@ class ArticleHistorySQLiteStore:
             return int(value)
         except Exception:
             return default
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: str) -> None:
+        columns = {
+            str(row[1] or "")
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if name not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    @classmethod
+    def _article_sort_key(cls, article: dict[str, Any]) -> tuple[int, int]:
+        published_timestamp = cls._first_article_sort_timestamp(
+            article,
+            ("published_ts", "published_at", "published", "ts"),
+        )
+        imported_timestamp = cls._first_article_sort_timestamp(
+            article,
+            ("imported_at", "created_at", "ts"),
+        )
+        return published_timestamp, imported_timestamp
+
+    @classmethod
+    def _first_article_sort_timestamp(cls, article: dict[str, Any], keys: tuple[str, ...]) -> int:
+        for key in keys:
+            timestamp = cls._sort_timestamp(article.get(key))
+            if timestamp > 0:
+                return timestamp
+        return 0
+
+    @staticmethod
+    def _sort_timestamp(value: Any) -> int:
+        text = str(value or "").strip()
+        if not text:
+            return 0
+        if re.fullmatch(r"\d{13}", text):
+            try:
+                return int(text) // 1000
+            except Exception:
+                return 0
+        if re.fullmatch(r"\d{10}", text):
+            try:
+                return int(text)
+            except Exception:
+                return 0
+
+        normalized = text.replace("T", " ").replace("Z", "+00:00")
+        normalized = re.sub(
+            r"([0-9]{4})\s*年\s*([0-9]{1,2})\s*月\s*([0-9]{1,2})\s*日?",
+            r"\1-\2-\3",
+            normalized,
+        )
+        normalized = re.sub(r"([0-9]{4})\.([0-9]{1,2})\.([0-9]{1,2})", r"\1-\2-\3", normalized)
+        normalized = normalized.replace("/", "-")
+        normalized = re.sub(r"(?<=\d{2}:\d{2}:\d{2})\.\d+", "", normalized)
+        try:
+            return int(datetime.fromisoformat(normalized).timestamp())
+        except Exception:
+            pass
+        for fmt, width in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d %H:%M", 16), ("%Y-%m-%d", 10)):
+            try:
+                return int(datetime.strptime(normalized[:width], fmt).timestamp())
+            except Exception:
+                continue
+        match = re.search(r"((?:19|20)\d{2}-\d{1,2}-\d{1,2})", normalized)
+        if match:
+            try:
+                return int(datetime.strptime(match.group(1), "%Y-%m-%d").timestamp())
+            except Exception:
+                pass
+        return 0

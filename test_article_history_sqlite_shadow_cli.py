@@ -102,6 +102,41 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
         self.assertFalse(parsed["ok"])
         self.assertEqual(parsed["queries"][0]["mismatches"], ["total"])
 
+    def test_compare_api_articles_command_prints_report(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_compare(db_path, *, max_workers, limit, timeout, include_export_keywords):
+            calls.append((db_path, max_workers, limit, timeout, include_export_keywords))
+            return {
+                "ok": True,
+                "failed_count": 0,
+                "queries": [{"name": "all", "mismatches": []}],
+            }
+
+        cli.compare_article_api_pages = fake_compare
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "compare-api-articles",
+                "--db-path",
+                "shadow.sqlite3",
+                "--workers",
+                "2",
+                "--limit",
+                "20",
+                "--timeout",
+                "3.5",
+                "--include-export-keywords",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [("shadow.sqlite3", 2, 20, 3.5, True)])
+        parsed = json.loads(output.getvalue())
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["queries"][0]["name"], "all")
+
 
 if __name__ == "__main__":
     unittest.main()
