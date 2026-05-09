@@ -181,6 +181,32 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             limited = store.get_history_records("task-a", limit=1, offset=1)
             self.assertEqual([record["id"] for record in limited], ["r2"])
 
+    def test_get_history_records_for_keys_reads_multiple_keys_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")
+            store.import_history_sources(
+                {
+                    "task-a": [
+                        {"id": "a2", "ts": "2024-01-02 09:00", "task_name": "品牌A"},
+                        {"id": "a1", "ts": "2024-01-01 09:00", "task_name": "品牌A"},
+                    ],
+                    "品牌A": [
+                        {"id": "legacy-1", "ts": "2024-01-03 09:00", "task_name": "品牌A"},
+                    ],
+                    "task-b": [
+                        {"id": "b1", "ts": "2024-01-04 09:00", "task_name": "品牌B"},
+                    ],
+                },
+                replace=True,
+            )
+
+            records_by_key = store.get_history_records_for_keys(["task-a", "品牌A", "task-a", "missing"])
+
+            self.assertEqual([item["id"] for item in records_by_key["task-a"]], ["a1", "a2"])
+            self.assertEqual([item["id"] for item in records_by_key["品牌A"]], ["legacy-1"])
+            self.assertEqual(records_by_key["missing"], [])
+            self.assertNotIn("task-b", records_by_key)
+
     def test_history_records_preserve_source_order_for_same_timestamp_missing_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")
@@ -354,6 +380,14 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
                             "rank": 99,
                             "success": False,
                             "review_status": "pending",
+                        },
+                        {
+                            "id": "success-without-review",
+                            "ts": "2024-01-06 09:00",
+                            "task_name": "品牌B",
+                            "rank": 1,
+                            "success": True,
+                            "review_status": "",
                         },
                     ],
                 },

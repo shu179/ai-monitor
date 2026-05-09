@@ -132,6 +132,10 @@ class ArticleHistorySQLiteStore:
                 "ON history_records(task_name, ts, id)"
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_history_pending_reviews "
+                "ON history_records(review_status, rank, ts DESC, task_name DESC, storage_key, sort_index, id)"
+            )
+            conn.execute(
                 """
                 INSERT INTO store_meta(key, value) VALUES('schema_version', ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -507,6 +511,36 @@ class ArticleHistorySQLiteStore:
             ).fetchall()
         return [self._json_loads(row[0]) for row in rows]
 
+    def get_history_records_for_keys(self, storage_keys: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
+        self.initialize()
+        unique_keys = []
+        seen_keys: set[str] = set()
+        for storage_key in storage_keys or []:
+            normalized_storage_key = self._text(storage_key)
+            if not normalized_storage_key or normalized_storage_key in seen_keys:
+                continue
+            seen_keys.add(normalized_storage_key)
+            unique_keys.append(normalized_storage_key)
+        if not unique_keys:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_keys)
+        results: dict[str, list[dict[str, Any]]] = {storage_key: [] for storage_key in unique_keys}
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT storage_key, raw_json
+                FROM history_records
+                WHERE storage_key IN ({placeholders})
+                ORDER BY storage_key ASC, ts ASC, sort_index ASC, id ASC
+                """,
+                unique_keys,
+            ).fetchall()
+        for storage_key, raw_json in rows:
+            normalized_storage_key = self._text(storage_key)
+            if normalized_storage_key in results:
+                results[normalized_storage_key].append(self._json_loads(raw_json))
+        return results
+
     def list_history_storage_keys(self) -> list[str]:
         self.initialize()
         with self._connection() as conn:
@@ -584,7 +618,7 @@ class ArticleHistorySQLiteStore:
                 """
                 SELECT storage_key, raw_json
                 FROM history_records
-                WHERE review_status = 'pending' OR (review_status = '' AND success = 1)
+                WHERE review_status = 'pending'
                 ORDER BY ts DESC, task_name DESC, storage_key ASC, sort_index ASC, id ASC
                 """
             ).fetchall()

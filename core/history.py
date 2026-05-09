@@ -226,8 +226,7 @@ def _structured_read_store_available() -> bool:
     return _history_shadow_db_file().exists()
 
 
-def _structured_history_read_targets(
-    store,
+def _structured_history_candidate_targets(
     *,
     task_id: str = "",
     task_name: str = "",
@@ -238,11 +237,27 @@ def _structured_history_read_targets(
     primary = _history_storage_key(task_id=normalized_task_id, task_name=task_name)
     if primary:
         targets.append(primary)
-    if normalized_task_id and store.get_history_record_count(normalized_task_id) > 0:
-        return targets
     legacy = str(task_name or "").strip()
     if include_legacy and legacy and legacy not in targets:
         targets.append(legacy)
+    return targets
+
+
+def _structured_history_read_targets(
+    store,
+    *,
+    task_id: str = "",
+    task_name: str = "",
+    include_legacy: bool = True,
+) -> list[str]:
+    targets = _structured_history_candidate_targets(
+        task_id=task_id,
+        task_name=task_name,
+        include_legacy=include_legacy,
+    )
+    normalized_task_id = str(task_id or "").strip()
+    if normalized_task_id and store.get_history_record_count(normalized_task_id) > 0:
+        return targets[:1]
     return targets
 
 
@@ -256,15 +271,21 @@ def _load_structured_history_records(
         return None
     try:
         store = _structured_shadow_store()
-        records: list[dict] = []
-        seen_keys: set[str] = set()
-        for key in _structured_history_read_targets(
-            store,
+        target_candidates = _structured_history_candidate_targets(
             task_id=task_id,
             task_name=task_name,
             include_legacy=include_legacy,
-        ):
-            for raw_record in store.get_history_records(key):
+        )
+        records_by_key = store.get_history_records_for_keys(target_candidates)
+        targets = target_candidates
+        normalized_task_id = str(task_id or "").strip()
+        primary = target_candidates[0] if target_candidates else ""
+        if normalized_task_id and primary and records_by_key.get(primary):
+            targets = [primary]
+        records: list[dict] = []
+        seen_keys: set[str] = set()
+        for key in targets:
+            for raw_record in records_by_key.get(key, []):
                 if not isinstance(raw_record, dict):
                     continue
                 dedupe_key = _history_record_dedupe_key(raw_record)
