@@ -564,6 +564,37 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self.assertEqual(primary["review_note"], "ok")
         self.assertEqual(store.get_pending_reviews(), [])
 
+    def test_configured_shadow_writes_failure_does_not_block_json_history(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ.pop(history.STRUCTURED_SHADOW_WRITE_ENV, None)
+        history.configure_structured_history_storage({
+            "storage": {
+                "history_read_backend": "auto",
+                "history_shadow_writes_enabled": True,
+            },
+        })
+
+        with (
+            patch.object(ArticleHistorySQLiteStore, "append_history_record", side_effect=RuntimeError("shadow boom")),
+            patch.object(history, "_mark_structured_shadow_dirty", return_value=None),
+        ):
+            entry = history.record(
+                "影子失败保底",
+                "doubao",
+                "关键词",
+                "品牌A",
+                1,
+                True,
+                task_id="task_shadow_fail",
+            )
+
+        self.assertEqual(
+            [item["id"] for item in history.get_records("影子失败保底", task_id="task_shadow_fail")],
+            [entry["id"]],
+        )
+        self.assertTrue(history.get_structured_read_health()["shadowWritesEnabled"])
+        self.assertEqual(history.get_structured_read_health()["effectiveBackend"], "json")
+
     def test_structured_shadow_runtime_writes_keep_auto_backend_fresh_when_shadow_was_fresh(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
         os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "auto"
@@ -968,12 +999,16 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with patch("core.article_history_sqlite_store.sqlite3.connect", wraps=sqlite3.connect) as connect_mock:
+        with patch.object(
+            ArticleHistorySQLiteStore,
+            "validate_readiness",
+            wraps=ArticleHistorySQLiteStore.validate_readiness,
+        ) as readiness_mock:
             self.assertEqual([item["id"] for item in history.get_records("Bad DB Cooldown")], ["bad-db-json-1"])
             self.assertEqual([item["id"] for item in history.get_records("Bad DB Cooldown")], ["bad-db-json-1"])
             health = history.get_structured_read_health()
 
-        self.assertEqual(connect_mock.call_count, 1)
+        self.assertEqual(readiness_mock.call_count, 1)
         self.assertTrue(health["available"])
         self.assertFalse(health["ready"])
         self.assertGreater(health["readinessCooldownRemainingSeconds"], 0)

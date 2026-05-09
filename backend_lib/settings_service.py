@@ -45,9 +45,16 @@ def _normalize_storage_settings(config: dict[str, Any]) -> dict[str, Any]:
     storage_cfg = config.get("storage", {}) if isinstance(config, dict) else {}
     if not isinstance(storage_cfg, dict):
         storage_cfg = {}
+    backend = str(storage_cfg.get("history_read_backend") or "").strip().lower()
+    if backend in {"sqlite_shadow", "sqlite_structured", "structured", "sqlite"}:
+        backend = "sqlite_shadow"
+    elif backend in {"", "auto", "sqlite_auto", "sqlite_shadow_auto", "auto_sqlite_shadow"}:
+        backend = "auto"
+    else:
+        backend = ""
     return {
-        "history_read_backend": str(storage_cfg.get("history_read_backend") or "").strip().lower(),
-        "history_shadow_writes_enabled": bool(storage_cfg.get("history_shadow_writes_enabled", False)),
+        "history_read_backend": backend,
+        "history_shadow_writes_enabled": bool(storage_cfg.get("history_shadow_writes_enabled", True)),
     }
 
 

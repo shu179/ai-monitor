@@ -249,6 +249,25 @@ def reset_structured_read_health() -> None:
     _clear_structured_read_store_status_cache()
 
 
+def maybe_schedule_structured_history_auto_rebuild(reason: str = "auto_requested") -> bool:
+    if not _history_structured_read_auto_configured():
+        return False
+    store_status = _structured_read_store_status()
+    if (
+        store_status.get("available")
+        and store_status.get("ready")
+        and _structured_read_store_fresh(store_status)
+    ):
+        return False
+    if not store_status.get("available"):
+        rebuild_reason = "shadow_db_missing"
+    elif not store_status.get("ready"):
+        rebuild_reason = "shadow_db_not_ready"
+    else:
+        rebuild_reason = "shadow_db_stale"
+    return _schedule_structured_shadow_rebuild(reason or rebuild_reason)
+
+
 def _record_structured_read_success(operation: str) -> None:
     with _structured_read_health_lock:
         _structured_read_health.update({
@@ -334,6 +353,8 @@ def _structured_shadow_rebuild_min_interval_seconds() -> float:
 
 
 def _structured_shadow_stored_signature() -> str:
+    if not _history_shadow_db_file().exists():
+        return ""
     try:
         return str(_structured_shadow_store().get_meta("history_source_signature") or "").strip()
     except Exception:
@@ -617,6 +638,14 @@ def _structured_read_store_status() -> dict[str, object]:
     cache_key = str(db_path)
     now_ts = time.time()
     with _structured_read_store_status_lock:
+        if _structured_read_store_status_cache.get("key") == cache_key:
+            cached_status = _structured_read_store_status_cache.get("status")
+            if isinstance(cached_status, dict) and not bool(cached_status.get("ready")):
+                cooldown_until = float(cached_status.get("cooldown_until") or 0.0)
+                if cooldown_until > now_ts:
+                    result = dict(cached_status)
+                    result["cooldown_remaining_seconds"] = max(0.0, round(cooldown_until - now_ts, 3))
+                    return result
         if (
             _structured_read_store_status_cache.get("key") == cache_key
             and _structured_read_store_status_cache.get("signature") == db_signature

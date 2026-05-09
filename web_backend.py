@@ -238,6 +238,7 @@ from core.history import (
     get_records_many,
     get_pending_reviews,
     get_structured_read_health,
+    maybe_schedule_structured_history_auto_rebuild,
     get_task_brand_names,
     is_manual_test_failure_record,
     is_success_record,
@@ -294,6 +295,10 @@ TASKS_FULL_CACHE_TTL_SECONDS = 3.0
 TEST_RUN_TERMINAL_TTL_SECONDS = 6 * 60 * 60
 SEARCH_FILE_CACHE_TTL_SECONDS = 24 * 60 * 60
 BROWSER_AUTH_SESSION_TTL_SECONDS = 6 * 60 * 60
+
+_HISTORY_READ_AUTO_VALUES = {"auto", "sqlite_auto", "sqlite_shadow_auto", "auto_sqlite_shadow"}
+_HISTORY_READ_SQLITE_VALUES = {"sqlite_shadow", "sqlite_structured", "structured", "sqlite"}
+_HISTORY_READ_DISABLED_VALUES = {"0", "false", "no", "off", "disabled", "json", "file", "files"}
 
 
 # 前端和后端平台 ID 可能不一致，做双向映射
@@ -1864,6 +1869,54 @@ def _build_dashboard_home_copy(
     )
 
 
+def _normalize_history_read_backend_setting(value: Any, *, default: str = "auto") -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in _HISTORY_READ_SQLITE_VALUES:
+        return "sqlite_shadow"
+    if normalized in _HISTORY_READ_AUTO_VALUES or normalized == "":
+        return default
+    if normalized in _HISTORY_READ_DISABLED_VALUES:
+        return ""
+    return default
+
+
+def _session_allows_guarded_history_sqlite(session: dict[str, Any] | None) -> bool:
+    if not isinstance(session, dict):
+        return True
+    user = session.get("user") if isinstance(session.get("user"), dict) else {}
+    role = str(user.get("role") or "").strip()
+    if not role or role == "admin":
+        return True
+    return not bool(str(session.get("access_token") or "").strip())
+
+
+def _apply_guarded_history_storage_defaults(
+    config: dict[str, Any],
+    *,
+    session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(config, dict):
+        return {}
+    storage_cfg = config.get("storage")
+    if not isinstance(storage_cfg, dict):
+        storage_cfg = {}
+    else:
+        storage_cfg = dict(storage_cfg)
+
+    if not _session_allows_guarded_history_sqlite(session):
+        storage_cfg["history_read_backend"] = ""
+        storage_cfg["history_shadow_writes_enabled"] = False
+    else:
+        storage_cfg["history_read_backend"] = _normalize_history_read_backend_setting(
+            storage_cfg.get("history_read_backend"),
+            default="auto",
+        )
+        storage_cfg["history_shadow_writes_enabled"] = True
+
+    config["storage"] = storage_cfg
+    return config
+
+
 class AppRuntime:
     """Holds live state used by the frontend."""
 
@@ -2003,10 +2056,13 @@ class AppRuntime:
         )
         self._isolate_ordinary_cloud_account_config(CloudSessionStore().load())
 
-    @staticmethod
-    def _sync_loaded_config(config: dict[str, Any]) -> None:
+    def _sync_loaded_config(self, config: dict[str, Any]) -> None:
+        _apply_guarded_history_storage_defaults(config, session=CloudSessionStore().load())
         get_local_model_manager().sync_config(config)
         configure_structured_history_storage(config)
+        storage_cfg = config.get("storage") if isinstance(config.get("storage"), dict) else {}
+        if storage_cfg.get("history_read_backend") == "auto":
+            maybe_schedule_structured_history_auto_rebuild("config_load")
 
     def _activate_current_account_space(self, *, copy_legacy: bool = True) -> None:
         ensure_current_account_space(copy_legacy=copy_legacy)
@@ -8852,19 +8908,11 @@ return changedCount
 
             storage_payload = normalized_payload.get("storage")
             if isinstance(storage_payload, dict):
-                history_read_backend = str(storage_payload.get("history_read_backend") or "").strip().lower()
-                if history_read_backend in {"0", "false", "no", "off", "disabled", "json", "file", "files"}:
-                    history_read_backend = ""
-                elif history_read_backend in {"auto", "sqlite_auto", "sqlite_shadow_auto", "auto_sqlite_shadow"}:
-                    history_read_backend = "auto"
-                elif history_read_backend in {"sqlite_shadow", "sqlite_structured", "structured", "sqlite"}:
-                    history_read_backend = "sqlite_shadow"
-                else:
-                    history_read_backend = ""
-                storage_payload["history_read_backend"] = history_read_backend
-                storage_payload["history_shadow_writes_enabled"] = bool(
-                    storage_payload.get("history_shadow_writes_enabled", False)
+                storage_payload["history_read_backend"] = _normalize_history_read_backend_setting(
+                    storage_payload.get("history_read_backend"),
+                    default="auto",
                 )
+                storage_payload["history_shadow_writes_enabled"] = True
 
             allowed_sections = [
                 "scheduler", "ai_assistant", "local_model", "recognition",
@@ -8935,9 +8983,13 @@ return changedCount
                 config["screenshot"] = _deep_merge_dict(existing, normalized_payload["screenshot"])
             if "detection_mode" in normalized_payload and isinstance(normalized_payload["detection_mode"], str):
                 config["detection_mode"] = normalized_payload["detection_mode"]
+            _apply_guarded_history_storage_defaults(config, session=CloudSessionStore().load())
             self.save_config(config)
             get_local_model_manager().sync_config(config)
             configure_structured_history_storage(config)
+            storage_cfg = config.get("storage") if isinstance(config.get("storage"), dict) else {}
+            if storage_cfg.get("history_read_backend") == "auto":
+                maybe_schedule_structured_history_auto_rebuild("settings_save")
             self._sync_recognition_mode(config)
         self._refresh_monitoring_runtime(restart_scheduler=False)
         return {"ok": True}

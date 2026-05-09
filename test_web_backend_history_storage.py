@@ -79,3 +79,49 @@ def test_rebuild_history_sqlite_shadow_rebuilds_without_changing_config(tmp_path
     assert result["status"]["history"]["effectiveBackend"] == "sqlite_shadow"
     assert rebuild_calls == [(db_path, 16, 1)]
     reset_health.assert_called_once_with()
+
+
+def test_loaded_config_defaults_history_storage_to_guarded_auto() -> None:
+    runtime = object.__new__(AppRuntime)
+    config = {"scheduler": {}}
+    local_model_manager = Mock(sync_config=Mock())
+
+    with (
+        patch("web_backend.CloudSessionStore") as session_store_mock,
+        patch("web_backend.get_local_model_manager", return_value=local_model_manager),
+        patch("web_backend.configure_structured_history_storage") as configure_mock,
+        patch("web_backend.maybe_schedule_structured_history_auto_rebuild") as rebuild_mock,
+    ):
+        session_store_mock.return_value.load.return_value = {}
+        runtime._sync_loaded_config(config)
+
+    assert config["storage"] == {
+        "history_read_backend": "auto",
+        "history_shadow_writes_enabled": True,
+    }
+    configure_mock.assert_called_once_with(config)
+    rebuild_mock.assert_called_once_with("config_load")
+    local_model_manager.sync_config.assert_called_once_with(config)
+
+
+def test_loaded_config_disables_history_storage_for_ordinary_cloud_session() -> None:
+    runtime = object.__new__(AppRuntime)
+    config = {"storage": {"history_read_backend": "auto", "history_shadow_writes_enabled": True}}
+    session = {"access_token": "token", "user": {"role": "viewer"}}
+
+    with (
+        patch("web_backend.CloudSessionStore") as session_store_mock,
+        patch("web_backend.get_local_model_manager") as local_model_manager_mock,
+        patch("web_backend.configure_structured_history_storage") as configure_mock,
+        patch("web_backend.maybe_schedule_structured_history_auto_rebuild") as rebuild_mock,
+    ):
+        session_store_mock.return_value.load.return_value = session
+        local_model_manager_mock.return_value = Mock(sync_config=Mock())
+        runtime._sync_loaded_config(config)
+
+    assert config["storage"] == {
+        "history_read_backend": "",
+        "history_shadow_writes_enabled": False,
+    }
+    configure_mock.assert_called_once_with(config)
+    rebuild_mock.assert_not_called()

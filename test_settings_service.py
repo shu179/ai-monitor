@@ -101,3 +101,7 @@ def test_settings_service_provides_selector_agent_fallback_from_ai_assistant(mon
         "platform": "deepseek",
         "model": "deepseek-chat",
     }
+    assert result["storage"] == {
+        "history_read_backend": "auto",
+        "history_shadow_writes_enabled": True,
+    }
