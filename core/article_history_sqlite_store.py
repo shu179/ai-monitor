@@ -187,7 +187,13 @@ class ArticleHistorySQLiteStore:
                 (str(SCHEMA_VERSION),),
             )
 
-    def import_articles(self, articles: Iterable[dict[str, Any]], *, replace: bool = False) -> dict[str, int]:
+    def import_articles(
+        self,
+        articles: Iterable[dict[str, Any]],
+        *,
+        replace: bool = False,
+        merge_same_id_url: bool = True,
+    ) -> dict[str, int]:
         self.initialize()
         created = 0
         updated = 0
@@ -215,7 +221,9 @@ class ArticleHistorySQLiteStore:
                 existing_id = existing_row[0] if existing_row is not None else None
                 target_id = existing_id or article_id
                 existed = existing_id is not None
-                if existing_row is not None and existing_row[2] == "url":
+                if existing_row is not None and (
+                    existing_row[2] == "url" or (merge_same_id_url and normalized_url)
+                ):
                     article = self._merge_article_for_duplicate_url(existing_row[1], article)
                 article["id"] = target_id
                 raw_json = self._json_dumps(article)
@@ -264,6 +272,35 @@ class ArticleHistorySQLiteStore:
                 else:
                     created += 1
         return {"created": created, "updated": updated, "skipped": skipped}
+
+    def upsert_article(self, article: dict[str, Any]) -> dict[str, int]:
+        return self.upsert_articles([article])
+
+    def upsert_articles(self, articles: Iterable[dict[str, Any]]) -> dict[str, int]:
+        return self.import_articles(articles, replace=False, merge_same_id_url=False)
+
+    def delete_articles_by_ids(self, article_ids: Iterable[str]) -> dict[str, int]:
+        self.initialize()
+        normalized_ids = [
+            self._text(article_id)
+            for article_id in (article_ids or [])
+            if self._text(article_id)
+        ]
+        if not normalized_ids:
+            return {"deleted": 0}
+        deleted = 0
+        with self._connection() as conn:
+            for article_id in dict.fromkeys(normalized_ids):
+                row = conn.execute(
+                    "SELECT 1 FROM articles WHERE id = ?",
+                    (article_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                conn.execute("DELETE FROM article_task_links WHERE article_id = ?", (article_id,))
+                conn.execute("DELETE FROM articles WHERE id = ?", (article_id,))
+                deleted += 1
+        return {"deleted": deleted}
 
     @classmethod
     def validate_readiness(cls, db_path: str | Path) -> dict[str, Any]:
@@ -997,7 +1034,9 @@ class ArticleHistorySQLiteStore:
                 (normalized_url,),
             ).fetchone()
             if row is not None:
-                return str(row[0]), self._json_loads(row[1]), "url"
+                existing_id = str(row[0])
+                matched_by = "id" if existing_id == article_id else "url"
+                return existing_id, self._json_loads(row[1]), matched_by
         row = conn.execute("SELECT id, raw_json FROM articles WHERE id = ?", (article_id,)).fetchone()
         if row is None:
             return None

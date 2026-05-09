@@ -67,6 +67,7 @@ from backend_lib.article_service import (
     _article_import_batch_to_api,
     _article_import_batches_path,
     _article_import_task_terms,
+    _article_published_date,
     _article_to_api,
     _compact_article_import_match_text,
     _dedupe_articles_by_url,
@@ -143,6 +144,7 @@ from core.account_crawler import (
 )
 from core.article_store import (
     export_article_store_bundle,
+    get_article_source_signature,
     get_articles,
     get_articles_file_path,
     get_excluded_article_urls,
@@ -1984,6 +1986,9 @@ class AppRuntime:
         self._article_cache_lock = threading.RLock()
         self._article_sqlite_shadow_lock = threading.RLock()
         self._article_sqlite_shadow_cache_key: tuple[Any, ...] | None = None
+        self._article_sqlite_shadow_unready_reason = ""
+        self._article_sqlite_shadow_rebuild_lock = threading.RLock()
+        self._article_sqlite_shadow_rebuild_state: dict[str, Any] = {}
         self._article_sqlite_shadow_compare_lock = threading.RLock()
         self._article_sqlite_shadow_compare_recent: list[dict[str, Any]] = []
         self._article_sqlite_shadow_health_lock = threading.RLock()
@@ -5537,13 +5542,9 @@ return changedCount
             type_map = {"media": "authority", "self-media": "selfmedia"}
             normalized_media_type = type_map.get(str(media_type or "").strip(), str(media_type or "").strip())
             if not self._ensure_sqlite_shadow_article_index(config, db_path=db_path):
-                self._record_sqlite_shadow_failure(
+                self._record_sqlite_shadow_fallback(
                     read_backend,
-                    "index_verify_failed",
-                    elapsed_ms=_elapsed_ms_since(started),
-                    fd_before=fd_before,
-                    fd_after=_open_sqlite_fd_count(db_path),
-                    db_path=db_path,
+                    str(self._article_sqlite_shadow_unready_reason or "article_shadow_not_fresh"),
                 )
                 return None
 
@@ -5798,16 +5799,85 @@ return changedCount
             return False
         return int(fd_after) - int(fd_before) > limit
 
+    @staticmethod
+    def _sqlite_shadow_article_rebuild_min_interval_seconds() -> float:
+        return max(0.0, _safe_float(os.environ.get("AIBRANDMONITOR_ARTICLE_SQLITE_REBUILD_MIN_INTERVAL_SECONDS"), 30.0))
+
     def _ensure_sqlite_shadow_article_index(self, config: dict[str, Any], *, db_path: Path) -> bool:
         match_key = self._article_match_config_key(config)
-        current_key = (str(db_path), self._article_store_version_key(), match_key)
+        source_signature = get_article_source_signature()
+        current_key = (str(db_path), source_signature, match_key)
         with self._article_sqlite_shadow_lock:
             if self._article_sqlite_shadow_cache_key == current_key and db_path.exists():
+                self._article_sqlite_shadow_unready_reason = ""
                 return True
 
-            articles = refresh_article_matches(config)
-            refreshed_key = (str(db_path), self._article_store_version_key(), match_key)
+            readiness = ArticleHistorySQLiteStore.validate_readiness(db_path)
+            if not bool(readiness.get("ready")):
+                reason = "article_shadow_db_missing" if not readiness.get("available") else f"article_shadow_db_{readiness.get('reason') or 'not_ready'}"
+                self._article_sqlite_shadow_cache_key = None
+                self._article_sqlite_shadow_unready_reason = reason
+                self._schedule_sqlite_shadow_article_rebuild(config, db_path=db_path, reason=reason)
+                return False
+
             store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+            stored_source_signature = str(store.get_meta("article_source_signature") or "").strip()
+            stored_match_signature = str(store.get_meta("article_match_config_signature") or "").strip()
+            if stored_source_signature == source_signature and stored_match_signature == match_key:
+                self._article_sqlite_shadow_cache_key = current_key
+                self._article_sqlite_shadow_unready_reason = ""
+                return True
+
+            if stored_source_signature != source_signature:
+                reason = "article_shadow_source_stale"
+            else:
+                reason = "article_shadow_match_config_stale"
+            self._article_sqlite_shadow_cache_key = None
+            self._article_sqlite_shadow_unready_reason = reason
+            self._schedule_sqlite_shadow_article_rebuild(config, db_path=db_path, reason=reason)
+            return False
+
+    def _schedule_sqlite_shadow_article_rebuild(
+        self,
+        config: dict[str, Any],
+        *,
+        db_path: Path,
+        reason: str,
+    ) -> bool:
+        now_ts = time.time()
+        with self._article_sqlite_shadow_rebuild_lock:
+            if bool(self._article_sqlite_shadow_rebuild_state.get("running")):
+                return False
+            next_allowed_at = _safe_float(self._article_sqlite_shadow_rebuild_state.get("next_allowed_at"), 0.0)
+            if next_allowed_at > now_ts:
+                return False
+            self._article_sqlite_shadow_rebuild_state.update({
+                "running": True,
+                "last_reason": str(reason or ""),
+                "last_started_at": now_ts,
+                "last_started_at_iso": local_now().isoformat(timespec="seconds"),
+                "next_allowed_at": now_ts + self._sqlite_shadow_article_rebuild_min_interval_seconds(),
+                "db_path": str(db_path),
+            })
+
+        thread = threading.Thread(
+            target=self._run_sqlite_shadow_article_rebuild,
+            args=(dict(config or {}), Path(db_path), str(reason or "")),
+            name="article-sqlite-shadow-rebuild",
+            daemon=True,
+        )
+        thread.start()
+        return True
+
+    def _run_sqlite_shadow_article_rebuild(self, config: dict[str, Any], db_path: Path, reason: str) -> None:
+        ok = False
+        detail = ""
+        try:
+            match_key = self._article_match_config_key(config)
+            articles = refresh_article_matches(config)
+            imported_source_signature = get_article_source_signature()
+            store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+            store.set_meta("article_source_signature", "")
             import_result = store.import_articles(articles, replace=True)
             if not self._verify_sqlite_shadow_article_index(store, articles):
                 print(
@@ -5818,10 +5888,34 @@ return changedCount
                     },
                 )
                 self._article_sqlite_shadow_cache_key = None
-                return False
+                detail = "verification_failed"
+                return
 
-            self._article_sqlite_shadow_cache_key = refreshed_key
-            return True
+            final_source_signature = get_article_source_signature()
+            if imported_source_signature != final_source_signature:
+                self._article_sqlite_shadow_cache_key = None
+                detail = "source_changed_during_rebuild"
+                return
+
+            store.set_meta("article_source_signature", final_source_signature)
+            store.set_meta("article_match_config_signature", match_key)
+            store.set_meta("article_last_rebuilt_at", local_now().isoformat(timespec="seconds"))
+            self._article_sqlite_shadow_cache_key = (str(db_path), final_source_signature, match_key)
+            ok = True
+        except Exception as exc:
+            detail = f"{exc.__class__.__name__}: {exc}"
+            self._article_sqlite_shadow_cache_key = None
+            print(f"[WebBackend] SQLite 文章影子索引后台重建失败: {exc}")
+        finally:
+            with self._article_sqlite_shadow_rebuild_lock:
+                self._article_sqlite_shadow_rebuild_state.update({
+                    "running": False,
+                    "last_ok": ok,
+                    "last_finished_at": time.time(),
+                    "last_finished_at_iso": local_now().isoformat(timespec="seconds"),
+                    "last_reason": str(reason or self._article_sqlite_shadow_rebuild_state.get("last_reason") or ""),
+                    "last_error": "" if ok else detail,
+                })
 
     @staticmethod
     def _verify_sqlite_shadow_article_index(

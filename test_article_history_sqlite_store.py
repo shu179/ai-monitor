@@ -669,6 +669,42 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             self.assertEqual(fallback_page["fallback_reason"], "url_dedupe_scan_limit")
             self.assertEqual(fallback_page["items"], [])
 
+    def test_upsert_and_delete_articles_by_id_support_incremental_shadow_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(
+                Path(tmpdir) / "local_store.sqlite3",
+                normalize_article_url=normalize_article_url,
+            )
+
+            store.upsert_article({
+                "id": "article-a",
+                "url": "https://example.com/a",
+                "title": "文章 A",
+                "matched_tasks": ["品牌A"],
+            })
+            store.upsert_articles([
+                {
+                    "id": "article-a",
+                    "url": "https://example.com/a",
+                    "title": "文章 A 更新",
+                    "matched_tasks": ["品牌A", "品牌B"],
+                },
+                {
+                    "id": "article-b",
+                    "url": "https://example.com/b",
+                    "title": "文章 B",
+                    "matched_tasks": ["品牌B"],
+                },
+            ])
+            delete_result = store.delete_articles_by_ids(["article-a", "missing"])
+
+            self.assertEqual(delete_result, {"deleted": 1})
+            page = store.get_article_page(limit=10)
+            self.assertEqual(page["total"], 1)
+            self.assertEqual([item["id"] for item in page["items"]], ["article-b"])
+            self.assertEqual(store.get_article_page(task_name="品牌A")["total"], 0)
+            self.assertEqual(store.get_article_page(task_name="品牌B")["total"], 1)
+
     def test_initialize_creates_expected_tables_and_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "local_store.sqlite3"

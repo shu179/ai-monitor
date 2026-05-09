@@ -33,16 +33,19 @@ DEFAULT_DOMAIN_OVERRIDES_FILE = resolve_app_path("logs/domain_overrides.json")
 DEFAULT_DOMAIN_MEDIA_NAMES_FILE = resolve_app_path("logs/domain_media_names.json")
 DEFAULT_EXCLUDED_ARTICLE_URLS_FILE = resolve_app_path("logs/excluded_article_urls.json")
 DEFAULT_LOCAL_STORE_DB_FILE = resolve_app_path("logs/local_store.sqlite3")
+DEFAULT_ARTICLE_SHADOW_DB_FILE = resolve_app_path("logs/article_history_shadow.sqlite3")
 
 ARTICLES_FILE = DEFAULT_ARTICLES_FILE
 DOMAIN_OVERRIDES_FILE = DEFAULT_DOMAIN_OVERRIDES_FILE
 DOMAIN_MEDIA_NAMES_FILE = DEFAULT_DOMAIN_MEDIA_NAMES_FILE
 EXCLUDED_ARTICLE_URLS_FILE = DEFAULT_EXCLUDED_ARTICLE_URLS_FILE
 LOCAL_STORE_DB_FILE = DEFAULT_LOCAL_STORE_DB_FILE
+ARTICLE_SHADOW_DB_FILE = DEFAULT_ARTICLE_SHADOW_DB_FILE
 
 MAX_REFERENCE_EVENTS_PER_TASK = 500
 MAX_EXCLUDED_ARTICLE_URLS = 5000
 STORAGE_BACKEND_ENV = "AIBRANDMONITOR_STORAGE_BACKEND"
+ARTICLE_SHADOW_WRITE_ENV = "AIBRANDMONITOR_ARTICLE_SQLITE_SHADOW_WRITES"
 SMALL_DOCUMENT_CACHE_TTL_SECONDS = 1.0
 
 _small_document_cache: dict[str, tuple[float, object]] = {}
@@ -338,6 +341,149 @@ def _sqlite_storage_enabled() -> bool:
 
 def _sqlite_store() -> SQLiteJsonDocumentStore:
     return SQLiteJsonDocumentStore(_local_store_db_file())
+
+
+def _article_shadow_db_file() -> Path:
+    if ARTICLE_SHADOW_DB_FILE != DEFAULT_ARTICLE_SHADOW_DB_FILE:
+        return ARTICLE_SHADOW_DB_FILE
+    if ARTICLES_FILE != DEFAULT_ARTICLES_FILE:
+        return ARTICLES_FILE.parent / "article_history_shadow.sqlite3"
+    return account_scoped_path("logs/article_history_shadow.sqlite3", fallback=DEFAULT_ARTICLE_SHADOW_DB_FILE)
+
+
+def _article_shadow_store():
+    from .article_history_sqlite_store import ArticleHistorySQLiteStore
+
+    return ArticleHistorySQLiteStore(_article_shadow_db_file(), normalize_article_url=normalize_article_url)
+
+
+def _article_shadow_writes_enabled() -> bool:
+    value = os.environ.get(ARTICLE_SHADOW_WRITE_ENV)
+    if value is None:
+        return True
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "sqlite", "shadow"}
+
+
+def _article_shadow_stored_source_signature() -> str:
+    if not _article_shadow_db_file().exists():
+        return ""
+    try:
+        return str(_article_shadow_store().get_meta("article_source_signature") or "").strip()
+    except Exception:
+        return ""
+
+
+def _begin_article_shadow_runtime_write() -> dict[str, object]:
+    return {
+        "enabled": _article_shadow_writes_enabled(),
+        "source_signature_before": get_article_source_signature(),
+        "stored_signature_before": _article_shadow_stored_source_signature(),
+    }
+
+
+def _mark_article_shadow_dirty(reason: str = "") -> None:
+    try:
+        _article_shadow_store().set_meta("article_source_signature", "")
+        _article_shadow_store().set_meta("article_last_dirty_reason", str(reason or "runtime_write"))
+    except Exception as exc:
+        print(f"[ArticleStore] 标记 SQLite 文章影子索引脏失败: {exc}")
+
+
+def _finish_article_shadow_runtime_write(context: dict[str, object], *, ok: bool, reason: str = "") -> None:
+    source_signature_before = str(context.get("source_signature_before") or "").strip()
+    stored_signature_before = str(context.get("stored_signature_before") or "").strip()
+    if not ok or not source_signature_before or stored_signature_before != source_signature_before:
+        if not stored_signature_before and not _article_shadow_db_file().exists():
+            return
+        _mark_article_shadow_dirty(reason or "runtime_write_needs_rebuild")
+        return
+    try:
+        store = _article_shadow_store()
+        store.set_meta("article_source_signature", get_article_source_signature())
+        store.set_meta("article_last_incremental_sync_at", local_now().isoformat(timespec="seconds"))
+    except Exception as exc:
+        print(f"[ArticleStore] 更新 SQLite 文章影子索引签名失败: {exc}")
+        _mark_article_shadow_dirty(reason or "runtime_signature_update_failed")
+
+
+def _sync_article_shadow_articles(
+    articles: list[dict] | tuple[dict, ...],
+    *,
+    reason: str,
+    context: dict[str, object] | None = None,
+) -> None:
+    payload = [dict(article) for article in (articles or []) if isinstance(article, dict)]
+    if not payload:
+        return
+    write_context = context if context is not None else _begin_article_shadow_runtime_write()
+    if not bool(write_context.get("enabled")):
+        _finish_article_shadow_runtime_write(write_context, ok=False, reason="shadow_writes_disabled")
+        return
+    ok = False
+    try:
+        _article_shadow_store().upsert_articles(payload)
+        ok = True
+    except Exception as exc:
+        print(f"[ArticleStore] SQLite 文章影子索引增量写入失败: {exc}")
+    _finish_article_shadow_runtime_write(write_context, ok=ok, reason=reason)
+
+
+def _sync_article_shadow_delete(
+    article_ids: list[str] | tuple[str, ...] | set[str],
+    *,
+    reason: str,
+    context: dict[str, object] | None = None,
+) -> None:
+    ids = [
+        str(article_id or "").strip()
+        for article_id in (article_ids or [])
+        if str(article_id or "").strip()
+    ]
+    if not ids:
+        return
+    write_context = context if context is not None else _begin_article_shadow_runtime_write()
+    if not bool(write_context.get("enabled")):
+        _finish_article_shadow_runtime_write(write_context, ok=False, reason="shadow_writes_disabled")
+        return
+    ok = False
+    try:
+        _article_shadow_store().delete_articles_by_ids(ids)
+        ok = True
+    except Exception as exc:
+        print(f"[ArticleStore] SQLite 文章影子索引删除失败: {exc}")
+    _finish_article_shadow_runtime_write(write_context, ok=ok, reason=reason)
+
+
+def _sync_article_shadow_mutation(
+    *,
+    upsert_articles: list[dict] | tuple[dict, ...] = (),
+    delete_article_ids: list[str] | tuple[str, ...] | set[str] = (),
+    reason: str,
+    context: dict[str, object] | None = None,
+) -> None:
+    payload = [dict(article) for article in (upsert_articles or []) if isinstance(article, dict)]
+    ids = [
+        str(article_id or "").strip()
+        for article_id in (delete_article_ids or [])
+        if str(article_id or "").strip()
+    ]
+    if not payload and not ids:
+        return
+    write_context = context if context is not None else _begin_article_shadow_runtime_write()
+    if not bool(write_context.get("enabled")):
+        _finish_article_shadow_runtime_write(write_context, ok=False, reason="shadow_writes_disabled")
+        return
+    ok = False
+    try:
+        store = _article_shadow_store()
+        if ids:
+            store.delete_articles_by_ids(ids)
+        if payload:
+            store.upsert_articles(payload)
+        ok = True
+    except Exception as exc:
+        print(f"[ArticleStore] SQLite 文章影子索引增量变更失败: {exc}")
+    _finish_article_shadow_runtime_write(write_context, ok=ok, reason=reason)
 
 
 def _read_json_path(path: Path, default):
@@ -1415,6 +1561,8 @@ def save_domain_media_name(domain: str, media_name: str, force: bool = False) ->
     if _looks_like_channel_media_name(media_name) and not force:
         return
 
+    changed_articles: list[dict] = []
+    shadow_context: dict[str, object] | None = None
     with _lock:
         media_names = _load_domain_media_names()
         site_key = get_domain_site_key(domain)
@@ -1449,8 +1597,16 @@ def save_domain_media_name(domain: str, media_name: str, force: bool = False) ->
             if locked_media_name or force or not current_name or current_name == article_domain:
                 article["media_name"] = effective_media_name
                 changed = True
+                changed_articles.append(dict(article))
         if changed:
+            shadow_context = _begin_article_shadow_runtime_write()
             _save_articles(articles)
+    if changed_articles and shadow_context is not None:
+        _sync_article_shadow_articles(
+            changed_articles,
+            reason="domain_media_name_backfill",
+            context=shadow_context,
+        )
 
 
 def save_domain_override(domain: str, media_type: str, force: bool = False) -> None:
@@ -1469,6 +1625,8 @@ def save_domain_override(domain: str, media_type: str, force: bool = False) -> N
         media_type = forced_media_type
     elif media_type not in {"authority", "selfmedia"}:
         media_type = "selfmedia"
+    changed_articles: list[dict] = []
+    shadow_context: dict[str, object] | None = None
     with _lock:
         overrides = _load_domain_overrides()
         site_key = get_domain_site_key(domain)
@@ -1505,8 +1663,16 @@ def save_domain_override(domain: str, media_type: str, force: bool = False) -> N
                 if _domains_share_site_key(article_domain, domain):
                     article["media_type"] = effective_media_type
                     changed = True
+                    changed_articles.append(dict(article))
             if changed:
+                shadow_context = _begin_article_shadow_runtime_write()
                 _save_articles(articles)
+    if changed_articles and shadow_context is not None:
+        _sync_article_shadow_articles(
+            changed_articles,
+            reason="domain_media_type_backfill",
+            context=shadow_context,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1762,6 +1928,8 @@ def add_article(entry: dict) -> dict:
     entry, _ = _normalize_article_entry(entry)
     normalized_url = normalize_article_url(entry.get("url", ""))
 
+    added_article: dict | None = None
+    shadow_context: dict[str, object] | None = None
     with _lock:
         articles = _load_articles()
         if normalized_url:
@@ -1769,12 +1937,16 @@ def add_article(entry: dict) -> dict:
                 if normalize_article_url(article.get("url", "")) == normalized_url:
                     return article
         articles.append(entry)
+        shadow_context = _begin_article_shadow_runtime_write()
         _save_articles(articles)
+        added_article = dict(entry)
         if normalized_url:
             excluded_urls = _load_excluded_article_urls()
             if normalized_url in excluded_urls:
                 excluded_urls.pop(normalized_url, None)
                 _save_excluded_article_urls(excluded_urls)
+    if added_article is not None and shadow_context is not None:
+        _sync_article_shadow_articles([added_article], reason="add_article", context=shadow_context)
     return entry
 
 
@@ -1786,6 +1958,7 @@ def bulk_upsert_articles(entries: list[dict] | tuple[dict, ...]) -> list[dict]:
 
     now_text = _article_now_minute_text()
     results: list[dict] = []
+    shadow_context: dict[str, object] | None = None
     with _lock:
         articles = _load_articles()
         index_by_id = {
@@ -1861,6 +2034,7 @@ def bulk_upsert_articles(entries: list[dict] | tuple[dict, ...]) -> list[dict]:
                 restored_urls.add(final_url)
             results.append(dict(final_item))
 
+        shadow_context = _begin_article_shadow_runtime_write()
         _save_articles(articles)
         if restored_urls:
             excluded_urls = _load_excluded_article_urls()
@@ -1872,6 +2046,8 @@ def bulk_upsert_articles(entries: list[dict] | tuple[dict, ...]) -> list[dict]:
             if changed_exclusions:
                 _save_excluded_article_urls(excluded_urls)
 
+    if results and shadow_context is not None:
+        _sync_article_shadow_articles(results, reason="bulk_upsert_articles", context=shadow_context)
     return results
 
 
@@ -1882,6 +2058,8 @@ def update_article(article_id: str, patch: dict) -> dict | None:
         return None
 
     updates = dict(patch or {})
+    updated_article: dict | None = None
+    shadow_context: dict[str, object] | None = None
     with _lock:
         articles = _load_articles()
         for index, article in enumerate(articles):
@@ -1911,8 +2089,13 @@ def update_article(article_id: str, patch: dict) -> dict | None:
             merged.setdefault("fetch_method", "html")
             merged, _ = _normalize_article_entry(merged)
             articles[index] = merged
+            shadow_context = _begin_article_shadow_runtime_write()
             _save_articles(articles)
-            return merged
+            updated_article = dict(merged)
+            break
+    if updated_article is not None and shadow_context is not None:
+        _sync_article_shadow_articles([updated_article], reason="update_article", context=shadow_context)
+        return updated_article
     return None
 
 
@@ -1933,6 +2116,8 @@ def confirm_article_import_batch(
         return 0
 
     updated_count = 0
+    updated_articles: list[dict] = []
+    shadow_context: dict[str, object] | None = None
     with _lock:
         articles = _load_articles()
         for index, article in enumerate(articles):
@@ -1947,9 +2132,17 @@ def confirm_article_import_batch(
             })
             normalized, _ = _normalize_article_entry(merged)
             articles[index] = normalized
+            updated_articles.append(dict(normalized))
             updated_count += 1
         if updated_count:
+            shadow_context = _begin_article_shadow_runtime_write()
             _save_articles(articles)
+    if updated_articles and shadow_context is not None:
+        _sync_article_shadow_articles(
+            updated_articles,
+            reason="confirm_article_import_batch",
+            context=shadow_context,
+        )
     return updated_count
 
 
@@ -1997,6 +2190,9 @@ def undo_article_import_batch(
 
     removed_count = 0
     restored_count = 0
+    removed_ids: list[str] = []
+    restored_articles: list[dict] = []
+    shadow_context: dict[str, object] | None = None
     with _lock:
         articles = _load_articles()
         next_articles = []
@@ -2004,6 +2200,7 @@ def undo_article_import_batch(
             article_id = str(article.get("id", "") or "").strip()
             if article_id and article_id in remove_ids:
                 removed_count += 1
+                removed_ids.append(article_id)
                 continue
             restore_patch = restore_by_id.get(article_id)
             if restore_patch is not None:
@@ -2012,11 +2209,20 @@ def undo_article_import_batch(
                 merged["id"] = article.get("id", merged.get("id", ""))
                 normalized, _ = _normalize_article_entry(merged)
                 next_articles.append(normalized)
+                restored_articles.append(dict(normalized))
                 restored_count += 1
                 continue
             next_articles.append(article)
         if removed_count or restored_count:
+            shadow_context = _begin_article_shadow_runtime_write()
             _save_articles(next_articles)
+    if shadow_context is not None:
+        _sync_article_shadow_mutation(
+            upsert_articles=restored_articles,
+            delete_article_ids=removed_ids,
+            reason="undo_article_import_batch",
+            context=shadow_context,
+        )
 
     return {"removed_count": removed_count, "restored_count": restored_count}
 
@@ -2047,6 +2253,15 @@ def get_articles_file_signature() -> tuple[str, int, int]:
         _articles_file(),
         use_sqlite=ARTICLES_FILE == DEFAULT_ARTICLES_FILE,
     )
+
+
+def get_article_source_signature() -> str:
+    payload = {
+        "version": 1,
+        "articles": get_articles_file_signature(),
+    }
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def _safe_positive_int(value) -> int | None:
@@ -2090,6 +2305,8 @@ def prune_cloud_articles_by_visible_task_ids(
         for url_hash in visible_cloud_url_hashes or []
         if str(url_hash or "").strip()
     }
+    updated_articles: list[dict] = []
+    shadow_context: dict[str, object] | None = None
     with _lock:
         articles = _load_articles()
         kept: list[dict] = []
@@ -2120,6 +2337,7 @@ def prune_cloud_articles_by_visible_task_ids(
                         next_article["match_reasons"] = {}
                         next_article["unmatched_reason"] = "云端文章当前不在当前账号可见范围"
                         pruned_links += 1
+                        updated_articles.append(dict(next_article))
                     kept.append(next_article)
                     continue
             cloud_task_ids = [
@@ -2136,15 +2354,23 @@ def prune_cloud_articles_by_visible_task_ids(
                 next_article["cloud_task_ids"] = visible_article_task_ids
                 kept.append(next_article)
                 pruned_links += 1
+                updated_articles.append(dict(next_article))
                 continue
             kept.append(article)
         if removed or pruned_links:
+            shadow_context = _begin_article_shadow_runtime_write()
             _save_articles(kept)
-        return {
-            "removed": removed,
-            "pruned_links": pruned_links,
-            "remaining": len(kept),
-        }
+    if updated_articles and shadow_context is not None:
+        _sync_article_shadow_articles(
+            updated_articles,
+            reason="prune_cloud_articles_by_visible_task_ids",
+            context=shadow_context,
+        )
+    return {
+        "removed": removed,
+        "pruned_links": pruned_links,
+        "remaining": len(kept),
+    }
 
 
 def export_article_store_bundle() -> dict:
@@ -2234,6 +2460,9 @@ def import_article_store_bundle(bundle: dict | None, *, mode: str = "merge") -> 
             payload_item["url"] = normalized_url
             normalized_excluded_urls[normalized_url] = payload_item
 
+    shadow_context: dict[str, object] | None = None
+    shadow_upserts: list[dict] = []
+    shadow_deletes: list[str] = []
     with _lock:
         existing_articles = _load_articles()
         created_articles = 0
@@ -2297,10 +2526,33 @@ def import_article_store_bundle(bundle: dict | None, *, mode: str = "merge") -> 
             next_excluded_urls.update(normalized_excluded_urls)
 
         next_excluded_urls, _ = _trim_excluded_article_urls_for_storage(next_excluded_urls)
+        if normalized_mode == "replace":
+            next_ids = {
+                str(article.get("id", "") or "").strip()
+                for article in next_articles
+                if str(article.get("id", "") or "").strip()
+            }
+            shadow_deletes = [
+                str(article.get("id", "") or "").strip()
+                for article in existing_articles
+                if str(article.get("id", "") or "").strip()
+                and str(article.get("id", "") or "").strip() not in next_ids
+            ]
+            shadow_upserts = [dict(article) for article in next_articles if isinstance(article, dict)]
+        else:
+            shadow_upserts = [dict(article) for article in normalized_articles if isinstance(article, dict)]
+        shadow_context = _begin_article_shadow_runtime_write()
         _save_articles(next_articles)
         _save_domain_overrides(next_overrides)
         _save_domain_media_names(next_media_names)
         _save_excluded_article_urls(next_excluded_urls)
+    if shadow_context is not None:
+        _sync_article_shadow_mutation(
+            upsert_articles=shadow_upserts,
+            delete_article_ids=shadow_deletes,
+            reason="import_article_store_bundle",
+            context=shadow_context,
+        )
 
     return {
         "mode": normalized_mode,
@@ -2319,6 +2571,7 @@ def delete_article(article_id: str, *, exclude_url: bool = True) -> dict | None:
     if not article_id:
         return None
 
+    shadow_context: dict[str, object] | None = None
     with _lock:
         articles = _load_articles()
         removed = None
@@ -2330,6 +2583,7 @@ def delete_article(article_id: str, *, exclude_url: bool = True) -> dict | None:
             remaining.append(article)
         if removed is None:
             return None
+        shadow_context = _begin_article_shadow_runtime_write()
         _save_articles(remaining)
         if exclude_url:
             exclude_article_url(
@@ -2337,6 +2591,8 @@ def delete_article(article_id: str, *, exclude_url: bool = True) -> dict | None:
                 title=str(removed.get("title") or "").strip(),
                 source="manual_delete",
             )
+    if shadow_context is not None:
+        _sync_article_shadow_delete([article_id], reason="delete_article", context=shadow_context)
     return removed
 
 
@@ -2347,6 +2603,8 @@ def remove_article_from_task(article_id: str, task_name: str) -> dict | None:
     if not article_id or not task_name:
         return None
 
+    updated_article: dict | None = None
+    shadow_context: dict[str, object] | None = None
     with _lock:
         articles = _load_articles()
         for index, article in enumerate(articles):
@@ -2390,8 +2648,17 @@ def remove_article_from_task(article_id: str, task_name: str) -> dict | None:
 
             updated, _ = _normalize_article_entry(updated)
             articles[index] = updated
+            shadow_context = _begin_article_shadow_runtime_write()
             _save_articles(articles)
-            return updated
+            updated_article = dict(updated)
+            break
+    if updated_article is not None and shadow_context is not None:
+        _sync_article_shadow_articles(
+            [updated_article],
+            reason="remove_article_from_task",
+            context=shadow_context,
+        )
+        return updated_article
     return None
 
 
@@ -2399,6 +2666,8 @@ def update_media_type(article_id: str, media_type: str) -> bool:
     """
     修改单条文章的媒体类型，并同步记忆该域名（force=True）。
     """
+    updated_article: dict | None = None
+    shadow_context: dict[str, object] | None = None
     with _lock:
         articles = _load_articles()
         changed = False
@@ -2407,11 +2676,19 @@ def update_media_type(article_id: str, media_type: str) -> bool:
             if article.get("id") == article_id:
                 article["media_type"] = media_type
                 domain = extract_domain(article.get("url", ""))
+                updated_article = dict(article)
                 changed = True
                 break
         if changed:
+            shadow_context = _begin_article_shadow_runtime_write()
             _save_articles(articles)
 
+    if updated_article is not None and shadow_context is not None:
+        _sync_article_shadow_articles(
+            [updated_article],
+            reason="update_media_type",
+            context=shadow_context,
+        )
     if changed and domain:
         save_domain_override(domain, media_type, force=True)
     return changed
@@ -2481,6 +2758,8 @@ def mark_articles_referenced_by_urls(
 
     matched_articles = []
     updated_count = 0
+    updated_articles: list[dict] = []
+    shadow_context: dict[str, object] | None = None
     with _lock:
         articles = _load_articles()
         changed = False
@@ -2577,6 +2856,7 @@ def mark_articles_referenced_by_urls(
             changed = changed or item_changed
             if item_changed:
                 updated_count += 1
+                updated_articles.append(dict(article))
             matched_articles.append({
                 "id": article.get("id", ""),
                 "title": article.get("title", ""),
@@ -2585,7 +2865,14 @@ def mark_articles_referenced_by_urls(
             })
 
         if changed:
+            shadow_context = _begin_article_shadow_runtime_write()
             _save_articles(articles)
+    if updated_articles and shadow_context is not None:
+        _sync_article_shadow_articles(
+            updated_articles,
+            reason="mark_articles_referenced_by_urls",
+            context=shadow_context,
+        )
 
     return {
         "matched_count": len(matched_articles),
@@ -3318,6 +3605,8 @@ def refresh_article_matches(config: dict) -> list:
     }
     config_signature = _article_match_config_signature(config)
 
+    updated_articles: list[dict] = []
+    shadow_context: dict[str, object] | None = None
     with _lock:
         articles = _load_articles()
         changed = False
@@ -3354,6 +3643,7 @@ def refresh_article_matches(config: dict) -> list:
                     article["matched_tasks"] = stored
                     article["match_reasons"] = match_reasons
                     article["unmatched_reason"] = unmatched_reason
+                    updated_articles.append(dict(article))
                     changed = True
                 continue
 
@@ -3393,8 +3683,16 @@ def refresh_article_matches(config: dict) -> list:
                 article["match_reasons"] = match_reasons
                 article["unmatched_reason"] = unmatched_reason
                 article["_match_signature"] = current_signature
+                updated_articles.append(dict(article))
                 changed = True
         if changed:
+            shadow_context = _begin_article_shadow_runtime_write()
             _save_articles(articles)
+    if updated_articles and shadow_context is not None:
+        _sync_article_shadow_articles(
+            updated_articles,
+            reason="refresh_article_matches",
+            context=shadow_context,
+        )
 
     return _sort_articles_for_display(articles)

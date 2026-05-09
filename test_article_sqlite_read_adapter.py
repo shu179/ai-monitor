@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core.article_history_sqlite_store import ArticleHistorySQLiteStore
+from core.article_store import normalize_article_url
 from web_backend import AppRuntime
 
 
@@ -26,7 +27,7 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
-    def test_sqlite_shadow_article_page_rebuilds_index_and_reads_page(self) -> None:
+    def test_sqlite_shadow_article_page_reads_fresh_index(self) -> None:
         today = "2026-05-09"
         articles = [
             {
@@ -54,11 +55,13 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "shadow.sqlite3"
+            self._write_fresh_article_shadow(db_path, articles)
             with (
                 patch.dict(os.environ, {"AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow"}),
                 patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
                 patch("web_backend.default_shadow_db_path", lambda: db_path),
-                patch("web_backend.refresh_article_matches", lambda config: list(articles)),
+                patch("web_backend.get_article_source_signature", lambda: "source-key"),
+                patch("web_backend.refresh_article_matches", side_effect=AssertionError("page read must not rebuild inline")),
                 patch("web_backend.local_today", lambda: type("FakeDate", (), {"isoformat": lambda self: today})()),
             ):
                 result = runtime._get_sqlite_shadow_article_page(
@@ -134,21 +137,24 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "shadow.sqlite3"
+            articles = [
+                {
+                    "id": "article-a",
+                    "url": "https://example.com/a",
+                    "title": "品牌A 今日报道",
+                    "media_type": "authority",
+                    "published_at": today,
+                    "ts": today,
+                    "matched_tasks": ["品牌A"],
+                }
+            ]
+            self._write_fresh_article_shadow(db_path, articles)
             with (
                 patch.dict(os.environ, {"AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow_compare"}),
                 patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
                 patch("web_backend.default_shadow_db_path", lambda: db_path),
-                patch("web_backend.refresh_article_matches", lambda config: [
-                    {
-                        "id": "article-a",
-                        "url": "https://example.com/a",
-                        "title": "品牌A 今日报道",
-                        "media_type": "authority",
-                        "published_at": today,
-                        "ts": today,
-                        "matched_tasks": ["品牌A"],
-                    }
-                ]),
+                patch("web_backend.get_article_source_signature", lambda: "source-key"),
+                patch("web_backend.refresh_article_matches", side_effect=AssertionError("page read must not rebuild inline")),
                 patch("web_backend.local_today", lambda: type("FakeDate", (), {"isoformat": lambda self: today})()),
             ):
                 result = runtime._get_sqlite_shadow_article_page(
@@ -191,11 +197,13 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "shadow.sqlite3"
+            self._write_fresh_article_shadow(db_path, articles)
             with (
                 patch.dict(os.environ, {"AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow"}),
                 patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
                 patch("web_backend.default_shadow_db_path", lambda: db_path),
-                patch("web_backend.refresh_article_matches", lambda config: list(articles)),
+                patch("web_backend.get_article_source_signature", lambda: "source-key"),
+                patch("web_backend.refresh_article_matches", side_effect=AssertionError("page read must not rebuild inline")),
                 patch("web_backend.local_today", lambda: type("FakeDate", (), {"isoformat": lambda self: today})()),
             ):
                 all_result = runtime._get_sqlite_shadow_article_page(
@@ -236,6 +244,50 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
         status = runtime.get_article_sqlite_shadow_compare_status()
         self.assertEqual(status["health"]["last_fallback_reason"], "limit_exceeded")
 
+    def test_sqlite_shadow_article_page_falls_back_when_shadow_stale_without_inline_refresh(self) -> None:
+        today = "2026-05-09"
+        runtime = self._runtime()
+        scheduled: list[str] = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "shadow.sqlite3"
+            self._write_fresh_article_shadow(
+                db_path,
+                [
+                    {
+                        "id": "article-stale",
+                        "url": "https://example.com/stale",
+                        "title": "旧索引文章",
+                        "media_type": "authority",
+                        "published_at": today,
+                        "ts": today,
+                        "matched_tasks": ["品牌A"],
+                    }
+                ],
+                source_signature="old-source",
+            )
+            runtime._schedule_sqlite_shadow_article_rebuild = (  # type: ignore[method-assign]
+                lambda config, *, db_path, reason: scheduled.append(str(reason)) or True
+            )
+            with (
+                patch.dict(os.environ, {"AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow"}),
+                patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
+                patch("web_backend.default_shadow_db_path", lambda: db_path),
+                patch("web_backend.get_article_source_signature", lambda: "new-source"),
+                patch("web_backend.refresh_article_matches", side_effect=AssertionError("stale read must not rebuild inline")),
+            ):
+                result = runtime._get_sqlite_shadow_article_page(
+                    {"tasks": [{"name": "品牌A"}]},
+                    media_type="media",
+                    limit=10,
+                    task_name="品牌A",
+                )
+
+        self.assertIsNone(result)
+        self.assertEqual(scheduled, ["article_shadow_source_stale"])
+        status = runtime.get_article_sqlite_shadow_compare_status()
+        self.assertEqual(status["health"]["last_fallback_reason"], "article_shadow_source_stale")
+
     def test_sqlite_shadow_article_page_merges_duplicate_url_tasks_like_json_page(self) -> None:
         today = "2026-05-09"
         articles = [
@@ -266,11 +318,13 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "shadow.sqlite3"
+            self._write_fresh_article_shadow(db_path, articles)
             with (
                 patch.dict(os.environ, {"AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow"}),
                 patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
                 patch("web_backend.default_shadow_db_path", lambda: db_path),
-                patch("web_backend.refresh_article_matches", lambda config: list(articles)),
+                patch("web_backend.get_article_source_signature", lambda: "source-key"),
+                patch("web_backend.refresh_article_matches", side_effect=AssertionError("page read must not rebuild inline")),
                 patch("web_backend.local_today", lambda: type("FakeDate", (), {"isoformat": lambda self: today})()),
             ):
                 result = runtime._get_sqlite_shadow_article_page(
@@ -367,6 +421,17 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "shadow.sqlite3"
+            self._write_fresh_article_shadow(db_path, [
+                {
+                    "id": "article-a",
+                    "url": "https://example.com/a",
+                    "title": "品牌A 今日报道",
+                    "media_type": "authority",
+                    "published_at": today,
+                    "ts": today,
+                    "matched_tasks": ["品牌A"],
+                }
+            ])
             with (
                 patch.dict(os.environ, {
                     "AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow",
@@ -377,17 +442,8 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
                 patch("web_backend.default_shadow_db_path", lambda: db_path),
                 patch("web_backend._open_fd_count", return_value=4),
                 patch("web_backend._open_sqlite_fd_count", side_effect=[4, 20]),
-                patch("web_backend.refresh_article_matches", lambda config: [
-                    {
-                        "id": "article-a",
-                        "url": "https://example.com/a",
-                        "title": "品牌A 今日报道",
-                        "media_type": "authority",
-                        "published_at": today,
-                        "ts": today,
-                        "matched_tasks": ["品牌A"],
-                    }
-                ]),
+                patch("web_backend.get_article_source_signature", lambda: "source-key"),
+                patch("web_backend.refresh_article_matches", side_effect=AssertionError("page read must not rebuild inline")),
                 patch("web_backend.local_today", lambda: type("FakeDate", (), {"isoformat": lambda self: today})()),
             ):
                 result = runtime._get_sqlite_shadow_article_page(
@@ -458,6 +514,9 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
         runtime = object.__new__(AppRuntime)
         runtime._article_sqlite_shadow_lock = threading.RLock()
         runtime._article_sqlite_shadow_cache_key = None
+        runtime._article_sqlite_shadow_unready_reason = ""
+        runtime._article_sqlite_shadow_rebuild_lock = threading.RLock()
+        runtime._article_sqlite_shadow_rebuild_state = {}
         runtime._article_sqlite_shadow_compare_lock = threading.RLock()
         runtime._article_sqlite_shadow_compare_recent = []
         runtime._article_sqlite_shadow_health_lock = threading.RLock()
@@ -466,6 +525,19 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
         runtime._article_store_version_key = lambda: ("articles.json", 1, 1)  # type: ignore[method-assign]
         runtime._article_match_config_key = lambda config: "config-key"  # type: ignore[method-assign]
         return runtime
+
+    def _write_fresh_article_shadow(
+        self,
+        db_path: Path,
+        articles: list[dict],
+        *,
+        source_signature: str = "source-key",
+        match_signature: str = "config-key",
+    ) -> None:
+        store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+        store.import_articles(articles, replace=True)
+        store.set_meta("article_source_signature", source_signature)
+        store.set_meta("article_match_config_signature", match_signature)
 
 
 if __name__ == "__main__":
