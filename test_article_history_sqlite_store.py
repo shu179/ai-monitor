@@ -181,6 +181,27 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             limited = store.get_history_records("task-a", limit=1, offset=1)
             self.assertEqual([record["id"] for record in limited], ["r2"])
 
+    def test_history_records_preserve_source_order_for_same_timestamp_missing_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")
+            records = [
+                {"ts": "2024-01-01 09:00", "rank": 3, "marker": "first"},
+                {"ts": "2024-01-01 09:00", "rank": 1, "marker": "second"},
+                {"ts": "2024-01-01 09:00", "rank": 2, "marker": "third"},
+            ]
+
+            result = store.import_history_records("task-a", records, replace=True)
+
+            self.assertEqual(result, {"created": 3, "updated": 0, "skipped": 0})
+            self.assertEqual(
+                [record["marker"] for record in store.get_history_records("task-a")],
+                ["first", "second", "third"],
+            )
+            self.assertEqual(
+                [record["marker"] for record in store.get_history_tail("task-a", limit=2)],
+                ["second", "third"],
+            )
+
     def test_import_history_sources_batches_multiple_keys_in_one_store_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")
@@ -318,6 +339,7 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             self.assertIn("history_records", names)
             self.assertIn("idx_article_task_links_lookup", names)
             self.assertIn("idx_history_storage_ts", names)
+            self.assertIn("idx_history_storage_order", names)
 
     def test_connection_context_closes_after_success_and_error(self) -> None:
         store = ArticleHistorySQLiteStore(Path("unused.sqlite3"))

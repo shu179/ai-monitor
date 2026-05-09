@@ -12,6 +12,7 @@ import core.history as history
 from core.article_history_sqlite_mirror import (
     build_article_compare_queries,
     compare_article_pages,
+    compare_history_records,
     load_json_history_sources,
     rebuild_shadow_store,
     verify_shadow_store,
@@ -257,6 +258,94 @@ class ArticleHistorySQLiteMirrorTests(unittest.TestCase):
         by_name = {item["name"]: item for item in result["queries"]}
         self.assertIn("total", by_name["all"]["mismatches"])
         self.assertIn("article_ids", by_name["all"]["mismatches"])
+
+    def test_compare_history_records_reports_matching_pages(self) -> None:
+        source = {
+            "task-a": [
+                {"id": f"r{index}", "ts": f"2024-01-{index:02d} 09:00", "rank": index}
+                for index in range(1, 8)
+            ],
+            "task-b": [
+                {"id": "b1", "ts": "2024-02-01 10:00", "success": True},
+            ],
+        }
+        db_path = Path(self._tmpdir.name) / "shadow.sqlite3"
+        store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+        store.import_history_sources(source, replace=True)
+
+        result = compare_history_records(
+            db_path,
+            source=source,
+            limit=2,
+            sample_pages=2,
+            max_workers=2,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["failed_count"], 0)
+        self.assertEqual(result["workers"], 2)
+        by_name = {item["name"]: item for item in result["queries"]}
+        self.assertEqual(by_name["task-a"]["json"]["count"], 7)
+        self.assertGreaterEqual(len(by_name["task-a"]["windows"]), 3)
+        self.assertEqual(by_name["task-a"]["windows"][0]["json"]["count"], 2)
+        self.assertNotIn("json_records", by_name["task-a"]["windows"][0])
+        self.assertEqual(by_name["task-b"]["windows"][0]["name"], "head")
+
+    def test_compare_history_records_matches_same_timestamp_missing_id_order(self) -> None:
+        source = {
+            "task-a": [
+                {"ts": "2024-01-01 09:00", "rank": 3, "marker": "first"},
+                {"ts": "2024-01-01 09:00", "rank": 1, "marker": "second"},
+                {"ts": "2024-01-01 09:00", "rank": 2, "marker": "third"},
+            ],
+        }
+        db_path = Path(self._tmpdir.name) / "shadow.sqlite3"
+
+        result = compare_history_records(
+            db_path,
+            source=source,
+            limit=10,
+            sample_pages=1,
+            rebuild=True,
+        )
+
+        self.assertTrue(result["ok"])
+        by_name = {item["name"]: item for item in result["queries"]}
+        self.assertEqual(by_name["task-a"]["mismatches"], [])
+
+    def test_compare_history_records_reports_count_and_record_mismatches(self) -> None:
+        source = {
+            "task-a": [
+                {"id": "r1", "ts": "2024-01-01 09:00", "rank": 1},
+                {"id": "r2", "ts": "2024-01-02 09:00", "rank": 2},
+            ],
+        }
+        db_path = Path(self._tmpdir.name) / "shadow.sqlite3"
+        store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+        store.import_history_sources({
+            "task-a": [
+                {"id": "r1", "ts": "2024-01-01 09:00", "rank": 99},
+            ],
+            "stale": [
+                {"id": "old", "ts": "2023-01-01 00:00"},
+            ],
+        }, replace=True)
+
+        result = compare_history_records(
+            db_path,
+            source=source,
+            limit=10,
+            sample_pages=1,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("storage_keys", result["keys"]["mismatches"])
+        by_name = {item["name"]: item for item in result["queries"]}
+        self.assertIn("count", by_name["task-a"]["mismatches"])
+        self.assertIn("records", by_name["task-a"]["mismatches"])
+        self.assertIn("json_records", by_name["task-a"]["windows"][0])
+        self.assertIn("sqlite_records", by_name["task-a"]["windows"][0])
+        self.assertIn("count", by_name["stale"]["mismatches"])
 
     def _write_articles(self, articles: list[dict]) -> None:
         article_store.ARTICLES_FILE.write_text(

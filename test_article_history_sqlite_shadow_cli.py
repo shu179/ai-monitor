@@ -102,6 +102,92 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
         self.assertFalse(parsed["ok"])
         self.assertEqual(parsed["queries"][0]["mismatches"], ["total"])
 
+    def test_compare_history_command_prints_report(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_compare(db_path, *, max_workers, limit, sample_pages, rebuild):
+            calls.append((db_path, max_workers, limit, sample_pages, rebuild))
+            return {
+                "ok": True,
+                "failed_count": 0,
+                "queries": [{"name": "task-a", "mismatches": []}],
+            }
+
+        cli.compare_history_records = fake_compare
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "compare-history",
+                "--db-path",
+                "shadow.sqlite3",
+                "--workers",
+                "4",
+                "--limit",
+                "25",
+                "--sample-pages",
+                "5",
+                "--rebuild",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [("shadow.sqlite3", 4, 25, 5, True)])
+        parsed = json.loads(output.getvalue())
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["queries"][0]["name"], "task-a")
+
+    def test_compare_history_compact_output_keeps_only_failures_and_summary(self) -> None:
+        cli = _load_cli_module()
+
+        def fake_compare(db_path, *, max_workers, limit, sample_pages, rebuild):
+            return {
+                "ok": True,
+                "db_path": str(db_path),
+                "limit": limit,
+                "sample_pages": sample_pages,
+                "workers": max_workers,
+                "storage_key_count": 2,
+                "failed_count": 0,
+                "keys": {
+                    "expected": ["task-a", "task-b"],
+                    "sqlite": ["task-a", "task-b"],
+                    "mismatches": [],
+                },
+                "queries": [
+                    {"name": "task-a", "ok": True, "mismatches": [], "windows": [{"json": {"count": 50}}]},
+                    {"name": "task-b", "ok": True, "mismatches": [], "windows": [{"json": {"count": 10}}]},
+                ],
+                "rebuild": {
+                    "storage_keys": 2,
+                    "created": 60,
+                    "updated": 0,
+                    "skipped": 0,
+                    "details": {"task-a": {"created": 50}},
+                },
+            }
+
+        cli.compare_history_records = fake_compare
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "compare-history",
+                "--db-path",
+                "shadow.sqlite3",
+                "--workers",
+                "4",
+                "--compact",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        parsed = json.loads(output.getvalue())
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["keys"]["expected_count"], 2)
+        self.assertEqual(parsed["failed_queries"], [])
+        self.assertNotIn("queries", parsed)
+        self.assertNotIn("details", parsed["rebuild"])
+
     def test_compare_api_articles_command_prints_report(self) -> None:
         cli = _load_cli_module()
         calls = []

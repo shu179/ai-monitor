@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -183,6 +184,83 @@ def compare_article_pages(
         "query_count": len(results),
         "failed_count": len(failed),
         "rebuild": rebuild_result,
+        "queries": results,
+    }
+
+
+def compare_history_records(
+    db_path: str | Path | None = None,
+    *,
+    source: dict[str, list[dict[str, Any]]] | None = None,
+    max_workers: int | None = None,
+    limit: int = 50,
+    sample_pages: int = 3,
+    rebuild: bool = False,
+) -> dict[str, Any]:
+    """Compare JSON history files with structured SQLite history reads."""
+    target_db_path = Path(db_path) if db_path is not None else default_shadow_db_path()
+    history_sources = source if source is not None else load_json_history_sources(max_workers=max_workers)
+    normalized_sources = {
+        str(storage_key): _ordered_history_records(records)
+        for storage_key, records in (history_sources or {}).items()
+        if str(storage_key or "").strip()
+    }
+    resolved_limit = max(1, min(500, int(limit or 50)))
+    resolved_sample_pages = max(0, min(20, int(sample_pages or 0)))
+    store = ArticleHistorySQLiteStore(
+        target_db_path,
+        normalize_article_url=article_store.normalize_article_url,
+    )
+    rebuild_result = None
+    if rebuild:
+        rebuild_result = store.import_history_sources(normalized_sources, replace=True)
+
+    expected_keys = sorted(normalized_sources.keys())
+    sqlite_keys = store.list_history_storage_keys()
+    all_keys = sorted(set(expected_keys) | set(sqlite_keys))
+    worker_count = _history_compare_worker_count(all_keys, max_workers=max_workers)
+    if worker_count <= 1:
+        results = [
+            _compare_history_storage_key(
+                store,
+                storage_key,
+                normalized_sources.get(storage_key, []),
+                limit=resolved_limit,
+                sample_pages=resolved_sample_pages,
+            )
+            for storage_key in all_keys
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(executor.map(
+                lambda storage_key: _compare_history_storage_key(
+                    store,
+                    storage_key,
+                    normalized_sources.get(storage_key, []),
+                    limit=resolved_limit,
+                    sample_pages=resolved_sample_pages,
+                ),
+                all_keys,
+            ))
+
+    key_mismatches = []
+    if expected_keys != sqlite_keys:
+        key_mismatches.append("storage_keys")
+    failed = [item for item in results if not bool(item.get("ok"))]
+    return {
+        "ok": not failed and not key_mismatches,
+        "db_path": str(target_db_path),
+        "limit": resolved_limit,
+        "sample_pages": resolved_sample_pages,
+        "workers": worker_count,
+        "storage_key_count": len(all_keys),
+        "failed_count": len(failed) + len(key_mismatches),
+        "rebuild": rebuild_result,
+        "keys": {
+            "expected": expected_keys,
+            "sqlite": sqlite_keys,
+            "mismatches": key_mismatches,
+        },
         "queries": results,
     }
 
@@ -371,6 +449,124 @@ def _article_compare_worker_count(queries: list[dict[str, str]], *, max_workers:
     return max(1, min(len(queries), cpu_count, 8))
 
 
+def _history_compare_worker_count(storage_keys: list[str], *, max_workers: int | None) -> int:
+    if len(storage_keys) <= 1:
+        return 1
+    if max_workers is not None:
+        return max(1, min(len(storage_keys), int(max_workers or 1)))
+    cpu_count = os.cpu_count() or 2
+    return max(1, min(len(storage_keys), cpu_count, 8))
+
+
+def _compare_history_storage_key(
+    store: ArticleHistorySQLiteStore,
+    storage_key: str,
+    expected_records: list[dict[str, Any]],
+    *,
+    limit: int,
+    sample_pages: int,
+) -> dict[str, Any]:
+    ordered_expected = _ordered_history_records(expected_records)
+    sqlite_count = store.get_history_record_count(storage_key)
+    expected_count = len(ordered_expected)
+    windows = []
+    mismatches: list[str] = []
+    if sqlite_count != expected_count:
+        mismatches.append("count")
+    for window in _history_compare_windows(expected_count, limit=limit, sample_pages=sample_pages):
+        offset = int(window["offset"])
+        window_limit = int(window["limit"])
+        expected_window = ordered_expected[offset:offset + window_limit]
+        sqlite_window = store.get_history_records(storage_key, limit=window_limit, offset=offset)
+        expected_signature = _history_records_signature(expected_window)
+        sqlite_signature = _history_records_signature(sqlite_window)
+        window_mismatches = []
+        if expected_signature != sqlite_signature:
+            window_mismatches.append("records")
+            if "records" not in mismatches:
+                mismatches.append("records")
+        window_report: dict[str, Any] = {
+            "name": window["name"],
+            "offset": offset,
+            "limit": window_limit,
+            "ok": not window_mismatches,
+            "mismatches": window_mismatches,
+            "json": {
+                "count": len(expected_window),
+            },
+            "sqlite": {
+                "count": len(sqlite_window),
+            },
+        }
+        if window_mismatches:
+            window_report["json_records"] = expected_signature
+            window_report["sqlite_records"] = sqlite_signature
+        windows.append(window_report)
+    return {
+        "ok": not mismatches,
+        "name": storage_key,
+        "mismatches": mismatches,
+        "json": {
+            "count": expected_count,
+        },
+        "sqlite": {
+            "count": sqlite_count,
+        },
+        "windows": windows,
+    }
+
+
+def _history_compare_windows(total: int, *, limit: int, sample_pages: int) -> list[dict[str, int | str]]:
+    capped_limit = max(1, min(500, int(limit or 1)))
+    if total <= 0:
+        return [{"name": "empty", "offset": 0, "limit": capped_limit}]
+    offsets = [0]
+    if total > capped_limit:
+        tail_offset = max(0, total - capped_limit)
+        offsets.append(tail_offset)
+        if sample_pages > 0:
+            available = max(0, tail_offset - capped_limit)
+            for index in range(1, sample_pages + 1):
+                offset = int(round((available * index) / (sample_pages + 1)))
+                offsets.append(max(0, min(tail_offset, offset)))
+    unique_offsets = sorted(set(offsets))
+    windows = []
+    for offset in unique_offsets:
+        if offset == 0:
+            name = "head"
+        elif offset >= max(0, total - capped_limit):
+            name = "tail"
+        else:
+            name = f"sample:{offset}"
+        windows.append({"name": name, "offset": offset, "limit": capped_limit})
+    return windows
+
+
+def _ordered_history_records(records: Any) -> list[dict[str, Any]]:
+    items = [item for item in (records or []) if isinstance(item, dict)]
+    return sorted(items, key=lambda item: str(item.get("ts") or ""))
+
+
+def _history_records_signature(records: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [
+        {
+            "id": str(record.get("id") or ""),
+            "ts": str(record.get("ts") or ""),
+            "digest": _history_record_digest(record),
+        }
+        for record in records
+        if isinstance(record, dict)
+    ]
+
+
+def _history_record_digest(record: dict[str, Any]) -> str:
+    try:
+        payload = json.dumps(record, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    except Exception:
+        payload = str(record)
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
 def _storage_media_type(media_type: str) -> str:
     return {
         "media": "authority",
@@ -473,7 +669,7 @@ def _merge_unique_texts(left: Any, right: Any) -> list[str]:
 def _read_history_file(path: Path) -> tuple[str, list[dict[str, Any]]]:
     data = _read_json_list(path)
     records = [item for item in data if isinstance(item, dict)]
-    records.sort(key=lambda item: (str(item.get("ts") or ""), str(item.get("id") or "")))
+    records.sort(key=lambda item: str(item.get("ts") or ""))
     return path.stem, records
 
 
@@ -531,7 +727,7 @@ def _history_tail_signature(records: list[dict[str, Any]], limit: int) -> list[t
     capped_limit = max(1, int(limit or 1))
     ordered = sorted(
         [item for item in records if isinstance(item, dict)],
-        key=lambda item: (str(item.get("ts") or ""), str(item.get("id") or "")),
+        key=lambda item: str(item.get("ts") or ""),
     )
     return [
         (str(item.get("id") or ""), str(item.get("ts") or ""))

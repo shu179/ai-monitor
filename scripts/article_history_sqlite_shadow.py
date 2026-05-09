@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 from core.article_history_sqlite_mirror import (
     build_article_compare_queries,
     compare_article_pages,
+    compare_history_records,
     default_shadow_db_path,
     rebuild_shadow_store,
     verify_shadow_store,
@@ -63,7 +64,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     common.add_argument(
         "--compact",
         action="store_true",
-        help="Print compact JSON instead of indented JSON.",
+        help="Print compact JSON. History comparison also omits successful per-key details.",
     )
     verify_common = argparse.ArgumentParser(add_help=False)
     verify_common.add_argument(
@@ -99,6 +100,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rebuild",
         action="store_true",
         help="Rebuild the SQLite shadow article index before comparing.",
+    )
+    history_compare_parser = subparsers.add_parser(
+        "compare-history",
+        parents=[common],
+        help="Compare JSON history pages with the SQLite shadow history table.",
+    )
+    history_compare_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Number of history records to compare per sampled page.",
+    )
+    history_compare_parser.add_argument(
+        "--sample-pages",
+        type=int,
+        default=3,
+        help="Number of middle pages to sample per history storage key.",
+    )
+    history_compare_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Rebuild the SQLite shadow history table before comparing.",
     )
     api_compare_parser = subparsers.add_parser(
         "compare-api-articles",
@@ -200,6 +223,15 @@ def main(argv: list[str] | None = None) -> int:
             rebuild=bool(args.rebuild),
         )
         ok = bool(result.get("ok"))
+    elif args.command == "compare-history":
+        result = compare_history_records(
+            args.db_path,
+            max_workers=args.workers,
+            limit=args.limit,
+            sample_pages=args.sample_pages,
+            rebuild=bool(args.rebuild),
+        )
+        ok = bool(result.get("ok"))
     elif args.command == "compare-api-articles":
         result = compare_article_api_pages(
             args.db_path,
@@ -232,7 +264,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         ok = bool(result.get("ok"))
 
-    print(_to_json(result, compact=bool(args.compact)))
+    output_result = result
+    if bool(args.compact) and args.command == "compare-history":
+        output_result = _compact_history_compare_result(result)
+    print(_to_json(output_result, compact=bool(args.compact)))
     return 0 if ok else 1
 
 
@@ -240,6 +275,47 @@ def _to_json(value: dict[str, Any], *, compact: bool) -> str:
     if compact:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def _compact_history_compare_result(result: dict[str, Any]) -> dict[str, Any]:
+    queries = [
+        query for query in (result.get("queries") or [])
+        if isinstance(query, dict)
+    ]
+    failed_queries = [query for query in queries if not bool(query.get("ok"))]
+    keys = result.get("keys") if isinstance(result.get("keys"), dict) else {}
+    key_mismatches = keys.get("mismatches") if isinstance(keys.get("mismatches"), list) else []
+    compact_keys: dict[str, Any] = {
+        "expected_count": len(keys.get("expected") or []),
+        "sqlite_count": len(keys.get("sqlite") or []),
+        "mismatches": key_mismatches,
+    }
+    if key_mismatches:
+        compact_keys["expected"] = keys.get("expected") or []
+        compact_keys["sqlite"] = keys.get("sqlite") or []
+
+    compact: dict[str, Any] = {
+        "ok": bool(result.get("ok")),
+        "db_path": result.get("db_path"),
+        "limit": result.get("limit"),
+        "sample_pages": result.get("sample_pages"),
+        "workers": result.get("workers"),
+        "storage_key_count": result.get("storage_key_count"),
+        "failed_count": result.get("failed_count"),
+        "keys": compact_keys,
+        "failed_queries": failed_queries,
+    }
+    rebuild = result.get("rebuild")
+    if isinstance(rebuild, dict):
+        compact["rebuild"] = {
+            "storage_keys": rebuild.get("storage_keys"),
+            "created": rebuild.get("created"),
+            "updated": rebuild.get("updated"),
+            "skipped": rebuild.get("skipped"),
+        }
+    else:
+        compact["rebuild"] = rebuild
+    return compact
 
 
 def compare_article_api_pages(

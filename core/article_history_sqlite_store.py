@@ -91,12 +91,14 @@ class ArticleHistorySQLiteStore:
                     review_status TEXT NOT NULL DEFAULT '',
                     mode TEXT NOT NULL DEFAULT '',
                     execution_source TEXT NOT NULL DEFAULT '',
+                    sort_index INTEGER NOT NULL DEFAULT 0,
                     raw_json TEXT NOT NULL,
                     updated_at_ns INTEGER NOT NULL,
                     PRIMARY KEY(storage_key, id)
                 )
                 """
             )
+            self._ensure_column(conn, "history_records", "sort_index", "INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_articles_display_time "
                 "ON articles(published_at DESC, ts DESC, imported_at DESC, id DESC)"
@@ -116,6 +118,10 @@ class ArticleHistorySQLiteStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_history_storage_ts "
                 "ON history_records(storage_key, ts, id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_history_storage_order "
+                "ON history_records(storage_key, ts, sort_index, id)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_history_task_id_ts "
@@ -316,11 +322,13 @@ class ArticleHistorySQLiteStore:
                     "DELETE FROM history_records WHERE storage_key = ?",
                     (normalized_storage_key,),
                 )
-            for raw_record in records or []:
+            start_index = 0 if replace else self._next_history_sort_index(conn, normalized_storage_key)
+            for sort_index, raw_record in enumerate(records or [], start=start_index):
                 outcome = self._upsert_history_record(
                     conn,
                     normalized_storage_key,
                     raw_record,
+                    sort_index=sort_index,
                     updated_at_ns=updated_at_ns,
                 )
                 if outcome == "updated":
@@ -349,11 +357,13 @@ class ArticleHistorySQLiteStore:
                 if not normalized_storage_key:
                     continue
                 detail = {"created": 0, "updated": 0, "skipped": 0}
-                for raw_record in records or []:
+                start_index = 0 if replace else self._next_history_sort_index(conn, normalized_storage_key)
+                for sort_index, raw_record in enumerate(records or [], start=start_index):
                     outcome = self._upsert_history_record(
                         conn,
                         normalized_storage_key,
                         raw_record,
+                        sort_index=sort_index,
                         updated_at_ns=updated_at_ns,
                     )
                     detail[outcome] += 1
@@ -389,7 +399,7 @@ class ArticleHistorySQLiteStore:
                 SELECT raw_json
                 FROM history_records
                 WHERE storage_key = ?
-                ORDER BY ts ASC, id ASC
+                ORDER BY ts ASC, sort_index ASC, id ASC
                 {limit_sql}
                 """,
                 params,
@@ -428,7 +438,7 @@ class ArticleHistorySQLiteStore:
                 SELECT raw_json
                 FROM history_records
                 WHERE storage_key = ?
-                ORDER BY ts DESC, id DESC
+                ORDER BY ts DESC, sort_index DESC, id DESC
                 LIMIT ?
                 """,
                 (normalized_storage_key, capped_limit),
@@ -507,6 +517,7 @@ class ArticleHistorySQLiteStore:
         storage_key: str,
         raw_record: Any,
         *,
+        sort_index: int,
         updated_at_ns: int,
     ) -> Literal["created", "updated", "skipped"]:
         if not isinstance(raw_record, dict):
@@ -524,9 +535,9 @@ class ArticleHistorySQLiteStore:
             INSERT INTO history_records(
                 storage_key, id, task_id, task_name, ts, platform,
                 keyword, brand, rank, success, review_status, mode,
-                execution_source, raw_json, updated_at_ns
+                execution_source, sort_index, raw_json, updated_at_ns
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(storage_key, id) DO UPDATE SET
                 task_id = excluded.task_id,
                 task_name = excluded.task_name,
@@ -539,6 +550,7 @@ class ArticleHistorySQLiteStore:
                 review_status = excluded.review_status,
                 mode = excluded.mode,
                 execution_source = excluded.execution_source,
+                sort_index = excluded.sort_index,
                 raw_json = excluded.raw_json,
                 updated_at_ns = excluded.updated_at_ns
             """,
@@ -556,11 +568,19 @@ class ArticleHistorySQLiteStore:
                 self._text(record.get("review_status")),
                 self._text(record.get("mode")),
                 self._text(record.get("execution_source")),
+                int(sort_index),
                 self._json_dumps(record),
                 updated_at_ns,
             ),
         )
         return "updated" if existed else "created"
+
+    def _next_history_sort_index(self, conn: sqlite3.Connection, storage_key: str) -> int:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(sort_index), -1) + 1 FROM history_records WHERE storage_key = ?",
+            (storage_key,),
+        ).fetchone()
+        return int((row or [0])[0] or 0)
 
     def _article_query_filters(
         self,
