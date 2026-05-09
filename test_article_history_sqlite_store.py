@@ -399,6 +399,41 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             self.assertEqual([item["id"] for item in reviews], ["pending-2"])
             self.assertEqual([item["id"] for item in store.get_pending_reviews(limit=10)], ["pending-2", "pending-1"])
 
+    def test_pending_reviews_pages_past_filtered_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")
+            filtered_rows = [
+                {
+                    "id": f"miss-{index}",
+                    "ts": "2024-01-03 09:00",
+                    "task_name": "品牌A",
+                    "rank": 99,
+                    "success": False,
+                    "review_status": "pending",
+                }
+                for index in range(70)
+            ]
+            store.import_history_sources(
+                {
+                    "task-a": filtered_rows + [
+                        {
+                            "id": "pending-eligible",
+                            "ts": "2024-01-01 09:00",
+                            "task_name": "品牌A",
+                            "rank": 1,
+                            "success": True,
+                            "review_status": "pending",
+                        }
+                    ],
+                },
+                replace=True,
+            )
+
+            self.assertEqual(
+                [item["id"] for item in store.get_pending_reviews(limit=1)],
+                ["pending-eligible"],
+            )
+
     def test_pending_reviews_preserve_json_stable_order_for_equal_sort_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")
@@ -550,6 +585,8 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             self.assertIn("idx_article_task_links_lookup", names)
             self.assertIn("idx_history_storage_ts", names)
             self.assertIn("idx_history_storage_order", names)
+            self.assertIn("idx_history_storage_sort", names)
+            self.assertIn("idx_history_pending_reviews", names)
 
     def test_connection_context_closes_after_success_and_error(self) -> None:
         store = ArticleHistorySQLiteStore(Path("unused.sqlite3"))

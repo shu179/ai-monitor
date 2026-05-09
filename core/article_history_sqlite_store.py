@@ -124,6 +124,10 @@ class ArticleHistorySQLiteStore:
                 "ON history_records(storage_key, ts, sort_index, id)"
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_history_storage_sort "
+                "ON history_records(storage_key, sort_index, id)"
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_history_task_id_ts "
                 "ON history_records(task_id, ts, id)"
             )
@@ -584,20 +588,27 @@ class ArticleHistorySQLiteStore:
         self.initialize()
         names: list[str] = []
         seen_names: set[str] = set()
-        seen_storage_keys: set[str] = set()
         with self._connection() as conn:
             rows = conn.execute(
                 """
                 SELECT storage_key, raw_json
-                FROM history_records
-                ORDER BY storage_key ASC, sort_index ASC, id ASC
+                FROM history_records AS current
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM history_records AS earlier
+                    WHERE earlier.storage_key = current.storage_key
+                      AND (
+                          earlier.sort_index < current.sort_index
+                          OR (earlier.sort_index = current.sort_index AND earlier.id < current.id)
+                      )
+                )
+                ORDER BY storage_key ASC
                 """
             ).fetchall()
         for storage_key, raw_json in rows:
             normalized_storage_key = self._text(storage_key)
-            if not normalized_storage_key or normalized_storage_key in seen_storage_keys:
+            if not normalized_storage_key:
                 continue
-            seen_storage_keys.add(normalized_storage_key)
             record = self._normalize_history_record(
                 self._json_loads(raw_json),
                 storage_key=normalized_storage_key,
@@ -614,31 +625,41 @@ class ArticleHistorySQLiteStore:
         items: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         with self._connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT storage_key, raw_json
-                FROM history_records
-                WHERE review_status = 'pending'
-                ORDER BY ts DESC, task_name DESC, storage_key ASC, sort_index ASC, id ASC
-                """
-            ).fetchall()
-        for storage_key, raw_json in rows:
-            record = self._normalize_history_record(
-                self._json_loads(raw_json),
-                storage_key=self._text(storage_key),
-            )
-            record_id = self._text(record.get("id"))
-            if record_id and record_id in seen_ids:
-                continue
-            if record.get("review_status") != "pending":
-                continue
-            if record.get("rank", 99) == 99:
-                continue
-            if record_id:
-                seen_ids.add(record_id)
-            items.append(record)
-            if len(items) >= capped_limit:
-                break
+            batch_size = max(capped_limit * 4, 64)
+            offset = 0
+            while len(items) < capped_limit:
+                rows = conn.execute(
+                    """
+                    SELECT storage_key, raw_json
+                    FROM history_records
+                    WHERE review_status = 'pending'
+                    ORDER BY ts DESC, task_name DESC, storage_key ASC, sort_index ASC, id ASC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (batch_size, offset),
+                ).fetchall()
+                if not rows:
+                    break
+                offset += len(rows)
+                for storage_key, raw_json in rows:
+                    record = self._normalize_history_record(
+                        self._json_loads(raw_json),
+                        storage_key=self._text(storage_key),
+                    )
+                    record_id = self._text(record.get("id"))
+                    if record_id and record_id in seen_ids:
+                        continue
+                    if record.get("review_status") != "pending":
+                        continue
+                    if record.get("rank", 99) == 99:
+                        continue
+                    if record_id:
+                        seen_ids.add(record_id)
+                    items.append(record)
+                    if len(items) >= capped_limit:
+                        break
+                if len(rows) < batch_size:
+                    break
         return items
 
     def get_article_task_counts(self, *, relation: str = "matched") -> dict[str, int]:
