@@ -188,6 +188,18 @@ class ArticleHistorySQLiteStore:
                     created += 1
         return {"created": created, "updated": updated, "skipped": skipped}
 
+    def clear_all(self) -> None:
+        self.initialize()
+        with self._connection() as conn:
+            conn.execute("DELETE FROM article_task_links")
+            conn.execute("DELETE FROM articles")
+            conn.execute("DELETE FROM history_records")
+
+    def clear_history_records(self) -> None:
+        self.initialize()
+        with self._connection() as conn:
+            conn.execute("DELETE FROM history_records")
+
     def get_article_page(
         self,
         *,
@@ -348,6 +360,53 @@ class ArticleHistorySQLiteStore:
                 "SELECT DISTINCT storage_key FROM history_records ORDER BY storage_key"
             ).fetchall()
         return [str(row[0]) for row in rows if str(row[0] or "")]
+
+    def get_history_record_count(self, storage_key: str) -> int:
+        self.initialize()
+        normalized_storage_key = self._text(storage_key)
+        if not normalized_storage_key:
+            return 0
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM history_records WHERE storage_key = ?",
+                (normalized_storage_key,),
+            ).fetchone()
+        return int((row or [0])[0] or 0)
+
+    def get_history_tail(self, storage_key: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        self.initialize()
+        normalized_storage_key = self._text(storage_key)
+        if not normalized_storage_key:
+            return []
+        capped_limit = max(1, min(500, int(limit or 20)))
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT raw_json
+                FROM history_records
+                WHERE storage_key = ?
+                ORDER BY ts DESC, id DESC
+                LIMIT ?
+                """,
+                (normalized_storage_key, capped_limit),
+            ).fetchall()
+        return list(reversed([self._json_loads(row[0]) for row in rows]))
+
+    def get_article_task_counts(self, *, relation: str = "matched") -> dict[str, int]:
+        self.initialize()
+        normalized_relation = self._text(relation) or "matched"
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT task_name, COUNT(*)
+                FROM article_task_links
+                WHERE relation = ?
+                GROUP BY task_name
+                ORDER BY task_name
+                """,
+                (normalized_relation,),
+            ).fetchall()
+        return {str(row[0]): int(row[1] or 0) for row in rows if str(row[0] or "")}
 
     @contextmanager
     def _connection(self):

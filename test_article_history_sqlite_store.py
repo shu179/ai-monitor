@@ -132,6 +132,35 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             limited = store.get_history_records("task-a", limit=1, offset=1)
             self.assertEqual([record["id"] for record in limited], ["r2"])
 
+    def test_large_article_import_supports_bounded_page_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(
+                Path(tmpdir) / "local_store.sqlite3",
+                normalize_article_url=normalize_article_url,
+            )
+            articles = [
+                {
+                    "id": f"article-{index}",
+                    "url": f"https://example.com/articles/{index}",
+                    "title": f"文章 {index}",
+                    "media_name": "示例媒体",
+                    "media_type": "authority" if index % 2 == 0 else "selfmedia",
+                    "published_at": f"2024-01-{(index % 28) + 1:02d}",
+                    "matched_tasks": [f"品牌{index % 5}"],
+                }
+                for index in range(5000)
+            ]
+
+            result = store.import_articles(articles, replace=True)
+            page = store.get_article_page(limit=50)
+            brand_page = store.get_article_page(task_name="品牌3", limit=25)
+
+            self.assertEqual(result, {"created": 5000, "updated": 0, "skipped": 0})
+            self.assertEqual(page["total"], 5000)
+            self.assertEqual(len(page["items"]), 50)
+            self.assertEqual(brand_page["total"], 1000)
+            self.assertEqual(len(brand_page["items"]), 25)
+
     def test_initialize_creates_expected_tables_and_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "local_store.sqlite3"
