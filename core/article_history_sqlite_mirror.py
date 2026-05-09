@@ -260,10 +260,13 @@ def _history_read_worker_count(files: list[Path], *, max_workers: int | None) ->
 
 
 def _load_current_config() -> dict[str, Any]:
-    try:
-        return load_config(str(current_account_config_path()))
-    except Exception:
-        return {}
+    for config_path in (current_account_config_path(), resolve_app_path("config.yaml")):
+        try:
+            if config_path.exists():
+                return load_config(str(config_path))
+        except Exception:
+            continue
+    return {}
 
 
 def _compare_article_query(

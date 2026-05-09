@@ -4,7 +4,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import core.article_history_sqlite_mirror as sqlite_mirror
 import core.article_store as article_store
 import core.history as history
 from core.article_history_sqlite_mirror import (
@@ -167,6 +169,26 @@ class ArticleHistorySQLiteMirrorTests(unittest.TestCase):
         self.assertIn("task:品牌A|media:media", names)
         self.assertIn("task:品牌B|media:self-media", names)
         self.assertNotIn("task:删除中", names)
+
+    def test_load_current_config_falls_back_when_account_config_missing(self) -> None:
+        missing_account_path = Path(self._tmpdir.name) / "missing" / "config.yaml"
+        fallback_path = Path(self._tmpdir.name) / "config.yaml"
+        fallback_path.write_text("tasks: []\n", encoding="utf-8")
+        calls = []
+
+        def fake_load_config(path: str) -> dict:
+            calls.append(path)
+            return {"loaded_from": path}
+
+        with (
+            patch("core.article_history_sqlite_mirror.current_account_config_path", lambda: missing_account_path),
+            patch("core.article_history_sqlite_mirror.resolve_app_path", lambda path: fallback_path),
+            patch("core.article_history_sqlite_mirror.load_config", fake_load_config),
+        ):
+            config = sqlite_mirror._load_current_config()
+
+        self.assertEqual(config, {"loaded_from": str(fallback_path)})
+        self.assertEqual(calls, [str(fallback_path)])
 
     def test_compare_article_pages_reports_matching_json_and_sqlite_pages(self) -> None:
         articles = [
