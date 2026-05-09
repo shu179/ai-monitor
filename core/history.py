@@ -83,6 +83,8 @@ _startup_missing_count: dict = {}  # task_name -> int
 _locks: dict[str, CrossProcessRLock] = {}
 _locks_mutex = threading.Lock()
 _structured_shadow_write_lock = threading.RLock()
+_structured_read_health_lock = threading.RLock()
+_structured_read_health: dict[str, object] = {}
 _MAX_LOCKS = 500  # 锁字典的最大容量，超出时清理最旧的 25%
 
 
@@ -115,6 +117,64 @@ def _history_structured_shadow_writes_enabled() -> bool:
 def _history_structured_read_enabled() -> bool:
     value = os.environ.get(STRUCTURED_READ_BACKEND_ENV, "").strip().lower()
     return value in {"sqlite_shadow", "sqlite_structured", "structured", "sqlite"}
+
+
+def get_structured_read_health() -> dict:
+    """Return process-local health for the opt-in structured history reader."""
+    with _structured_read_health_lock:
+        health = dict(_structured_read_health)
+    health.update({
+        "enabled": _history_structured_read_enabled(),
+        "backend": os.environ.get(STRUCTURED_READ_BACKEND_ENV, "").strip(),
+        "available": _structured_read_store_available(),
+        "db_path": str(_history_shadow_db_file()),
+    })
+    return health
+
+
+def reset_structured_read_health() -> None:
+    with _structured_read_health_lock:
+        _structured_read_health.clear()
+
+
+def _record_structured_read_success(operation: str) -> None:
+    with _structured_read_health_lock:
+        _structured_read_health.update({
+            "last_status": "success",
+            "last_operation": str(operation or ""),
+            "last_success_at": local_now().isoformat(timespec="seconds"),
+            "last_db_path": str(_history_shadow_db_file()),
+            "success_count": int(_structured_read_health.get("success_count") or 0) + 1,
+            "consecutive_errors": 0,
+        })
+
+
+def _record_structured_read_fallback(operation: str, reason: str, detail: str = "") -> None:
+    is_exception = str(reason or "") == "exception"
+    with _structured_read_health_lock:
+        _structured_read_health.update({
+            "last_status": "fallback",
+            "last_operation": str(operation or ""),
+            "last_fallback_reason": str(reason or ""),
+            "last_fallback_at": local_now().isoformat(timespec="seconds"),
+            "last_db_path": str(_history_shadow_db_file()),
+            "fallback_count": int(_structured_read_health.get("fallback_count") or 0) + 1,
+        })
+        if detail:
+            _structured_read_health["last_error"] = str(detail)
+            _structured_read_health["last_error_at"] = local_now().isoformat(timespec="seconds")
+        if is_exception:
+            _structured_read_health["error_count"] = int(_structured_read_health.get("error_count") or 0) + 1
+            _structured_read_health["consecutive_errors"] = int(_structured_read_health.get("consecutive_errors") or 0) + 1
+
+
+def _structured_read_ready(operation: str) -> bool:
+    if not _history_structured_read_enabled():
+        return False
+    if _structured_read_store_available():
+        return True
+    _record_structured_read_fallback(operation, "shadow_db_missing")
+    return False
 
 
 def _sqlite_store() -> SQLiteJsonDocumentStore:
@@ -267,7 +327,7 @@ def _load_structured_history_records(
     task_id: str = "",
     include_legacy: bool = True,
 ) -> list[dict] | None:
-    if not _history_structured_read_enabled() or not _structured_read_store_available():
+    if not _structured_read_ready("records"):
         return None
     try:
         store = _structured_shadow_store()
@@ -277,13 +337,16 @@ def _load_structured_history_records(
             include_legacy=include_legacy,
         )
         records_by_key = store.get_history_records_for_keys(target_candidates)
-        return _structured_records_from_keyed_rows(
+        records = _structured_records_from_keyed_rows(
             records_by_key,
             target_candidates,
             task_name=task_name,
             task_id=task_id,
         )
+        _record_structured_read_success("records")
+        return records
     except Exception as e:
+        _record_structured_read_fallback("records", "exception", str(e))
         print(f"[History] 读取结构化 SQLite 影子历史失败，回退 JSON: {e}")
         return None
 
@@ -578,7 +641,7 @@ def get_records_many(
     if not normalized_specs:
         return []
 
-    if _history_structured_read_enabled() and _structured_read_store_available():
+    if _structured_read_ready("records_many"):
         try:
             store = _structured_shadow_store()
             candidates_by_spec = [
@@ -593,7 +656,7 @@ def get_records_many(
             for candidates in candidates_by_spec:
                 all_candidates.extend(candidates)
             records_by_key = store.get_history_records_for_keys(all_candidates)
-            return [
+            results = [
                 _structured_records_from_keyed_rows(
                     records_by_key,
                     candidates,
@@ -602,7 +665,10 @@ def get_records_many(
                 )
                 for (task_name, task_id), candidates in zip(normalized_specs, candidates_by_spec)
             ]
+            _record_structured_read_success("records_many")
+            return results
         except Exception as e:
+            _record_structured_read_fallback("records_many", "exception", str(e))
             print(f"[History] 批量读取结构化 SQLite 影子历史失败，回退 JSON: {e}")
 
     return [
@@ -702,10 +768,10 @@ def get_records_file_signature(
     """Return a cheap source signature for the files read by get_records()."""
     task_name = str(task_name or "").strip()
     task_id = str(task_id or "").strip()
-    if _history_structured_read_enabled() and _structured_read_store_available():
+    if _structured_read_ready("signature"):
         try:
             store = _structured_shadow_store()
-            return tuple(
+            signature = tuple(
                 _history_shadow_db_signature(key)
                 for key in _structured_history_read_targets(
                     store,
@@ -714,7 +780,10 @@ def get_records_file_signature(
                     include_legacy=include_legacy,
                 )
             )
+            _record_structured_read_success("signature")
+            return signature
         except Exception as e:
+            _record_structured_read_fallback("signature", "exception", str(e))
             print(f"[History] 读取结构化 SQLite 签名失败，回退 JSON: {e}")
     signatures: list[tuple[str, int, int]] = []
     for key in _history_read_targets(task_id=task_id, task_name=task_name, include_legacy=include_legacy):
@@ -1236,10 +1305,13 @@ def _compute_rates_locked(task_name: str, records: list):
 
 def get_all_task_names() -> list:
     """返回所有有历史记录的任务名列表"""
-    if _history_structured_read_enabled() and _structured_read_store_available():
+    if _structured_read_ready("task_names"):
         try:
-            return _structured_shadow_store().get_history_task_names()
+            names = _structured_shadow_store().get_history_task_names()
+            _record_structured_read_success("task_names")
+            return names
         except Exception as e:
+            _record_structured_read_fallback("task_names", "exception", str(e))
             print(f"[History] 读取结构化 SQLite 任务名失败，回退 JSON: {e}")
 
     history_dir = _history_dir()
@@ -1424,10 +1496,13 @@ def get_brand_trend_series_from_records(
 
 def get_pending_reviews(limit: int = 200) -> list[dict]:
     """返回待人工复核的命中记录。"""
-    if _history_structured_read_enabled() and _structured_read_store_available():
+    if _structured_read_ready("pending_reviews"):
         try:
-            return _structured_shadow_store().get_pending_reviews(limit=limit)
+            reviews = _structured_shadow_store().get_pending_reviews(limit=limit)
+            _record_structured_read_success("pending_reviews")
+            return reviews
         except Exception as e:
+            _record_structured_read_fallback("pending_reviews", "exception", str(e))
             print(f"[History] 读取结构化 SQLite 待复核失败，回退 JSON: {e}")
 
     items = []

@@ -395,6 +395,7 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         history.LOCAL_STORE_DB_FILE = root / "logs" / "local_store.sqlite3"
         history.HISTORY_SHADOW_DB_FILE = root / "logs" / "article_history_shadow.sqlite3"
         history.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        history.reset_structured_read_health()
 
     def tearDown(self) -> None:
         if self._original_storage_backend is None:
@@ -413,6 +414,7 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         history.HISTORY_DIR = self._original_paths["HISTORY_DIR"]
         history.LOCAL_STORE_DB_FILE = self._original_paths["LOCAL_STORE_DB_FILE"]
         history.HISTORY_SHADOW_DB_FILE = self._original_paths["HISTORY_SHADOW_DB_FILE"]
+        history.reset_structured_read_health()
         self._tmpdir.cleanup()
 
     def test_default_history_keeps_json_backend(self) -> None:
@@ -618,6 +620,12 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in history.get_pending_reviews(limit=10)], ["pending-1"])
         signature = history.get_records_file_signature("读取影子", task_id="task_read_path")
         self.assertIn("article_history_shadow.sqlite3::history_records/task_read_path", signature[0][0])
+        health = history.get_structured_read_health()
+        self.assertTrue(health["enabled"])
+        self.assertTrue(health["available"])
+        self.assertEqual(health["last_status"], "success")
+        self.assertGreaterEqual(health["success_count"], 5)
+        self.assertEqual(health.get("consecutive_errors"), 0)
 
     def test_structured_read_backend_falls_back_to_json_when_shadow_db_missing(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
@@ -639,6 +647,12 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self.assertFalse(history.HISTORY_SHADOW_DB_FILE.exists())
         self.assertEqual([item["id"] for item in history.get_records("json-fallback")], ["json-1"])
         self.assertIn("JSON 回退", history.get_all_task_names())
+        health = history.get_structured_read_health()
+        self.assertTrue(health["enabled"])
+        self.assertFalse(health["available"])
+        self.assertEqual(health["last_status"], "fallback")
+        self.assertEqual(health["last_fallback_reason"], "shadow_db_missing")
+        self.assertGreaterEqual(health["fallback_count"], 1)
 
 
 if __name__ == "__main__":
