@@ -49,6 +49,7 @@ class BenchmarkOptions:
     bulk_size: int = DEFAULT_BULK_SIZE
     duplicate_every: int = DEFAULT_DUPLICATE_EVERY
     today_every: int = DEFAULT_TODAY_EVERY
+    article_store_backend: str = "json"
     data_dir: Path | None = None
     force: bool = False
     keep_data: bool = False
@@ -294,6 +295,7 @@ def run_benchmark(options: BenchmarkOptions | None = None) -> dict[str, Any]:
 
 def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, Any]:
     paths = _prepare_data_dir(data_dir, force=opts.force)
+    article_store_backend = _normalize_article_store_backend(opts.article_store_backend)
     today = local_today()
     config = build_synthetic_config(opts.task_count)
     articles = build_synthetic_articles(
@@ -309,7 +311,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
     json_loader_calls = {"count": 0}
     page_refresh_calls = {"count": 0}
 
-    with isolated_article_store_paths(data_dir):
+    with isolated_article_store_paths(data_dir, article_store_backend=article_store_backend):
         probe = SQLiteArticlePageProbe(paths["shadow_db"], today=today)
         service = ArticleService(
             config_provider=StaticConfigProvider(config),
@@ -338,6 +340,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
                 media_type="",
                 task_name="",
                 json_loader_calls=json_loader_calls,
+                article_store_backend=article_store_backend,
             )
         )
         operations.append(
@@ -350,6 +353,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
                 media_type="",
                 task_name="Brand 3" if opts.task_count > 3 else "Brand 0",
                 json_loader_calls=json_loader_calls,
+                article_store_backend=article_store_backend,
             )
         )
         operations.append(
@@ -362,6 +366,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
                 media_type="media",
                 task_name="",
                 json_loader_calls=json_loader_calls,
+                article_store_backend=article_store_backend,
             )
         )
         operations.append(
@@ -402,6 +407,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
             )
 
         final_json_count = _json_article_count(paths["articles"])
+        final_authoritative_count = len(article_store.get_articles())
         sqlite_status = _sqlite_status(paths["shadow_db"], today)
 
     summary: dict[str, Any] = {
@@ -415,15 +421,18 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
             "bulk_size": int(opts.bulk_size),
             "duplicate_every": int(opts.duplicate_every),
             "today_every": int(opts.today_every),
+            "article_store_backend": article_store_backend,
             "skip_refresh": bool(opts.skip_refresh),
         },
         "paths": {
             "articles_json": str(paths["articles"]),
+            "article_store_sqlite_db": str(paths["article_store_db"]),
             "sqlite_shadow_db": str(paths["shadow_db"]),
         },
         "article_counts": {
             "synthetic_generated": len(articles),
             "json_final": final_json_count,
+            "authoritative_final": final_authoritative_count,
             **sqlite_status,
         },
         "operations": operations,
@@ -446,6 +455,7 @@ def migration_recommendations() -> list[str]:
 
 def evaluate_standards(summary: dict[str, Any]) -> dict[str, Any]:
     operations = {str(item.get("name")): item for item in summary.get("operations", [])}
+    article_store_backend = str(summary.get("input", {}).get("article_store_backend") or "json")
     page_names = (
         "article_page_default_first_screen",
         "article_page_by_task_name",
@@ -478,12 +488,19 @@ def evaluate_standards(summary: dict[str, Any]) -> dict[str, Any]:
         op = operations.get(name)
         if not op:
             continue
+        details = op.get("details") if isinstance(op.get("details"), dict) else {}
+        known_bottleneck = bool(details.get("known_bottleneck"))
         write_bottlenecks.append(
             {
                 "operation": name,
                 "elapsed_ms": op.get("elapsed_ms"),
-                "classification": "known_bottleneck",
-                "reason": "JSON remains authoritative and still requires full-document load/rewrite or full matching scan.",
+                "effective_backend": details.get("effective_backend"),
+                "classification": "known_bottleneck" if known_bottleneck else "measurement",
+                "reason": (
+                    "JSON remains authoritative and still requires full-document load/rewrite or full matching scan."
+                    if known_bottleneck
+                    else "SQLite authoritative backend handled this mutation path during the benchmark run."
+                ),
             }
         )
 
@@ -505,7 +522,7 @@ def evaluate_standards(summary: dict[str, Any]) -> dict[str, Any]:
             "limit": SQLITE_FD_GROWTH_LIMIT,
         },
         "json_write_path_bottlenecks": {
-            "status": "known_bottleneck",
+            "status": "known_bottleneck" if article_store_backend == "json" else "sqlite_measurement",
             "items": write_bottlenecks,
         },
     }
@@ -526,12 +543,26 @@ def _prepare_data_dir(data_dir: Path, *, force: bool) -> dict[str, Path]:
         "domain_media_names": logs_dir / "domain_media_names.json",
         "excluded_article_urls": logs_dir / "excluded_article_urls.json",
         "local_store_db": logs_dir / "local_store.sqlite3",
+        "article_store_db": logs_dir / "article_store.sqlite3",
         "shadow_db": logs_dir / "article_history_shadow.sqlite3",
     }
 
 
+def _normalize_article_store_backend(value: str) -> str:
+    backend = str(value or "json").strip().lower()
+    return "sqlite" if backend in {"sqlite", "sqlite3", "db", "database"} else "json"
+
+
+def _article_authoritative_backend_label() -> str:
+    return (
+        "sqlite_authoritative"
+        if article_store._article_store_sqlite_enabled()  # noqa: SLF001
+        else "json_authoritative_with_sqlite_shadow_write_through"
+    )
+
+
 @contextlib.contextmanager
-def isolated_article_store_paths(data_dir: Path):
+def isolated_article_store_paths(data_dir: Path, *, article_store_backend: str = "json"):
     logs_dir = data_dir / "logs"
     originals = {
         "ARTICLES_FILE": article_store.ARTICLES_FILE,
@@ -540,6 +571,8 @@ def isolated_article_store_paths(data_dir: Path):
         "EXCLUDED_ARTICLE_URLS_FILE": article_store.EXCLUDED_ARTICLE_URLS_FILE,
         "LOCAL_STORE_DB_FILE": article_store.LOCAL_STORE_DB_FILE,
         "ARTICLE_SHADOW_DB_FILE": article_store.ARTICLE_SHADOW_DB_FILE,
+        "ARTICLE_STORE_DB_FILE": article_store.ARTICLE_STORE_DB_FILE,
+        "ARTICLE_STORE_BACKEND_ENV": os.environ.get(article_store.ARTICLE_STORE_BACKEND_ENV),
     }
     try:
         article_store.ARTICLES_FILE = logs_dir / "articles.json"
@@ -548,6 +581,11 @@ def isolated_article_store_paths(data_dir: Path):
         article_store.EXCLUDED_ARTICLE_URLS_FILE = logs_dir / "excluded_article_urls.json"
         article_store.LOCAL_STORE_DB_FILE = logs_dir / "local_store.sqlite3"
         article_store.ARTICLE_SHADOW_DB_FILE = logs_dir / "article_history_shadow.sqlite3"
+        article_store.ARTICLE_STORE_DB_FILE = logs_dir / "article_store.sqlite3"
+        if _normalize_article_store_backend(article_store_backend) == "sqlite":
+            os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "sqlite"
+        else:
+            os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
         article_store._small_document_cache.clear()  # noqa: SLF001
         yield
     finally:
@@ -557,6 +595,11 @@ def isolated_article_store_paths(data_dir: Path):
         article_store.EXCLUDED_ARTICLE_URLS_FILE = originals["EXCLUDED_ARTICLE_URLS_FILE"]
         article_store.LOCAL_STORE_DB_FILE = originals["LOCAL_STORE_DB_FILE"]
         article_store.ARTICLE_SHADOW_DB_FILE = originals["ARTICLE_SHADOW_DB_FILE"]
+        article_store.ARTICLE_STORE_DB_FILE = originals["ARTICLE_STORE_DB_FILE"]
+        if originals["ARTICLE_STORE_BACKEND_ENV"] is None:
+            os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
+        else:
+            os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = originals["ARTICLE_STORE_BACKEND_ENV"]
         article_store._small_document_cache.clear()  # noqa: SLF001
 
 
@@ -601,6 +644,7 @@ def _measure_article_page(
     media_type: str,
     task_name: str,
     json_loader_calls: dict[str, int],
+    article_store_backend: str,
 ) -> dict[str, Any]:
     before_calls = int(json_loader_calls.get("count") or 0)
 
@@ -620,6 +664,7 @@ def _measure_article_page(
                 "today_total": int(result.get("today_total") or 0),
                 "returned_count": len(result.get("articles") or []),
                 "json_loader_calls": after_calls - before_calls,
+                "article_store_backend": article_store_backend,
                 "query": {
                     "limit": int(limit),
                     "media_type": str(media_type or ""),
@@ -703,11 +748,12 @@ def _bulk_upsert_small_batch(count: int, bulk_size: int, task_count: int) -> dic
             }
         )
     results = article_store.bulk_upsert_articles(entries)
+    backend_label = _article_authoritative_backend_label()
     return {
-        "effective_backend": "json_authoritative_with_sqlite_shadow_write_through",
+        "effective_backend": backend_label,
         "requested": len(entries),
         "stored": len(results),
-        "known_bottleneck": True,
+        "known_bottleneck": backend_label.startswith("json_"),
     }
 
 
@@ -724,33 +770,37 @@ def _update_single_article(count: int, task_count: int) -> dict[str, Any]:
             "match_reasons": {task_name: ["benchmark single update"]},
         },
     )
+    backend_label = _article_authoritative_backend_label()
     return {
-        "effective_backend": "json_authoritative_with_sqlite_shadow_write_through",
+        "effective_backend": backend_label,
         "article_id": article_id,
         "updated": bool(updated),
-        "known_bottleneck": True,
+        "known_bottleneck": backend_label.startswith("json_"),
     }
 
 
 def _delete_single_article(count: int) -> dict[str, Any]:
     total = max(1, int(count or 1))
-    article_id = f"article-{max(0, total // 3)}"
+    article_index = max(0, min(total - 1, (total // 3) + 1 if total > 1 else 0))
+    article_id = f"article-{article_index}"
     removed = article_store.delete_article(article_id)
+    backend_label = _article_authoritative_backend_label()
     return {
-        "effective_backend": "json_authoritative_with_sqlite_shadow_write_through",
+        "effective_backend": backend_label,
         "article_id": article_id,
         "deleted": bool(removed),
-        "known_bottleneck": True,
+        "known_bottleneck": backend_label.startswith("json_"),
     }
 
 
 def _refresh_article_matches(config: dict[str, Any], counter: dict[str, int]) -> dict[str, Any]:
     counter["count"] = int(counter.get("count") or 0) + 1
     articles = article_store.refresh_article_matches(config)
+    backend_label = _article_authoritative_backend_label()
     return {
-        "effective_backend": "json_authoritative_full_scan",
+        "effective_backend": f"{backend_label}_full_scan",
         "articles_returned": len(articles),
-        "known_bottleneck": True,
+        "known_bottleneck": backend_label.startswith("json_"),
     }
 
 
@@ -833,6 +883,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bulk-size", type=int, default=DEFAULT_BULK_SIZE, help="Small bulk upsert batch size.")
     parser.add_argument("--duplicate-every", type=int, default=DEFAULT_DUPLICATE_EVERY, help="Repeat one URL every N rows; 0 disables duplicates.")
     parser.add_argument("--today-every", type=int, default=DEFAULT_TODAY_EVERY, help="Mark every Nth article as published today.")
+    parser.add_argument("--article-store-backend", choices=("json", "sqlite"), default="json", help="Authoritative ArticleStore backend for write-path measurements.")
     parser.add_argument("--data-dir", type=Path, default=None, help="Explicit isolated benchmark data dir. Defaults to tempfile.")
     parser.add_argument("--force", action="store_true", help="Overwrite an existing explicit data dir articles.json.")
     parser.add_argument("--keep-data", action="store_true", help="Keep a generated tempfile data dir after the run.")
@@ -851,6 +902,7 @@ def main(argv: list[str] | None = None) -> int:
             bulk_size=args.bulk_size,
             duplicate_every=args.duplicate_every,
             today_every=args.today_every,
+            article_store_backend=args.article_store_backend,
             data_dir=args.data_dir,
             force=args.force,
             keep_data=args.keep_data,

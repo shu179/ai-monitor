@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -181,6 +183,143 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
         self.assertEqual(article_store.ARTICLES_FILE.read_text(encoding="utf-8"), "[]")
         self.assertTrue(article_store.ARTICLE_STORE_DB_FILE.exists())
         self.assertEqual([item["id"] for item in article_store.get_articles()], ["article-a"])
+
+    def test_sqlite_backend_first_use_imports_existing_articles_json(self) -> None:
+        self._configure_paths("sqlite-import")
+        os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "sqlite"
+        legacy_payload = [
+            {
+                "id": "legacy-a",
+                "url": "https://www.example.com/a?utm_source=x",
+                "title": "Legacy A",
+                "published_at": "2026-05-08",
+                "ts": "2026-05-08 09:00",
+            }
+        ]
+        legacy_text = json.dumps(legacy_payload, ensure_ascii=False)
+        article_store.ARTICLES_FILE.write_text(legacy_text, encoding="utf-8")
+
+        articles = article_store.get_articles()
+
+        self.assertEqual([item["id"] for item in articles], ["legacy-a"])
+        self.assertEqual(articles[0]["url"], "https://example.com/a")
+        self.assertEqual(article_store.ARTICLES_FILE.read_text(encoding="utf-8"), legacy_text)
+        with sqlite3.connect(article_store.ARTICLE_STORE_DB_FILE) as conn:
+            meta = dict(conn.execute("SELECT key, value FROM store_meta").fetchall())
+        self.assertEqual(meta["article_store_import_source"], "articles.json")
+        self.assertEqual(meta["article_store_import_source_path"], str(article_store.ARTICLES_FILE))
+        self.assertIn("created", meta["article_store_import_result"])
+
+    def test_sqlite_backend_confirm_undo_and_refresh_paths(self) -> None:
+        self._configure_paths("sqlite-surrounding")
+        os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "sqlite"
+        with patch.object(article_store, "_article_now_minute_text", return_value="2026-05-09 10:00"):
+            original = article_store.add_article(
+                {
+                    "id": "article-existing",
+                    "url": "https://example.com/existing",
+                    "title": "Original Brand A launch",
+                    "matched_tasks": ["Brand A"],
+                    "match_reasons": {"Brand A": ["seed"]},
+                }
+            )
+            imported = article_store.bulk_upsert_articles(
+                [
+                    {
+                        "id": "article-new",
+                        "url": "https://example.com/new",
+                        "title": "New Brand A launch",
+                        "matched_tasks": ["Brand A"],
+                        "import_batch_id": "import-1",
+                        "import_status": "pending",
+                    },
+                    {
+                        "id": "article-existing",
+                        "url": "https://example.com/existing",
+                        "title": "Imported Existing",
+                        "matched_tasks": ["Brand B"],
+                        "import_batch_id": "import-1",
+                        "import_status": "pending",
+                    },
+                ]
+            )
+            confirmed = article_store.confirm_article_import_batch(
+                ["article-new"],
+                ["article-existing"],
+                import_id="import-1",
+                confirmed_at="2026-05-09 11:00",
+            )
+            article_store.undo_article_import_batch(
+                ["article-new"],
+                [{"id": "article-existing", "before": original}],
+            )
+            refreshed = article_store.refresh_article_matches(
+                {
+                    "tasks": [
+                        {
+                            "name": "Brand A",
+                            "brand": "Brand A",
+                            "keywords": [{"keyword": "Brand A launch", "brand": "Brand A"}],
+                        }
+                    ]
+                }
+            )
+
+        self.assertEqual(len(imported), 2)
+        self.assertEqual(confirmed, 2)
+        self.assertEqual([item["id"] for item in article_store.get_articles()], ["article-existing"])
+        restored = article_store.find_article_by_url("https://example.com/existing")
+        self.assertEqual(restored["title"], "Original Brand A launch")
+        self.assertEqual(restored["matched_tasks"], ["Brand A"])
+        self.assertEqual([item["id"] for item in refreshed], ["article-existing"])
+        self.assertEqual(article_store.ARTICLES_FILE.read_text(encoding="utf-8"), "[]")
+
+    def test_sqlite_backend_reference_remove_and_prune_paths(self) -> None:
+        self._configure_paths("sqlite-reference-prune")
+        os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "sqlite"
+        article_store.bulk_upsert_articles(
+            [
+                {
+                    "id": "article-a",
+                    "url": "https://example.com/a",
+                    "title": "A",
+                    "matched_tasks": ["Brand A"],
+                },
+                {
+                    "id": "cloud-a",
+                    "url": "https://example.com/cloud-a",
+                    "title": "Cloud A",
+                    "fetch_method": "cloud",
+                    "cloud_article_id": 10,
+                    "cloud_task_ids": [1, 2],
+                    "matched_tasks": ["Brand Cloud"],
+                    "match_reasons": {"Brand Cloud": ["seed"]},
+                },
+            ]
+        )
+
+        referenced = article_store.mark_articles_referenced_by_urls(
+            ["Brand A"],
+            ["https://example.com/a"],
+            referenced_at="2026-05-09 12:00",
+            event_id="event-1",
+            platform="doubao",
+        )
+        removed = article_store.remove_article_from_task("article-a", "Brand A")
+        pruned = article_store.prune_cloud_articles_by_visible_task_ids(
+            [1],
+            visible_cloud_article_ids=[],
+        )
+
+        self.assertEqual(referenced["matched_count"], 1)
+        self.assertEqual(referenced["updated_count"], 1)
+        self.assertEqual(removed["matched_tasks"], [])
+        self.assertEqual(removed["excluded_tasks"], ["Brand A"])
+        self.assertEqual(pruned["pruned_links"], 1)
+        cloud = article_store.find_article_by_url("https://example.com/cloud-a")
+        self.assertEqual(cloud["cloud_task_ids"], [2])
+        self.assertEqual(cloud["matched_tasks"], [])
+        self.assertEqual(article_store.ARTICLES_FILE.read_text(encoding="utf-8"), "[]")
 
     def _configure_paths(self, label: str) -> None:
         logs_dir = Path(self._tmpdir.name) / label / "logs"

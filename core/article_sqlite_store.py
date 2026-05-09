@@ -344,6 +344,14 @@ class ArticleSQLiteStore:
             ).fetchone()
         return self._json_loads(row[0]) if row else None
 
+    def get_article_by_id(self, article_id: str) -> dict[str, Any] | None:
+        normalized_id = self._text(article_id)
+        if not normalized_id:
+            return None
+        self.initialize()
+        with self._connection() as conn:
+            return self._get_article_by_id_conn(conn, normalized_id)
+
     def get_article_task_counts(self, *, relation: str = "matched") -> dict[str, int]:
         self.initialize()
         normalized_relation = self._text(relation) or "matched"

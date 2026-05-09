@@ -55,6 +55,7 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
                     bulk_size=6,
                     duplicate_every=11,
                     today_every=4,
+                    article_store_backend="json",
                     data_dir=Path(tmpdir),
                     force=True,
                 )
@@ -67,6 +68,7 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
         self.assertEqual(article_store.ARTICLE_SHADOW_DB_FILE, original_shadow_file)
         self.assertTrue(summary["ok"])
         self.assertEqual(summary["input"]["requested_count"], 120)
+        self.assertEqual(summary["input"]["article_store_backend"], "json")
         self.assertIn("article_counts", summary)
         self.assertIn("standards", summary)
         self.assertIn("recommendations", summary)
@@ -94,6 +96,55 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             summary["standards"]["json_write_path_bottlenecks"]["status"],
             "known_bottleneck",
+        )
+
+    def test_small_benchmark_supports_sqlite_authoritative_backend(self) -> None:
+        original_articles_file = article_store.ARTICLES_FILE
+        original_shadow_file = article_store.ARTICLE_SHADOW_DB_FILE
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary = run_benchmark(
+                BenchmarkOptions(
+                    count=120,
+                    task_count=4,
+                    page_limit=10,
+                    bulk_size=6,
+                    duplicate_every=11,
+                    today_every=4,
+                    article_store_backend="sqlite",
+                    data_dir=Path(tmpdir),
+                    force=True,
+                )
+            )
+
+            self.assertTrue((Path(tmpdir) / "logs" / "articles.json").exists())
+            self.assertTrue((Path(tmpdir) / "logs" / "article_store.sqlite3").exists())
+            self.assertTrue((Path(tmpdir) / "logs" / "article_history_shadow.sqlite3").exists())
+
+        self.assertEqual(article_store.ARTICLES_FILE, original_articles_file)
+        self.assertEqual(article_store.ARTICLE_SHADOW_DB_FILE, original_shadow_file)
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["input"]["article_store_backend"], "sqlite")
+        self.assertEqual(
+            summary["standards"]["json_write_path_bottlenecks"]["status"],
+            "sqlite_measurement",
+        )
+        operations = {operation["name"]: operation for operation in summary["operations"]}
+        self.assertEqual(
+            operations["bulk_upsert_small_batch"]["details"]["effective_backend"],
+            "sqlite_authoritative",
+        )
+        self.assertEqual(
+            operations["update_article_single"]["details"]["effective_backend"],
+            "sqlite_authoritative",
+        )
+        self.assertEqual(
+            operations["delete_article_single"]["details"]["effective_backend"],
+            "sqlite_authoritative",
+        )
+        self.assertEqual(
+            operations["refresh_article_matches"]["details"]["effective_backend"],
+            "sqlite_authoritative_full_scan",
         )
 
 
