@@ -2268,93 +2268,99 @@ def _refresh_article_matches_sqlite(config: dict) -> list:
     }
     config_signature = _article_match_config_signature(config)
     store = _article_sqlite_store()
-    articles = store.list_articles()
-    updated_articles: list[dict] = []
-    for article in articles:
-        excluded_task_names = {
-            str(name or "").strip()
-            for name in (article.get("excluded_tasks") or [])
-            if str(name or "").strip()
-        }
-        raw_matched = [
-            str(name or "").strip()
-            for name in (article.get("matched_tasks") or [])
-            if str(name or "").strip()
-        ]
-        stored = [
-            str(name or "").strip()
-            for name in (article.get("matched_tasks") or [])
-            if str(name or "").strip() in valid_task_names
-            and str(name or "").strip() not in excluded_task_names
-        ]
-        existing_reasons = article.get("match_reasons") if isinstance(article.get("match_reasons"), dict) else {}
-        current_signature = _article_match_signature(article, config_signature)
-        if str(article.get("_match_signature") or "") == current_signature:
-            match_reasons = {
-                task_name: existing_reasons.get(task_name) or ["保留历史归类"]
-                for task_name in stored
-            }
-            unmatched_reason = "" if stored else str(article.get("unmatched_reason", "") or "").strip()
-            if (
-                stored != raw_matched
-                or match_reasons != existing_reasons
-                or unmatched_reason != str(article.get("unmatched_reason", "") or "").strip()
-            ):
-                article["matched_tasks"] = stored
-                article["match_reasons"] = match_reasons
-                article["unmatched_reason"] = unmatched_reason
-                updated_articles.append(dict(article))
-            continue
+    stats = store.get_match_refresh_stats(config_signature)
+    if int(stats.get("needs_refresh_count") or 0) <= 0:
+        # API compatibility still requires returning the full display list; the
+        # expensive match analysis/write phase is skipped on the warm path.
+        return store.list_articles()
 
-        analyzed = analyze_article_matches(article.get("title", ""), config, article=article)
-        inferred = [
-            str(name or "").strip()
-            for name in (analyzed.get("matched_tasks") or [])
-            if str(name or "").strip()
-            and str(name or "").strip() not in excluded_task_names
-        ]
-        inferred_reasons = {
-            str(name or "").strip(): [
-                str(reason or "").strip()
-                for reason in reasons
-                if str(reason or "").strip()
+    for batch in store.iter_articles_needing_match(config_signature, batch_size=500):
+        updates: list[dict] = []
+        for article in batch:
+            excluded_task_names = {
+                str(name or "").strip()
+                for name in (article.get("excluded_tasks") or [])
+                if str(name or "").strip()
+            }
+            raw_matched = [
+                str(name or "").strip()
+                for name in (article.get("matched_tasks") or [])
+                if str(name or "").strip()
             ]
-            for name, reasons in (analyzed.get("match_reasons") or {}).items()
-            if str(name or "").strip()
-            and str(name or "").strip() not in excluded_task_names
-        }
-        merged = []
-        for task_name in stored + inferred:
-            if task_name and task_name not in merged:
-                merged.append(task_name)
-        match_reasons = {
-            task_name: inferred_reasons.get(task_name) or ["保留历史归类"]
-            for task_name in merged
-        }
-        unmatched_reason = "" if merged else str(analyzed.get("unmatched_reason", "") or "").strip()
-        if (
-            merged != list(article.get("matched_tasks") or [])
-            or match_reasons != dict(article.get("match_reasons") or {})
-            or unmatched_reason != str(article.get("unmatched_reason", "") or "").strip()
-            or str(article.get("_match_signature") or "") != current_signature
-        ):
-            article["matched_tasks"] = merged
-            article["match_reasons"] = match_reasons
-            article["unmatched_reason"] = unmatched_reason
-            article["_match_signature"] = current_signature
-            updated_articles.append(dict(article))
-    if updated_articles:
-        store.bulk_upsert_articles(updated_articles)
-        updated_by_id = {
-            str(article.get("id") or "").strip(): article
-            for article in updated_articles
-            if str(article.get("id") or "").strip()
-        }
-        articles = [
-            updated_by_id.get(str(article.get("id") or "").strip(), article)
-            for article in articles
-        ]
-    return _sort_articles_for_display(articles)
+            stored = [
+                str(name or "").strip()
+                for name in (article.get("matched_tasks") or [])
+                if str(name or "").strip() in valid_task_names
+                and str(name or "").strip() not in excluded_task_names
+            ]
+            existing_reasons = article.get("match_reasons") if isinstance(article.get("match_reasons"), dict) else {}
+            current_signature = _article_match_signature(article, config_signature)
+            metadata_changed = (
+                str(article.get("_match_signature") or "") != current_signature
+                or str(article.get("_match_config_signature") or "") != config_signature
+            )
+            if str(article.get("_match_signature") or "") == current_signature:
+                match_reasons = {
+                    task_name: existing_reasons.get(task_name) or ["保留历史归类"]
+                    for task_name in stored
+                }
+                unmatched_reason = "" if stored else str(article.get("unmatched_reason", "") or "").strip()
+                if (
+                    stored != raw_matched
+                    or match_reasons != existing_reasons
+                    or unmatched_reason != str(article.get("unmatched_reason", "") or "").strip()
+                    or metadata_changed
+                ):
+                    updates.append({
+                        "id": article.get("id"),
+                        "matched_tasks": stored,
+                        "match_reasons": match_reasons,
+                        "unmatched_reason": unmatched_reason,
+                        "_match_signature": current_signature,
+                        "_match_config_signature": config_signature,
+                    })
+                continue
+
+            analyzed = analyze_article_matches(article.get("title", ""), config, article=article)
+            inferred = [
+                str(name or "").strip()
+                for name in (analyzed.get("matched_tasks") or [])
+                if str(name or "").strip()
+                and str(name or "").strip() not in excluded_task_names
+            ]
+            inferred_reasons = {
+                str(name or "").strip(): [
+                    str(reason or "").strip()
+                    for reason in reasons
+                    if str(reason or "").strip()
+                ]
+                for name, reasons in (analyzed.get("match_reasons") or {}).items()
+                if str(name or "").strip()
+                and str(name or "").strip() not in excluded_task_names
+            }
+            merged = []
+            for task_name in stored + inferred:
+                if task_name and task_name not in merged:
+                    merged.append(task_name)
+            match_reasons = {
+                task_name: inferred_reasons.get(task_name) or ["保留历史归类"]
+                for task_name in merged
+            }
+            unmatched_reason = "" if merged else str(analyzed.get("unmatched_reason", "") or "").strip()
+            updates.append({
+                "id": article.get("id"),
+                "matched_tasks": merged,
+                "match_reasons": match_reasons,
+                "unmatched_reason": unmatched_reason,
+                "_match_signature": current_signature,
+                "_match_config_signature": config_signature,
+            })
+        if updates:
+            store.bulk_update_match_fields(updates)
+
+    # Returning the full list is intentionally retained for caller compatibility;
+    # SQLite avoids the full analyze/write pass even though this read can still be large.
+    return store.list_articles()
 
 
 def _mark_articles_referenced_by_urls_sqlite(

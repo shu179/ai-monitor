@@ -97,6 +97,11 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
             summary["standards"]["json_write_path_bottlenecks"]["status"],
             "known_bottleneck",
         )
+        refresh_details = operations["refresh_article_matches"]["details"]
+        self.assertIn("refresh_cold_full_seconds", refresh_details)
+        self.assertIn("refresh_warm_noop_seconds", refresh_details)
+        self.assertIn("refresh_small_dirty_seconds", refresh_details)
+        self.assertEqual(refresh_details["effective_backend"], "json_authoritative_with_sqlite_shadow_write_through_full_scan")
 
     def test_small_benchmark_supports_sqlite_authoritative_backend(self) -> None:
         original_articles_file = article_store.ARTICLES_FILE
@@ -144,7 +149,19 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             operations["refresh_article_matches"]["details"]["effective_backend"],
-            "sqlite_authoritative_full_scan",
+            "sqlite_authoritative_incremental",
+        )
+        self.assertIn(
+            "refresh_cold_full_seconds",
+            operations["refresh_article_matches"]["details"],
+        )
+        self.assertIn(
+            "refresh_warm_noop_seconds",
+            operations["refresh_article_matches"]["details"],
+        )
+        self.assertIn(
+            "refresh_small_dirty_seconds",
+            operations["refresh_article_matches"]["details"],
         )
 
 

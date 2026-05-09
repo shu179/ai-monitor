@@ -127,6 +127,65 @@ class ArticleSQLiteStoreTests(unittest.TestCase):
             self.assertEqual(store.get_article_page(task_name="Brand C")["total"], 1)
             self.assertIsNone(store.get_article_by_url("https://example.com/a"))
 
+    def test_bulk_update_match_fields_maintains_task_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(Path(tmpdir) / "article_store.sqlite3")
+            store.import_from_articles(
+                [
+                    {
+                        "id": "article-a",
+                        "url": "https://example.com/a",
+                        "title": "Brand B launch",
+                        "published_at": "2026-05-09",
+                        "matched_tasks": ["Brand A"],
+                        "excluded_tasks": ["Brand X"],
+                        "referenced_tasks": ["Brand R"],
+                    }
+                ],
+                replace=True,
+            )
+
+            updates = store.bulk_update_match_fields(
+                [
+                    {
+                        "id": "article-a",
+                        "matched_tasks": ["Brand B", "Brand B"],
+                        "match_reasons": {"Brand B": ["title"]},
+                        "unmatched_reason": "",
+                        "_match_signature": "match-sig-1",
+                        "_match_config_signature": "config-sig-1",
+                    }
+                ]
+            )
+
+            refreshed = store.get_article_by_id("article-a")
+            stats = store.get_match_refresh_stats("config-sig-1")
+            batches = list(store.iter_articles_needing_match("config-sig-1", batch_size=1))
+            with sqlite3.connect(store.db_path) as conn:
+                links = {
+                    (row[0], row[1])
+                    for row in conn.execute(
+                        "SELECT task_name, relation FROM article_task_links WHERE article_id = ?",
+                        ("article-a",),
+                    ).fetchall()
+                }
+
+            self.assertEqual(len(updates), 1)
+            self.assertEqual(refreshed["matched_tasks"], ["Brand B"])
+            self.assertEqual(refreshed["match_reasons"], {"Brand B": ["title"]})
+            self.assertEqual(refreshed["_match_signature"], "match-sig-1")
+            self.assertEqual(refreshed["_match_config_signature"], "config-sig-1")
+            self.assertEqual(stats, {"total": 1, "matching_signature_count": 1, "needs_refresh_count": 0})
+            self.assertEqual(batches, [])
+            self.assertEqual(
+                links,
+                {
+                    ("Brand B", "matched"),
+                    ("Brand X", "excluded"),
+                    ("Brand R", "referenced"),
+                },
+            )
+
 
 class ArticleStoreSQLiteParityTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -321,6 +380,66 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
         self.assertEqual(cloud["matched_tasks"], [])
         self.assertEqual(article_store.ARTICLES_FILE.read_text(encoding="utf-8"), "[]")
 
+    def test_refresh_article_matches_parity_between_json_and_sqlite(self) -> None:
+        json_result = self._run_refresh_scenario("json")
+        sqlite_result = self._run_refresh_scenario("sqlite")
+
+        self.assertEqual(sqlite_result, json_result)
+
+    def test_sqlite_warm_refresh_does_not_analyze_articles(self) -> None:
+        self._configure_paths("sqlite-warm-refresh")
+        os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "sqlite"
+        config = self._refresh_config()
+        article_store.bulk_upsert_articles(self._refresh_articles())
+        article_store.refresh_article_matches(config)
+
+        with patch.object(
+            article_store,
+            "analyze_article_matches",
+            side_effect=AssertionError("warm refresh should not analyze"),
+        ) as mocked:
+            refreshed = article_store.refresh_article_matches(config)
+
+        self.assertEqual(mocked.call_count, 0)
+        self.assertEqual(len(refreshed), len(self._refresh_articles()))
+
+    def test_sqlite_small_dirty_refresh_only_analyzes_dirty_articles(self) -> None:
+        self._configure_paths("sqlite-small-dirty-refresh")
+        os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "sqlite"
+        config = self._refresh_config()
+        article_store.bulk_upsert_articles(self._refresh_articles())
+        article_store.refresh_article_matches(config)
+        article_store.update_article("article-b", {"title": "Brand B market dirty update"})
+        original_analyze = article_store.analyze_article_matches
+
+        with patch.object(article_store, "analyze_article_matches", wraps=original_analyze) as mocked:
+            article_store.refresh_article_matches(config)
+
+        self.assertEqual(mocked.call_count, 1)
+
+    def test_sqlite_config_signature_change_refreshes_all_articles(self) -> None:
+        self._configure_paths("sqlite-config-refresh")
+        os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "sqlite"
+        config = self._refresh_config()
+        article_store.bulk_upsert_articles(self._refresh_articles())
+        article_store.refresh_article_matches(config)
+        changed_config = {
+            "tasks": [
+                *config["tasks"],
+                {
+                    "name": "Brand C",
+                    "brand": "Brand C",
+                    "keywords": [{"keyword": "Brand C signal", "brand": "Brand C"}],
+                },
+            ]
+        }
+        original_analyze = article_store.analyze_article_matches
+
+        with patch.object(article_store, "analyze_article_matches", wraps=original_analyze) as mocked:
+            article_store.refresh_article_matches(changed_config)
+
+        self.assertEqual(mocked.call_count, len(self._refresh_articles()))
+
     def _configure_paths(self, label: str) -> None:
         logs_dir = Path(self._tmpdir.name) / label / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
@@ -332,6 +451,68 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
         article_store.ARTICLE_STORE_DB_FILE = logs_dir / "article_store.sqlite3"
         article_store.ARTICLES_FILE.write_text("[]", encoding="utf-8")
         article_store._small_document_cache.clear()  # noqa: SLF001
+
+    def _refresh_config(self) -> dict:
+        return {
+            "tasks": [
+                {
+                    "name": "Brand A",
+                    "brand": "Brand A",
+                    "keywords": [{"keyword": "Brand A launch", "brand": "Brand A"}],
+                },
+                {
+                    "name": "Brand B",
+                    "brand": "Brand B",
+                    "keywords": [{"keyword": "Brand B market", "brand": "Brand B"}],
+                },
+            ]
+        }
+
+    def _refresh_articles(self) -> list[dict]:
+        return [
+            {
+                "id": "article-a",
+                "url": "https://example.com/a",
+                "title": "Brand A launch coverage",
+                "published_at": "2026-05-09",
+                "matched_tasks": ["Legacy"],
+                "match_reasons": {"Legacy": ["seed"]},
+            },
+            {
+                "id": "article-b",
+                "url": "https://example.com/b",
+                "title": "Brand B market update",
+                "published_at": "2026-05-08",
+                "matched_tasks": [],
+            },
+            {
+                "id": "article-c",
+                "url": "https://example.com/c",
+                "title": "Unrelated article",
+                "published_at": "2026-05-07",
+                "matched_tasks": ["Brand A"],
+                "excluded_tasks": ["Brand A"],
+            },
+        ]
+
+    def _run_refresh_scenario(self, backend: str) -> dict:
+        self._configure_paths(f"{backend}-refresh-parity")
+        if backend == "sqlite":
+            os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "sqlite"
+        else:
+            os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
+        refreshed = []
+        article_store.bulk_upsert_articles(self._refresh_articles())
+        refreshed = article_store.refresh_article_matches(self._refresh_config())
+        return {
+            str(article.get("id")): {
+                "matched_tasks": article.get("matched_tasks"),
+                "match_reasons": article.get("match_reasons"),
+                "unmatched_reason": article.get("unmatched_reason"),
+                "_match_signature": article.get("_match_signature"),
+            }
+            for article in refreshed
+        }
 
     def _run_public_crud_scenario(self, backend: str) -> dict:
         self._configure_paths(backend)

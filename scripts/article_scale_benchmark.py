@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Repeatable capacity benchmark for article SQLite shadow migration work.
 
-The benchmark intentionally keeps JSON as the authoritative store. It creates
-an isolated synthetic articles.json, rebuilds the SQLite article shadow, then
-measures the guarded page read path and the remaining JSON write bottlenecks.
+The benchmark creates an isolated synthetic articles.json, rebuilds the SQLite
+article shadow, then measures the guarded page read path and authoritative
+article-store write paths for either JSON or SQLite.
 """
 
 from __future__ import annotations
@@ -794,14 +794,61 @@ def _delete_single_article(count: int) -> dict[str, Any]:
 
 
 def _refresh_article_matches(config: dict[str, Any], counter: dict[str, int]) -> dict[str, Any]:
-    counter["count"] = int(counter.get("count") or 0) + 1
-    articles = article_store.refresh_article_matches(config)
     backend_label = _article_authoritative_backend_label()
+    cold = _timed_refresh_article_matches(config, counter)
+    warm = _timed_refresh_article_matches(config, counter)
+    dirty_article_ids = _mark_small_dirty_articles(config)
+    small_dirty = _timed_refresh_article_matches(config, counter)
     return {
-        "effective_backend": f"{backend_label}_full_scan",
-        "articles_returned": len(articles),
+        "effective_backend": (
+            "sqlite_authoritative_incremental"
+            if backend_label == "sqlite_authoritative"
+            else f"{backend_label}_full_scan"
+        ),
+        "articles_returned": small_dirty["articles_returned"],
+        "dirty_article_ids": dirty_article_ids,
+        "refresh_cold_full_seconds": cold["elapsed_seconds"],
+        "refresh_warm_noop_seconds": warm["elapsed_seconds"],
+        "refresh_small_dirty_seconds": small_dirty["elapsed_seconds"],
+        "refresh_cold_full_returned": cold["articles_returned"],
+        "refresh_warm_noop_returned": warm["articles_returned"],
+        "refresh_small_dirty_returned": small_dirty["articles_returned"],
         "known_bottleneck": backend_label.startswith("json_"),
     }
+
+
+def _timed_refresh_article_matches(config: dict[str, Any], counter: dict[str, int]) -> dict[str, Any]:
+    counter["count"] = int(counter.get("count") or 0) + 1
+    started = time.perf_counter()
+    articles = article_store.refresh_article_matches(config)
+    return {
+        "elapsed_seconds": round(time.perf_counter() - started, 6),
+        "articles_returned": len(articles),
+    }
+
+
+def _mark_small_dirty_articles(config: dict[str, Any]) -> list[str]:
+    tasks = [
+        str(task.get("name", "") or "").strip()
+        for task in (config.get("tasks", []) or [])
+        if isinstance(task, dict) and str(task.get("name", "") or "").strip()
+    ]
+    task_name = tasks[0] if tasks else "Brand 0"
+    dirty_ids: list[str] = []
+    for index in range(10):
+        article_id = f"article-{index}"
+        updated = article_store.update_article(
+            article_id,
+            {
+                "title": f"{task_name} launch dirty refresh {len(dirty_ids)}",
+                "excerpt": f"{task_name} market update dirty refresh sample",
+            },
+        )
+        if updated is not None:
+            dirty_ids.append(article_id)
+        if len(dirty_ids) >= 3:
+            break
+    return dirty_ids
 
 
 def _sqlite_status(db_path: Path, today: date) -> dict[str, Any]:

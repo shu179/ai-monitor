@@ -31,6 +31,8 @@ REQUIRED_TABLE_COLUMNS: dict[str, set[str]] = {
         "fetch_method",
         "sort_published_ts",
         "sort_imported_ts",
+        "match_signature",
+        "match_config_signature",
         "raw_json",
         "updated_at_ns",
     },
@@ -85,6 +87,8 @@ class ArticleSQLiteStore:
                     fetch_method TEXT NOT NULL DEFAULT '',
                     sort_published_ts INTEGER NOT NULL DEFAULT 0,
                     sort_imported_ts INTEGER NOT NULL DEFAULT 0,
+                    match_signature TEXT NOT NULL DEFAULT '',
+                    match_config_signature TEXT NOT NULL DEFAULT '',
                     raw_json TEXT NOT NULL,
                     updated_at_ns INTEGER NOT NULL
                 )
@@ -92,6 +96,8 @@ class ArticleSQLiteStore:
             )
             self._ensure_column(conn, "articles", "sort_published_ts", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "articles", "sort_imported_ts", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "articles", "match_signature", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "articles", "match_config_signature", "TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS article_task_links (
@@ -114,6 +120,10 @@ class ArticleSQLiteStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_article_store_task_links "
                 "ON article_task_links(task_name, relation, article_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_article_store_match_refresh "
+                "ON articles(match_config_signature, match_signature, sort_published_ts DESC, sort_imported_ts DESC, id DESC)"
             )
             conn.execute(
                 """
@@ -158,6 +168,7 @@ class ArticleSQLiteStore:
                     skipped += 1
                     continue
                 article["id"] = article_id
+                article = self._clear_match_metadata(article)
                 article = self._normalize_article(article)
                 normalized_url = self._normalized_url(article)
                 existing = self._find_article_row(
@@ -269,6 +280,7 @@ class ArticleSQLiteStore:
                         now_text=now_text,
                         existing=current,
                     )
+                entry = self._clear_match_metadata(entry)
                 article = self._normalize_article(entry)
                 self._upsert_article_row(conn, article, updated_at_ns=updated_at_ns)
                 results.append(dict(article))
@@ -277,7 +289,9 @@ class ArticleSQLiteStore:
     def add_article(self, entry: dict[str, Any]) -> dict[str, Any]:
         self.initialize()
         now_text = self._now_text()
-        article = self._apply_article_defaults(dict(entry or {}), now_text=now_text)
+        raw_entry = dict(entry or {})
+        article = self._apply_article_defaults(raw_entry, now_text=now_text)
+        article = self._clear_match_metadata(article)
         article = self._normalize_article(article)
         normalized_url = self._normalized_url(article)
         updated_at_ns = time.time_ns()
@@ -310,6 +324,7 @@ class ArticleSQLiteStore:
             merged["id"] = existing.get("id", merged.get("id", ""))
             if "ts" not in updates or not self._text(updates.get("ts")):
                 merged["ts"] = existing.get("ts", merged.get("ts", ""))
+            merged = self._clear_match_metadata(merged)
             merged = self._apply_article_defaults(
                 merged,
                 now_text=self._now_text(),
@@ -367,6 +382,113 @@ class ArticleSQLiteStore:
                 (normalized_relation,),
             ).fetchall()
         return {str(row[0]): int(row[1] or 0) for row in rows if str(row[0] or "")}
+
+    def get_match_refresh_stats(self, config_signature: str) -> dict[str, int]:
+        self.initialize()
+        signature = self._text(config_signature)
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    SUM(CASE WHEN match_config_signature = ? AND match_signature != '' THEN 1 ELSE 0 END)
+                FROM articles
+                """,
+                (signature,),
+            ).fetchone()
+        total = int((row or [0, 0])[0] or 0)
+        matching = int((row or [0, 0])[1] or 0)
+        return {
+            "total": total,
+            "matching_signature_count": matching,
+            "needs_refresh_count": max(0, total - matching),
+        }
+
+    def iter_articles_needing_match(
+        self,
+        config_signature: str,
+        *,
+        batch_size: int = 500,
+        limit: int | None = None,
+    ):
+        self.initialize()
+        signature = self._text(config_signature)
+        capped_batch_size = max(1, min(5000, int(batch_size or 500)))
+        remaining = None if limit is None else max(0, int(limit or 0))
+        last_key: tuple[int, int, str] | None = None
+        while remaining is None or remaining > 0:
+            current_limit = capped_batch_size if remaining is None else min(capped_batch_size, remaining)
+            if current_limit <= 0:
+                break
+            params: list[Any] = [signature]
+            keyset_sql = ""
+            if last_key is not None:
+                keyset_sql = """
+                    AND (
+                        sort_published_ts < ?
+                        OR (sort_published_ts = ? AND sort_imported_ts < ?)
+                        OR (sort_published_ts = ? AND sort_imported_ts = ? AND id < ?)
+                    )
+                """
+                params.extend([
+                    last_key[0],
+                    last_key[0],
+                    last_key[1],
+                    last_key[0],
+                    last_key[1],
+                    last_key[2],
+                ])
+            params.append(current_limit)
+            with self._connection() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT raw_json, sort_published_ts, sort_imported_ts, id
+                    FROM articles
+                    WHERE NOT (match_config_signature = ? AND match_signature != '')
+                    {keyset_sql}
+                    ORDER BY sort_published_ts DESC, sort_imported_ts DESC, id DESC
+                    LIMIT ?
+                    """,
+                    params,
+                ).fetchall()
+            if not rows:
+                break
+            batch = [self._json_loads(row[0]) for row in rows]
+            yield batch
+            last_row = rows[-1]
+            last_key = (int(last_row[1] or 0), int(last_row[2] or 0), self._text(last_row[3]))
+            if remaining is not None:
+                remaining -= len(rows)
+            if len(rows) < current_limit:
+                break
+
+    def bulk_update_match_fields(self, updates: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        prepared_updates = [dict(update) for update in (updates or []) if isinstance(update, dict)]
+        if not prepared_updates:
+            return []
+        self.initialize()
+        updated_at_ns = time.time_ns()
+        results: list[dict[str, Any]] = []
+        with self._connection() as conn:
+            for update in prepared_updates:
+                article_id = self._text(update.get("id"))
+                if not article_id:
+                    continue
+                existing = self._get_article_by_id_conn(conn, article_id)
+                if existing is None:
+                    continue
+                article = dict(existing)
+                article["matched_tasks"] = self._unique_texts(update.get("matched_tasks"))
+                article["match_reasons"] = self._normalize_match_reasons(update.get("match_reasons"))
+                article["unmatched_reason"] = self._text(update.get("unmatched_reason"))
+                article["_match_signature"] = self._text(update.get("_match_signature"))
+                article["_match_config_signature"] = self._text(
+                    update.get("_match_config_signature") or update.get("match_config_signature")
+                )
+                article = self._normalize_article(article)
+                self._upsert_article_row(conn, article, updated_at_ns=updated_at_ns)
+                results.append(dict(article))
+        return results
 
     def source_signature(self) -> str:
         self.initialize()
@@ -587,9 +709,11 @@ class ArticleSQLiteStore:
             INSERT INTO articles(
                 id, normalized_url, title, media_name, media_type,
                 published_at, imported_at, ts, fetch_method,
-                sort_published_ts, sort_imported_ts, raw_json, updated_at_ns
+                sort_published_ts, sort_imported_ts,
+                match_signature, match_config_signature,
+                raw_json, updated_at_ns
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 normalized_url = excluded.normalized_url,
                 title = excluded.title,
@@ -601,6 +725,8 @@ class ArticleSQLiteStore:
                 fetch_method = excluded.fetch_method,
                 sort_published_ts = excluded.sort_published_ts,
                 sort_imported_ts = excluded.sort_imported_ts,
+                match_signature = excluded.match_signature,
+                match_config_signature = excluded.match_config_signature,
                 raw_json = excluded.raw_json,
                 updated_at_ns = excluded.updated_at_ns
             """,
@@ -616,6 +742,8 @@ class ArticleSQLiteStore:
                 self._text(article.get("fetch_method")),
                 sort_published_ts,
                 sort_imported_ts,
+                self._text(article.get("_match_signature")),
+                self._text(article.get("_match_config_signature")),
                 self._json_dumps(article),
                 int(updated_at_ns),
             ),
@@ -795,6 +923,35 @@ class ArticleSQLiteStore:
             if text and text not in result:
                 result.append(text)
         return result
+
+    @classmethod
+    def _normalize_match_reasons(cls, value: Any) -> dict[str, list[str]]:
+        if not isinstance(value, dict):
+            return {}
+        result: dict[str, list[str]] = {}
+        for raw_task_name, raw_reasons in value.items():
+            task_name = cls._text(raw_task_name)
+            if not task_name:
+                continue
+            reasons: list[str] = []
+            if isinstance(raw_reasons, list):
+                for raw_reason in raw_reasons:
+                    reason = cls._text(raw_reason)
+                    if reason:
+                        reasons.append(reason)
+            elif raw_reasons is not None:
+                reason = cls._text(raw_reasons)
+                if reason:
+                    reasons.append(reason)
+            result[task_name] = reasons
+        return result
+
+    @staticmethod
+    def _clear_match_metadata(article: dict[str, Any]) -> dict[str, Any]:
+        item = dict(article)
+        item.pop("_match_signature", None)
+        item.pop("_match_config_signature", None)
+        return item
 
     @staticmethod
     def _json_dumps(value: Any) -> str:
