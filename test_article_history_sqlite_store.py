@@ -132,6 +132,34 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             limited = store.get_history_records("task-a", limit=1, offset=1)
             self.assertEqual([record["id"] for record in limited], ["r2"])
 
+    def test_import_history_sources_batches_multiple_keys_in_one_store_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")
+            store.import_history_records("stale", [{"id": "old", "ts": "2023-01-01 00:00"}])
+
+            result = store.import_history_sources(
+                {
+                    "task-a": [
+                        {"id": "r1", "ts": "2024-01-01 09:00", "task_name": "品牌A"},
+                        {"id": "r2", "ts": "2024-01-02 09:00", "task_name": "品牌A"},
+                    ],
+                    "task-b": [
+                        {"id": "r3", "ts": "2024-01-03 09:00", "task_name": "品牌B"},
+                        "bad-record",
+                    ],
+                },
+                replace=True,
+            )
+
+            self.assertEqual(result["storage_keys"], 2)
+            self.assertEqual(result["created"], 3)
+            self.assertEqual(result["updated"], 0)
+            self.assertEqual(result["skipped"], 1)
+            self.assertEqual(store.list_history_storage_keys(), ["task-a", "task-b"])
+            self.assertEqual(store.get_history_record_count("stale"), 0)
+            self.assertEqual(store.get_history_record_count("task-a"), 2)
+            self.assertEqual(store.get_history_record_count("task-b"), 1)
+
     def test_large_article_import_supports_bounded_page_reads(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ArticleHistorySQLiteStore(

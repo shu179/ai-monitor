@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 SCHEMA_VERSION = 1
@@ -265,64 +265,55 @@ class ArticleHistorySQLiteStore:
                     (normalized_storage_key,),
                 )
             for raw_record in records or []:
-                if not isinstance(raw_record, dict):
-                    skipped += 1
-                    continue
-                record = dict(raw_record)
-                record_id = self._history_record_id(normalized_storage_key, record)
-                if not record_id:
-                    skipped += 1
-                    continue
-                existed = conn.execute(
-                    "SELECT 1 FROM history_records WHERE storage_key = ? AND id = ?",
-                    (normalized_storage_key, record_id),
-                ).fetchone() is not None
-                conn.execute(
-                    """
-                    INSERT INTO history_records(
-                        storage_key, id, task_id, task_name, ts, platform,
-                        keyword, brand, rank, success, review_status, mode,
-                        execution_source, raw_json, updated_at_ns
-                    )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(storage_key, id) DO UPDATE SET
-                        task_id = excluded.task_id,
-                        task_name = excluded.task_name,
-                        ts = excluded.ts,
-                        platform = excluded.platform,
-                        keyword = excluded.keyword,
-                        brand = excluded.brand,
-                        rank = excluded.rank,
-                        success = excluded.success,
-                        review_status = excluded.review_status,
-                        mode = excluded.mode,
-                        execution_source = excluded.execution_source,
-                        raw_json = excluded.raw_json,
-                        updated_at_ns = excluded.updated_at_ns
-                    """,
-                    (
-                        normalized_storage_key,
-                        record_id,
-                        self._text(record.get("task_id")),
-                        self._text(record.get("task_name")),
-                        self._date_text(record.get("ts")),
-                        self._text(record.get("platform")),
-                        self._text(record.get("keyword")),
-                        self._text(record.get("brand")),
-                        self._int(record.get("rank"), default=99),
-                        1 if bool(record.get("success")) else 0,
-                        self._text(record.get("review_status")),
-                        self._text(record.get("mode")),
-                        self._text(record.get("execution_source")),
-                        self._json_dumps(record),
-                        updated_at_ns,
-                    ),
+                outcome = self._upsert_history_record(
+                    conn,
+                    normalized_storage_key,
+                    raw_record,
+                    updated_at_ns=updated_at_ns,
                 )
-                if existed:
+                if outcome == "updated":
                     updated += 1
-                else:
+                elif outcome == "created":
                     created += 1
+                else:
+                    skipped += 1
         return {"created": created, "updated": updated, "skipped": skipped}
+
+    def import_history_sources(
+        self,
+        sources: dict[str, Iterable[dict[str, Any]]],
+        *,
+        replace: bool = False,
+    ) -> dict[str, Any]:
+        self.initialize()
+        details: dict[str, dict[str, int]] = {}
+        totals = {"created": 0, "updated": 0, "skipped": 0}
+        updated_at_ns = time.time_ns()
+        with self._connection() as conn:
+            if replace:
+                conn.execute("DELETE FROM history_records")
+            for storage_key, records in sorted((sources or {}).items()):
+                normalized_storage_key = self._text(storage_key)
+                if not normalized_storage_key:
+                    continue
+                detail = {"created": 0, "updated": 0, "skipped": 0}
+                for raw_record in records or []:
+                    outcome = self._upsert_history_record(
+                        conn,
+                        normalized_storage_key,
+                        raw_record,
+                        updated_at_ns=updated_at_ns,
+                    )
+                    detail[outcome] += 1
+                    totals[outcome] += 1
+                details[normalized_storage_key] = detail
+        return {
+            "storage_keys": len(details),
+            "created": totals["created"],
+            "updated": totals["updated"],
+            "skipped": totals["skipped"],
+            "details": details,
+        }
 
     def get_history_records(
         self,
@@ -457,6 +448,67 @@ class ArticleHistorySQLiteStore:
                     """,
                     (article_id, task_name, relation),
                 )
+
+    def _upsert_history_record(
+        self,
+        conn: sqlite3.Connection,
+        storage_key: str,
+        raw_record: Any,
+        *,
+        updated_at_ns: int,
+    ) -> Literal["created", "updated", "skipped"]:
+        if not isinstance(raw_record, dict):
+            return "skipped"
+        record = dict(raw_record)
+        record_id = self._history_record_id(storage_key, record)
+        if not record_id:
+            return "skipped"
+        existed = conn.execute(
+            "SELECT 1 FROM history_records WHERE storage_key = ? AND id = ?",
+            (storage_key, record_id),
+        ).fetchone() is not None
+        conn.execute(
+            """
+            INSERT INTO history_records(
+                storage_key, id, task_id, task_name, ts, platform,
+                keyword, brand, rank, success, review_status, mode,
+                execution_source, raw_json, updated_at_ns
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(storage_key, id) DO UPDATE SET
+                task_id = excluded.task_id,
+                task_name = excluded.task_name,
+                ts = excluded.ts,
+                platform = excluded.platform,
+                keyword = excluded.keyword,
+                brand = excluded.brand,
+                rank = excluded.rank,
+                success = excluded.success,
+                review_status = excluded.review_status,
+                mode = excluded.mode,
+                execution_source = excluded.execution_source,
+                raw_json = excluded.raw_json,
+                updated_at_ns = excluded.updated_at_ns
+            """,
+            (
+                storage_key,
+                record_id,
+                self._text(record.get("task_id")),
+                self._text(record.get("task_name")),
+                self._date_text(record.get("ts")),
+                self._text(record.get("platform")),
+                self._text(record.get("keyword")),
+                self._text(record.get("brand")),
+                self._int(record.get("rank"), default=99),
+                1 if bool(record.get("success")) else 0,
+                self._text(record.get("review_status")),
+                self._text(record.get("mode")),
+                self._text(record.get("execution_source")),
+                self._json_dumps(record),
+                updated_at_ns,
+            ),
+        )
+        return "updated" if existed else "created"
 
     def _article_query_filters(
         self,

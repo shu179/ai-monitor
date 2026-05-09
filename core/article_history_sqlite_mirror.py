@@ -34,10 +34,8 @@ def rebuild_shadow_store(
     )
 
     store.clear_all()
-    article_result = store.import_articles(source["articles"], replace=True)
-    history_results: dict[str, dict[str, int]] = {}
-    for storage_key, records in source["history"].items():
-        history_results[storage_key] = store.import_history_records(storage_key, records, replace=True)
+    article_result = store.import_articles(source["articles"], replace=False)
+    history_result = store.import_history_sources(source["history"], replace=False)
 
     verification = verify_shadow_store(
         target_db_path,
@@ -48,9 +46,12 @@ def rebuild_shadow_store(
         "db_path": str(target_db_path),
         "articles": article_result,
         "history": {
-            "storage_keys": len(history_results),
-            "records": sum(item.get("created", 0) + item.get("updated", 0) for item in history_results.values()),
-            "details": history_results,
+            "storage_keys": history_result["storage_keys"],
+            "records": history_result["created"] + history_result["updated"],
+            "created": history_result["created"],
+            "updated": history_result["updated"],
+            "skipped": history_result["skipped"],
+            "details": history_result["details"],
         },
         "verification": verification,
     }
