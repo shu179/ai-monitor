@@ -9,6 +9,7 @@ from pathlib import Path
 from core import article_store
 from scripts.article_scale_benchmark import (
     BenchmarkOptions,
+    build_rollout_guard,
     build_synthetic_articles,
     build_synthetic_config,
     run_benchmark,
@@ -203,6 +204,36 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
         probe = operations["article_store_auto_primary_probe"]["details"]
         self.assertEqual(probe["initial_effective_backend"], "json")
         self.assertEqual(probe["final_effective_backend"], "sqlite")
+
+    def test_rollout_guard_uses_final_health_migration_state(self) -> None:
+        summary = {
+            "article_store_backend_health": {
+                "effective_backend": "sqlite",
+                "fallback_reason": "",
+                "migration_state": {"last_ok": True},
+            },
+            "article_store_doctor": {
+                "status": "healthy",
+                "backend": {"effective_backend": "sqlite", "fallback_reason": ""},
+                "exit_code": 0,
+            },
+            "operations": [
+                {
+                    "name": "article_store_auto_primary_probe",
+                    "details": {
+                        "initial_effective_backend": "json",
+                        "initial_fallback_reason": "article_store_db_missing",
+                        "final_effective_backend": "sqlite",
+                        "final_fallback_reason": "",
+                        "migration_state": {"running": True},
+                    },
+                }
+            ],
+        }
+
+        guard = build_rollout_guard(summary)
+
+        self.assertTrue(guard["migration_completed"])
 
 
 if __name__ == "__main__":

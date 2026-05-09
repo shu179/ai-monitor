@@ -549,6 +549,22 @@ def build_rollout_guard(summary: dict[str, Any]) -> dict[str, Any]:
         if isinstance(operations.get("article_store_auto_primary_probe", {}).get("details"), dict)
         else {}
     )
+    probe_health = probe_details.get("health") if isinstance(probe_details.get("health"), dict) else {}
+    probe_health_migration = (
+        probe_health.get("migration_state")
+        if isinstance(probe_health.get("migration_state"), dict)
+        else {}
+    )
+    backend_health = (
+        summary.get("article_store_backend_health")
+        if isinstance(summary.get("article_store_backend_health"), dict)
+        else {}
+    )
+    backend_health_migration = (
+        backend_health.get("migration_state")
+        if isinstance(backend_health.get("migration_state"), dict)
+        else {}
+    )
     page_names = (
         "article_page_default_first_screen",
         "article_page_by_task_name",
@@ -567,7 +583,15 @@ def build_rollout_guard(summary: dict[str, Any]) -> dict[str, Any]:
     return {
         "initial_effective_backend": probe_details.get("initial_effective_backend", ""),
         "initial_fallback_reason": probe_details.get("initial_fallback_reason", ""),
-        "migration_completed": bool(probe_details.get("migration_state", {}).get("last_ok")),
+        "migration_completed": any(
+            bool(state.get("last_ok"))
+            for state in (
+                probe_details.get("migration_state", {}),
+                probe_health_migration,
+                backend_health_migration,
+            )
+            if isinstance(state, dict)
+        ),
         "final_effective_backend": (
             probe_details.get("final_effective_backend")
             or summary.get("article_store_backend_health", {}).get("effective_backend", "")

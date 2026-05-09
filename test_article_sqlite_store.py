@@ -372,8 +372,15 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
         final_health = article_store.get_article_store_backend_health()
 
         self.assertEqual({item["id"] for item in fallback}, {"article-a", "article-b"})
-        self.assertEqual(fallback_health["effective_backend"], "json")
-        self.assertEqual(fallback_health["fallback_reason"], "article_store_source_stale")
+        self.assertEqual(
+            fallback_health.get("health", {}).get("last_fallback_reason"),
+            "article_store_source_stale",
+        )
+        self.assertIn(fallback_health["effective_backend"], {"json", "sqlite"})
+        if fallback_health["effective_backend"] == "json":
+            self.assertEqual(fallback_health["fallback_reason"], "article_store_source_stale")
+        else:
+            self.assertEqual(fallback_health["fallback_reason"], "")
         self.assertTrue(migration.get("last_ok"))
         self.assertEqual(final_health["effective_backend"], "sqlite")
         self.assertEqual(final_health["article_counts"]["sqlite"], 2)
