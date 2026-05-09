@@ -18,14 +18,104 @@ class _FakeCloudSessionStore:
 
 
 class ArticleSQLiteReadAdapterTests(unittest.TestCase):
-    def test_sqlite_shadow_article_page_is_disabled_by_default(self) -> None:
+    def test_sqlite_shadow_article_page_defaults_to_auto_and_reads_fresh_index(self) -> None:
+        today = "2026-05-09"
+        articles = [
+            {
+                "id": "article-a",
+                "url": "https://www.example.com/a?utm_source=x",
+                "title": "品牌A 今日报道",
+                "media_name": "示例媒体",
+                "media_type": "authority",
+                "published_at": today,
+                "ts": today,
+                "matched_tasks": ["品牌A"],
+            }
+        ]
         runtime = self._runtime()
 
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("AIBRANDMONITOR_ARTICLE_READ_BACKEND", None)
-            result = runtime._get_sqlite_shadow_article_page({}, limit=10)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "shadow.sqlite3"
+            self._write_fresh_article_shadow(db_path, articles)
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AIBRANDMONITOR_ARTICLE_READ_BACKEND", None)
+                with (
+                    patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
+                    patch("web_backend.default_shadow_db_path", lambda: db_path),
+                    patch("web_backend.get_article_source_signature", lambda: "source-key"),
+                    patch("web_backend.refresh_article_matches", side_effect=AssertionError("auto page read must not rebuild inline")),
+                    patch("web_backend.local_today", lambda: type("FakeDate", (), {"isoformat": lambda self: today})()),
+                ):
+                    result = runtime._get_sqlite_shadow_article_page(
+                        {"tasks": [{"name": "品牌A"}]},
+                        media_type="media",
+                        limit=10,
+                        task_name="品牌A",
+                    )
 
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["requested_backend"], "auto")
+        self.assertEqual(result["backend_source"], "default")
+        self.assertFalse(result["compare_only"])
+        self.assertEqual(result["total"], 1)
+        self.assertEqual([item["id"] for item in result["articles"]], ["article-a"])
+
+    def test_sqlite_shadow_article_page_disabled_env_values_skip_sqlite(self) -> None:
+        for value in ("json", "off", "disabled"):
+            runtime = self._runtime()
+            with self.subTest(value=value):
+                with (
+                    patch.dict(os.environ, {"AIBRANDMONITOR_ARTICLE_READ_BACKEND": value}),
+                    patch("web_backend.default_shadow_db_path", side_effect=AssertionError("disabled backend must not inspect sqlite")),
+                ):
+                    result = runtime._get_sqlite_shadow_article_page({}, limit=10)
+
+                self.assertIsNone(result)
+
+    def test_sqlite_shadow_status_reports_auto_freshness_and_rebuild_state(self) -> None:
+        today = "2026-05-09"
+        runtime = self._runtime()
+        runtime.load_config = lambda: {"tasks": [{"name": "品牌A"}]}  # type: ignore[method-assign]
+        runtime._article_sqlite_shadow_rebuild_state = {
+            "running": False,
+            "last_reason": "article_shadow_source_stale",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "shadow.sqlite3"
+            self._write_fresh_article_shadow(
+                db_path,
+                [
+                    {
+                        "id": "article-a",
+                        "url": "https://example.com/a",
+                        "title": "品牌A 今日报道",
+                        "media_type": "authority",
+                        "published_at": today,
+                        "ts": today,
+                        "matched_tasks": ["品牌A"],
+                    }
+                ],
+            )
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AIBRANDMONITOR_ARTICLE_READ_BACKEND", None)
+                with (
+                    patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
+                    patch("web_backend.default_shadow_db_path", lambda: db_path),
+                    patch("web_backend.get_article_source_signature", lambda: "source-key"),
+                ):
+                    status = runtime.get_article_sqlite_shadow_compare_status()
+
+        self.assertEqual(status["requested_backend"], "auto")
+        self.assertEqual(status["backend_source"], "default")
+        self.assertEqual(status["effectiveBackend"], "sqlite_shadow")
+        self.assertEqual(status["fallbackReason"], "")
+        self.assertTrue(status["readiness"]["ready"])
+        self.assertTrue(status["freshness"]["fresh"])
+        self.assertEqual(status["freshness"]["stored_article_source_signature"], "source-key")
+        self.assertEqual(status["freshness"]["stored_article_match_config_signature"], "config-key")
+        self.assertEqual(status["rebuild"]["last_reason"], "article_shadow_source_stale")
 
     def test_sqlite_shadow_article_page_reads_fresh_index(self) -> None:
         today = "2026-05-09"
@@ -168,6 +258,9 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
         assert result is not None
         self.assertTrue(result["compare_only"])
         self.assertEqual([item["id"] for item in result["articles"]], ["article-a"])
+        status = runtime.get_article_sqlite_shadow_compare_status()
+        self.assertEqual(status["health"].get("last_effective_backend"), "json")
+        self.assertEqual(status["health"].get("last_probe_backend"), "sqlite_shadow")
 
     def test_sqlite_shadow_article_index_uses_json_page_deduping(self) -> None:
         today = "2026-05-09"
@@ -269,24 +362,89 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
             runtime._schedule_sqlite_shadow_article_rebuild = (  # type: ignore[method-assign]
                 lambda config, *, db_path, reason: scheduled.append(str(reason)) or True
             )
-            with (
-                patch.dict(os.environ, {"AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow"}),
-                patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
-                patch("web_backend.default_shadow_db_path", lambda: db_path),
-                patch("web_backend.get_article_source_signature", lambda: "new-source"),
-                patch("web_backend.refresh_article_matches", side_effect=AssertionError("stale read must not rebuild inline")),
-            ):
-                result = runtime._get_sqlite_shadow_article_page(
-                    {"tasks": [{"name": "品牌A"}]},
-                    media_type="media",
-                    limit=10,
-                    task_name="品牌A",
-                )
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AIBRANDMONITOR_ARTICLE_READ_BACKEND", None)
+                with (
+                    patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
+                    patch("web_backend.default_shadow_db_path", lambda: db_path),
+                    patch("web_backend.get_article_source_signature", lambda: "new-source"),
+                    patch("web_backend.refresh_article_matches", side_effect=AssertionError("stale read must not rebuild inline")),
+                ):
+                    result = runtime._get_sqlite_shadow_article_page(
+                        {"tasks": [{"name": "品牌A"}]},
+                        media_type="media",
+                        limit=10,
+                        task_name="品牌A",
+                    )
 
         self.assertIsNone(result)
         self.assertEqual(scheduled, ["article_shadow_source_stale"])
         status = runtime.get_article_sqlite_shadow_compare_status()
         self.assertEqual(status["health"]["last_fallback_reason"], "article_shadow_source_stale")
+
+    def test_sqlite_shadow_article_page_falls_back_when_match_config_stale_without_inline_refresh(self) -> None:
+        today = "2026-05-09"
+        runtime = self._runtime()
+        scheduled: list[str] = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "shadow.sqlite3"
+            self._write_fresh_article_shadow(
+                db_path,
+                [
+                    {
+                        "id": "article-stale",
+                        "url": "https://example.com/stale",
+                        "title": "旧配置索引文章",
+                        "media_type": "authority",
+                        "published_at": today,
+                        "ts": today,
+                        "matched_tasks": ["品牌A"],
+                    }
+                ],
+                match_signature="old-config",
+            )
+            runtime._schedule_sqlite_shadow_article_rebuild = (  # type: ignore[method-assign]
+                lambda config, *, db_path, reason: scheduled.append(str(reason)) or True
+            )
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AIBRANDMONITOR_ARTICLE_READ_BACKEND", None)
+                with (
+                    patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
+                    patch("web_backend.default_shadow_db_path", lambda: db_path),
+                    patch("web_backend.get_article_source_signature", lambda: "source-key"),
+                    patch("web_backend.refresh_article_matches", side_effect=AssertionError("stale read must not rebuild inline")),
+                ):
+                    result = runtime._get_sqlite_shadow_article_page(
+                        {"tasks": [{"name": "品牌A"}]},
+                        media_type="media",
+                        limit=10,
+                        task_name="品牌A",
+                    )
+
+        self.assertIsNone(result)
+        self.assertEqual(scheduled, ["article_shadow_match_config_stale"])
+        status = runtime.get_article_sqlite_shadow_compare_status()
+        self.assertEqual(status["health"]["last_fallback_reason"], "article_shadow_match_config_stale")
+
+    def test_sqlite_shadow_article_page_skips_ordinary_cloud_session(self) -> None:
+        runtime = self._runtime()
+        runtime._is_ordinary_cloud_session = lambda session: True  # type: ignore[method-assign]
+        runtime._ensure_sqlite_shadow_article_index = (  # type: ignore[method-assign]
+            lambda config, *, db_path: (_ for _ in ()).throw(AssertionError("ordinary cloud must skip sqlite"))
+        )
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AIBRANDMONITOR_ARTICLE_READ_BACKEND", None)
+            with (
+                patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
+                patch("web_backend.default_shadow_db_path", lambda: Path("/tmp/unused-shadow.sqlite3")),
+            ):
+                result = runtime._get_sqlite_shadow_article_page({}, limit=10)
+
+        self.assertIsNone(result)
+        status = runtime.get_article_sqlite_shadow_compare_status()
+        self.assertEqual(status["health"]["last_fallback_reason"], "ordinary_cloud_session")
 
     def test_sqlite_shadow_article_page_merges_duplicate_url_tasks_like_json_page(self) -> None:
         today = "2026-05-09"

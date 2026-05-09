@@ -18,6 +18,7 @@ import secrets
 import signal
 import shutil
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -300,6 +301,10 @@ BROWSER_AUTH_SESSION_TTL_SECONDS = 6 * 60 * 60
 _HISTORY_READ_AUTO_VALUES = {"auto", "sqlite_auto", "sqlite_shadow_auto", "auto_sqlite_shadow"}
 _HISTORY_READ_SQLITE_VALUES = {"sqlite_shadow", "sqlite_structured", "structured", "sqlite"}
 _HISTORY_READ_DISABLED_VALUES = {"0", "false", "no", "off", "disabled", "json", "file", "files"}
+_ARTICLE_READ_AUTO_VALUES = {"", "auto", "sqlite_auto", "sqlite_shadow_auto", "auto_sqlite_shadow"}
+_ARTICLE_READ_SQLITE_VALUES = {"sqlite_shadow"}
+_ARTICLE_READ_COMPARE_VALUES = {"sqlite_shadow_compare"}
+_ARTICLE_READ_DISABLED_VALUES = {"0", "false", "no", "off", "disabled", "json", "file", "files"}
 
 
 # 前端和后端平台 ID 可能不一致，做双向映射
@@ -578,6 +583,48 @@ def _merge_browser_automation_config(
             merged.pop(pid, None)
 
     return merged
+
+
+def _article_read_backend_with_source() -> tuple[str, str, str]:
+    raw = os.environ.get("AIBRANDMONITOR_ARTICLE_READ_BACKEND")
+    if raw is None:
+        return "auto", "default", ""
+    raw_text = str(raw or "").strip()
+    normalized = raw_text.lower()
+    if normalized in _ARTICLE_READ_DISABLED_VALUES:
+        return "", "env", raw_text
+    if normalized in _ARTICLE_READ_COMPARE_VALUES:
+        return "sqlite_shadow_compare", "env", raw_text
+    if normalized in _ARTICLE_READ_SQLITE_VALUES:
+        return "sqlite_shadow", "env", raw_text
+    if normalized in _ARTICLE_READ_AUTO_VALUES:
+        return "auto", "env", raw_text
+    return "", "env", raw_text
+
+
+def _read_sqlite_store_meta(db_path: Path, keys: list[str]) -> dict[str, str]:
+    if not db_path.exists() or not keys:
+        return {}
+    normalized_keys = [str(key or "").strip() for key in keys if str(key or "").strip()]
+    if not normalized_keys:
+        return {}
+    placeholders = ", ".join("?" for _ in normalized_keys)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        rows = conn.execute(
+            f"SELECT key, value FROM store_meta WHERE key IN ({placeholders})",
+            normalized_keys,
+        ).fetchall()
+    except Exception:
+        return {}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return {str(key or ""): str(value or "") for key, value in rows}
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -5519,8 +5566,8 @@ return changedCount
         limit: int = 50,
         task_name: str = "",
     ) -> dict[str, Any] | None:
-        read_backend = str(os.environ.get("AIBRANDMONITOR_ARTICLE_READ_BACKEND", "") or "").strip().lower()
-        if read_backend not in {"sqlite_shadow", "sqlite_shadow_compare"}:
+        read_backend, backend_source, raw_backend = _article_read_backend_with_source()
+        if not read_backend:
             return None
         resolved_limit = max(1, int(limit or 50))
         if resolved_limit > 500:
@@ -5576,6 +5623,9 @@ return changedCount
                 "today_total": int(page.get("today_total") or 0),
                 "compare_only": read_backend == "sqlite_shadow_compare",
             }
+            result["requested_backend"] = read_backend
+            result["backend_source"] = backend_source
+            result["raw_backend"] = raw_backend
         except Exception as exc:
             self._record_sqlite_shadow_failure(
                 read_backend,
@@ -5662,7 +5712,7 @@ return changedCount
             self._article_sqlite_shadow_compare_recent = self._article_sqlite_shadow_compare_recent[-50:]
         if mismatches:
             self._record_sqlite_shadow_failure(
-                str(os.environ.get("AIBRANDMONITOR_ARTICLE_READ_BACKEND", "") or "").strip().lower(),
+                _article_read_backend_with_source()[0],
                 "compare_mismatch",
                 detail=",".join(mismatches),
             )
@@ -5672,12 +5722,105 @@ return changedCount
         with self._article_sqlite_shadow_compare_lock:
             recent = list(self._article_sqlite_shadow_compare_recent)
         mismatch_count = sum(1 for item in recent if not bool(item.get("ok")))
+        requested_backend, backend_source, raw_backend = _article_read_backend_with_source()
+        db_path = default_shadow_db_path()
+        readiness = ArticleHistorySQLiteStore.validate_readiness(db_path)
+        article_meta = _read_sqlite_store_meta(
+            db_path,
+            [
+                "article_source_signature",
+                "article_match_config_signature",
+                "article_last_rebuilt_at",
+                "article_last_incremental_sync_at",
+                "article_last_dirty_reason",
+            ],
+        ) if bool(readiness.get("ready")) else {}
+        expected_source_signature = ""
+        expected_match_signature = ""
+        try:
+            expected_source_signature = str(get_article_source_signature() or "").strip()
+        except Exception:
+            expected_source_signature = ""
+        try:
+            config = self.load_config()
+            expected_match_signature = str(self._article_match_config_key(config) or "").strip()
+        except Exception:
+            expected_match_signature = ""
+        stored_source_signature = str(article_meta.get("article_source_signature") or "").strip()
+        stored_match_signature = str(article_meta.get("article_match_config_signature") or "").strip()
+        source_fresh = (
+            stored_source_signature == expected_source_signature
+            if expected_source_signature
+            else None
+        )
+        match_fresh = (
+            stored_match_signature == expected_match_signature
+            if expected_match_signature
+            else None
+        )
+        cooldown_reason = self._sqlite_shadow_cooldown_reason()
+        try:
+            session = CloudSessionStore().load()
+            ordinary_cloud_session = self._is_ordinary_cloud_session(session)
+        except Exception:
+            ordinary_cloud_session = False
+        fallback_reason = ""
+        effective_backend = "json"
+        if not requested_backend:
+            fallback_reason = "disabled"
+        elif requested_backend == "sqlite_shadow_compare":
+            fallback_reason = "compare_only"
+        elif ordinary_cloud_session:
+            fallback_reason = "ordinary_cloud_session"
+        elif cooldown_reason:
+            fallback_reason = cooldown_reason
+        elif not bool(readiness.get("ready")):
+            fallback_reason = (
+                "article_shadow_db_missing"
+                if not readiness.get("available")
+                else f"article_shadow_db_{readiness.get('reason') or 'not_ready'}"
+            )
+        elif source_fresh is False:
+            fallback_reason = "article_shadow_source_stale"
+        elif match_fresh is False:
+            fallback_reason = "article_shadow_match_config_stale"
+        elif source_fresh is True and match_fresh is True:
+            effective_backend = "sqlite_shadow"
+        else:
+            fallback_reason = "article_shadow_freshness_unknown"
+        rebuild_lock = getattr(self, "_article_sqlite_shadow_rebuild_lock", None)
+        if rebuild_lock is None:
+            rebuild_state = dict(getattr(self, "_article_sqlite_shadow_rebuild_state", {}) or {})
+        else:
+            with rebuild_lock:
+                rebuild_state = dict(getattr(self, "_article_sqlite_shadow_rebuild_state", {}) or {})
         return {
             "ok": True,
-            "mode": str(os.environ.get("AIBRANDMONITOR_ARTICLE_READ_BACKEND", "") or "").strip().lower(),
+            "mode": requested_backend,
+            "requested_backend": requested_backend,
+            "backend_source": backend_source,
+            "raw_backend": raw_backend,
+            "effectiveBackend": effective_backend,
+            "effective_backend": effective_backend,
+            "fallbackReason": fallback_reason,
+            "fallback_reason": fallback_reason,
             "checked": len(recent),
             "mismatches": mismatch_count,
             "health": self._article_sqlite_shadow_health_snapshot(),
+            "readiness": readiness,
+            "freshness": {
+                "fresh": source_fresh is True and match_fresh is True,
+                "source_fresh": source_fresh,
+                "match_config_fresh": match_fresh,
+                "stored_article_source_signature": stored_source_signature,
+                "current_article_source_signature": expected_source_signature,
+                "stored_article_match_config_signature": stored_match_signature,
+                "current_article_match_config_signature": expected_match_signature,
+                "last_rebuilt_at": str(article_meta.get("article_last_rebuilt_at") or ""),
+                "last_incremental_sync_at": str(article_meta.get("article_last_incremental_sync_at") or ""),
+                "last_dirty_reason": str(article_meta.get("article_last_dirty_reason") or ""),
+            },
+            "rebuild": rebuild_state,
             "last": recent[-1] if recent else None,
             "recent": recent,
         }
@@ -5705,6 +5848,8 @@ return changedCount
                 "disabled_until": 0.0,
                 "disabled_until_iso": "",
                 "last_mode": str(mode or ""),
+                "last_effective_backend": "json" if str(mode or "") == "sqlite_shadow_compare" else "sqlite_shadow",
+                "last_probe_backend": "sqlite_shadow",
                 "last_success_at": local_now().isoformat(timespec="seconds"),
                 "last_elapsed_ms": round(float(elapsed_ms), 3),
                 "last_fd_before": fd_before,
@@ -5717,6 +5862,8 @@ return changedCount
         with self._article_sqlite_shadow_health_lock:
             self._article_sqlite_shadow_health.update({
                 "last_mode": str(mode or ""),
+                "last_effective_backend": "json",
+                "last_probe_backend": "",
                 "last_fallback_reason": str(reason or ""),
                 "last_fallback_at": local_now().isoformat(timespec="seconds"),
                 "fallback_count": _safe_int(self._article_sqlite_shadow_health.get("fallback_count"), 0) + 1,
@@ -5743,6 +5890,8 @@ return changedCount
             self._article_sqlite_shadow_health.update({
                 "consecutive_errors": consecutive,
                 "last_mode": str(mode or ""),
+                "last_effective_backend": "json",
+                "last_probe_backend": "",
                 "last_fallback_reason": str(reason or ""),
                 "last_fallback_at": local_now().isoformat(timespec="seconds"),
                 "last_error": str(detail or reason or ""),

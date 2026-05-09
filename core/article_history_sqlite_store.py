@@ -318,6 +318,17 @@ class ArticleHistorySQLiteStore:
             status["reason"] = "missing"
             return status
 
+        try:
+            with path.open("rb") as fp:
+                header = fp.read(16)
+        except Exception as exc:
+            status["reason"] = "exception"
+            status["error"] = f"{exc.__class__.__name__}: {exc}"
+            return status
+        if header and header != b"SQLite format 3\x00":
+            status["reason"] = "not_sqlite"
+            return status
+
         conn: sqlite3.Connection | None = None
         try:
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)

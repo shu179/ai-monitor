@@ -705,6 +705,18 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             self.assertEqual(store.get_article_page(task_name="品牌A")["total"], 0)
             self.assertEqual(store.get_article_page(task_name="品牌B")["total"], 1)
 
+    def test_validate_readiness_rejects_non_sqlite_file_without_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "local_store.sqlite3"
+            db_path.write_bytes(b"shadow")
+
+            status = ArticleHistorySQLiteStore.validate_readiness(db_path)
+
+            self.assertFalse(status["ready"])
+            self.assertEqual(status["reason"], "not_sqlite")
+            self.assertFalse(Path(f"{db_path}-shm").exists())
+            self.assertFalse(Path(f"{db_path}-wal").exists())
+
     def test_initialize_creates_expected_tables_and_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "local_store.sqlite3"
