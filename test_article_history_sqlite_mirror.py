@@ -132,6 +132,49 @@ class ArticleHistorySQLiteMirrorTests(unittest.TestCase):
         store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
         self.assertEqual(store.get_meta("history_source_signature"), "source-before-import")
 
+    def test_rebuild_shadow_store_does_not_mark_fresh_when_verify_fails(self) -> None:
+        self._write_history_file("task-a", [
+            {
+                "id": "r1",
+                "ts": "2024-01-01 09:00",
+                "task_name": "品牌A",
+                "success": True,
+            },
+        ])
+        db_path = Path(self._tmpdir.name) / "shadow.sqlite3"
+        stale_store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+        stale_store.set_meta("history_source_signature", "old-fresh")
+
+        with patch.object(sqlite_mirror, "verify_shadow_store", return_value={"ok": False, "history": {}}):
+            result = rebuild_shadow_store(db_path)
+
+        store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+        self.assertFalse(result["verification"]["ok"])
+        self.assertEqual(store.get_meta("history_source_signature"), "")
+
+    def test_rebuild_shadow_store_does_not_mark_fresh_when_source_changes(self) -> None:
+        self._write_history_file("task-a", [
+            {
+                "id": "r1",
+                "ts": "2024-01-01 09:00",
+                "task_name": "品牌A",
+                "success": True,
+            },
+        ])
+        db_path = Path(self._tmpdir.name) / "shadow.sqlite3"
+
+        with patch.object(
+            sqlite_mirror.history,
+            "get_history_source_signature",
+            side_effect=["source-before", "source-after"],
+        ):
+            result = rebuild_shadow_store(db_path)
+
+        store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+        self.assertFalse(result["verification"]["ok"])
+        self.assertFalse(result["verification"]["source_signature"]["stable"])
+        self.assertEqual(store.get_meta("history_source_signature"), "")
+
     def test_verify_shadow_store_reports_mismatches(self) -> None:
         self._write_articles([
             {

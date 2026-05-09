@@ -70,10 +70,14 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             page = store.get_article_page(limit=10)
             self.assertEqual(page["total"], 2)
             self.assertEqual([item["id"] for item in page["items"]], ["article-newer", "article-old"])
-            self.assertEqual(page["items"][1]["title"], "URL 更新标题")
+            self.assertEqual(page["items"][1]["title"], "旧标题")
+            self.assertEqual(page["items"][1]["matched_tasks"], ["品牌A", "品牌C"])
 
             brand_a_page = store.get_article_page(task_name="品牌A")
-            self.assertEqual([item["id"] for item in brand_a_page["items"]], ["article-newer"])
+            self.assertEqual([item["id"] for item in brand_a_page["items"]], ["article-newer", "article-old"])
+
+            brand_c_page = store.get_article_page(task_name="品牌C")
+            self.assertEqual([item["id"] for item in brand_c_page["items"]], ["article-old"])
 
             brand_b_referenced = store.get_article_page(task_name="品牌B", relation="referenced")
             self.assertEqual([item["id"] for item in brand_b_referenced["items"]], ["article-newer"])
@@ -82,7 +86,54 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             self.assertEqual([item["id"] for item in selfmedia_page["items"]], ["article-newer"])
 
             search_page = store.get_article_page(search="更新")
-            self.assertEqual([item["id"] for item in search_page["items"]], ["article-old"])
+            self.assertEqual([item["id"] for item in search_page["items"]], [])
+
+    def test_import_articles_merges_duplicate_url_task_links_like_json_page_dedupe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(
+                Path(tmpdir) / "local_store.sqlite3",
+                normalize_article_url=normalize_article_url,
+            )
+
+            result = store.import_articles([
+                {
+                    "id": "article-first",
+                    "url": "https://www.example.com/news/a?utm_source=x",
+                    "title": "同一篇报道",
+                    "published_at": "2024-01-02",
+                    "matched_tasks": ["品牌A"],
+                    "referenced_tasks": ["品牌R1"],
+                    "match_reasons": {"品牌A": ["标题命中"]},
+                },
+                {
+                    "id": "article-second",
+                    "url": "https://example.com/news/a",
+                    "title": "后来的重复报道",
+                    "published_at": "2024-01-03",
+                    "matched_tasks": ["品牌B"],
+                    "referenced_tasks": ["品牌R2"],
+                    "match_reasons": {"品牌B": ["导入命中"]},
+                },
+                {
+                    "id": "article-first",
+                    "url": "https://example.com/news/a/",
+                    "title": "同 ID 的重复报道",
+                    "published_at": "2024-01-04",
+                    "matched_tasks": ["品牌C"],
+                    "referenced_tasks": ["品牌R3"],
+                },
+            ])
+
+            self.assertEqual(result, {"created": 1, "updated": 2, "skipped": 0})
+            page = store.get_article_page(limit=10)
+            self.assertEqual(page["total"], 1)
+            self.assertEqual(page["items"][0]["id"], "article-first")
+            self.assertEqual(page["items"][0]["matched_tasks"], ["品牌A", "品牌B", "品牌C"])
+            self.assertEqual(page["items"][0]["referenced_tasks"], ["品牌R1", "品牌R2", "品牌R3"])
+            self.assertEqual(store.get_article_page(task_name="品牌A")["total"], 1)
+            self.assertEqual(store.get_article_page(task_name="品牌B")["total"], 1)
+            self.assertEqual(store.get_article_page(task_name="品牌C")["total"], 1)
+            self.assertEqual(store.get_article_page(task_name="品牌R2", relation="referenced")["total"], 1)
 
     def test_article_page_order_matches_runtime_display_sort_tiebreakers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

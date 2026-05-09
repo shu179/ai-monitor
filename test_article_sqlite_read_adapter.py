@@ -160,6 +160,58 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
         self.assertFalse(status["health"].get("last_fallback_reason", ""))
         self.assertEqual(status["health"].get("fallback_count", 0), 0)
 
+    def test_sqlite_shadow_article_page_merges_duplicate_url_tasks_like_json_page(self) -> None:
+        today = "2026-05-09"
+        articles = [
+            {
+                "id": "article-first",
+                "url": "https://www.example.com/a?utm_source=x",
+                "title": "同一篇报道",
+                "media_name": "示例媒体",
+                "media_type": "authority",
+                "published_at": today,
+                "ts": today,
+                "matched_tasks": ["品牌A"],
+                "referenced_tasks": ["品牌R1"],
+            },
+            {
+                "id": "article-second",
+                "url": "https://example.com/a",
+                "title": "重复报道",
+                "media_name": "示例媒体",
+                "media_type": "authority",
+                "published_at": today,
+                "ts": today,
+                "matched_tasks": ["品牌B"],
+                "referenced_tasks": ["品牌R2"],
+            },
+        ]
+        runtime = self._runtime()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "shadow.sqlite3"
+            with (
+                patch.dict(os.environ, {"AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow"}),
+                patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
+                patch("web_backend.default_shadow_db_path", lambda: db_path),
+                patch("web_backend.refresh_article_matches", lambda config: list(articles)),
+                patch("web_backend.local_today", lambda: type("FakeDate", (), {"isoformat": lambda self: today})()),
+            ):
+                result = runtime._get_sqlite_shadow_article_page(
+                    {"tasks": [{"name": "品牌A"}, {"name": "品牌B"}]},
+                    media_type="media",
+                    limit=10,
+                    task_name="品牌B",
+                )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["total"], 1)
+        self.assertEqual([item["id"] for item in result["articles"]], ["article-first"])
+        self.assertEqual(result["articles"][0]["matched_tasks"], ["品牌A", "品牌B"])
+        status = runtime.get_article_sqlite_shadow_compare_status()
+        self.assertFalse(status["health"].get("last_fallback_reason", ""))
+
     def test_compare_recorder_tracks_recent_mismatches_for_diagnostics(self) -> None:
         runtime = self._runtime()
 

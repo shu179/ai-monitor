@@ -11,6 +11,7 @@ import random
 import sqlite3
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -93,6 +94,8 @@ _structured_read_store_status_cache: dict[str, object] = {}
 _structured_read_config_lock = threading.RLock()
 _structured_read_config_backend = ""
 _structured_shadow_write_config_enabled = False
+_structured_shadow_rebuild_lock = threading.RLock()
+_structured_shadow_rebuild_state: dict[str, object] = {}
 _MAX_LOCKS = 500  # 锁字典的最大容量，超出时清理最旧的 25%
 
 
@@ -227,6 +230,11 @@ def get_structured_read_health() -> dict:
         "available": bool(store_status.get("available")),
         "ready": ready,
         "fresh": fresh,
+        "readinessReason": str(store_status.get("reason") or ""),
+        "readinessCooldownRemainingSeconds": store_status.get("cooldown_remaining_seconds", 0),
+        "schemaVersion": str(store_status.get("schema_version") or ""),
+        "storedSignature": str(store_status.get("stored_signature") or ""),
+        "selfHeal": _structured_shadow_rebuild_state_snapshot(),
         "shadowWritesEnabled": _history_structured_shadow_writes_enabled(),
         "db_path": str(_history_shadow_db_file()),
     })
@@ -236,6 +244,8 @@ def get_structured_read_health() -> dict:
 def reset_structured_read_health() -> None:
     with _structured_read_health_lock:
         _structured_read_health.clear()
+    with _structured_shadow_rebuild_lock:
+        _structured_shadow_rebuild_state.clear()
     _clear_structured_read_store_status_cache()
 
 
@@ -283,6 +293,7 @@ def _structured_read_ready(operation: str) -> bool:
             reason = "shadow_db_stale"
         else:
             return True
+        _schedule_structured_shadow_rebuild(reason)
         _record_structured_read_fallback(operation, reason)
         return False
     store_status = _structured_read_store_status()
@@ -306,6 +317,124 @@ def _structured_shadow_store():
 def _clear_structured_read_store_status_cache() -> None:
     with _structured_read_store_status_lock:
         _structured_read_store_status_cache.clear()
+
+
+def _structured_read_bad_db_cooldown_seconds() -> int:
+    try:
+        return max(1, int(os.environ.get("AIBRANDMONITOR_HISTORY_SQLITE_BAD_DB_COOLDOWN_SECONDS", "60")))
+    except Exception:
+        return 60
+
+
+def _structured_shadow_rebuild_min_interval_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("AIBRANDMONITOR_HISTORY_SQLITE_REBUILD_MIN_INTERVAL_SECONDS", "30")))
+    except Exception:
+        return 30.0
+
+
+def _structured_shadow_stored_signature() -> str:
+    try:
+        return str(_structured_shadow_store().get_meta("history_source_signature") or "").strip()
+    except Exception:
+        return ""
+
+
+def _begin_structured_shadow_runtime_write() -> dict[str, object] | None:
+    if not _history_structured_shadow_writes_enabled():
+        return None
+    return {
+        "source_signature_before": get_history_source_signature(),
+        "stored_signature_before": _structured_shadow_stored_signature(),
+    }
+
+
+def _mark_structured_shadow_dirty(reason: str = "") -> None:
+    try:
+        _structured_shadow_store().set_meta("history_source_signature", "")
+    except Exception:
+        pass
+    _clear_structured_read_store_status_cache()
+    if _history_structured_read_auto_configured():
+        _schedule_structured_shadow_rebuild(reason or "shadow_dirty")
+
+
+def _finish_structured_shadow_runtime_write(context: dict[str, object] | None, *, ok: bool, reason: str = "") -> None:
+    if context is None:
+        return
+    source_signature_before = str(context.get("source_signature_before") or "").strip()
+    stored_signature_before = str(context.get("stored_signature_before") or "").strip()
+    if not ok or not stored_signature_before or stored_signature_before != source_signature_before:
+        _mark_structured_shadow_dirty(reason or "runtime_shadow_write_needs_rebuild")
+        return
+    try:
+        _structured_shadow_store().set_meta("history_source_signature", get_history_source_signature())
+        _clear_structured_read_store_status_cache()
+    except Exception:
+        _mark_structured_shadow_dirty(reason or "runtime_shadow_signature_update_failed")
+
+
+def _structured_shadow_rebuild_state_snapshot() -> dict[str, object]:
+    now_ts = time.time()
+    with _structured_shadow_rebuild_lock:
+        state = dict(_structured_shadow_rebuild_state)
+    next_allowed_at = float(state.get("next_allowed_at") or 0.0)
+    state["cooldown_remaining_seconds"] = max(0.0, round(next_allowed_at - now_ts, 3))
+    return state
+
+
+def _schedule_structured_shadow_rebuild(reason: str) -> bool:
+    if not _history_structured_read_auto_configured():
+        return False
+    now_ts = time.time()
+    with _structured_shadow_rebuild_lock:
+        if bool(_structured_shadow_rebuild_state.get("running")):
+            return False
+        next_allowed_at = float(_structured_shadow_rebuild_state.get("next_allowed_at") or 0.0)
+        if next_allowed_at > now_ts:
+            return False
+        _structured_shadow_rebuild_state.update({
+            "running": True,
+            "last_reason": str(reason or ""),
+            "last_started_at": now_ts,
+            "last_started_at_iso": local_now().isoformat(timespec="seconds"),
+            "next_allowed_at": now_ts + _structured_shadow_rebuild_min_interval_seconds(),
+        })
+
+    thread = threading.Thread(
+        target=_run_structured_shadow_rebuild,
+        args=(str(reason or ""),),
+        name="history-sqlite-shadow-rebuild",
+        daemon=True,
+    )
+    thread.start()
+    return True
+
+
+def _run_structured_shadow_rebuild(reason: str = "") -> None:
+    ok = False
+    detail = ""
+    try:
+        from .article_history_sqlite_mirror import rebuild_shadow_store
+
+        result = rebuild_shadow_store(_history_shadow_db_file())
+        verification = result.get("verification") if isinstance(result, dict) else {}
+        ok = bool(isinstance(verification, dict) and verification.get("ok"))
+        if not ok:
+            detail = "verification_failed"
+    except Exception as exc:
+        detail = f"{exc.__class__.__name__}: {exc}"
+    finally:
+        _clear_structured_read_store_status_cache()
+        with _structured_shadow_rebuild_lock:
+            _structured_shadow_rebuild_state.update({
+                "running": False,
+                "last_ok": ok,
+                "last_finished_at": time.time(),
+                "last_finished_at_iso": local_now().isoformat(timespec="seconds"),
+                "last_reason": str(reason or _structured_shadow_rebuild_state.get("last_reason") or ""),
+                "last_error": "" if ok else detail,
+            })
 
 
 def _append_unique_text(items: list[str], value: str) -> None:
@@ -391,30 +520,34 @@ def _save_json_document(path: Path, data) -> None:
     _write_json_path(path, data)
 
 
-def _shadow_append_history_record(storage_key: str, entry: dict) -> None:
+def _shadow_append_history_record(storage_key: str, entry: dict) -> bool:
     if not _history_structured_shadow_writes_enabled():
-        return
+        return True
     try:
         with _structured_shadow_write_lock:
             key = _structured_canonical_storage_key(storage_key)
             if key:
                 _structured_shadow_store().append_history_record(key, entry, max_records=MAX_RECORDS)
-                _clear_structured_read_store_status_cache()
+                return True
+            return False
     except Exception as e:
         print(f"[History] 写入结构化 SQLite 影子历史失败 {storage_key}: {e}")
+        return False
 
 
-def _shadow_replace_history_records(storage_key: str, records: list[dict]) -> None:
+def _shadow_replace_history_records(storage_key: str, records: list[dict]) -> bool:
     if not _history_structured_shadow_writes_enabled():
-        return
+        return True
     try:
         with _structured_shadow_write_lock:
             key = _structured_canonical_storage_key(storage_key)
             if key:
                 _structured_shadow_store().import_history_records(key, records, replace=True)
-                _clear_structured_read_store_status_cache()
+                return True
+            return False
     except Exception as e:
         print(f"[History] 替换结构化 SQLite 影子历史失败 {storage_key}: {e}")
+        return False
 
 
 def _shadow_apply_history_review(
@@ -423,9 +556,9 @@ def _shadow_apply_history_review(
     status: str,
     note: str,
     reviewed_at: str,
-) -> None:
+) -> bool:
     if not _history_structured_shadow_writes_enabled():
-        return
+        return True
     try:
         expanded_storage_keys: list[str] = []
         for key in storage_keys:
@@ -439,9 +572,10 @@ def _shadow_apply_history_review(
                 note,
                 reviewed_at=reviewed_at,
             )
-            _clear_structured_read_store_status_cache()
+            return True
     except Exception as e:
         print(f"[History] 更新结构化 SQLite 影子复核失败 {record_id}: {e}")
+        return False
 
 
 def _structured_read_store_available() -> bool:
@@ -471,10 +605,17 @@ def _structured_read_db_signature(db_path: Path) -> tuple[str, int, int]:
 def _structured_read_store_status() -> dict[str, object]:
     db_path = _history_shadow_db_file()
     if not db_path.exists():
-        return {"available": False, "ready": False, "stored_signature": ""}
+        return {
+            "available": False,
+            "ready": False,
+            "stored_signature": "",
+            "schema_version": "",
+            "reason": "missing",
+        }
 
     db_signature = _structured_read_db_signature(db_path)
     cache_key = str(db_path)
+    now_ts = time.time()
     with _structured_read_store_status_lock:
         if (
             _structured_read_store_status_cache.get("key") == cache_key
@@ -482,33 +623,25 @@ def _structured_read_store_status() -> dict[str, object]:
         ):
             cached_status = _structured_read_store_status_cache.get("status")
             if isinstance(cached_status, dict):
-                return dict(cached_status)
+                cooldown_until = float(cached_status.get("cooldown_until") or 0.0)
+                if bool(cached_status.get("ready")) or cooldown_until > now_ts:
+                    result = dict(cached_status)
+                    result["cooldown_remaining_seconds"] = (
+                        max(0.0, round(cooldown_until - now_ts, 3))
+                        if cooldown_until > now_ts
+                        else 0
+                    )
+                    return result
 
-    status: dict[str, object] = {"available": True, "ready": False, "stored_signature": ""}
-    conn = None
-    try:
-        conn = sqlite3.connect(str(db_path))
-        row = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'history_records' LIMIT 1"
-        ).fetchone()
-        if row is not None:
-            status["ready"] = True
-            try:
-                meta_row = conn.execute(
-                    "SELECT value FROM store_meta WHERE key = 'history_source_signature'"
-                ).fetchone()
-            except Exception:
-                meta_row = None
-            status["stored_signature"] = str(meta_row[0] or "").strip() if meta_row else ""
-    except Exception:
-        status["ready"] = False
-        status["stored_signature"] = ""
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    from .article_history_sqlite_store import ArticleHistorySQLiteStore
+
+    status = ArticleHistorySQLiteStore.validate_readiness(db_path)
+    if status.get("available") and not status.get("ready"):
+        status["cooldown_until"] = now_ts + _structured_read_bad_db_cooldown_seconds()
+        status["cooldown_remaining_seconds"] = _structured_read_bad_db_cooldown_seconds()
+    else:
+        status["cooldown_until"] = 0.0
+        status["cooldown_remaining_seconds"] = 0
 
     with _structured_read_store_status_lock:
         _structured_read_store_status_cache.update({
@@ -857,6 +990,7 @@ def record(
     if isinstance(extra, dict) and extra:
         entry["extra"] = extra
 
+    shadow_context = _begin_structured_shadow_runtime_write()
     written_storage_keys: list[str] = []
     for key in _history_write_targets(task_id=task_id, task_name=task_name):
         if not key:
@@ -871,8 +1005,14 @@ def record(
             _save(path, records)
             written_storage_keys.append(key)
 
+    shadow_ok = True
     for key in written_storage_keys:
-        _shadow_append_history_record(key, entry)
+        shadow_ok = _shadow_append_history_record(key, entry) and shadow_ok
+    _finish_structured_shadow_runtime_write(
+        shadow_context,
+        ok=shadow_ok,
+        reason="record_shadow_write",
+    )
 
     # 保留旧的 task_name 口径统计产物，避免影响现有趋势/报表读取。
     if task_name and task_name in written_storage_keys:
@@ -1015,7 +1155,9 @@ def import_records(task_name: str, entries: list[dict], *, task_id: str = "") ->
     if not normalized_entries:
         return 0
 
+    shadow_context = _begin_structured_shadow_runtime_write()
     imported = 0
+    shadow_ok = True
     for key in _history_write_targets(task_id=task_id, task_name=task_name):
         if not key:
             continue
@@ -1042,10 +1184,15 @@ def import_records(task_name: str, entries: list[dict], *, task_id: str = "") ->
             if len(records) > MAX_RECORDS:
                 records = records[-MAX_RECORDS:]
             _save(path, records)
-            _shadow_replace_history_records(key, records)
+            shadow_ok = _shadow_replace_history_records(key, records) and shadow_ok
             if key == task_name:
                 _compute_rates_locked(task_name, records)
             imported = max(imported, added_for_target)
+    _finish_structured_shadow_runtime_write(
+        shadow_context,
+        ok=shadow_ok,
+        reason="import_records_shadow_write",
+    )
     return imported
 
 
@@ -1850,6 +1997,7 @@ def apply_review(task_name: str, record_id: str, status: str, note: str = "", *,
     changed = False
     changed_storage_keys: list[str] = []
     reviewed_at = local_now().strftime("%Y-%m-%d %H:%M:%S")
+    shadow_context: dict[str, object] | None = None
     for key in _history_write_targets(task_id=str(task_id or "").strip(), task_name=str(task_name or "").strip()):
         path = _task_file(key)
         lock = _get_lock(key)
@@ -1866,12 +2014,19 @@ def apply_review(task_name: str, record_id: str, status: str, note: str = "", *,
                 file_changed = True
                 changed = True
             if file_changed:
+                if shadow_context is None:
+                    shadow_context = _begin_structured_shadow_runtime_write()
                 _save(path, records)
                 changed_storage_keys.append(key)
                 if key == str(task_name or "").strip():
                     _compute_rates_locked(task_name, records)
     if changed_storage_keys:
-        _shadow_apply_history_review(changed_storage_keys, record_id, status, note, reviewed_at)
+        shadow_ok = _shadow_apply_history_review(changed_storage_keys, record_id, status, note, reviewed_at)
+        _finish_structured_shadow_runtime_write(
+            shadow_context,
+            ok=shadow_ok,
+            reason="apply_review_shadow_write",
+        )
     return changed
 
 

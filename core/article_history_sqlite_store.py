@@ -14,6 +14,44 @@ from typing import Any, Literal
 
 SCHEMA_VERSION = 1
 
+REQUIRED_TABLE_COLUMNS: dict[str, set[str]] = {
+    "store_meta": {"key", "value"},
+    "articles": {
+        "id",
+        "normalized_url",
+        "title",
+        "media_name",
+        "media_type",
+        "published_at",
+        "imported_at",
+        "ts",
+        "fetch_method",
+        "sort_published_ts",
+        "sort_imported_ts",
+        "raw_json",
+        "updated_at_ns",
+    },
+    "article_task_links": {"article_id", "task_name", "relation"},
+    "history_records": {
+        "storage_key",
+        "id",
+        "task_id",
+        "task_name",
+        "ts",
+        "platform",
+        "keyword",
+        "brand",
+        "rank",
+        "success",
+        "review_status",
+        "mode",
+        "execution_source",
+        "sort_index",
+        "raw_json",
+        "updated_at_ns",
+    },
+}
+
 
 class ArticleHistorySQLiteStore:
     """Structured SQLite store for future article/history migration.
@@ -167,9 +205,16 @@ class ArticleHistorySQLiteStore:
                     skipped += 1
                     continue
                 normalized_url = self._normalized_url(article)
-                existing_id = self._find_article_id(conn, article_id=article_id, normalized_url=normalized_url)
+                existing_row = self._find_article_row(
+                    conn,
+                    article_id=article_id,
+                    normalized_url=normalized_url,
+                )
+                existing_id = existing_row[0] if existing_row is not None else None
                 target_id = existing_id or article_id
                 existed = existing_id is not None
+                if existing_row is not None and existing_row[2] == "url":
+                    article = self._merge_article_for_duplicate_url(existing_row[1], article)
                 article["id"] = target_id
                 raw_json = self._json_dumps(article)
                 sort_published_ts, sort_imported_ts = self._article_sort_key(article)
@@ -217,6 +262,83 @@ class ArticleHistorySQLiteStore:
                 else:
                     created += 1
         return {"created": created, "updated": updated, "skipped": skipped}
+
+    @classmethod
+    def validate_readiness(cls, db_path: str | Path) -> dict[str, Any]:
+        path = Path(db_path)
+        status: dict[str, Any] = {
+            "available": path.exists(),
+            "ready": False,
+            "stored_signature": "",
+            "schema_version": "",
+            "reason": "",
+            "missing_tables": [],
+            "missing_columns": {},
+        }
+        if not path.exists():
+            status["reason"] = "missing"
+            return status
+
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+            table_names = {
+                str(row[0] or "")
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            missing_tables = sorted(
+                table for table in REQUIRED_TABLE_COLUMNS.keys()
+                if table not in table_names
+            )
+            status["missing_tables"] = missing_tables
+            if missing_tables:
+                status["reason"] = "missing_tables"
+                return status
+
+            schema_row = conn.execute(
+                "SELECT value FROM store_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            schema_version = cls._text(schema_row[0]) if schema_row else ""
+            status["schema_version"] = schema_version
+            if schema_version != str(SCHEMA_VERSION):
+                status["reason"] = "schema_version"
+                return status
+
+            missing_columns: dict[str, list[str]] = {}
+            for table, required_columns in REQUIRED_TABLE_COLUMNS.items():
+                columns = {
+                    str(row[1] or "")
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                missing = sorted(required_columns - columns)
+                if missing:
+                    missing_columns[table] = missing
+            status["missing_columns"] = missing_columns
+            if missing_columns:
+                status["reason"] = "missing_columns"
+                return status
+
+            signature_row = conn.execute(
+                "SELECT value FROM store_meta WHERE key = 'history_source_signature'"
+            ).fetchone()
+            status["stored_signature"] = cls._text(signature_row[0]) if signature_row else ""
+            status["ready"] = True
+            status["reason"] = ""
+            return status
+        except Exception as exc:
+            status["reason"] = "exception"
+            status["error"] = f"{exc.__class__.__name__}: {exc}"
+            status["ready"] = False
+            status["stored_signature"] = ""
+            return status
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def clear_all(self) -> None:
         self.initialize()
@@ -757,16 +879,24 @@ class ArticleHistorySQLiteStore:
             raise
         return conn
 
-    def _find_article_id(self, conn: sqlite3.Connection, *, article_id: str, normalized_url: str) -> str | None:
+    def _find_article_row(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        article_id: str,
+        normalized_url: str,
+    ) -> tuple[str, dict[str, Any], str] | None:
         if normalized_url:
             row = conn.execute(
-                "SELECT id FROM articles WHERE normalized_url = ?",
+                "SELECT id, raw_json FROM articles WHERE normalized_url = ?",
                 (normalized_url,),
             ).fetchone()
             if row is not None:
-                return str(row[0])
-        row = conn.execute("SELECT id FROM articles WHERE id = ?", (article_id,)).fetchone()
-        return str(row[0]) if row is not None else None
+                return str(row[0]), self._json_loads(row[1]), "url"
+        row = conn.execute("SELECT id, raw_json FROM articles WHERE id = ?", (article_id,)).fetchone()
+        if row is None:
+            return None
+        return str(row[0]), self._json_loads(row[1]), "id"
 
     def _replace_article_task_links(self, conn: sqlite3.Connection, article_id: str, article: dict[str, Any]) -> None:
         conn.execute("DELETE FROM article_task_links WHERE article_id = ?", (article_id,))
@@ -783,6 +913,49 @@ class ArticleHistorySQLiteStore:
                     """,
                     (article_id, task_name, relation),
                 )
+
+    @classmethod
+    def _merge_article_for_duplicate_url(
+        cls,
+        base: dict[str, Any],
+        duplicate: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(base)
+        for key in ("matched_tasks", "referenced_tasks", "cloud_task_ids"):
+            merged[key] = cls._merge_unique_texts(merged.get(key), duplicate.get(key))
+
+        base_reasons = merged.get("match_reasons") if isinstance(merged.get("match_reasons"), dict) else {}
+        duplicate_reasons = duplicate.get("match_reasons") if isinstance(duplicate.get("match_reasons"), dict) else {}
+        if base_reasons or duplicate_reasons:
+            next_reasons: dict[str, list[str]] = {}
+            for task_name in set(base_reasons.keys()) | set(duplicate_reasons.keys()):
+                next_reasons[str(task_name)] = cls._merge_unique_texts(
+                    base_reasons.get(task_name),
+                    duplicate_reasons.get(task_name),
+                )
+            merged["match_reasons"] = next_reasons
+
+        base_hits = merged.get("reference_hits") if isinstance(merged.get("reference_hits"), dict) else {}
+        duplicate_hits = duplicate.get("reference_hits") if isinstance(duplicate.get("reference_hits"), dict) else {}
+        if duplicate_hits:
+            merged["reference_hits"] = {**base_hits, **duplicate_hits}
+
+        for key in ("url", "title", "media_name", "platform", "published_at", "ts"):
+            if not cls._text(merged.get(key)) and cls._text(duplicate.get(key)):
+                merged[key] = duplicate.get(key)
+        return merged
+
+    @classmethod
+    def _merge_unique_texts(cls, left: Any, right: Any) -> list[str]:
+        result: list[str] = []
+        for values in (left, right):
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                text = cls._text(value)
+                if text and text not in result:
+                    result.append(text)
+        return result
 
     def _upsert_history_record(
         self,

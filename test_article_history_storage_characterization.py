@@ -4,8 +4,10 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import core.article_store as article_store
 import core.history as history
@@ -385,6 +387,8 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self._original_storage_backend = os.environ.get(history.STORAGE_BACKEND_ENV)
         self._original_shadow_write = os.environ.get(history.STRUCTURED_SHADOW_WRITE_ENV)
         self._original_read_backend = os.environ.get(history.STRUCTURED_READ_BACKEND_ENV)
+        self._original_rebuild_interval = os.environ.get("AIBRANDMONITOR_HISTORY_SQLITE_REBUILD_MIN_INTERVAL_SECONDS")
+        self._original_bad_db_cooldown = os.environ.get("AIBRANDMONITOR_HISTORY_SQLITE_BAD_DB_COOLDOWN_SECONDS")
         self._original_paths = {
             "DEFAULT_HISTORY_DIR": history.DEFAULT_HISTORY_DIR,
             "HISTORY_DIR": history.HISTORY_DIR,
@@ -412,6 +416,14 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             os.environ.pop(history.STRUCTURED_READ_BACKEND_ENV, None)
         else:
             os.environ[history.STRUCTURED_READ_BACKEND_ENV] = self._original_read_backend
+        if self._original_rebuild_interval is None:
+            os.environ.pop("AIBRANDMONITOR_HISTORY_SQLITE_REBUILD_MIN_INTERVAL_SECONDS", None)
+        else:
+            os.environ["AIBRANDMONITOR_HISTORY_SQLITE_REBUILD_MIN_INTERVAL_SECONDS"] = self._original_rebuild_interval
+        if self._original_bad_db_cooldown is None:
+            os.environ.pop("AIBRANDMONITOR_HISTORY_SQLITE_BAD_DB_COOLDOWN_SECONDS", None)
+        else:
+            os.environ["AIBRANDMONITOR_HISTORY_SQLITE_BAD_DB_COOLDOWN_SECONDS"] = self._original_bad_db_cooldown
         history.DEFAULT_HISTORY_DIR = self._original_paths["DEFAULT_HISTORY_DIR"]
         history.HISTORY_DIR = self._original_paths["HISTORY_DIR"]
         history.LOCAL_STORE_DB_FILE = self._original_paths["LOCAL_STORE_DB_FILE"]
@@ -419,6 +431,16 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         history.configure_structured_history_storage({})
         history.reset_structured_read_health()
         self._tmpdir.cleanup()
+
+    def _wait_for_effective_history_backend(self, backend: str, timeout: float = 2.0) -> dict:
+        deadline = time.time() + timeout
+        last_health: dict = {}
+        while time.time() < deadline:
+            last_health = history.get_structured_read_health()
+            if last_health.get("effectiveBackend") == backend:
+                return last_health
+            time.sleep(0.02)
+        return last_health
 
     def test_default_history_keeps_json_backend(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
@@ -541,6 +563,95 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self.assertEqual(legacy["review_status"], "approved")
         self.assertEqual(primary["review_note"], "ok")
         self.assertEqual(store.get_pending_reviews(), [])
+
+    def test_structured_shadow_runtime_writes_keep_auto_backend_fresh_when_shadow_was_fresh(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "auto"
+        os.environ[history.STRUCTURED_SHADOW_WRITE_ENV] = "1"
+        source_records = [
+            {
+                "id": "existing-1",
+                "ts": "2024-01-01 09:00",
+                "task_id": "task_runtime_auto",
+                "task_name": "Runtime Auto",
+                "rank": 1,
+                "success": True,
+            },
+        ]
+        history._task_file("task_runtime_auto").write_text(
+            json.dumps(source_records, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        store = ArticleHistorySQLiteStore(history.HISTORY_SHADOW_DB_FILE)
+        store.import_history_sources({"task_runtime_auto": source_records}, replace=True)
+        store.set_meta("history_source_signature", history.get_history_source_signature())
+
+        entry = history.record(
+            "Runtime Auto",
+            "doubao",
+            "关键词",
+            "品牌A",
+            1,
+            True,
+            task_id="task_runtime_auto",
+        )
+        changed = history.apply_review("Runtime Auto", entry["id"], "approved", "ok", task_id="task_runtime_auto")
+
+        self.assertTrue(changed)
+        health = history.get_structured_read_health()
+        self.assertTrue(health["fresh"])
+        self.assertEqual(health["effectiveBackend"], "sqlite_shadow")
+        self.assertEqual(
+            [item["id"] for item in history.get_records("Runtime Auto", task_id="task_runtime_auto")],
+            ["existing-1", entry["id"]],
+        )
+        self.assertEqual(history.get_records("Runtime Auto", task_id="task_runtime_auto")[-1]["review_status"], "approved")
+        self.assertEqual(history.get_structured_read_health()["last_status"], "success")
+
+    def test_structured_shadow_runtime_writes_trigger_auto_rebuild_when_shadow_was_stale(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "auto"
+        os.environ[history.STRUCTURED_SHADOW_WRITE_ENV] = "1"
+        os.environ["AIBRANDMONITOR_HISTORY_SQLITE_REBUILD_MIN_INTERVAL_SECONDS"] = "0"
+        history._task_file("task_runtime_stale").write_text(
+            json.dumps([
+                {
+                    "id": "stale-before",
+                    "ts": "2024-01-01 09:00",
+                    "task_id": "task_runtime_stale",
+                    "task_name": "Runtime Stale",
+                    "rank": 1,
+                    "success": True,
+                },
+            ], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        store = ArticleHistorySQLiteStore(history.HISTORY_SHADOW_DB_FILE)
+        store.import_history_sources({"task_runtime_stale": []}, replace=True)
+        store.set_meta("history_source_signature", "stale-signature")
+
+        entry = history.record(
+            "Runtime Stale",
+            "doubao",
+            "关键词",
+            "品牌A",
+            1,
+            True,
+            task_id="task_runtime_stale",
+        )
+
+        immediate_health = history.get_structured_read_health()
+        self.assertTrue(
+            immediate_health["selfHeal"].get("running")
+            or immediate_health["selfHeal"].get("last_started_at")
+        )
+        healed = self._wait_for_effective_history_backend("sqlite_shadow")
+        self.assertTrue(healed["fresh"])
+        self.assertEqual(healed["selfHeal"].get("last_ok"), True)
+        self.assertEqual(
+            [item["id"] for item in history.get_records("Runtime Stale", task_id="task_runtime_stale")],
+            ["stale-before", entry["id"]],
+        )
 
     def test_structured_shadow_writes_use_safe_legacy_storage_key_for_spaced_names(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
@@ -742,9 +853,10 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self.assertEqual(health["last_fallback_reason"], "shadow_db_missing")
         self.assertGreaterEqual(health["fallback_count"], 1)
 
-    def test_structured_read_auto_mode_uses_json_without_creating_missing_shadow_db(self) -> None:
+    def test_structured_read_auto_mode_self_heals_missing_shadow_db_after_json_fallback(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
         os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "auto"
+        os.environ["AIBRANDMONITOR_HISTORY_SQLITE_REBUILD_MIN_INTERVAL_SECONDS"] = "0"
         legacy_file = history._task_file("Auto Fallback")
         legacy_file.write_text(
             json.dumps([
@@ -761,19 +873,24 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
 
         self.assertFalse(history.HISTORY_SHADOW_DB_FILE.exists())
         self.assertEqual([item["id"] for item in history.get_records("Auto Fallback")], ["auto-json-1"])
-        self.assertFalse(history.HISTORY_SHADOW_DB_FILE.exists())
         health = history.get_structured_read_health()
-        self.assertFalse(health["enabled"])
-        self.assertFalse(health["available"])
-        self.assertFalse(health["ready"])
-        self.assertFalse(health["fresh"])
         self.assertEqual(health["backend"], "auto")
         self.assertEqual(health["last_status"], "fallback")
         self.assertEqual(health["last_fallback_reason"], "shadow_db_missing")
+        self.assertTrue(health["selfHeal"].get("running") or health["selfHeal"].get("last_started_at"))
 
-    def test_structured_read_auto_mode_falls_back_when_shadow_db_has_no_history_schema(self) -> None:
+        healed = self._wait_for_effective_history_backend("sqlite_shadow")
+        self.assertTrue(healed["enabled"])
+        self.assertTrue(healed["available"])
+        self.assertTrue(healed["ready"])
+        self.assertTrue(healed["fresh"])
+        self.assertEqual(healed["selfHeal"].get("last_ok"), True)
+        self.assertEqual([item["id"] for item in history.get_records("Auto Fallback")], ["auto-json-1"])
+
+    def test_structured_read_auto_mode_self_heals_shadow_db_with_no_history_schema(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
         os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "sqlite_shadow_auto"
+        os.environ["AIBRANDMONITOR_HISTORY_SQLITE_REBUILD_MIN_INTERVAL_SECONDS"] = "0"
         conn = sqlite3.connect(history.HISTORY_SHADOW_DB_FILE)
         conn.close()
         legacy_file = history._task_file("Auto No Schema")
@@ -792,12 +909,15 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in history.get_records("Auto No Schema")], ["auto-json-2"])
         health = history.get_structured_read_health()
-        self.assertFalse(health["enabled"])
         self.assertTrue(health["available"])
-        self.assertFalse(health["ready"])
-        self.assertFalse(health["fresh"])
         self.assertEqual(health["last_status"], "fallback")
         self.assertEqual(health["last_fallback_reason"], "shadow_db_not_ready")
+        self.assertTrue(health["selfHeal"].get("running") or health["selfHeal"].get("last_started_at"))
+
+        healed = self._wait_for_effective_history_backend("sqlite_shadow")
+        self.assertTrue(healed["ready"])
+        self.assertTrue(healed["fresh"])
+        self.assertEqual([item["id"] for item in history.get_records("Auto No Schema")], ["auto-json-2"])
 
     def test_structured_read_explicit_mode_falls_back_when_shadow_db_has_no_history_schema(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
@@ -826,6 +946,38 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self.assertFalse(health["fresh"])
         self.assertEqual(health["effectiveBackend"], "json")
         self.assertEqual(health["last_status"], "fallback")
+        self.assertEqual(health["last_fallback_reason"], "shadow_db_not_ready")
+
+    def test_structured_read_bad_shadow_db_uses_readiness_cooldown(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "sqlite_shadow"
+        os.environ["AIBRANDMONITOR_HISTORY_SQLITE_BAD_DB_COOLDOWN_SECONDS"] = "120"
+        conn = sqlite3.connect(history.HISTORY_SHADOW_DB_FILE)
+        conn.close()
+        legacy_file = history._task_file("Bad DB Cooldown")
+        legacy_file.write_text(
+            json.dumps([
+                {
+                    "id": "bad-db-json-1",
+                    "ts": "2024-01-01 09:00",
+                    "task_name": "Bad DB Cooldown",
+                    "rank": 1,
+                    "success": True,
+                },
+            ], ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        with patch("core.article_history_sqlite_store.sqlite3.connect", wraps=sqlite3.connect) as connect_mock:
+            self.assertEqual([item["id"] for item in history.get_records("Bad DB Cooldown")], ["bad-db-json-1"])
+            self.assertEqual([item["id"] for item in history.get_records("Bad DB Cooldown")], ["bad-db-json-1"])
+            health = history.get_structured_read_health()
+
+        self.assertEqual(connect_mock.call_count, 1)
+        self.assertTrue(health["available"])
+        self.assertFalse(health["ready"])
+        self.assertGreater(health["readinessCooldownRemainingSeconds"], 0)
+        self.assertEqual(health["readinessReason"], "missing_tables")
         self.assertEqual(health["last_fallback_reason"], "shadow_db_not_ready")
 
     def test_structured_read_auto_mode_uses_sqlite_when_shadow_db_is_ready(self) -> None:
@@ -921,9 +1073,10 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self.assertEqual(health["requestedBackend"], "json")
         self.assertEqual(health["effectiveBackend"], "json")
 
-    def test_structured_read_auto_mode_falls_back_when_shadow_db_is_stale(self) -> None:
+    def test_structured_read_auto_mode_self_heals_stale_shadow_db_after_json_fallback(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
         os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "auto"
+        os.environ["AIBRANDMONITOR_HISTORY_SQLITE_REBUILD_MIN_INTERVAL_SECONDS"] = "0"
         source_records = [
             {
                 "id": "auto-stale-1",
@@ -958,12 +1111,19 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             ["auto-stale-1", "auto-stale-2"],
         )
         health = history.get_structured_read_health()
-        self.assertFalse(health["enabled"])
         self.assertTrue(health["available"])
         self.assertTrue(health["ready"])
-        self.assertFalse(health["fresh"])
         self.assertEqual(health["last_status"], "fallback")
         self.assertEqual(health["last_fallback_reason"], "shadow_db_stale")
+        self.assertTrue(health["selfHeal"].get("running") or health["selfHeal"].get("last_started_at"))
+
+        healed = self._wait_for_effective_history_backend("sqlite_shadow")
+        self.assertTrue(healed["fresh"])
+        self.assertEqual(healed["selfHeal"].get("last_ok"), True)
+        self.assertEqual(
+            [item["id"] for item in history.get_records("Auto Stale", task_id="auto_stale")],
+            ["auto-stale-1", "auto-stale-2"],
+        )
 
 
 if __name__ == "__main__":

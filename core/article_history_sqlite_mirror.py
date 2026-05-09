@@ -33,23 +33,35 @@ def rebuild_shadow_store(
 ) -> dict[str, Any]:
     """Rebuild the structured SQLite shadow store from the current JSON stores."""
     target_db_path = Path(db_path) if db_path is not None else default_shadow_db_path()
-    source_signature = history.get_history_source_signature()
+    source_signature_before = history.get_history_source_signature()
     source = load_json_source(max_workers=max_workers)
     store = ArticleHistorySQLiteStore(
         target_db_path,
         normalize_article_url=article_store.normalize_article_url,
     )
 
+    store.set_meta("history_source_signature", "")
     store.clear_all()
     article_result = store.import_articles(source["articles"], replace=False)
     history_result = store.import_history_sources(source["history"], replace=False)
-    store.set_meta("history_source_signature", source_signature)
 
     verification = verify_shadow_store(
         target_db_path,
         source=source,
         tail_limit=verify_tail_limit,
     )
+    source_signature_after = history.get_history_source_signature()
+    source_signature_stable = source_signature_before == source_signature_after
+    verification = dict(verification)
+    verification["source_signature"] = {
+        "before": source_signature_before,
+        "after": source_signature_after,
+        "stable": source_signature_stable,
+    }
+    if not source_signature_stable:
+        verification["ok"] = False
+    if verification.get("ok"):
+        store.set_meta("history_source_signature", source_signature_after)
     return {
         "db_path": str(target_db_path),
         "articles": article_result,
