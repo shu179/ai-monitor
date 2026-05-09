@@ -274,6 +274,7 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
         class FakeRuntime:
             def snapshot(self) -> dict:
                 mode = os.environ.get("AIBRANDMONITOR_HISTORY_READ_BACKEND") or "json"
+                sqlite_mode = mode == "sqlite_shadow"
                 return {
                     "stats": {
                         "enabledTasks": 2,
@@ -295,6 +296,15 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
                         },
                     },
                     "pendingReviews": [{"id": "review-1"}],
+                    "historyStorage": {
+                        "enabled": sqlite_mode,
+                        "available": True,
+                        "backend": "sqlite_shadow" if sqlite_mode else "",
+                        "last_status": "success" if sqlite_mode else "",
+                        "success_count": 1 if sqlite_mode else 0,
+                        "fallback_count": 0,
+                        "consecutive_errors": 0,
+                    },
                 }
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -314,6 +324,53 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
         self.assertEqual(
             result["comparisons"][0]["field_mismatches"][0]["field"],
             "dashboardTrend",
+        )
+
+    def test_compare_history_runtime_snapshot_requires_sqlite_health(self) -> None:
+        cli = _load_cli_module()
+
+        class FakeRuntime:
+            def snapshot(self) -> dict:
+                return {
+                    "stats": {
+                        "enabledTasks": 1,
+                        "totalTasks": 1,
+                        "todayRecords": 0,
+                        "hitRecords": 0,
+                        "errorRecords": 0,
+                    },
+                    "dashboard": {
+                        "todayTaskCount": 1,
+                        "completedCount": 0,
+                        "runningCount": 0,
+                        "failedTaskCount": 0,
+                        "todayIntercepted": 0,
+                        "trend": {"timeRange": "week", "data": []},
+                    },
+                    "pendingReviews": [],
+                    "historyStorage": {
+                        "enabled": False,
+                        "available": False,
+                        "last_status": "fallback",
+                        "fallback_count": 1,
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "shadow.sqlite3"
+            db_path.touch()
+            result = cli.compare_history_runtime_snapshot(
+                db_path,
+                rounds=1,
+                runtime_factory=FakeRuntime,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failed_checks"], ["history_storage"])
+        self.assertEqual(result["storage_mismatch_count"], 1)
+        self.assertEqual(
+            result["comparisons"][0]["storage_mismatches"],
+            ["enabled", "available", "last_status", "success_count", "fallback_count"],
         )
 
     def test_compare_history_compact_output_keeps_only_failures_and_summary(self) -> None:

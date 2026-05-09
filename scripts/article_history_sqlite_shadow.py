@@ -943,6 +943,8 @@ def compare_history_runtime_snapshot(
 
     comparisons = _compare_snapshot_batches(json_batch["results"], sqlite_batch["results"])
     mismatch_count = sum(1 for item in comparisons if not bool(item.get("ok")))
+    field_mismatch_count = sum(1 for item in comparisons if "snapshot_fields" in (item.get("mismatches") or []))
+    storage_mismatch_count = sum(1 for item in comparisons if "history_storage" in (item.get("mismatches") or []))
     request_failed_count = int(json_batch.get("failed_count") or 0) + int(sqlite_batch.get("failed_count") or 0)
     fd_failed_count = int(not bool(json_batch.get("fd_ok", True))) + int(not bool(sqlite_batch.get("fd_ok", True)))
     failed_checks: list[str] = []
@@ -954,8 +956,10 @@ def compare_history_runtime_snapshot(
         failed_checks.append("snapshot_request")
     if fd_failed_count:
         failed_checks.append("fd_growth")
-    if mismatch_count:
+    if field_mismatch_count:
         failed_checks.append("snapshot_fields")
+    if storage_mismatch_count:
+        failed_checks.append("history_storage")
     setup_failed_count = sum(1 for name in failed_checks if name in {"rebuild", "sqlite_shadow_missing"})
 
     return {
@@ -971,6 +975,8 @@ def compare_history_runtime_snapshot(
         "request_failed_count": request_failed_count,
         "fd_failed_count": fd_failed_count,
         "mismatch_count": mismatch_count,
+        "field_mismatch_count": field_mismatch_count,
+        "storage_mismatch_count": storage_mismatch_count,
         "json": _snapshot_batch_summary(json_batch),
         "sqlite_shadow": _snapshot_batch_summary(sqlite_batch),
         "comparisons": comparisons,
@@ -999,6 +1005,7 @@ def _snapshot_runtime_batch(
                 "round": round_index,
                 "elapsed_ms": round((time.perf_counter() - round_started) * 1000, 3),
                 "signature": _history_snapshot_signature(snapshot),
+                "history_storage": _history_storage_summary(snapshot),
             }
         except Exception as exc:
             return {
@@ -1067,6 +1074,24 @@ def _history_snapshot_signature(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _history_storage_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    storage = snapshot.get("historyStorage") if isinstance(snapshot.get("historyStorage"), dict) else {}
+    return {
+        "enabled": bool(storage.get("enabled")),
+        "available": bool(storage.get("available")),
+        "backend": str(storage.get("backend") or ""),
+        "last_status": str(storage.get("last_status") or ""),
+        "last_operation": str(storage.get("last_operation") or ""),
+        "last_fallback_reason": str(storage.get("last_fallback_reason") or ""),
+        "success_count": int(storage.get("success_count") or 0),
+        "fallback_count": int(storage.get("fallback_count") or 0),
+        "consecutive_errors": int(storage.get("consecutive_errors") or 0),
+        "db_path": str(storage.get("db_path") or storage.get("last_db_path") or ""),
+    }
+
+
 def _stable_snapshot_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _stable_snapshot_value(value[key]) for key in sorted(value.keys(), key=str)}
@@ -1092,6 +1117,7 @@ def _compare_snapshot_result(json_item: dict[str, Any], sqlite_item: dict[str, A
     round_index = int(json_item.get("round") or sqlite_item.get("round") or 0)
     mismatches: list[str] = []
     field_mismatches: list[dict[str, Any]] = []
+    storage_mismatches: list[str] = []
     if not bool(json_item.get("ok")) or not bool(sqlite_item.get("ok")):
         mismatches.append("snapshot_request")
     else:
@@ -1100,6 +1126,10 @@ def _compare_snapshot_result(json_item: dict[str, Any], sqlite_item: dict[str, A
         field_mismatches = _snapshot_field_mismatches(json_signature, sqlite_signature)
         if field_mismatches:
             mismatches.append("snapshot_fields")
+        sqlite_storage = sqlite_item.get("history_storage") if isinstance(sqlite_item.get("history_storage"), dict) else {}
+        storage_mismatches = _sqlite_history_storage_mismatches(sqlite_storage)
+        if storage_mismatches:
+            mismatches.append("history_storage")
 
     return {
         "ok": not mismatches,
@@ -1110,15 +1140,35 @@ def _compare_snapshot_result(json_item: dict[str, Any], sqlite_item: dict[str, A
             "elapsed_ms": json_item.get("elapsed_ms"),
             "error": json_item.get("error", ""),
             "message": json_item.get("message", ""),
+            "history_storage": json_item.get("history_storage") or {},
         },
         "sqlite": {
             "ok": bool(sqlite_item.get("ok")),
             "elapsed_ms": sqlite_item.get("elapsed_ms"),
             "error": sqlite_item.get("error", ""),
             "message": sqlite_item.get("message", ""),
+            "history_storage": sqlite_item.get("history_storage") or {},
         },
         "field_mismatches": field_mismatches[:10],
+        "storage_mismatches": storage_mismatches,
     }
+
+
+def _sqlite_history_storage_mismatches(storage: dict[str, Any]) -> list[str]:
+    mismatches: list[str] = []
+    if not bool(storage.get("enabled")):
+        mismatches.append("enabled")
+    if not bool(storage.get("available")):
+        mismatches.append("available")
+    if str(storage.get("last_status") or "") != "success":
+        mismatches.append("last_status")
+    if int(storage.get("success_count") or 0) <= 0:
+        mismatches.append("success_count")
+    if int(storage.get("fallback_count") or 0) > 0:
+        mismatches.append("fallback_count")
+    if int(storage.get("consecutive_errors") or 0) > 0:
+        mismatches.append("consecutive_errors")
+    return mismatches
 
 
 def _snapshot_field_mismatches(
