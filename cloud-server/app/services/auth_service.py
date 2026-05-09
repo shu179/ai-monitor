@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import secrets
-from datetime import timedelta
+from datetime import date, timedelta
 
 from fastapi import HTTPException, status
 from jwt import InvalidTokenError
@@ -275,10 +275,31 @@ def login_user(
     device_id: str | None = None,
     app_version: str | None = None,
 ) -> tuple[User, str, str]:
-    normalized_username = username.strip().lower()
-    user = db.scalar(select(User).where(User.username == normalized_username))
-    if not user or not verify_password(password, user.password_hash):
+    raw_username = str(username or "").strip()
+    if not raw_username:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
+    candidates = list(
+        db.scalars(
+            select(User)
+            .where(User.username == raw_username, User.deleted_at.is_(None))
+            .order_by(User.id)
+        )
+    )
+    lower_username = raw_username.lower()
+    if lower_username != raw_username:
+        lower_candidates = list(
+            db.scalars(
+                select(User)
+                .where(User.username == lower_username, User.deleted_at.is_(None))
+                .order_by(User.id)
+            )
+        )
+        seen_ids = {user.id for user in candidates}
+        candidates.extend(user for user in lower_candidates if user.id not in seen_ids)
+    matched_users = [candidate for candidate in candidates if verify_password(password, candidate.password_hash)]
+    if not matched_users:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
+    user = matched_users[0]
     if not user.enabled:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User disabled")
     if user.role == UserRole.admin and not user.email_verified and get_settings().email_verification_required:
@@ -299,7 +320,7 @@ def refresh_access_token(db: Session, refresh_token: str) -> tuple[User, str, st
     token_row = db.scalar(select(RefreshToken).where(RefreshToken.user_id == user_id, RefreshToken.jti == jti))
     if not token_row or token_row.revoked or token_row.expires_at < utc_now():
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token revoked")
-    user = db.scalar(select(User).where(User.id == user_id))
+    user = db.scalar(select(User).where(User.id == user_id, User.deleted_at.is_(None)))
     if not user or not user.enabled:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User disabled")
 
@@ -321,3 +342,28 @@ def revoke_refresh_token(db: Session, refresh_token: str) -> None:
     if token_row:
         token_row.revoked = True
         db.commit()
+
+
+def update_my_profile(
+    db: Session,
+    user: User,
+    *,
+    display_name: str | None,
+    avatar: str | None,
+    birthday: date | None,
+    hire_date: date | None,
+    fields_set: set[str],
+) -> User:
+    if "avatar" in fields_set:
+        user.avatar = str(avatar or "").strip() or None
+    if user.role == UserRole.admin:
+        if "display_name" in fields_set:
+            user.display_name = str(display_name or "").strip() or None
+        if "birthday" in fields_set:
+            user.birthday = birthday
+        if "hire_date" in fields_set:
+            user.hire_date = hire_date
+    user.updated_at = utc_now()
+    db.commit()
+    db.refresh(user)
+    return user

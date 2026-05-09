@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -7,8 +9,10 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    Article,
     ArticleReferenceEvent,
     BrandTask,
+    ClassificationJob,
     RunRecord,
     SyncEvent,
     TaskMember,
@@ -17,6 +21,9 @@ from app.models import (
     UserRole,
 )
 from app.sync_event_types import (
+    EVENT_ARTICLE_CHANGED,
+    EVENT_ARTICLE_TASK_LINKS,
+    EVENT_ARTICLE_UPSERT,
     EVENT_ASSIGNMENT_CHANGED,
     EVENT_REFERENCE_CHANGED,
     EVENT_RUN_RECORD_CHANGED,
@@ -65,6 +72,20 @@ def build_workspace_event_snapshot(db: Session, user: User) -> dict[str, Any]:
                 )
             )
         ),
+        "article_event_id": _int_version(
+            db.scalar(
+                select(func.max(SyncEvent.id)).where(
+                    SyncEvent.workspace_id == workspace_id,
+                    SyncEvent.event_type.in_([EVENT_ARTICLE_UPSERT, EVENT_ARTICLE_TASK_LINKS]),
+                )
+            )
+        ),
+        "article_updated_at": _datetime_version(
+            db.scalar(select(func.max(Article.updated_at)).where(Article.workspace_id == workspace_id))
+        ),
+        "classification_job_updated_at": _datetime_version(
+            db.scalar(select(func.max(ClassificationJob.updated_at)).where(ClassificationJob.workspace_id == workspace_id))
+        ),
         "reference_event_id": _int_version(
             db.scalar(
                 select(func.max(ArticleReferenceEvent.id)).where(ArticleReferenceEvent.workspace_id == workspace_id)
@@ -104,6 +125,12 @@ def diff_workspace_event_names(previous: dict[str, Any], current: dict[str, Any]
         events.append(EVENT_RUN_RECORD_CHANGED)
     if _int_version(current.get("task_day_status_event_id")) > _int_version(previous.get("task_day_status_event_id")):
         events.append(EVENT_TASK_DAY_STATUS_CHANGED)
+    if (
+        _int_version(current.get("article_event_id")) > _int_version(previous.get("article_event_id"))
+        or current.get("article_updated_at") != previous.get("article_updated_at")
+        or current.get("classification_job_updated_at") != previous.get("classification_job_updated_at")
+    ):
+        events.append(EVENT_ARTICLE_CHANGED)
     if _int_version(current.get("reference_event_id")) > _int_version(previous.get("reference_event_id")):
         events.append(EVENT_REFERENCE_CHANGED)
     if _int_version(current.get("sync_event_id")) > _int_version(previous.get("sync_event_id")) and not events:
@@ -112,18 +139,19 @@ def diff_workspace_event_names(previous: dict[str, Any], current: dict[str, Any]
 
 
 def event_id_for_snapshot(snapshot: dict[str, Any]) -> str:
-    parts = [
-        str(snapshot.get("task_updated_at") or "0"),
-        str(snapshot.get("task_count") or 0),
-        str(snapshot.get("assignment_event_id") or 0),
-        str(snapshot.get("run_record_id") or 0),
-        str(snapshot.get("task_day_status_event_id") or 0),
-        str(snapshot.get("reference_event_id") or 0),
-        str(snapshot.get("sync_event_id") or 0),
-        str(snapshot.get("visible_task_count") or 0),
-        str(snapshot.get("visible_task_signature") or ""),
-    ]
-    return ".".join(parts)
+    if not snapshot:
+        return "0"
+    payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+    return ".".join([
+        str(_int_version(snapshot.get("sync_event_id"))),
+        str(_int_version(snapshot.get("assignment_event_id"))),
+        str(_int_version(snapshot.get("run_record_id"))),
+        str(_int_version(snapshot.get("task_day_status_event_id"))),
+        str(_int_version(snapshot.get("article_event_id"))),
+        str(_int_version(snapshot.get("reference_event_id"))),
+        digest,
+    ])
 
 
 def build_sync_changes(
@@ -150,17 +178,50 @@ def build_sync_changes(
         if max_id > _int_version((task_day_status_cursors or {}).get(task_id))
     ]
     task_or_assignment_changed = any(event in FULL_TASK_PULL_EVENT_NAMES for event in events)
+    changed_task_ids = _changed_visible_task_ids(previous, snapshot) if task_or_assignment_changed else []
     return {
         "snapshot": snapshot,
         "event_id": event_id_for_snapshot(snapshot),
         "events": events,
         "full_task_pull_required": bool(not previous or task_or_assignment_changed),
+        "changed_task_ids": changed_task_ids,
         "run_record_task_ids": changed_run_record_task_ids,
         "run_record_max_ids": run_record_max_ids,
         "task_day_status_task_ids": changed_task_day_status_task_ids,
         "task_day_status_max_ids": task_day_status_max_ids,
         "reference_changed": EVENT_REFERENCE_CHANGED in events,
     }
+
+
+def _changed_visible_task_ids(previous: dict[str, Any], current: dict[str, Any]) -> list[int]:
+    previous_parts = _visible_task_signature_parts(previous)
+    current_parts = _visible_task_signature_parts(current)
+    changed: set[int] = set()
+    for task_id, current_value in current_parts.items():
+        if previous_parts.get(task_id) != current_value:
+            changed.add(task_id)
+    for task_id in previous_parts:
+        if task_id not in current_parts:
+            changed.add(task_id)
+    return sorted(changed)
+
+
+def _visible_task_signature_parts(snapshot: dict[str, Any]) -> dict[int, str]:
+    signature = str((snapshot or {}).get("visible_task_signature") or "")
+    parts: dict[int, str] = {}
+    for raw_part in signature.split("|"):
+        part = raw_part.strip()
+        if not part:
+            continue
+        first, _sep, _rest = part.partition(":")
+        try:
+            task_id = int(first)
+        except Exception:
+            continue
+        if task_id <= 0:
+            continue
+        parts[task_id] = part
+    return parts
 
 
 def _run_record_max_ids_for_visible_tasks(db: Session, user: User, task_cursors: dict[int, int]) -> dict[int, int]:

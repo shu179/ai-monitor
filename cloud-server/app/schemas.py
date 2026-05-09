@@ -21,6 +21,7 @@ class UserPublic(BaseModel):
     birthday: date | None = None
     hire_date: date | None = None
     view_all_tasks: bool = False
+    visible_task_ids: list[int] = Field(default_factory=list)
     enabled: bool
     token_version: int
     deleted_at: datetime | None = None
@@ -178,6 +179,7 @@ class SyncChangesResponse(BaseModel):
     event_id: str
     events: list[str]
     full_task_pull_required: bool
+    changed_task_ids: list[int] = Field(default_factory=list)
     run_record_task_ids: list[int]
     run_record_max_ids: dict[int, int]
     task_day_status_task_ids: list[int] = Field(default_factory=list)
@@ -218,6 +220,60 @@ class TaskDayStatusEventsBatchRequest(BaseModel):
 
 class TaskDayStatusEventsBatchResponse(BaseModel):
     events: dict[int, list[dict[str, Any]]]
+
+
+class ArticleTaskLinkPublic(BaseModel):
+    task_id: int
+    source: str
+    confidence: int
+    reason_json: dict[str, Any]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ArticlePublic(BaseModel):
+    id: int
+    workspace_id: int
+    canonical_url: str
+    url_hash: str
+    title: str | None = None
+    source: str | None = None
+    media_type: str | None = None
+    published_at: datetime | None = None
+    payload_json: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+    task_links: list[ArticleTaskLinkPublic] = Field(default_factory=list)
+
+
+class ArticlesResponse(BaseModel):
+    articles: list[ArticlePublic]
+    count: int
+    max_updated_at: str = ""
+    max_article_id: int = 0
+
+
+class ArticleClassificationJobPublic(BaseModel):
+    id: int
+    workspace_id: int
+    article_id: int
+    status: Literal["unresolved", "resolved", "ignored"]
+    reason_json: dict[str, Any]
+    resolved_task_id: int | None = None
+    resolved_by: int | None = None
+    created_at: datetime
+    updated_at: datetime
+    article: ArticlePublic
+
+
+class ResolveArticleClassificationRequest(BaseModel):
+    task_id: int
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class IgnoreArticleClassificationRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=1000)
 
 
 class ReferenceRankingItem(BaseModel):

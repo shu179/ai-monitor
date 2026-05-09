@@ -13,6 +13,7 @@ from app.schemas import (
     ResetPasswordRequest,
     TokenPair,
     UserPublic,
+    UpdateMyProfileRequest,
     VerifyEmailRequest,
 )
 from app.services.auth_service import (
@@ -23,6 +24,7 @@ from app.services.auth_service import (
     resend_admin_verification_code,
     reset_admin_password,
     revoke_refresh_token,
+    update_my_profile,
     verify_admin_email,
 )
 
@@ -102,3 +104,16 @@ def logout(payload: RefreshRequest, db: DbSession) -> APIMessage:
 @router.get("/me", response_model=UserPublic)
 def me(current_user: CurrentUser) -> UserPublic:
     return current_user
+
+
+@router.patch("/me/profile", response_model=UserPublic)
+def update_profile(payload: UpdateMyProfileRequest, current_user: CurrentUser, db: DbSession) -> UserPublic:
+    return update_my_profile(
+        db,
+        current_user,
+        display_name=payload.display_name,
+        avatar=payload.avatar,
+        birthday=payload.birthday,
+        hire_date=payload.hire_date,
+        fields_set=set(payload.model_fields_set),
+    )

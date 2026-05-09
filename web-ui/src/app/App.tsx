@@ -18,8 +18,10 @@ import {
   TASK_DATA_CHANGED_EVENT,
   areArticlesEqual,
   areTodosEqual,
+  cloudStatusIdentityKey,
   fetchBootstrap,
   fetchCloudStatus,
+  invalidateAccountScopedCaches,
   invalidateBootstrapCache,
   loginCloud,
   logoutCloud,
@@ -37,11 +39,13 @@ import {
   type BootstrapPayload,
   type CloudStatusSnapshot,
 } from "./lib/backend";
+import { commitCloudAdminStatus } from "./lib/cloudAdminCache";
 
 const LOGIN_IDENTITY_STORAGE_KEY = "surfaced-web-ui-login-identity";
 const DEFAULT_CLOUD_BASE_URL = "https://api.surfacedlab.com";
 const LOGIN_MODAL_WIDTH = 332;
 const LOGIN_MODAL_HEIGHT = 430;
+const ACCOUNT_DATA_LOADING_MAX_WAIT_MS = 2600;
 
 const loadCenterContent = () => import("./components/CenterContent").then((module) => ({ default: module.CenterContent }));
 const loadBrandsContent = () => import("./components/BrandsContent").then((module) => ({ default: module.BrandsContent }));
@@ -90,9 +94,71 @@ function readStoredLoginIdentity() {
   return window.localStorage.getItem(LOGIN_IDENTITY_STORAGE_KEY) || "";
 }
 
+function createSecureBootstrap(): BootstrapPayload {
+  return {
+    ...FALLBACK_BOOTSTRAP,
+    sidebar: {
+      userName: "",
+      role: "",
+      avatar: "",
+      online: false,
+    },
+    profile: {
+      name: "",
+      role: "",
+      avatar: "",
+      birthday: "",
+      hireDate: "",
+    },
+    assistant: {
+      ...FALLBACK_BOOTSTRAP.assistant,
+      status: "账号数据加载中",
+    },
+    dashboard: {
+      ...FALLBACK_BOOTSTRAP.dashboard,
+      userName: "",
+      headline: "",
+      todayTaskCount: 0,
+      completedCount: 0,
+      runningCount: 0,
+      failedTaskCount: 0,
+      failedTasks: [],
+      todayIntercepted: 0,
+      sourceBreakdown: [],
+      taskCards: [],
+      mediaStats: [],
+    },
+    platforms: [],
+    tasks: [],
+    todos: [],
+    articles: [],
+    recentEvents: [],
+    pendingReviews: [],
+    stats: {
+      enabledTasks: 0,
+      totalTasks: 0,
+      todayRecords: 0,
+      hitRecords: 0,
+      errorRecords: 0,
+    },
+    monitoring: {
+      enabled: false,
+      running: false,
+      statusMessage: "账号数据加载中",
+    },
+    lastRun: null,
+    availableModels: {},
+    regionTags: [],
+    industryTags: [],
+    config: {},
+  };
+}
+
 export default function App() {
   const saveToastTimerRef = useRef<number | null>(null);
   const runMessageTimerRef = useRef<number | null>(null);
+  const bootstrapRequestSeqRef = useRef(0);
+  const activeCloudIdentityRef = useRef("");
   const loginModalDragRef = useRef<{
     pointerId: number;
     offsetX: number;
@@ -112,16 +178,7 @@ export default function App() {
     taskName: "",
     key: 0,
   });
-  const [bootstrap, setBootstrap] = useState<BootstrapPayload>(() => {
-    const cachedTodos = readTodoCache();
-    if (!cachedTodos?.todos.length) {
-      return FALLBACK_BOOTSTRAP;
-    }
-    return {
-      ...FALLBACK_BOOTSTRAP,
-      todos: cachedTodos.todos,
-    };
-  });
+  const [bootstrap, setBootstrap] = useState<BootstrapPayload>(() => createSecureBootstrap());
   const [runMessage, setRunMessage] = useState("");
   const [saveToast, setSaveToast] = useState({
     visible: false,
@@ -129,10 +186,12 @@ export default function App() {
   });
   const [isAuthChecked, setIsAuthChecked] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isAccountDataLoading, setIsAccountDataLoading] = useState(false);
   const [cloudStatus, setCloudStatus] = useState<CloudStatusSnapshot | null>(null);
   const [loginIdentity, setLoginIdentity] = useState(() => readStoredLoginIdentity());
   const [isLoginModalOpen, setIsLoginModalOpen] = useState(false);
   const [loginModalPosition, setLoginModalPosition] = useState({ x: 0, y: 0 });
+  const currentCloudIdentityKey = cloudStatusIdentityKey(cloudStatus);
   const currentDetectionMode = (() => {
     const activeCard = bootstrap.dashboard?.taskCards?.find((card) => card.active);
     if (!activeCard) return "smart";
@@ -144,8 +203,34 @@ export default function App() {
   const residentOcrWindowEnabled = Boolean(bootstrap.config?.recognition?.floating_window_resident_enabled);
   const showResidentOcrWindow = residentOcrWindowEnabled && !recognitionTestWindow.open;
 
+  const beginAccountDataTransition = useCallback(() => {
+    bootstrapRequestSeqRef.current += 1;
+    invalidateAccountScopedCaches();
+    commitCloudAdminStatus(null);
+    setBootstrap(createSecureBootstrap());
+    setRunMessage("");
+    setRecognitionTestWindow((prev) => ({
+      ...prev,
+      open: false,
+      taskId: "",
+      taskName: "",
+    }));
+    setIsAccountDataLoading(true);
+  }, []);
+
   const applyCloudAuthStatus = useCallback((status?: CloudStatusSnapshot | null) => {
     const nextStatus = status || null;
+    const nextIdentityKey = cloudStatusIdentityKey(nextStatus);
+    const previousIdentityKey = activeCloudIdentityRef.current;
+    if (nextIdentityKey && previousIdentityKey && nextIdentityKey !== previousIdentityKey) {
+      beginAccountDataTransition();
+    }
+    if (!nextIdentityKey && previousIdentityKey) {
+      beginAccountDataTransition();
+      setIsAccountDataLoading(false);
+    }
+    activeCloudIdentityRef.current = nextIdentityKey;
+    commitCloudAdminStatus(nextStatus);
     const loggedIn = Boolean(nextStatus?.loggedIn);
     setCloudStatus(nextStatus);
     setIsAuthenticated(loggedIn);
@@ -153,17 +238,25 @@ export default function App() {
       setActiveTab("看板");
       setIsLoginModalOpen(false);
     }
-  }, []);
+  }, [beginAccountDataTransition]);
 
-  const refreshBootstrap = useCallback(async (options?: { force?: boolean }) => {
+  const refreshBootstrap = useCallback(async (options?: { force?: boolean; fallback?: BootstrapPayload; timeoutMs?: number }) => {
     if (options?.force) {
       invalidateBootstrapCache();
     }
-    const data = await fetchBootstrap();
-    const cachedTodos = readTodoCache();
+    const requestSeq = bootstrapRequestSeqRef.current;
+    const identityKey = activeCloudIdentityRef.current;
+    const data = await fetchBootstrap({
+      fallback: options?.fallback,
+      timeoutMs: options?.timeoutMs,
+    });
+    if (requestSeq !== bootstrapRequestSeqRef.current) {
+      return;
+    }
+    const cachedTodos = readTodoCache(identityKey);
     if (cachedTodos?.pending) {
       if (areTodosEqual(cachedTodos.todos, data.todos)) {
-        writeTodoCache(data.todos, false);
+        writeTodoCache(data.todos, false, identityKey);
       } else {
         data.todos = cachedTodos.todos;
       }
@@ -181,13 +274,16 @@ export default function App() {
       if (cancelled) {
         return;
       }
+      if (result.cloud?.loggedIn) {
+        beginAccountDataTransition();
+      }
       applyCloudAuthStatus(result.cloud);
       setIsAuthChecked(true);
     });
     return () => {
       cancelled = true;
     };
-  }, [applyCloudAuthStatus]);
+  }, [applyCloudAuthStatus, beginAccountDataTransition]);
 
   useEffect(() => {
     if (!isAuthChecked) {
@@ -255,13 +351,28 @@ export default function App() {
       return;
     }
     let cancelled = false;
-    refreshBootstrap().then(() => {
+    const secureFallback = createSecureBootstrap();
+    setIsAccountDataLoading(true);
+    const loadingTimer = window.setTimeout(() => {
+      if (!cancelled) {
+        setIsAccountDataLoading(false);
+      }
+    }, ACCOUNT_DATA_LOADING_MAX_WAIT_MS);
+    refreshBootstrap({ force: true, fallback: secureFallback }).then(() => {
       if (cancelled) {
         return;
       }
+      setIsAccountDataLoading(false);
+    }).catch(() => {
+      if (!cancelled) {
+        setIsAccountDataLoading(false);
+      }
+    }).finally(() => {
+      window.clearTimeout(loadingTimer);
     });
     return () => {
       cancelled = true;
+      window.clearTimeout(loadingTimer);
     };
   }, [isAuthenticated, refreshBootstrap]);
 
@@ -404,16 +515,17 @@ export default function App() {
   }, [isAuthenticated]);
 
   const handleLogout = useCallback(async () => {
+    beginAccountDataTransition();
+    applyCloudAuthStatus(null);
+    setIsAuthenticated(false);
+    setActiveTab("看板");
+    setIsLoginModalOpen(false);
     try {
       await logoutCloud();
     } catch {
       // Local auth state is still cleared even if the cloud logout request fails.
     }
-    applyCloudAuthStatus(null);
-    setIsAuthenticated(false);
-    setActiveTab("看板");
-    setIsLoginModalOpen(false);
-  }, [applyCloudAuthStatus]);
+  }, [applyCloudAuthStatus, beginAccountDataTransition]);
 
   const handleLogin = useCallback(async (payload: LoginPayload) => {
     const nextIdentity = payload.username.trim();
@@ -425,13 +537,13 @@ export default function App() {
     if (!result.ok || !result.cloud?.loggedIn) {
       throw new Error(result.message || "云端登录失败");
     }
+    beginAccountDataTransition();
     setLoginIdentity(nextIdentity);
     applyCloudAuthStatus(result.cloud);
     setIsLoginModalOpen(false);
     setActiveTab("看板");
     window.localStorage.setItem(LOGIN_IDENTITY_STORAGE_KEY, nextIdentity);
-    await refreshBootstrap({ force: true });
-  }, [applyCloudAuthStatus, refreshBootstrap]);
+  }, [applyCloudAuthStatus, beginAccountDataTransition]);
 
   const handleRegister = useCallback(async (payload: RegisterPayload) => {
     const email = payload.email.trim();
@@ -448,13 +560,13 @@ export default function App() {
     if (!result.ok || !result.cloud?.loggedIn) {
       throw new Error(result.message || "管理员账号注册失败");
     }
+    beginAccountDataTransition();
     setLoginIdentity(email);
     applyCloudAuthStatus(result.cloud);
     setIsLoginModalOpen(false);
     setActiveTab("看板");
     window.localStorage.setItem(LOGIN_IDENTITY_STORAGE_KEY, email);
-    await refreshBootstrap({ force: true });
-  }, [applyCloudAuthStatus, refreshBootstrap]);
+  }, [applyCloudAuthStatus, beginAccountDataTransition]);
 
   const handleVerifyEmail = useCallback(async (payload: VerifyEmailPayload) => {
     const email = payload.email.trim();
@@ -466,13 +578,13 @@ export default function App() {
     if (!result.ok || !result.cloud?.loggedIn) {
       throw new Error(result.message || "邮箱验证失败");
     }
+    beginAccountDataTransition();
     setLoginIdentity(email);
     applyCloudAuthStatus(result.cloud);
     setIsLoginModalOpen(false);
     setActiveTab("看板");
     window.localStorage.setItem(LOGIN_IDENTITY_STORAGE_KEY, email);
-    await refreshBootstrap({ force: true });
-  }, [applyCloudAuthStatus, refreshBootstrap]);
+  }, [applyCloudAuthStatus, beginAccountDataTransition]);
 
   const handleResendEmailCode = useCallback(async (payload: { email: string; baseUrl: string }) => {
     const result = await resendCloudEmailCode({
@@ -682,6 +794,23 @@ export default function App() {
     );
   }
 
+  if (isAccountDataLoading) {
+    return (
+      <div
+        className="flex min-h-screen w-full items-center justify-center text-[#173A43]"
+        style={{
+          background:
+            "radial-gradient(circle at 50% 28%, rgba(20,199,243,0.10), transparent 34%), linear-gradient(180deg, #fcfdff 0%, #f7faff 100%)",
+        }}
+      >
+        <div className="flex flex-col items-center gap-4">
+          <div className="text-[42px] font-bold tracking-[-0.04em]">Surfaced</div>
+          <div className="text-[12px] font-semibold tracking-wide text-gray-400">正在加载当前账号数据</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <>
       {isDarkMode && <style>{darkThemeStyles}</style>}
@@ -717,6 +846,7 @@ export default function App() {
           ) : activeTab === "品牌" ? (
             <BrandsContent
               currentDetectionMode={currentDetectionMode}
+              cloudRole={cloudStatus?.user.role || ""}
               onSaveSuccess={showSaveSuccessToast}
               onRecognitionTestStart={handleRecognitionTestStart}
             />
@@ -733,6 +863,12 @@ export default function App() {
           ) : activeTab === "账号" ? (
             <AccountContent
               isAuthenticated={isAuthenticated}
+              cloudStatusSnapshot={cloudStatus}
+              initialProfile={bootstrap.profile || {
+                name: bootstrap.sidebar?.userName,
+                role: bootstrap.sidebar?.role,
+                avatar: bootstrap.sidebar?.avatar,
+              }}
               onSaveSuccess={showSaveSuccessToast}
               onProfileSaved={refreshBootstrap}
               onLogout={handleLogout}
@@ -760,9 +896,11 @@ export default function App() {
         </Suspense>
         <RightSidebar
           monitoring={bootstrap.monitoring}
+          cloudRole={cloudStatus?.user.role || ""}
           todos={bootstrap.todos}
           articles={bootstrap.articles}
           stats={bootstrap.stats}
+          todoCacheIdentity={currentCloudIdentityKey}
           onMonitoringToggle={handleMonitoringToggle}
           onTodosChange={handleTodosChange}
           onArticlesChange={handleArticlesChange}

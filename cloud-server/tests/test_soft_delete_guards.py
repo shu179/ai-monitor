@@ -21,7 +21,7 @@ from app.services.sync_service import _task_allows_operation  # noqa: E402
 class SoftDeleteGuardTests(unittest.TestCase):
     def test_deleted_task_accepts_only_pre_delete_run(self) -> None:
         deleted_at = datetime(2026, 5, 4, 2, 0, 0, tzinfo=timezone.utc)
-        task = SimpleNamespace(deleted_at=deleted_at, delete_expires_at=deleted_at + timedelta(days=3))
+        task = SimpleNamespace(deleted_at=deleted_at, delete_expires_at=datetime(2099, 1, 1, tzinfo=timezone.utc))
 
         self.assertTrue(_task_allows_operation(task, run_started_at="2026-05-04T09:59:59+08:00"))
         self.assertTrue(_task_allows_operation(task, run_started_at="2026-05-04T10:00:00+08:00"))

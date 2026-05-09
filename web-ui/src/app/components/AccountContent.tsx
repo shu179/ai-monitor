@@ -1,9 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CalendarDays, Clock, Edit2, LogOut, Save, Upload, RotateCcw, User, Link2, Plus, Trash2 } from "lucide-react";
+import { Edit2, LogOut, Save, Upload, RotateCcw, User, Plus, Trash2 } from "lucide-react";
 import { ImageWithFallback } from "./figma/ImageWithFallback";
 import { ConfirmModal } from "./ConfirmModal";
 import { DatePickerField } from "./ui/date-picker-field";
-import { fetchSettings, saveProfile, saveSettings, type ArticleAccountSnapshot } from "../lib/backend";
+import { CloudSubAccountsSection } from "./account/CloudSubAccountsSection";
+import { AccountSection, DetailItem, Field, ReadOnlyFieldValue } from "./account/AccountPrimitives";
+import { formatProfileDate, normalizeDateText, roleToProfileLabel } from "./account/cloudAccountUtils";
+import {
+  fetchCloudStatus,
+  fetchSettings,
+  saveProfile,
+  saveSettings,
+  type ArticleAccountSnapshot,
+  type CloudStatusSnapshot,
+  type CloudUserSnapshot,
+  type ProfileSnapshot,
+} from "../lib/backend";
 import { notifySaveSuccess } from "../lib/saveToast";
 
 type AvatarCropDraft = {
@@ -31,12 +43,77 @@ const ARTICLE_ACCOUNT_PLATFORM_LABELS: Record<string, string> = {
   unknown: "未知平台",
 };
 
+type UserProfile = {
+  name: string;
+  role: string;
+  birthday: string;
+  hireDate: string;
+  avatar: string;
+};
+
 type ArticleAccountGroup = {
   key: string;
   label: string;
   latestCrawledAt: string;
   accounts: ArticleAccountSnapshot[];
 };
+
+function normalizeInitialProfile(initialProfile?: Partial<ProfileSnapshot> | null): UserProfile {
+  return {
+    name: String(initialProfile?.name || "林见鹿").trim(),
+    role: String(initialProfile?.role || "资深 AI 运营").trim(),
+    birthday: normalizeDateText(initialProfile?.birthday),
+    hireDate: normalizeDateText(initialProfile?.hireDate),
+    avatar: String(initialProfile?.avatar || "").trim(),
+  };
+}
+
+function mergeProfileFallback(base: UserProfile, next: UserProfile): UserProfile {
+  return {
+    name: next.name || base.name,
+    role: next.role || base.role,
+    birthday: next.birthday || base.birthday,
+    hireDate: next.hireDate || base.hireDate,
+    avatar: next.avatar || base.avatar,
+  };
+}
+
+function profileFromCloudUser(user: CloudUserSnapshot | undefined | null, fallback: UserProfile): UserProfile {
+  if (!user) {
+    return fallback;
+  }
+  const role = String(user.role || "").trim();
+  const cloudAvatar = String(user.avatar || "").trim();
+  const cloudName = String(user.display_name || "").trim();
+  return {
+    name: String(cloudName || user.username || fallback.name || "").trim(),
+    role: roleToProfileLabel(role) || fallback.role,
+    birthday: normalizeDateText(user.birthday) || fallback.birthday,
+    hireDate: normalizeDateText(user.hire_date) || fallback.hireDate,
+    avatar: cloudAvatar || fallback.avatar,
+  };
+}
+
+function cloudStatusProfileSignature(status: CloudStatusSnapshot | null | undefined) {
+  if (!status?.loggedIn) {
+    return "logged-out";
+  }
+  const user = status.user || {};
+  return [
+    String(status.baseUrl || "").trim(),
+    String(user.workspace_id || "").trim(),
+    String(user.id || "").trim(),
+    String(user.role || "").trim(),
+    String(user.username || "").trim(),
+    String(user.display_name || "").trim(),
+    String(user.avatar || "").trim(),
+    String(user.birthday || "").trim(),
+    String(user.hire_date || "").trim(),
+    String(user.enabled ?? "").trim(),
+    String(user.token_version || "").trim(),
+    String(user.deleted_at || "").trim(),
+  ].join("|");
+}
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -180,22 +257,20 @@ async function renderAvatarFromCrop(draft: AvatarCropDraft): Promise<string> {
 
 export function AccountContent({
   isAuthenticated,
+  cloudStatusSnapshot,
+  initialProfile,
   onSaveSuccess,
   onProfileSaved,
   onLogout,
 }: {
   isAuthenticated?: boolean;
+  cloudStatusSnapshot?: CloudStatusSnapshot | null;
+  initialProfile?: Partial<ProfileSnapshot> | null;
   onSaveSuccess?: (message?: string) => void;
   onProfileSaved?: () => void | Promise<void>;
   onLogout?: () => void | Promise<void>;
 }) {
-  const [profile, setProfile] = useState({
-    name: "林见鹿",
-    role: "资深 AI 运营",
-    birthday: "1996-08-12",
-    hireDate: "2022-10-24",
-    avatar: DEFAULT_PROFILE_AVATAR,
-  });
+  const [profile, setProfile] = useState<UserProfile>(() => normalizeInitialProfile(initialProfile));
   const [editProfile, setEditProfile] = useState(profile);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
@@ -205,21 +280,63 @@ export function AccountContent({
   const [articleAccountUrl, setArticleAccountUrl] = useState("");
   const [articleAccountMessage, setArticleAccountMessage] = useState("");
   const [articleAccountsSaving, setArticleAccountsSaving] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState<CloudStatusSnapshot | null>(null);
+  const cloudStatusRef = useRef<CloudStatusSnapshot | null>(null);
+  const cloudStatusSignatureRef = useRef("");
   const avatarDragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
+
+  const handleCloudStatusChange = useCallback((status: CloudStatusSnapshot | null) => {
+    const nextSignature = cloudStatusProfileSignature(status);
+    cloudStatusRef.current = status;
+    if (cloudStatusSignatureRef.current === nextSignature) {
+      return;
+    }
+    cloudStatusSignatureRef.current = nextSignature;
+    setCloudStatus(status);
+    if (status?.loggedIn) {
+      setProfile((current) => profileFromCloudUser(status.user, current));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (cloudStatusSnapshot) {
+      handleCloudStatusChange(cloudStatusSnapshot);
+    }
+  }, [cloudStatusSnapshot, handleCloudStatusChange]);
+
+  useEffect(() => {
+    if (isEditingProfile) {
+      return;
+    }
+    const nextProfile = normalizeInitialProfile(initialProfile);
+    setProfile((current) => mergeProfileFallback(current, nextProfile));
+    setEditProfile((current) => mergeProfileFallback(current, nextProfile));
+  }, [
+    initialProfile?.avatar,
+    initialProfile?.birthday,
+    initialProfile?.hireDate,
+    initialProfile?.name,
+    initialProfile?.role,
+    isEditingProfile,
+  ]);
 
   useEffect(() => {
     fetchSettings().then((data) => {
       const prof = data.profile as Record<string, string> | undefined;
       if (prof) {
         const nextProfile = {
-          name: prof.name || "林见鹿",
-          role: prof.role || "资深 AI 运营",
-          birthday: prof.birthday || "1996-08-12",
-          hireDate: prof.hire_date || "2022-10-24",
-          avatar: prof.avatar || DEFAULT_PROFILE_AVATAR,
+          name: prof.name || profile.name,
+          role: prof.role || profile.role,
+          birthday: normalizeDateText(prof.birthday) || profile.birthday,
+          hireDate: normalizeDateText(prof.hire_date) || profile.hireDate,
+          avatar: prof.avatar || profile.avatar,
         };
-        setProfile(nextProfile);
-        setEditProfile(nextProfile);
+        const cloudStatus = cloudStatusRef.current;
+        const effectiveProfile = cloudStatus?.loggedIn
+          ? profileFromCloudUser(cloudStatus.user, nextProfile)
+          : nextProfile;
+        setProfile(effectiveProfile);
+        setEditProfile(effectiveProfile);
       }
       const accountCrawling = data.account_crawling as { accounts?: ArticleAccountSnapshot[] } | undefined;
       if (Array.isArray(accountCrawling?.accounts)) {
@@ -228,15 +345,21 @@ export function AccountContent({
     });
   }, []);
 
-  const hireDays = useMemo(() => {
-    const start = new Date(profile.hireDate);
-    const now = new Date();
-    if (Number.isNaN(start.getTime())) {
-      return 0;
+  const refreshCloudStatus = useCallback(async () => {
+    try {
+      const statusResult = await fetchCloudStatus();
+      handleCloudStatusChange(statusResult.cloud || null);
+    } catch {
+      // 保留上一次状态，避免账号页因为一次瞬时请求失败闪回本地资料。
     }
-    const diffTime = Math.abs(now.getTime() - start.getTime());
-    return Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-  }, [profile.hireDate]);
+  }, [handleCloudStatusChange]);
+
+  useEffect(() => {
+    if (cloudStatusSnapshot) {
+      return;
+    }
+    void refreshCloudStatus();
+  }, [cloudStatusSnapshot, refreshCloudStatus]);
 
   const articleAccountGroups = useMemo<ArticleAccountGroup[]>(() => {
     const groups: ArticleAccountGroup[] = [];
@@ -360,17 +483,31 @@ export function AccountContent({
     }
 
     setProfile(nextProfile);
-    setIsEditingProfile(false);
-    setAvatarCropDraft(null);
-    setAvatarUploadMessage("");
-
-    await saveProfile({
+    const result = await saveProfile({
       name: nextProfile.name,
       role: nextProfile.role,
       avatar: nextProfile.avatar,
       birthday: nextProfile.birthday,
       hire_date: nextProfile.hireDate,
+      display_name: nextProfile.name,
     });
+    if (!result.ok) {
+      setIsEditingProfile(false);
+      setAvatarCropDraft(null);
+      setAvatarUploadMessage(result.message || "资料已保存本地，云端同步失败");
+      return;
+    }
+
+    if (result.cloud) {
+      cloudStatusRef.current = result.cloud;
+      setCloudStatus(result.cloud);
+      setProfile(result.cloud.loggedIn ? profileFromCloudUser(result.cloud.user, nextProfile) : nextProfile);
+    } else {
+      setProfile(nextProfile);
+    }
+    setIsEditingProfile(false);
+    setAvatarCropDraft(null);
+    setAvatarUploadMessage("");
 
     if (onProfileSaved) {
       await onProfileSaved();
@@ -445,6 +582,13 @@ export function AccountContent({
     }
   }, [articleAccounts, onSaveSuccess]);
 
+  const isCloudAdmin = Boolean(cloudStatus?.loggedIn && cloudStatus.user.role === "admin");
+  const isCloudLoggedIn = Boolean(cloudStatus?.loggedIn);
+  const currentCloudRole = String(cloudStatus?.user?.role || "").trim();
+  const profileNameLocked = isCloudLoggedIn && currentCloudRole !== "admin";
+  const profileRoleLocked = isCloudLoggedIn;
+  const profileDatesEditable = !isCloudLoggedIn || currentCloudRole === "admin";
+
   if (!isAuthenticated) {
     return null;
   }
@@ -462,74 +606,49 @@ export function AccountContent({
       </div>
 
       <div className="flex-1 overflow-y-auto pr-3 -mr-3 scrollbar-thin scrollbar-thumb-gray-200 scrollbar-track-transparent pb-10">
-        <div className="max-w-4xl">
-          <div className="flex items-start justify-between gap-4 pb-6 border-b border-gray-200/80">
-            <div className="flex items-start gap-4 min-w-0">
-              <div className="w-20 h-20 rounded-[22px] overflow-hidden bg-white border border-gray-200/80 shadow-sm shrink-0">
-                <ImageWithFallback
-                  src={(isEditingProfile ? editProfile.avatar : profile.avatar) || DEFAULT_PROFILE_AVATAR}
-                  alt="Avatar"
-                  className="w-full h-full object-cover"
-                />
-              </div>
-              <div className="min-w-0 pt-1">
-                <h2 className="text-[22px] font-black text-gray-900 tracking-tight leading-none">
-                  {isEditingProfile ? (editProfile.name || "未设置姓名") : profile.name}
-                </h2>
-                <div className="mt-2 text-[13px] font-medium text-gray-500">
-                  {isEditingProfile ? (editProfile.role || "未设置职位") : profile.role}
-                </div>
-                <div className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-2 text-[12px] text-gray-500">
-                  <span className="inline-flex items-center gap-1.5">
-                    <CalendarDays className="w-3.5 h-3.5" />
-                    生日 {isEditingProfile ? (editProfile.birthday ? editProfile.birthday.replace(/-/g, ".") : "未设置") : profile.birthday.replace(/-/g, ".")}
-                  </span>
-                  <span className="inline-flex items-center gap-1.5">
-                    <Clock className="w-3.5 h-3.5" />
-                    入职 {isEditingProfile ? (editProfile.hireDate ? editProfile.hireDate.replace(/-/g, ".") : "未设置") : profile.hireDate.replace(/-/g, ".")}
-                  </span>
-                  <span className="inline-flex items-center gap-1.5">
-                    <User className="w-3.5 h-3.5" />
-                    在岗 {hireDays.toLocaleString()} 天
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            {!isEditingProfile ? (
-              <div className="flex items-center gap-2 shrink-0">
+        <div className="max-w-4xl space-y-6">
+          <AccountSection
+            title="个人资料"
+            action={!isEditingProfile ? (
+              <div className="flex items-center gap-3 text-[12px] font-bold">
                 <button
+                  type="button"
                   onClick={() => {
                     setEditProfile(profile);
                     setAvatarCropDraft(null);
                     setAvatarUploadMessage("");
                     setIsEditingProfile(true);
                   }}
-                  className="inline-flex items-center gap-1.5 px-0 py-1 text-[12px] font-bold text-gray-600 hover:text-gray-900 transition-colors"
+                  className="inline-flex items-center gap-1.5 text-gray-600 transition-colors hover:text-gray-900"
                 >
-                  <Edit2 className="w-3.5 h-3.5" />
+                  <Edit2 className="h-3.5 w-3.5" />
                   编辑资料
                 </button>
                 <span className="text-gray-200">/</span>
                 <button
+                  type="button"
                   onClick={() => setShowLogoutConfirm(true)}
-                  className="inline-flex items-center gap-1.5 px-0 py-1 text-[12px] font-bold text-gray-400 hover:text-red-600 transition-colors"
+                  className="inline-flex items-center gap-1.5 text-gray-400 transition-colors hover:text-red-600"
                 >
-                  <LogOut className="w-3.5 h-3.5" />
+                  <LogOut className="h-3.5 w-3.5" />
                   退出登录
                 </button>
               </div>
             ) : null}
-          </div>
-
-          {isEditingProfile ? (
-            <div className="pt-7 animate-in fade-in duration-200">
-              <div className="grid gap-10 xl:grid-cols-[260px_minmax(0,1fr)]">
+          >
+            {isEditingProfile ? (
+              <div className="grid gap-8 border-y border-gray-200/80 py-5 xl:grid-cols-[180px_minmax(0,1fr)]">
                 <div>
-                  <div className="text-[12px] font-bold text-gray-900">头像</div>
-                  <div className="mt-3 flex items-center gap-3">
-                    <label className="inline-flex items-center gap-1.5 text-[12px] font-bold text-gray-900 hover:text-black transition-colors cursor-pointer">
-                      <Upload className="w-3.5 h-3.5" />
+                  <div className="h-[76px] w-[76px] overflow-hidden rounded-[18px] border border-gray-200/80 bg-white shadow-sm">
+                    <ImageWithFallback
+                      src={editProfile.avatar || DEFAULT_PROFILE_AVATAR}
+                      alt="Avatar"
+                      className="h-full w-full object-cover"
+                    />
+                  </div>
+                  <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2">
+                    <label className="inline-flex cursor-pointer items-center gap-1.5 text-[12px] font-bold text-gray-900 transition-colors hover:text-black">
+                      <Upload className="h-3.5 w-3.5" />
                       上传头像
                       <input
                         type="file"
@@ -545,17 +664,14 @@ export function AccountContent({
                         setEditProfile((prev) => ({ ...prev, avatar: "" }));
                         setAvatarUploadMessage("已切换为默认头像");
                       }}
-                      className="inline-flex items-center gap-1.5 text-[12px] font-bold text-gray-400 hover:text-gray-700 transition-colors"
+                      className="inline-flex items-center gap-1.5 text-[12px] font-bold text-gray-400 transition-colors hover:text-gray-700"
                     >
-                      <RotateCcw className="w-3.5 h-3.5" />
+                      <RotateCcw className="h-3.5 w-3.5" />
                       恢复默认
                     </button>
                   </div>
-                  <div className="mt-2 text-[11px] leading-relaxed text-gray-500">
-                    支持 JPG、PNG、WEBP、GIF。头像会同步到左侧账号状态。
-                  </div>
                   {avatarUploadMessage ? (
-                    <div className="mt-2 text-[11px] font-medium text-blue-600">{avatarUploadMessage}</div>
+                    <div className="mt-3 text-[11px] font-medium text-blue-600">{avatarUploadMessage}</div>
                   ) : null}
 
                   {avatarCropDraft ? (
@@ -586,14 +702,14 @@ export function AccountContent({
                             setAvatarCropDraft(null);
                             setAvatarUploadMessage("已取消本次头像裁切");
                           }}
-                          className="text-gray-400 hover:text-gray-700 transition-colors"
+                          className="text-gray-400 transition-colors hover:text-gray-700"
                         >
                           取消裁切
                         </button>
                         <button
                           type="button"
                           onClick={handleApplyAvatarCrop}
-                          className="text-gray-900 hover:text-black transition-colors"
+                          className="text-gray-900 transition-colors hover:text-black"
                         >
                           应用裁切
                         </button>
@@ -603,230 +719,248 @@ export function AccountContent({
                 </div>
 
                 <div>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-5">
-                    <Field label="姓名">
-                      <input
-                        type="text"
-                        value={editProfile.name}
-                        onChange={(event) => setEditProfile({ ...editProfile, name: event.target.value })}
-                        className="w-full border-0 border-b border-gray-200 bg-transparent px-0 py-2 text-[14px] text-gray-900 outline-none focus:border-gray-900 transition-colors"
-                      />
+                  <div className="grid grid-cols-1 gap-x-8 gap-y-5 md:grid-cols-2">
+                    <Field label="账号名">
+                      {profileNameLocked ? (
+                        <ReadOnlyFieldValue value={editProfile.name || "未设置"} />
+                      ) : (
+                        <input
+                          type="text"
+                          value={editProfile.name}
+                          onChange={(event) => setEditProfile({ ...editProfile, name: event.target.value })}
+                          className="w-full border-0 border-b border-gray-200 bg-transparent px-0 py-2 text-[14px] text-gray-900 outline-none transition-colors focus:border-gray-900"
+                        />
+                      )}
                     </Field>
                     <Field label="职位">
-                      <input
-                        type="text"
-                        value={editProfile.role}
-                        onChange={(event) => setEditProfile({ ...editProfile, role: event.target.value })}
-                        className="w-full border-0 border-b border-gray-200 bg-transparent px-0 py-2 text-[14px] text-gray-900 outline-none focus:border-gray-900 transition-colors"
-                      />
+                      {profileRoleLocked ? (
+                        <ReadOnlyFieldValue value={editProfile.role || "未设置"} />
+                      ) : (
+                        <input
+                          type="text"
+                          value={editProfile.role}
+                          onChange={(event) => setEditProfile({ ...editProfile, role: event.target.value })}
+                          className="w-full border-0 border-b border-gray-200 bg-transparent px-0 py-2 text-[14px] text-gray-900 outline-none transition-colors focus:border-gray-900"
+                        />
+                      )}
                     </Field>
-                    <DatePickerField
-                      label="生日"
-                      value={editProfile.birthday}
-                      onChange={(value) => setEditProfile({ ...editProfile, birthday: value })}
-                      fromYear={1950}
-                      toYear={new Date().getFullYear() + 1}
-                      triggerClassName="border-0 border-b border-gray-200 rounded-none px-0 py-2 shadow-none hover:border-gray-300 focus:border-gray-900"
-                    />
-                    <DatePickerField
-                      label="入职时间"
-                      value={editProfile.hireDate}
-                      onChange={(value) => setEditProfile({ ...editProfile, hireDate: value })}
-                      fromYear={1990}
-                      toYear={new Date().getFullYear() + 1}
-                      triggerClassName="border-0 border-b border-gray-200 rounded-none px-0 py-2 shadow-none hover:border-gray-300 focus:border-gray-900"
-                    />
-                  </div>
-
-                  <div className="mt-8 grid grid-cols-1 md:grid-cols-3 gap-x-8 gap-y-4 border-t border-gray-200/80 pt-6">
-                    <SimpleMeta label="当前姓名" value={editProfile.name || "未设置"} />
-                    <SimpleMeta label="当前职位" value={editProfile.role || "未设置"} />
-                    <SimpleMeta label="入职天数" value={`${(() => {
-                      const start = new Date(editProfile.hireDate);
-                      if (Number.isNaN(start.getTime())) return 0;
-                      return Math.ceil(Math.abs(Date.now() - start.getTime()) / (1000 * 60 * 60 * 24));
-                    })().toLocaleString()} 天`} />
+                    {profileDatesEditable ? (
+                      <DatePickerField
+                        label="生日"
+                        value={editProfile.birthday}
+                        onChange={(value) => setEditProfile({ ...editProfile, birthday: value })}
+                        fromYear={1950}
+                        toYear={new Date().getFullYear() + 1}
+                        triggerClassName="border-0 border-b border-gray-200 rounded-none px-0 py-2 shadow-none hover:border-gray-300 focus:border-gray-900"
+                      />
+                    ) : (
+                      <Field label="生日">
+                        <ReadOnlyFieldValue value={formatProfileDate(editProfile.birthday)} />
+                      </Field>
+                    )}
+                    {profileDatesEditable ? (
+                      <DatePickerField
+                        label="入职时间"
+                        value={editProfile.hireDate}
+                        onChange={(value) => setEditProfile({ ...editProfile, hireDate: value })}
+                        fromYear={1990}
+                        toYear={new Date().getFullYear() + 1}
+                        triggerClassName="border-0 border-b border-gray-200 rounded-none px-0 py-2 shadow-none hover:border-gray-300 focus:border-gray-900"
+                      />
+                    ) : (
+                      <Field label="入职时间">
+                        <ReadOnlyFieldValue value={formatProfileDate(editProfile.hireDate)} />
+                      </Field>
+                    )}
                   </div>
 
                   <div className="mt-8 flex justify-end gap-5 border-t border-gray-200/80 pt-5 text-[12px] font-bold">
                     <button
+                      type="button"
                       onClick={() => {
                         setAvatarCropDraft(null);
                         setAvatarUploadMessage("");
                         setEditProfile(profile);
                         setIsEditingProfile(false);
                       }}
-                      className="text-gray-400 hover:text-gray-700 transition-colors"
+                      className="text-gray-400 transition-colors hover:text-gray-700"
                     >
                       取消
                     </button>
                     <button
+                      type="button"
                       onClick={handleSaveProfile}
-                      className="inline-flex items-center gap-1.5 text-gray-900 hover:text-black transition-colors"
+                      className="inline-flex items-center gap-1.5 text-gray-900 transition-colors hover:text-black"
                     >
-                      <Save className="w-3.5 h-3.5" />
+                      <Save className="h-3.5 w-3.5" />
                       保存信息
                     </button>
                   </div>
                 </div>
               </div>
-            </div>
-          ) : (
-            <div className="pt-7 animate-in fade-in duration-200">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-x-10 gap-y-6">
-                <DetailItem label="姓名" value={profile.name} />
-                <DetailItem label="职位" value={profile.role} />
-                <DetailItem label="生日" value={profile.birthday.replace(/-/g, ".")} />
-                <DetailItem label="入职时间" value={profile.hireDate.replace(/-/g, ".")} />
-              </div>
-
-              <div className="mt-8 pt-6 border-t border-gray-200/80 grid grid-cols-1 md:grid-cols-3 gap-x-10 gap-y-4">
-                <SimpleMeta label="在岗时长" value={`${hireDays.toLocaleString()} 天`} />
-                <SimpleMeta label="头像状态" value={profile.avatar ? "已设置" : "默认"} />
-                <SimpleMeta label="资料同步" value="已生效" />
-              </div>
-            </div>
-          )}
-        </div>
-
-        <section className="mt-8 max-w-4xl border-t border-gray-200/80 pt-7">
-          <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
-            <div>
-              <div className="flex items-center gap-2">
-                <Link2 className="h-4 w-4 text-blue-600" />
-                <h2 className="text-[16px] font-black text-gray-900 tracking-tight">自媒体账号主页链接</h2>
-              </div>
-              <p className="mt-1 text-[12px] font-medium leading-relaxed text-gray-500">
-                填搜狐号、头条号、知乎、博客园等自媒体账号主页；系统会按设置频率抓取首页 / 接口最新列表。
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={handleSaveArticleAccounts}
-              disabled={articleAccountsSaving}
-              className="inline-flex items-center gap-1.5 px-0 py-2 text-[12px] font-bold text-gray-600 transition-colors hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              <Save className="h-3.5 w-3.5" />
-              {articleAccountsSaving ? "保存中..." : "保存自媒体账号"}
-            </button>
-          </div>
-
-          <div className="mb-4 flex gap-3">
-            <input
-              type="text"
-              value={articleAccountUrl}
-              onChange={(event) => {
-                setArticleAccountUrl(event.target.value);
-                if (articleAccountMessage) setArticleAccountMessage("");
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  handleAddArticleAccount();
-                }
-              }}
-              placeholder="粘贴自媒体账号主页链接，例如 https://www.cnblogs.com/用户名/"
-              className="min-w-0 flex-1 border-0 border-b border-gray-200 bg-transparent px-0 py-2 text-[13px] text-gray-900 outline-none transition-colors placeholder:text-gray-400 focus:border-gray-900"
-            />
-            <button
-              type="button"
-              onClick={handleAddArticleAccount}
-              className="inline-flex items-center gap-1.5 px-0 py-2 text-[12px] font-bold text-gray-900 transition-colors hover:text-black"
-            >
-              <Plus className="h-3.5 w-3.5" />
-              添加
-            </button>
-          </div>
-
-          {articleAccountMessage ? (
-            <div className="mb-4 text-[12px] font-medium text-blue-600">{articleAccountMessage}</div>
-          ) : null}
-
-          <div className="border-t border-gray-200/80">
-            {articleAccounts.length > 0 ? (
-              articleAccountGroups.map((group) => (
-                <div key={group.key} className="border-b border-gray-200/80 py-4">
-                  <div className="mb-3 flex flex-wrap items-start justify-between gap-x-5 gap-y-1">
-                    <div className="flex items-center gap-2">
-                      <div className="text-[12px] font-black text-gray-900">{group.label}</div>
-                      <div className="text-[11px] font-medium text-gray-400">{group.accounts.length} 个账号</div>
+            ) : (
+              <div className="border-y border-gray-200/80 py-5">
+                <div className="flex items-start justify-between gap-6">
+                  <div className="min-w-0">
+                    <div className="truncate text-[22px] font-black leading-none tracking-tight text-gray-900">
+                      {profile.name || "未设置账号名"}
                     </div>
-                    <div className="text-[10px] font-medium text-gray-400">
-                      {group.latestCrawledAt ? `上次抓取 ${group.latestCrawledAt}` : "尚未抓取"}
+                    <div className="mt-2 text-[13px] font-semibold text-gray-500">
+                      {profile.role || "未设置职位"}
                     </div>
                   </div>
-
-                  <div className="border-t border-gray-100">
-                    {group.accounts.map((account) => (
-                      <div
-                        key={account.id}
-                        className="border-b border-gray-100 py-3 transition-colors last:border-b-0 hover:bg-gray-50/40"
-                      >
-                        <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-start">
-                          <div className="min-w-0">
-                            <input
-                              type="text"
-                              value={account.url}
-                              spellCheck={false}
-                              title={account.url}
-                              onChange={(event) => {
-                                const nextUrl = event.target.value;
-                                const nextPlatform = inferArticleAccountPlatform(nextUrl);
-                                updateArticleAccount(account.id, {
-                                  url: nextUrl,
-                                  platform: nextPlatform,
-                                  platform_label: ARTICLE_ACCOUNT_PLATFORM_LABELS[nextPlatform] || ARTICLE_ACCOUNT_PLATFORM_LABELS.unknown,
-                                });
-                              }}
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter") {
-                                  event.preventDefault();
-                                }
-                              }}
-                              className="block w-full min-w-0 truncate border-0 border-b border-gray-200 bg-transparent px-0 pb-2 text-[13px] font-semibold text-gray-900 outline-none transition-colors focus:border-gray-900"
-                            />
-                            <input
-                              type="text"
-                              value={account.name || ""}
-                              onChange={(event) => updateArticleAccount(account.id, { name: event.target.value })}
-                              placeholder="账号备注名（可选）"
-                              className="mt-2 w-full border-0 bg-transparent px-0 py-1 text-[12px] text-gray-500 outline-none placeholder:text-gray-400"
-                            />
-                          </div>
-                          <div className="flex items-center justify-start gap-4 md:justify-end">
-                            <button
-                              type="button"
-                              onClick={() => updateArticleAccount(account.id, { enabled: !account.enabled })}
-                              className={`text-[11px] font-bold transition-colors ${account.enabled ? "text-gray-700 hover:text-gray-900" : "text-gray-400 hover:text-gray-600"}`}
-                            >
-                              {account.enabled ? "已启用" : "已停用"}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setArticleAccounts((prev) => prev.filter((item) => item.id !== account.id))}
-                              className="text-gray-300 transition-colors hover:text-red-500"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          </div>
-                        </div>
-                        {account.last_message ? (
-                          <div className="mt-2 text-[11px] text-gray-500">
-                            最近结果：{account.last_message}
-                          </div>
-                        ) : null}
-                      </div>
-                    ))}
+                  <div className="h-[76px] w-[76px] shrink-0 overflow-hidden rounded-[18px] border border-gray-200/80 bg-white shadow-sm">
+                    <ImageWithFallback
+                      src={profile.avatar || DEFAULT_PROFILE_AVATAR}
+                      alt="Avatar"
+                      className="h-full w-full object-cover"
+                    />
                   </div>
                 </div>
-              ))
-            ) : (
-              <div className="border-b border-gray-100 py-8 text-center text-[13px] font-medium text-gray-400">
-                暂无自媒体账号主页链接，添加后可以在全部文章汇总页手动抓取。
+                <div className="mt-6 grid grid-cols-1 gap-x-10 gap-y-5 border-t border-gray-200/80 pt-5 md:grid-cols-2">
+                  <DetailItem label="生日" value={formatProfileDate(profile.birthday)} />
+                  <DetailItem label="入职时间" value={formatProfileDate(profile.hireDate)} />
+                </div>
               </div>
             )}
-          </div>
-        </section>
+          </AccountSection>
+
+          <CloudSubAccountsSection
+            isCloudAdmin={isCloudAdmin}
+            onCloudStatusChange={handleCloudStatusChange}
+          />
+
+          <AccountSection
+            title="自媒体账号主页链接"
+            action={(
+              <button
+                type="button"
+                onClick={handleSaveArticleAccounts}
+                disabled={articleAccountsSaving}
+                className="inline-flex items-center gap-1.5 text-[12px] font-bold text-gray-600 transition-colors hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Save className="h-3.5 w-3.5" />
+                {articleAccountsSaving ? "保存中..." : "保存"}
+              </button>
+            )}
+          >
+            <div className="mb-4 flex gap-3">
+              <input
+                type="text"
+                value={articleAccountUrl}
+                onChange={(event) => {
+                  setArticleAccountUrl(event.target.value);
+                  if (articleAccountMessage) setArticleAccountMessage("");
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    handleAddArticleAccount();
+                  }
+                }}
+                placeholder="粘贴自媒体账号主页链接"
+                className="min-w-0 flex-1 border-0 border-b border-gray-200 bg-transparent px-0 py-2 text-[13px] text-gray-900 outline-none transition-colors placeholder:text-gray-400 focus:border-gray-900"
+              />
+              <button
+                type="button"
+                onClick={handleAddArticleAccount}
+                className="inline-flex items-center gap-1.5 px-0 py-2 text-[12px] font-bold text-gray-900 transition-colors hover:text-black"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                添加
+              </button>
+            </div>
+
+            {articleAccountMessage ? (
+              <div className="mb-4 text-[12px] font-medium text-blue-600">{articleAccountMessage}</div>
+            ) : null}
+
+            <div className="border-t border-gray-200/80">
+              {articleAccounts.length > 0 ? (
+                articleAccountGroups.map((group) => (
+                  <div key={group.key} className="border-b border-gray-200/80 py-4">
+                    <div className="mb-3 flex flex-wrap items-start justify-between gap-x-5 gap-y-1">
+                      <div className="flex items-center gap-2">
+                        <div className="text-[12px] font-black text-gray-900">{group.label}</div>
+                        <div className="text-[11px] font-medium text-gray-400">{group.accounts.length} 个账号</div>
+                      </div>
+                      <div className="text-[10px] font-medium text-gray-400">
+                        {group.latestCrawledAt ? `上次抓取 ${group.latestCrawledAt}` : "尚未抓取"}
+                      </div>
+                    </div>
+
+                    <div className="border-t border-gray-100">
+                      {group.accounts.map((account) => (
+                        <div
+                          key={account.id}
+                          className="border-b border-gray-100 py-3 transition-colors last:border-b-0 hover:bg-gray-50/40"
+                        >
+                          <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-start">
+                            <div className="min-w-0">
+                              <input
+                                type="text"
+                                value={account.url}
+                                spellCheck={false}
+                                title={account.url}
+                                onChange={(event) => {
+                                  const nextUrl = event.target.value;
+                                  const nextPlatform = inferArticleAccountPlatform(nextUrl);
+                                  updateArticleAccount(account.id, {
+                                    url: nextUrl,
+                                    platform: nextPlatform,
+                                    platform_label: ARTICLE_ACCOUNT_PLATFORM_LABELS[nextPlatform] || ARTICLE_ACCOUNT_PLATFORM_LABELS.unknown,
+                                  });
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter") {
+                                    event.preventDefault();
+                                  }
+                                }}
+                                className="block w-full min-w-0 truncate border-0 border-b border-gray-200 bg-transparent px-0 pb-2 text-[13px] font-semibold text-gray-900 outline-none transition-colors focus:border-gray-900"
+                              />
+                              <input
+                                type="text"
+                                value={account.name || ""}
+                                onChange={(event) => updateArticleAccount(account.id, { name: event.target.value })}
+                                placeholder="账号备注名（可选）"
+                                className="mt-2 w-full border-0 bg-transparent px-0 py-1 text-[12px] text-gray-500 outline-none placeholder:text-gray-400"
+                              />
+                            </div>
+                            <div className="flex items-center justify-start gap-4 md:justify-end">
+                              <button
+                                type="button"
+                                onClick={() => updateArticleAccount(account.id, { enabled: !account.enabled })}
+                                className={`text-[11px] font-bold transition-colors ${account.enabled ? "text-gray-700 hover:text-gray-900" : "text-gray-400 hover:text-gray-600"}`}
+                              >
+                                {account.enabled ? "已启用" : "已停用"}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setArticleAccounts((prev) => prev.filter((item) => item.id !== account.id))}
+                                className="text-gray-300 transition-colors hover:text-red-500"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                          {account.last_message ? (
+                            <div className="mt-2 text-[11px] text-gray-500">
+                              最近结果：{account.last_message}
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="border-b border-gray-100 py-8 text-center text-[13px] font-medium text-gray-400">
+                  暂无自媒体账号主页链接，添加后可以在全部文章汇总页手动抓取。
+                </div>
+              )}
+            </div>
+          </AccountSection>
+        </div>
       </div>
 
       <ConfirmModal
@@ -841,39 +975,6 @@ export function AccountContent({
         confirmText="退出"
         type="danger"
       />
-    </div>
-  );
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="flex flex-col gap-1.5">
-      <label className="text-[12px] font-bold text-gray-500">{label}</label>
-      {children}
-    </div>
-  );
-}
-
-function DetailItem({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="pb-3 border-b border-gray-200/70">
-      <div className="text-[11px] font-bold tracking-wide text-gray-400">{label}</div>
-      <div className="mt-2 text-[16px] font-semibold text-gray-900 leading-snug">{value}</div>
-    </div>
-  );
-}
-
-function SimpleMeta({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
-  return (
-    <div>
-      <div className="text-[11px] font-bold tracking-wide text-gray-400">{label}</div>
-      <div className="mt-2 text-[14px] font-semibold text-gray-900">{value}</div>
     </div>
   );
 }

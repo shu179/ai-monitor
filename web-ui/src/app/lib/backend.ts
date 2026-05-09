@@ -416,6 +416,7 @@ export type CloudUserSnapshot = {
   birthday?: string | null;
   hire_date?: string | null;
   view_all_tasks?: boolean | null;
+  visible_task_ids?: number[];
   enabled?: boolean;
   token_version?: number;
   created_at?: string;
@@ -440,6 +441,7 @@ export type CloudAutoSyncStatus = {
   last_error_at: string;
   last_upload_metrics?: Record<string, unknown>;
   last_pull_metrics?: Record<string, unknown>;
+  last_pull_summary?: Record<string, unknown>;
   startup_recovery_running?: boolean;
   last_startup_recovery_at?: string;
   last_startup_recovery_metrics?: Record<string, unknown>;
@@ -503,6 +505,40 @@ export type CloudAdminTaskSnapshot = {
   assigned_viewer_user_ids?: number[];
 };
 
+export type CloudArticleClassificationArticleSnapshot = {
+  id: number;
+  workspace_id: number;
+  canonical_url: string;
+  url_hash: string;
+  title: string;
+  source: string;
+  media_type: string;
+  published_at?: string | null;
+  payload_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+  task_links: Array<{
+    task_id: number;
+    source?: string;
+    confidence?: number;
+    reason_json?: Record<string, unknown>;
+    created_at?: string;
+  }>;
+};
+
+export type CloudArticleClassificationJobSnapshot = {
+  id: number;
+  workspace_id: number;
+  article_id: number;
+  status: "unresolved" | "resolved" | "ignored";
+  reason_json: Record<string, unknown>;
+  resolved_task_id?: number | null;
+  resolved_by?: number | null;
+  created_at: string;
+  updated_at: string;
+  article: CloudArticleClassificationArticleSnapshot;
+};
+
 export type DeletedTaskSnapshot = {
   id: string;
   task_id: string;
@@ -553,6 +589,20 @@ export type CloudAdminTaskUpdateResponse = {
   cloud?: CloudStatusSnapshot;
 };
 
+export type CloudArticleClassificationJobsResponse = {
+  ok: boolean;
+  message?: string;
+  jobs: CloudArticleClassificationJobSnapshot[];
+  cloud?: CloudStatusSnapshot;
+};
+
+export type CloudArticleClassificationJobUpdateResponse = {
+  ok: boolean;
+  message?: string;
+  job?: CloudArticleClassificationJobSnapshot;
+  cloud?: CloudStatusSnapshot;
+};
+
 export const ARTICLE_DATA_CHANGED_EVENT = "article-updated";
 export const TASK_DATA_CHANGED_EVENT = "task-updated";
 export const CLOUD_ADMIN_USERS_CHANGED_EVENT = "cloud-admin-users-updated";
@@ -560,10 +610,13 @@ export const CLOUD_ADMIN_USERS_CHANGED_EVENT = "cloud-admin-users-updated";
 const BOOTSTRAP_CACHE_TTL_MS = 2500;
 const TASKS_FULL_CACHE_TTL_MS = 5000;
 const SETTINGS_CACHE_TTL_MS = 30000;
+const SESSION_REQUEST_TIMEOUT_MS = 2500;
+const BOOTSTRAP_REQUEST_TIMEOUT_MS = 6500;
 
 let bootstrapCache: { data: BootstrapPayload; updatedAt: number } | null = null;
 let bootstrapInFlight: Promise<BootstrapPayload> | null = null;
 let bootstrapCacheVersion = 0;
+let sessionInFlight: Promise<string> | null = null;
 let tasksFullCache: { tasks: TaskFull[]; updatedAt: number } | null = null;
 let tasksFullInFlight: Promise<TaskFull[]> | null = null;
 let tasksFullCacheVersion = 0;
@@ -583,6 +636,7 @@ type TodoCacheState = {
   todos: TodoSnapshot[];
   pending: boolean;
   updatedAt: string;
+  identityKey?: string;
 };
 
 const TODO_CACHE_KEY = "ai-monitor.todo-cache.v1";
@@ -848,7 +902,20 @@ export function areArticlesEqual(
   return leftArticles.every((item, index) => item === rightArticles[index]);
 }
 
-export function readTodoCache(): TodoCacheState | null {
+export function cloudStatusIdentityKey(status: CloudStatusSnapshot | null | undefined): string {
+  if (!status?.loggedIn) {
+    return "";
+  }
+  const user = status.user || {};
+  return [
+    String(status.baseUrl || "").trim(),
+    String(user.workspace_id || "").trim(),
+    String(user.id || "").trim(),
+    String(user.role || "").trim(),
+  ].join("|");
+}
+
+export function readTodoCache(identityKey = ""): TodoCacheState | null {
   if (typeof window === "undefined") {
     return null;
   }
@@ -861,29 +928,72 @@ export function readTodoCache(): TodoCacheState | null {
     if (!isTodoSnapshotArray(parsed.todos)) {
       return null;
     }
+    const cacheIdentityKey = String(parsed.identityKey || "");
+    if (!identityKey || !cacheIdentityKey || cacheIdentityKey !== identityKey) {
+      return null;
+    }
     return {
       todos: parsed.todos.map(sanitizeTodoSnapshot),
       pending: Boolean(parsed.pending),
       updatedAt: String(parsed.updatedAt || ""),
+      identityKey: cacheIdentityKey,
     };
   } catch {
     return null;
   }
 }
 
-export function writeTodoCache(todos: TodoSnapshot[], pending: boolean): void {
+export function writeTodoCache(todos: TodoSnapshot[], pending: boolean, identityKey = ""): void {
   if (typeof window === "undefined") {
+    return;
+  }
+  const normalizedIdentityKey = String(identityKey || "").trim();
+  if (!normalizedIdentityKey) {
     return;
   }
   const payload: TodoCacheState = {
     todos: todos.map(sanitizeTodoSnapshot),
     pending,
     updatedAt: new Date().toISOString(),
+    identityKey: normalizedIdentityKey,
   };
   window.localStorage.setItem(TODO_CACHE_KEY, JSON.stringify(payload));
 }
 
-export async function fetchBootstrap(): Promise<BootstrapPayload> {
+type BootstrapFetchOptions = {
+  fallback?: BootstrapPayload;
+  timeoutMs?: number;
+};
+
+function fallbackBootstrap(options?: BootstrapFetchOptions): BootstrapPayload {
+  return options?.fallback || bootstrapCache?.data || FALLBACK_BOOTSTRAP;
+}
+
+async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  const upstreamSignal = init.signal;
+  const abortFromUpstream = () => controller.abort();
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) {
+      controller.abort();
+    } else {
+      upstreamSignal.addEventListener("abort", abortFromUpstream, { once: true });
+    }
+  }
+  try {
+    return await window.fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timeoutId);
+    upstreamSignal?.removeEventListener("abort", abortFromUpstream);
+  }
+}
+
+export async function fetchBootstrap(options?: BootstrapFetchOptions): Promise<BootstrapPayload> {
   const now = Date.now();
   if (bootstrapCache && now - bootstrapCache.updatedAt < BOOTSTRAP_CACHE_TTL_MS) {
     return bootstrapCache.data;
@@ -897,12 +1007,23 @@ export async function fetchBootstrap(): Promise<BootstrapPayload> {
     try {
       const hasSessionToken = Boolean(readSessionToken());
       const fetcher = hasSessionToken ? apiFetch : window.fetch;
-      const response = await fetcher("/api/bootstrap", {
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-      });
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(
+        () => controller.abort(),
+        options?.timeoutMs ?? BOOTSTRAP_REQUEST_TIMEOUT_MS,
+      );
+      let response: Response;
+      try {
+        response = await fetcher("/api/bootstrap", {
+          headers: { Accept: "application/json" },
+          cache: "no-store",
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
       if (!response.ok) {
-        return FALLBACK_BOOTSTRAP;
+        return fallbackBootstrap(options);
       }
       const data = (await response.json()) as Partial<BootstrapPayload>;
       storeSessionToken(data.session);
@@ -912,7 +1033,7 @@ export async function fetchBootstrap(): Promise<BootstrapPayload> {
       }
       return merged;
     } catch {
-      return FALLBACK_BOOTSTRAP;
+      return fallbackBootstrap(options);
     } finally {
       bootstrapInFlight = null;
     }
@@ -929,6 +1050,12 @@ export function invalidateBootstrapCache() {
 
 export function warmBootstrapCache() {
   void fetchBootstrap();
+}
+
+export function invalidateAccountScopedCaches() {
+  invalidateBootstrapCache();
+  invalidateTasksFullCache();
+  invalidateSettingsCache();
 }
 
 export function readTasksFullCache(): TaskFull[] | null {
@@ -984,28 +1111,38 @@ async function ensureSessionToken() {
   if (existing) {
     return existing;
   }
-  try {
-    await fetchBootstrap();
-    return readSessionToken();
-  } catch {
-    return "";
+  if (sessionInFlight) {
+    return sessionInFlight;
   }
+  sessionInFlight = (async () => {
+    try {
+      const response = await fetchWithTimeout(
+        "/api/session",
+        {
+          headers: { Accept: "application/json" },
+          cache: "no-store",
+        },
+        SESSION_REQUEST_TIMEOUT_MS,
+      );
+      if (!response.ok) {
+        return "";
+      }
+      const data = (await response.json()) as Partial<Pick<BootstrapPayload, "session">>;
+      storeSessionToken(data.session);
+      return readSessionToken();
+    } catch {
+      return "";
+    } finally {
+      sessionInFlight = null;
+    }
+  })();
+  return sessionInFlight;
 }
 
 async function refreshSessionTokenAfterRejection() {
   clearSessionToken();
   try {
-    const response = await window.fetch("/api/bootstrap", {
-      headers: { Accept: "application/json" },
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      return "";
-    }
-    const data = (await response.json()) as Partial<BootstrapPayload>;
-    storeSessionToken(data.session);
-    bootstrapCache = { data: mergeBootstrap(data), updatedAt: Date.now() };
-    return readSessionToken();
+    return await ensureSessionToken();
   } catch {
     return "";
   }
@@ -1080,6 +1217,7 @@ const EMPTY_CLOUD_STATUS: CloudStatusSnapshot = {
     last_error_at: "",
     last_upload_metrics: {},
     last_pull_metrics: {},
+    last_pull_summary: {},
     startup_recovery_running: false,
     last_startup_recovery_at: "",
     last_startup_recovery_metrics: {},
@@ -1326,6 +1464,77 @@ export async function fetchCloudAdminUsers(): Promise<CloudAdminUsersResponse> {
   }
 }
 
+export async function fetchCloudArticleClassificationJobs(): Promise<CloudArticleClassificationJobsResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/admin/article-classification-jobs", {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    const data = await response.json();
+    const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
+    return {
+      ok: Boolean(source.ok && response.ok),
+      message: String(source.message || ""),
+      jobs: normalizeCloudArticleClassificationJobs(source.jobs),
+      cloud: source.cloud ? normalizeCloudStatus(source.cloud) : undefined,
+    };
+  } catch {
+    return { ok: false, message: "未归类文章获取失败", jobs: [], cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function resolveCloudArticleClassificationJob(payload: {
+  jobId: number;
+  taskId: number;
+}): Promise<CloudArticleClassificationJobUpdateResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/admin/resolve-article-classification-job", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        job_id: payload.jobId,
+        task_id: payload.taskId,
+        reason: "管理员归类未归类文章",
+      }),
+    });
+    const data = await response.json();
+    const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
+    return {
+      ok: Boolean(source.ok && response.ok),
+      message: String(source.message || ""),
+      job: normalizeCloudArticleClassificationJob(source.job),
+      cloud: source.cloud ? normalizeCloudStatus(source.cloud) : undefined,
+    };
+  } catch {
+    return { ok: false, message: "文章归类失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
+export async function ignoreCloudArticleClassificationJob(payload: {
+  jobId: number;
+}): Promise<CloudArticleClassificationJobUpdateResponse> {
+  try {
+    const response = await apiFetch("/api/cloud/admin/ignore-article-classification-job", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        job_id: payload.jobId,
+        reason: "管理员忽略未归类文章",
+      }),
+    });
+    const data = await response.json();
+    const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
+    return {
+      ok: Boolean(source.ok && response.ok),
+      message: String(source.message || ""),
+      job: normalizeCloudArticleClassificationJob(source.job),
+      cloud: source.cloud ? normalizeCloudStatus(source.cloud) : undefined,
+    };
+  } catch {
+    return { ok: false, message: "文章忽略失败", cloud: EMPTY_CLOUD_STATUS };
+  }
+}
+
 export async function createCloudAdminUser(payload: {
   username: string;
   password: string;
@@ -1524,6 +1733,9 @@ function normalizeCloudStatus(value: unknown): CloudStatusSnapshot {
       last_pull_metrics: autoSyncSource.last_pull_metrics && typeof autoSyncSource.last_pull_metrics === "object"
         ? autoSyncSource.last_pull_metrics as Record<string, unknown>
         : {},
+      last_pull_summary: autoSyncSource.last_pull_summary && typeof autoSyncSource.last_pull_summary === "object"
+        ? autoSyncSource.last_pull_summary as Record<string, unknown>
+        : {},
       startup_recovery_running: Boolean(autoSyncSource.startup_recovery_running),
       last_startup_recovery_at: String(autoSyncSource.last_startup_recovery_at || ""),
       last_startup_recovery_metrics: autoSyncSource.last_startup_recovery_metrics && typeof autoSyncSource.last_startup_recovery_metrics === "object"
@@ -1550,6 +1762,9 @@ function normalizeCloudUser(value: unknown): CloudUserSnapshot | undefined {
     birthday: source.birthday ? String(source.birthday) : null,
     hire_date: source.hire_date ? String(source.hire_date) : null,
     view_all_tasks: Boolean(source.view_all_tasks),
+    visible_task_ids: Array.isArray(source.visible_task_ids)
+      ? source.visible_task_ids.map((item) => Number(item || 0)).filter((item) => Number.isFinite(item) && item > 0)
+      : undefined,
     enabled: source.enabled !== undefined ? Boolean(source.enabled) : undefined,
     token_version: source.token_version !== undefined ? Number(source.token_version || 0) : undefined,
     created_at: String(source.created_at || ""),
@@ -1594,6 +1809,96 @@ function normalizeCloudAdminTask(value: unknown): CloudAdminTaskSnapshot | undef
     assigned_viewer_user_ids: Array.isArray(source.assigned_viewer_user_ids)
       ? source.assigned_viewer_user_ids.map((item) => Number(item || 0)).filter((item) => Number.isFinite(item) && item > 0)
       : [],
+  };
+}
+
+function normalizeCloudArticleClassificationJobs(value: unknown): CloudArticleClassificationJobSnapshot[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => normalizeCloudArticleClassificationJob(item))
+    .filter((item): item is CloudArticleClassificationJobSnapshot => Boolean(item));
+}
+
+function normalizeCloudArticleClassificationJob(value: unknown): CloudArticleClassificationJobSnapshot | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const source = value as Record<string, unknown>;
+  const id = Number(source.id || 0);
+  const articleId = Number(source.article_id || 0);
+  if (!Number.isFinite(id) || id <= 0 || !Number.isFinite(articleId) || articleId <= 0) {
+    return undefined;
+  }
+  const article = normalizeCloudArticleClassificationArticle(source.article);
+  if (!article) {
+    return undefined;
+  }
+  const status = String(source.status || "unresolved");
+  return {
+    id,
+    workspace_id: Number(source.workspace_id || 0),
+    article_id: articleId,
+    status: status === "resolved" || status === "ignored" ? status : "unresolved",
+    reason_json: source.reason_json && typeof source.reason_json === "object"
+      ? source.reason_json as Record<string, unknown>
+      : {},
+    resolved_task_id: source.resolved_task_id === null || source.resolved_task_id === undefined
+      ? null
+      : Number(source.resolved_task_id || 0) || null,
+    resolved_by: source.resolved_by === null || source.resolved_by === undefined
+      ? null
+      : Number(source.resolved_by || 0) || null,
+    created_at: String(source.created_at || ""),
+    updated_at: String(source.updated_at || ""),
+    article,
+  };
+}
+
+function normalizeCloudArticleClassificationArticle(value: unknown): CloudArticleClassificationArticleSnapshot | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const source = value as Record<string, unknown>;
+  const id = Number(source.id || 0);
+  if (!Number.isFinite(id) || id <= 0) {
+    return undefined;
+  }
+  const taskLinks: CloudArticleClassificationArticleSnapshot["task_links"] = [];
+  if (Array.isArray(source.task_links)) {
+    source.task_links.forEach((item) => {
+      const link = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      const taskId = Number(link.task_id || 0);
+      if (!Number.isFinite(taskId) || taskId <= 0) {
+        return;
+      }
+      taskLinks.push({
+        task_id: taskId,
+        source: String(link.source || ""),
+        confidence: Number(link.confidence || 0),
+        reason_json: link.reason_json && typeof link.reason_json === "object"
+          ? link.reason_json as Record<string, unknown>
+          : {},
+        created_at: String(link.created_at || ""),
+      });
+    });
+  }
+  return {
+    id,
+    workspace_id: Number(source.workspace_id || 0),
+    canonical_url: String(source.canonical_url || ""),
+    url_hash: String(source.url_hash || ""),
+    title: String(source.title || ""),
+    source: String(source.source || ""),
+    media_type: String(source.media_type || ""),
+    published_at: source.published_at ? String(source.published_at) : null,
+    payload_json: source.payload_json && typeof source.payload_json === "object"
+      ? source.payload_json as Record<string, unknown>
+      : {},
+    created_at: String(source.created_at || ""),
+    updated_at: String(source.updated_at || ""),
+    task_links: taskLinks,
   };
 }
 

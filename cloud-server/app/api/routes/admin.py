@@ -1,17 +1,25 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Query, status
 
 from app.api.deps import AdminUser, DbSession
 from app.schemas import (
     APIMessage,
     AssignTaskRequest,
+    ArticleClassificationJobPublic,
     BrandTaskPublic,
     CreateTaskRequest,
     CreateUserRequest,
+    IgnoreArticleClassificationRequest,
+    ResolveArticleClassificationRequest,
     UpdateTaskRequest,
     UpdateUserRequest,
     UserPublic,
+)
+from app.services.article_classification_service import (
+    ignore_article_classification_job,
+    list_article_classification_jobs,
+    resolve_article_classification_job,
 )
 from app.services.admin_service import (
     assign_task_member,
@@ -26,19 +34,20 @@ from app.services.admin_service import (
     restore_task,
     update_task,
     update_workspace_user,
+    workspace_user_public_payload,
 )
 
 router = APIRouter()
 
 
 @router.get("/users", response_model=list[UserPublic])
-def users(admin: AdminUser, db: DbSession) -> list[UserPublic]:
+def users(admin: AdminUser, db: DbSession) -> list[dict]:
     return list_workspace_users(db, admin)
 
 
 @router.post("/users", response_model=UserPublic, status_code=status.HTTP_201_CREATED)
-def create_user(payload: CreateUserRequest, admin: AdminUser, db: DbSession) -> UserPublic:
-    return create_workspace_user(
+def create_user(payload: CreateUserRequest, admin: AdminUser, db: DbSession) -> dict:
+    user = create_workspace_user(
         db,
         admin,
         username=payload.username,
@@ -46,26 +55,78 @@ def create_user(payload: CreateUserRequest, admin: AdminUser, db: DbSession) -> 
         role=payload.role,
         display_name=payload.display_name,
         email=str(payload.email) if payload.email else None,
+        birthday=payload.birthday,
+        hire_date=payload.hire_date,
+        view_all_tasks=payload.view_all_tasks,
+        visible_task_ids=payload.visible_task_ids,
     )
+    return workspace_user_public_payload(db, admin, user)
 
 
 @router.patch("/users/{user_id}", response_model=UserPublic)
-def update_user(user_id: int, payload: UpdateUserRequest, admin: AdminUser, db: DbSession) -> UserPublic:
-    return update_workspace_user(
+def update_user(user_id: int, payload: UpdateUserRequest, admin: AdminUser, db: DbSession) -> dict:
+    user = update_workspace_user(
         db,
         admin,
         user_id,
+        username=payload.username,
         password=payload.password,
         display_name=payload.display_name,
-        email=str(payload.email) if payload.email else None,
+        email=(
+            str(payload.email)
+            if payload.email
+            else ("" if "email" in payload.model_fields_set else None)
+        ),
+        birthday=payload.birthday,
+        hire_date=payload.hire_date,
+        view_all_tasks=payload.view_all_tasks,
+        visible_task_ids=payload.visible_task_ids,
         enabled=payload.enabled,
+        fields_set=set(payload.model_fields_set),
     )
+    return workspace_user_public_payload(db, admin, user)
 
 
 @router.delete("/users/{user_id}", response_model=APIMessage)
 def delete_user(user_id: int, admin: AdminUser, db: DbSession) -> APIMessage:
     delete_workspace_user(db, admin, user_id)
     return APIMessage(message="ok")
+
+
+@router.get("/articles/classification-jobs", response_model=list[ArticleClassificationJobPublic])
+def article_classification_jobs(
+    admin: AdminUser,
+    db: DbSession,
+    status_filter: str = Query(default="unresolved", alias="status", max_length=32),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> list[dict]:
+    return list_article_classification_jobs(db, admin, status_filter=status_filter, limit=limit)
+
+
+@router.post("/articles/classification-jobs/{job_id}/resolve", response_model=ArticleClassificationJobPublic)
+def resolve_article_classification(
+    job_id: int,
+    payload: ResolveArticleClassificationRequest,
+    admin: AdminUser,
+    db: DbSession,
+) -> dict:
+    return resolve_article_classification_job(
+        db,
+        admin,
+        job_id=job_id,
+        task_id=payload.task_id,
+        reason=payload.reason or "",
+    )
+
+
+@router.post("/articles/classification-jobs/{job_id}/ignore", response_model=ArticleClassificationJobPublic)
+def ignore_article_classification(
+    job_id: int,
+    payload: IgnoreArticleClassificationRequest,
+    admin: AdminUser,
+    db: DbSession,
+) -> dict:
+    return ignore_article_classification_job(db, admin, job_id=job_id, reason=payload.reason or "")
 
 
 @router.get("/tasks", response_model=list[BrandTaskPublic])

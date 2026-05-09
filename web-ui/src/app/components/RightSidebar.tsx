@@ -70,16 +70,25 @@ function normalizeArticleUrl(url: string): string {
   }
 }
 
+function normalizeArticleHref(url?: string): string {
+  const raw = String(url || "").trim();
+  if (!raw) return "";
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw) ? raw : `https://${raw}`;
+}
+
 export function RightSidebar({
   monitoring,
+  cloudRole = "",
   todos,
   articles,
   stats,
+  todoCacheIdentity = "",
   onMonitoringToggle,
   onTodosChange,
   onArticlesChange,
 }: {
   monitoring?: MonitoringSnapshot;
+  cloudRole?: string;
   todos?: TodoSnapshot[];
   articles?: ArticleSnapshot[];
   stats?: {
@@ -89,6 +98,7 @@ export function RightSidebar({
     hitRecords: number;
     errorRecords: number;
   };
+  todoCacheIdentity?: string;
   onMonitoringToggle?: (enabled: boolean) => void | Promise<void>;
   onTodosChange?: (todos: TodoSnapshot[]) => void;
   onArticlesChange?: (articles: ArticleSnapshot[]) => void;
@@ -148,12 +158,12 @@ export function RightSidebar({
   }, [onArticlesChange]);
 
   const persistTodos = async (updated: TodoSnapshot[]) => {
-    writeTodoCache(updated, true);
+    writeTodoCache(updated, true, todoCacheIdentity);
     onTodosChange?.(updated);
     const result = await syncTodos(updated);
     if (result.ok) {
       const syncedTodos = result.todos ?? updated;
-      writeTodoCache(syncedTodos, false);
+      writeTodoCache(syncedTodos, false, todoCacheIdentity);
       onTodosChange?.(syncedTodos);
       setTodoMessage('');
       return;
@@ -327,16 +337,16 @@ export function RightSidebar({
   };
 
   const handleArticleOpen = (url?: string) => {
-    const raw = String(url || "").trim();
-    if (!raw) return;
-    const normalized = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    const normalized = normalizeArticleHref(url);
+    if (!normalized) return;
     window.open(normalized, "_blank", "noopener,noreferrer");
   };
 
   const monitoringEnabled = Boolean(monitoring?.enabled);
   const monitoringRunning = Boolean(monitoring?.running);
+  const isViewerAccount = cloudRole === "viewer";
   const handleMonitoringClick = async () => {
-    if (toggleLoading) {
+    if (toggleLoading || isViewerAccount) {
       return;
     }
     setToggleLoading(true);
@@ -378,15 +388,17 @@ export function RightSidebar({
           onClick={() => {
             void handleMonitoringClick();
           }}
-          disabled={toggleLoading}
+          disabled={toggleLoading || isViewerAccount}
           className={`inline-flex w-full items-center justify-center gap-2 rounded-[12px] px-3 py-2.5 text-[12px] font-semibold transition-all ${
-            monitoringEnabled
+            isViewerAccount
+              ? "bg-gray-100 text-gray-400"
+              : monitoringEnabled
               ? "bg-emerald-50 text-emerald-700 hover:bg-emerald-100/80"
               : "bg-gray-100 text-gray-700 hover:bg-gray-200/80"
           } disabled:cursor-not-allowed disabled:opacity-80`}
         >
           {toggleLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Power className="h-3.5 w-3.5" />}
-          {toggleLoading ? "状态切换中..." : monitoringEnabled ? "关闭定时任务" : "开启定时任务"}
+          {isViewerAccount ? "浏览账号仅查看" : toggleLoading ? "状态切换中..." : monitoringEnabled ? "关闭定时任务" : "开启定时任务"}
         </button>
       </div>
 
@@ -583,9 +595,11 @@ export function RightSidebar({
       <ArticleEditModal
         isOpen={Boolean(editingArticle)}
         article={editingArticle ? {
+          id: editingArticle.id,
           source: editingArticle.source,
           mediaName: editingArticle.media_name,
           title: editingArticle.title,
+          url: editingArticle.url,
           publishedAt: editingArticle.published_at,
           ts: editingArticle.ts,
           matchedTasks: editingArticle.matchedTasks,
@@ -697,13 +711,22 @@ function ArticleItem({
   const fullContextLines = referenced
     ? [...contextLines, referencedTaskText ? `引用状态：已被 ${referencedTaskText} 引用` : "引用状态：已引用"]
     : contextLines;
+  const articleHref = normalizeArticleHref(url);
   
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
-        <div
-          className="flex p-3 rounded-lg border border-gray-100/80 bg-white gap-3 hover:border-gray-300 hover:shadow-sm transition-all cursor-pointer group"
-          onClick={() => onOpen?.()}
+        <a
+          href={articleHref || undefined}
+          target={articleHref ? "_blank" : undefined}
+          rel={articleHref ? "noopener noreferrer" : undefined}
+          className="flex p-3 rounded-lg border border-gray-100/80 bg-white gap-3 text-inherit no-underline hover:border-gray-300 hover:shadow-sm transition-all cursor-pointer group"
+          onClick={(event) => {
+            if (!articleHref) {
+              event.preventDefault();
+              onOpen?.();
+            }
+          }}
           onMouseEnter={() => setIsHovered(true)}
           onMouseLeave={() => setIsHovered(false)}
           title={url ? "左键打开文章，右键查看归类原因" : undefined}
@@ -748,7 +771,7 @@ function ArticleItem({
               </p>
             </div>
           </div>
-        </div>
+        </a>
       </ContextMenuTrigger>
       <ContextMenuContent className={ARTICLE_MENU_CONTENT_CLASS}>
         <ContextMenuLabel className={ARTICLE_MENU_LABEL_CLASS}>

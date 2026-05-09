@@ -5,6 +5,7 @@ from fastapi import Query
 
 from app.api.deps import CurrentUser, DbSession
 from app.schemas import (
+    ArticlesResponse,
     ReferenceRankingResponse,
     RunRecordPublic,
     RunRecordsBatchRequest,
@@ -16,6 +17,7 @@ from app.schemas import (
 from app.services.sync_service import (
     REFERENCE_ALGORITHM_VERSION,
     build_reference_ranking,
+    list_visible_articles,
     list_deleted_visible_tasks,
     list_task_day_status_events_batch,
     list_task_run_records_batch,
@@ -27,18 +29,43 @@ router = APIRouter()
 
 
 @router.get("", response_model=list[VisibleBrandTaskPublic])
-def visible_tasks(current_user: CurrentUser, db: DbSession) -> list[VisibleBrandTaskPublic]:
-    return list_visible_tasks(db, current_user)
+def visible_tasks(
+    current_user: CurrentUser,
+    db: DbSession,
+    ids: list[int] | None = Query(default=None),
+) -> list[VisibleBrandTaskPublic]:
+    return list_visible_tasks(db, current_user, ids)
 
 
 @router.get("/", response_model=list[VisibleBrandTaskPublic], include_in_schema=False)
-def visible_tasks_with_slash(current_user: CurrentUser, db: DbSession) -> list[VisibleBrandTaskPublic]:
-    return list_visible_tasks(db, current_user)
+def visible_tasks_with_slash(
+    current_user: CurrentUser,
+    db: DbSession,
+    ids: list[int] | None = Query(default=None),
+) -> list[VisibleBrandTaskPublic]:
+    return list_visible_tasks(db, current_user, ids)
 
 
 @router.get("/deleted", response_model=list[VisibleBrandTaskPublic])
 def deleted_visible_tasks(current_user: CurrentUser, db: DbSession) -> list[VisibleBrandTaskPublic]:
     return list_deleted_visible_tasks(db, current_user)
+
+
+@router.get("/articles", response_model=ArticlesResponse)
+def visible_articles(
+    current_user: CurrentUser,
+    db: DbSession,
+    limit: int = Query(default=5000, ge=1, le=10000),
+    updated_after: str = Query(default="", max_length=64),
+    updated_after_id: int = Query(default=0, ge=0),
+) -> ArticlesResponse:
+    return ArticlesResponse(**list_visible_articles(
+        db,
+        current_user,
+        limit=limit,
+        updated_after=updated_after,
+        updated_after_id=updated_after_id,
+    ))
 
 
 @router.get("/{task_id}/article-reference-ranking", response_model=ReferenceRankingResponse)

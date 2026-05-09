@@ -20,7 +20,7 @@ from app.services.event_service import (
 
 router = APIRouter()
 
-STREAM_POLL_SECONDS = 5.0
+STREAM_POLL_SECONDS = 2.0
 STREAM_HEARTBEAT_SECONDS = 20.0
 STREAM_MAX_SECONDS = 120.0
 

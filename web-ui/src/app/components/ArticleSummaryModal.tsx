@@ -114,6 +114,29 @@ function normalizeArticleDate(ts: string) {
   return raw ? raw.slice(0, 10) : "";
 }
 
+function normalizeExternalArticleHref(url?: string) {
+  const raw = String(url || "").trim();
+  if (!raw) {
+    return "";
+  }
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw) ? raw : `https://${raw}`;
+}
+
+function openExternalArticleUrl(url?: string) {
+  const href = normalizeExternalArticleHref(url);
+  if (!href || typeof document === "undefined") {
+    return false;
+  }
+  const anchor = document.createElement("a");
+  anchor.href = href;
+  anchor.target = "_blank";
+  anchor.rel = "noopener noreferrer";
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  return true;
+}
+
 function articleSnapshotToSummaryArticle(article: ArticleSnapshot): Article {
   const publishedAt = String(article.published_at || "");
   const ts = String(publishedAt || article.ts || "");
@@ -168,6 +191,23 @@ function formatArticleExportKeywords(article: Article) {
     .map((name) => String(name || "").trim())
     .filter(Boolean);
   return labels.length ? labels : ["未识别关键词"];
+}
+
+function mergeArticleExportKeywords(baseArticles: Article[], keywordArticles: Article[]) {
+  const keywordsById = new Map<string, string[]>();
+  for (const article of keywordArticles) {
+    if (!article.id) {
+      continue;
+    }
+    keywordsById.set(article.id, article.exportKeywords || []);
+  }
+  return baseArticles.map((article) => {
+    const exportKeywords = keywordsById.get(article.id);
+    if (!exportKeywords) {
+      return article;
+    }
+    return { ...article, exportKeywords };
+  });
 }
 
 function formatRankingDate(value: string) {
@@ -518,7 +558,6 @@ export function ArticleSummaryModal({
         const result = await fetchArticles({
           limit: ARTICLE_FETCH_LIMIT,
           task_name: taskName || undefined,
-          includeExportKeywords: articleExportShowKeywordCategory,
         });
         const mapped: Article[] = (result.articles || [])
           .map(articleSnapshotToSummaryArticle)
@@ -543,7 +582,7 @@ export function ArticleSummaryModal({
       cancelled = true;
       window.removeEventListener(ARTICLE_DATA_CHANGED_EVENT, handleArticleDataChanged);
     };
-  }, [articleExportShowKeywordCategory, taskName]);
+  }, [taskName]);
 
   useEffect(() => {
     if (!canShowRanking || !isRankingMode || !taskId) {
@@ -822,9 +861,20 @@ export function ArticleSummaryModal({
         return;
       }
 
+      let exportRows = filteredArticles;
+      if (articleExportShowKeywordCategory) {
+        const result = await fetchArticles({
+          limit: ARTICLE_FETCH_LIMIT,
+          task_name: taskName || undefined,
+          includeExportKeywords: true,
+        });
+        const keywordArticles = (result.articles || []).map(articleSnapshotToSummaryArticle);
+        exportRows = mergeArticleExportKeywords(filteredArticles, keywordArticles);
+      }
+
       downloadArticlesCsv(
         exportFileBaseName,
-        filteredArticles,
+        exportRows,
         isAllScope,
         articleExportShowKeywordCategory,
         articleExportShowSelfMediaAccount,
@@ -916,6 +966,7 @@ export function ArticleSummaryModal({
       }
       setPendingArticleImport(null);
       setExportNotice({ tone: "success", message: result.message || "已确认本次导入" });
+      window.dispatchEvent(new CustomEvent(ARTICLE_DATA_CHANGED_EVENT));
     } finally {
       setPendingImportAction(null);
     }
@@ -1598,9 +1649,11 @@ export function ArticleSummaryModal({
       <ArticleEditModal
         isOpen={Boolean(editingArticle)}
         article={editingArticle ? {
+          id: editingArticle.id,
           source: editingArticle.source,
           mediaName: editingArticle.mediaName,
           title: editingArticle.title,
+          url: editingArticle.url,
           publishedAt: editingArticle.publishedAt || editingArticle.date,
           ts: editingArticle.ts,
           matchedTasks: editingArticle.matchedTasks,
@@ -1645,18 +1698,20 @@ function ArticleRow({
     ? [...contextLines, referencedTaskText ? `引用状态：已被 ${referencedTaskText} 引用` : "引用状态：已引用"]
     : contextLines;
   const branding = getMediaBranding(article.source);
+  const articleHref = normalizeExternalArticleHref(article.url);
 
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
-        <div
-          className="grid min-w-0 grid-cols-[minmax(112px,150px)_minmax(0,1fr)_auto] items-center gap-3 border-t border-gray-100 py-3 transition-colors group cursor-pointer first:border-t-0 hover:bg-gray-50/55 sm:grid-cols-[minmax(140px,180px)_minmax(0,1fr)_100px] sm:gap-4"
-          onClick={() => {
-            if (!article.url) {
-              return;
+        <a
+          href={articleHref || undefined}
+          target={articleHref ? "_blank" : undefined}
+          rel={articleHref ? "noopener noreferrer" : undefined}
+          className="grid min-w-0 grid-cols-[minmax(112px,150px)_minmax(0,1fr)_auto] items-center gap-3 border-t border-gray-100 py-3 text-inherit no-underline transition-colors group cursor-pointer first:border-t-0 hover:bg-gray-50/55 sm:grid-cols-[minmax(140px,180px)_minmax(0,1fr)_100px] sm:gap-4"
+          onClick={(event) => {
+            if (!articleHref) {
+              event.preventDefault();
             }
-            const normalized = /^https?:\/\//i.test(article.url) ? article.url : `https://${article.url}`;
-            window.open(normalized, "_blank", "noopener,noreferrer");
           }}
           title={article.url ? "左键打开文章，右键查看归类原因" : "右键查看归类原因"}
         >
@@ -1683,6 +1738,7 @@ function ArticleRow({
               <div className="flex">
                 <span
                   onClick={(event) => {
+                    event.preventDefault();
                     event.stopPropagation();
                     onTypeClick?.(article.type);
                   }}
@@ -1708,7 +1764,7 @@ function ArticleRow({
               {article.date || "--"}
             </span>
           </div>
-        </div>
+        </a>
       </ContextMenuTrigger>
       <ContextMenuContent className={ARTICLE_MENU_CONTENT_CLASS}>
         <ContextMenuLabel className={ARTICLE_MENU_LABEL_CLASS}>
@@ -1775,7 +1831,9 @@ function RankingRow({
     <div
       className="grid w-full min-w-0 grid-cols-[32px_minmax(0,1fr)_104px_74px] items-start gap-2 border-t border-gray-100 py-3 transition-colors group cursor-pointer first:border-t-0 hover:bg-gray-50/55 sm:grid-cols-[40px_minmax(0,1fr)_132px_90px] sm:gap-3"
       onClick={() => {
-        onOpen?.();
+        if (!openExternalArticleUrl(item.article.url)) {
+          onOpen?.();
+        }
       }}
       title={item.article.url ? "左键打开文章链接" : "暂无链接"}
     >

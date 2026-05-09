@@ -60,15 +60,20 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
-    username: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    username: Mapped[str] = mapped_column(String(128), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
     role: Mapped[UserRole] = mapped_column(Enum(UserRole, name="user_role"), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(128))
     email: Mapped[str | None] = mapped_column(String(256))
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    avatar: Mapped[str | None] = mapped_column(Text)
+    birthday: Mapped[date | None] = mapped_column(Date)
+    hire_date: Mapped[date | None] = mapped_column(Date)
+    view_all_tasks: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
     token_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -76,6 +81,13 @@ class User(Base):
 
     __table_args__ = (
         Index("idx_users_workspace_role", "workspace_id", "role"),
+        Index("idx_users_workspace_deleted", "workspace_id", "deleted_at"),
+        Index(
+            "idx_users_username_unique",
+            func.lower(username),
+            unique=True,
+            postgresql_where=deleted_at.is_(None),
+        ),
         Index("idx_admin_email_unique", "email", unique=True, postgresql_where=(role == UserRole.admin)),
     )
 
@@ -198,7 +210,10 @@ class RunRecord(Base):
     executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    __table_args__ = (Index("idx_rr_ws_task_time", "workspace_id", "task_id", "executed_at"),)
+    __table_args__ = (
+        Index("idx_rr_ws_task_time", "workspace_id", "task_id", "executed_at"),
+        Index("idx_rr_ws_task_id", "workspace_id", "task_id", "id"),
+    )
 
 
 class Article(Base):

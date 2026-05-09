@@ -20,9 +20,11 @@ type ArticleBrandOption = {
 type ArticleEditModalProps = {
   isOpen: boolean;
   article: {
+    id?: string | number;
     source?: string;
     mediaName?: string;
     title?: string;
+    url?: string;
     publishedAt?: string;
     ts?: string;
     matchedTasks?: string[];
@@ -34,6 +36,10 @@ type ArticleEditModalProps = {
 
 function normalizeSearchText(value: string) {
   return String(value || "").trim().toLocaleLowerCase();
+}
+
+function isNumericIdLike(value: string) {
+  return /^\d+$/.test(String(value || "").trim());
 }
 
 function normalizeTaskNames(value: unknown): string[] {
@@ -51,11 +57,34 @@ function normalizeTaskNames(value: unknown): string[] {
 }
 
 function taskToBrandOption(task: TaskFull): ArticleBrandOption | null {
-  const taskName = String(task.name || task.id || "").trim();
+  const source = task as TaskFull & Record<string, unknown>;
+  const rawTaskName = String(
+    source.name
+    || source.taskName
+    || source.task_name
+    || source.task_id
+    || source.id
+    || "",
+  ).trim();
+  const rawBrandName = String(
+    source.brand
+    || source.brandName
+    || source.brand_name
+    || rawTaskName
+    || "",
+  ).trim();
+  const taskName = rawTaskName;
   if (!taskName) {
     return null;
   }
-  const brandName = String(task.brand || taskName).trim() || taskName;
+  const brandName = (
+    rawBrandName && !isNumericIdLike(rawBrandName)
+      ? rawBrandName
+      : taskName
+  ).trim() || taskName;
+  if (isNumericIdLike(taskName) && isNumericIdLike(brandName)) {
+    return null;
+  }
   const label = brandName === taskName ? brandName : `${brandName} (${taskName})`;
   return {
     taskName,
@@ -147,10 +176,15 @@ export function ArticleEditModal({
   const [brandInputDirty, setBrandInputDirty] = useState(false);
   const [brandInputFocused, setBrandInputFocused] = useState(false);
   const [brandOptions, setBrandOptions] = useState<ArticleBrandOption[]>([]);
+  const articleIdentity = [
+    article?.id ?? "",
+    article?.url ?? "",
+    article?.title ?? "",
+  ].map((value) => String(value || "").trim()).join("|");
 
   const initialTaskNames = useMemo(
     () => normalizeTaskNames(article?.matchedTasks),
-    [article],
+    [article?.matchedTasks],
   );
   const effectiveBrandOptions = useMemo(
     () => mergeCurrentBrandOptions(brandOptions, initialTaskNames),
@@ -166,14 +200,14 @@ export function ArticleEditModal({
     setPublishedAt(String(article.publishedAt || article.ts || "").slice(0, 10));
     setBrandInput(formatBrandInput(normalizeTaskNames(article.matchedTasks), effectiveBrandOptions));
     setBrandInputDirty(false);
-  }, [article, isOpen]);
+  }, [articleIdentity, isOpen]);
 
   useEffect(() => {
     if (!isOpen || !article || brandInputDirty) {
       return;
     }
     setBrandInput(formatBrandInput(initialTaskNames, effectiveBrandOptions));
-  }, [article, brandInputDirty, effectiveBrandOptions, initialTaskNames, isOpen]);
+  }, [articleIdentity, brandInputDirty, effectiveBrandOptions, initialTaskNames, isOpen]);
 
   useEffect(() => {
     if (!isOpen) {

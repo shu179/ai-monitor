@@ -38,7 +38,7 @@ def get_current_user(
     if payload.get("type") != "access":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type")
     user_id = int(payload.get("sub") or 0)
-    user = db.scalar(select(User).where(User.id == user_id))
+    user = db.scalar(select(User).where(User.id == user_id, User.deleted_at.is_(None)))
     if not user or not user.enabled:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User disabled")
     if int(payload.get("token_version") or 0) != user.token_version:
