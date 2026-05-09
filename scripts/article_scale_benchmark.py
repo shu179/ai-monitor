@@ -417,6 +417,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
         final_json_count = _json_article_count(paths["articles"])
         final_authoritative_count = len(article_store.get_articles())
         article_store_backend_health = article_store.get_article_store_backend_health()
+        article_store_doctor = _article_store_doctor_summary(data_dir, article_store_backend)
         sqlite_status = _sqlite_status(paths["shadow_db"], today)
 
     summary: dict[str, Any] = {
@@ -446,11 +447,13 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
             **sqlite_status,
         },
         "article_store_backend_health": article_store_backend_health,
+        "article_store_doctor": article_store_doctor,
         "operations": operations,
         "standards": {},
         "recommendations": migration_recommendations(),
     }
     summary["standards"] = evaluate_standards(summary)
+    summary["rollout_guard"] = build_rollout_guard(summary)
     return summary
 
 
@@ -539,6 +542,64 @@ def evaluate_standards(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_rollout_guard(summary: dict[str, Any]) -> dict[str, Any]:
+    operations = {str(item.get("name")): item for item in summary.get("operations", [])}
+    probe_details = (
+        operations.get("article_store_auto_primary_probe", {}).get("details")
+        if isinstance(operations.get("article_store_auto_primary_probe", {}).get("details"), dict)
+        else {}
+    )
+    page_names = (
+        "article_page_default_first_screen",
+        "article_page_by_task_name",
+        "article_page_by_media_type",
+    )
+    crud_names = (
+        "bulk_upsert_small_batch",
+        "update_article_single",
+        "delete_article_single",
+    )
+    refresh_details = (
+        operations.get("refresh_article_matches", {}).get("details")
+        if isinstance(operations.get("refresh_article_matches", {}).get("details"), dict)
+        else {}
+    )
+    return {
+        "initial_effective_backend": probe_details.get("initial_effective_backend", ""),
+        "initial_fallback_reason": probe_details.get("initial_fallback_reason", ""),
+        "migration_completed": bool(probe_details.get("migration_state", {}).get("last_ok")),
+        "final_effective_backend": (
+            probe_details.get("final_effective_backend")
+            or summary.get("article_store_backend_health", {}).get("effective_backend", "")
+        ),
+        "final_fallback_reason": (
+            probe_details.get("final_fallback_reason")
+            or summary.get("article_store_backend_health", {}).get("fallback_reason", "")
+        ),
+        "page_read_timings_ms": {
+            name: operations.get(name, {}).get("elapsed_ms")
+            for name in page_names
+            if name in operations
+        },
+        "crud_timings_ms": {
+            name: operations.get(name, {}).get("elapsed_ms")
+            for name in crud_names
+            if name in operations
+        },
+        "refresh_timings_seconds": {
+            "cold": refresh_details.get("refresh_cold_full_seconds"),
+            "warm": refresh_details.get("refresh_warm_noop_seconds"),
+            "small_dirty": refresh_details.get("refresh_small_dirty_seconds"),
+        },
+        "doctor": {
+            "status": summary.get("article_store_doctor", {}).get("status", ""),
+            "effective_backend": summary.get("article_store_doctor", {}).get("backend", {}).get("effective_backend", ""),
+            "fallback_reason": summary.get("article_store_doctor", {}).get("backend", {}).get("fallback_reason", ""),
+            "exit_code": summary.get("article_store_doctor", {}).get("exit_code"),
+        },
+    }
+
+
 def _prepare_data_dir(data_dir: Path, *, force: bool) -> dict[str, Path]:
     logs_dir = data_dir / "logs"
     articles_path = logs_dir / "articles.json"
@@ -566,6 +627,18 @@ def _normalize_article_store_backend(value: str) -> str:
     if backend in {"json", "off", "disabled", "file", "files"}:
         return "json"
     return "auto"
+
+
+def _article_store_doctor_summary(data_dir: Path, article_store_backend: str) -> dict[str, Any]:
+    from scripts.article_store_doctor import DoctorOptions, run_doctor
+
+    return run_doctor(
+        DoctorOptions(
+            data_dir=data_dir,
+            requested_backend=article_store_backend,
+            check_only=True,
+        )
+    )
 
 
 def _article_authoritative_backend_label() -> str:
