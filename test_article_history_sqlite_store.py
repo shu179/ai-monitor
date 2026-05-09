@@ -230,6 +230,121 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             self.assertEqual(store.get_history_record_count("task-a"), 2)
             self.assertEqual(store.get_history_record_count("task-b"), 1)
 
+    def test_history_task_names_follow_first_record_per_storage_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")
+            store.import_history_sources(
+                {
+                    "task-a": [
+                        {"id": "r2", "ts": "2024-01-02 09:00", "task_name": "品牌A"},
+                        {"id": "r1", "ts": "2024-01-01 09:00", "task_name": "品牌A"},
+                    ],
+                    "task-b": [
+                        {"id": "r3", "ts": "2024-01-03 09:00"},
+                    ],
+                    "task-c": [
+                        {"id": "r4", "ts": "2024-01-04 09:00", "task_name": "品牌A"},
+                    ],
+                },
+                replace=True,
+            )
+
+            self.assertEqual(store.get_history_task_names(), ["品牌A", "task-b"])
+
+    def test_pending_reviews_dedupes_legacy_copies_and_applies_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")
+            pending_record = {
+                "id": "pending-1",
+                "ts": "2024-01-03 09:00",
+                "task_id": "task-a",
+                "task_name": "品牌A",
+                "rank": 1,
+                "success": True,
+                "review_status": "pending",
+            }
+            store.import_history_sources(
+                {
+                    "task-a": [
+                        pending_record,
+                        {
+                            "id": "approved",
+                            "ts": "2024-01-02 09:00",
+                            "task_name": "品牌A",
+                            "rank": 1,
+                            "success": True,
+                            "review_status": "approved",
+                        },
+                    ],
+                    "品牌A": [dict(pending_record)],
+                    "task-b": [
+                        {
+                            "id": "pending-2",
+                            "ts": "2024-01-04 09:00",
+                            "task_name": "品牌B",
+                            "rank": 2,
+                            "success": True,
+                            "review_status": "pending",
+                        },
+                        {
+                            "id": "miss",
+                            "ts": "2024-01-05 09:00",
+                            "task_name": "品牌B",
+                            "rank": 99,
+                            "success": False,
+                            "review_status": "pending",
+                        },
+                    ],
+                },
+                replace=True,
+            )
+
+            reviews = store.get_pending_reviews(limit=1)
+
+            self.assertEqual([item["id"] for item in reviews], ["pending-2"])
+            self.assertEqual([item["id"] for item in store.get_pending_reviews(limit=10)], ["pending-2", "pending-1"])
+
+    def test_pending_reviews_preserve_json_stable_order_for_equal_sort_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")
+            store.import_history_sources(
+                {
+                    "task-a": [
+                        {
+                            "id": "pending-a1",
+                            "ts": "2024-01-03 09:00",
+                            "task_name": "品牌A",
+                            "rank": 1,
+                            "success": True,
+                            "review_status": "pending",
+                        },
+                        {
+                            "id": "pending-a2",
+                            "ts": "2024-01-03 09:00",
+                            "task_name": "品牌A",
+                            "rank": 2,
+                            "success": True,
+                            "review_status": "pending",
+                        },
+                    ],
+                    "task-b": [
+                        {
+                            "id": "pending-b1",
+                            "ts": "2024-01-03 09:00",
+                            "task_name": "品牌A",
+                            "rank": 3,
+                            "success": True,
+                            "review_status": "pending",
+                        },
+                    ],
+                },
+                replace=True,
+            )
+
+            reviews = store.get_pending_reviews(limit=10)
+
+            self.assertEqual([item["id"] for item in reviews], ["pending-a1", "pending-a2", "pending-b1"])
+
     def test_large_article_import_supports_bounded_page_reads(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ArticleHistorySQLiteStore(

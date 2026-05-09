@@ -445,6 +445,67 @@ class ArticleHistorySQLiteStore:
             ).fetchall()
         return list(reversed([self._json_loads(row[0]) for row in rows]))
 
+    def get_history_task_names(self) -> list[str]:
+        self.initialize()
+        names: list[str] = []
+        seen_names: set[str] = set()
+        seen_storage_keys: set[str] = set()
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT storage_key, raw_json
+                FROM history_records
+                ORDER BY storage_key ASC, sort_index ASC, id ASC
+                """
+            ).fetchall()
+        for storage_key, raw_json in rows:
+            normalized_storage_key = self._text(storage_key)
+            if not normalized_storage_key or normalized_storage_key in seen_storage_keys:
+                continue
+            seen_storage_keys.add(normalized_storage_key)
+            record = self._normalize_history_record(
+                self._json_loads(raw_json),
+                storage_key=normalized_storage_key,
+            )
+            task_name = self._text(record.get("task_name") or normalized_storage_key)
+            if task_name and task_name not in seen_names:
+                seen_names.add(task_name)
+                names.append(task_name)
+        return names
+
+    def get_pending_reviews(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        self.initialize()
+        capped_limit = max(1, int(limit or 200))
+        items: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT storage_key, raw_json
+                FROM history_records
+                WHERE review_status = 'pending' OR (review_status = '' AND success = 1)
+                ORDER BY ts DESC, task_name DESC, storage_key ASC, sort_index ASC, id ASC
+                """
+            ).fetchall()
+        for storage_key, raw_json in rows:
+            record = self._normalize_history_record(
+                self._json_loads(raw_json),
+                storage_key=self._text(storage_key),
+            )
+            record_id = self._text(record.get("id"))
+            if record_id and record_id in seen_ids:
+                continue
+            if record.get("review_status") != "pending":
+                continue
+            if record.get("rank", 99) == 99:
+                continue
+            if record_id:
+                seen_ids.add(record_id)
+            items.append(record)
+            if len(items) >= capped_limit:
+                break
+        return items
+
     def get_article_task_counts(self, *, relation: str = "matched") -> dict[str, int]:
         self.initialize()
         normalized_relation = self._text(relation) or "matched"
@@ -523,6 +584,7 @@ class ArticleHistorySQLiteStore:
         if not isinstance(raw_record, dict):
             return "skipped"
         record = dict(raw_record)
+        record_for_columns = self._normalize_history_record(record, storage_key=storage_key)
         record_id = self._history_record_id(storage_key, record)
         if not record_id:
             return "skipped"
@@ -557,17 +619,17 @@ class ArticleHistorySQLiteStore:
             (
                 storage_key,
                 record_id,
-                self._text(record.get("task_id")),
-                self._text(record.get("task_name")),
-                self._date_text(record.get("ts")),
-                self._text(record.get("platform")),
-                self._text(record.get("keyword")),
-                self._text(record.get("brand")),
-                self._int(record.get("rank"), default=99),
+                self._text(record_for_columns.get("task_id")),
+                self._text(record_for_columns.get("task_name")),
+                self._date_text(record_for_columns.get("ts")),
+                self._text(record_for_columns.get("platform")),
+                self._text(record_for_columns.get("keyword")),
+                self._text(record_for_columns.get("brand")),
+                self._int(record_for_columns.get("rank"), default=99),
                 1 if bool(record.get("success")) else 0,
-                self._text(record.get("review_status")),
-                self._text(record.get("mode")),
-                self._text(record.get("execution_source")),
+                self._text(record_for_columns.get("review_status")),
+                self._text(record_for_columns.get("mode")),
+                self._text(record_for_columns.get("execution_source")),
                 int(sort_index),
                 self._json_dumps(record),
                 updated_at_ns,
@@ -581,6 +643,25 @@ class ArticleHistorySQLiteStore:
             (storage_key,),
         ).fetchone()
         return int((row or [0])[0] or 0)
+
+    @classmethod
+    def _normalize_history_record(cls, record: dict[str, Any], *, storage_key: str) -> dict[str, Any]:
+        item = dict(record) if isinstance(record, dict) else {}
+        if storage_key and not item.get("task_name"):
+            item["task_name"] = storage_key
+        item.setdefault("id", "")
+        item.setdefault("review_status", "pending" if item.get("success") and item.get("rank", 99) != 99 else "")
+        item.setdefault("review_note", "")
+        item.setdefault("reviewed_at", "")
+        item.setdefault("screenshot", "")
+        item.setdefault("highlight_count", 0)
+        item.setdefault("answer_text", "")
+        item.setdefault("evidence", "")
+        item.setdefault("error_message", "")
+        item.setdefault("diagnostic_id", "")
+        item.setdefault("mode", "")
+        item.setdefault("execution_source", "")
+        return item
 
     def _article_query_filters(
         self,

@@ -173,6 +173,64 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
         self.assertTrue(parsed["ok"])
         self.assertEqual(parsed["queries"][0]["name"], "task-a")
 
+    def test_compare_history_derived_command_compact_output_keeps_failed_views(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_compare(db_path, *, max_workers, pending_limit, rebuild):
+            calls.append((db_path, max_workers, pending_limit, rebuild))
+            return {
+                "ok": False,
+                "db_path": str(db_path),
+                "pending_limit": pending_limit,
+                "view_count": 2,
+                "failed_count": 1,
+                "views": [
+                    {"name": "task_names", "ok": True, "mismatches": []},
+                    {
+                        "name": "pending_reviews",
+                        "ok": False,
+                        "mismatches": ["records"],
+                        "json": {"count": 1},
+                        "sqlite": {"count": 0},
+                    },
+                ],
+                "rebuild": {
+                    "storage_keys": 1,
+                    "created": 1,
+                    "updated": 0,
+                    "skipped": 0,
+                    "details": {"task-a": {"created": 1}},
+                },
+            }
+
+        cli.compare_history_derived_views = fake_compare
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "compare-history-derived",
+                "--db-path",
+                "shadow.sqlite3",
+                "--workers",
+                "4",
+                "--pending-limit",
+                "25",
+                "--rebuild",
+                "--compact",
+            ])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(calls, [("shadow.sqlite3", 4, 25, True)])
+        parsed = json.loads(output.getvalue())
+        self.assertFalse(parsed["ok"])
+        self.assertEqual(parsed["pending_limit"], 25)
+        self.assertEqual(parsed["view_count"], 2)
+        self.assertEqual([item["name"] for item in parsed["failed_views"]], ["pending_reviews"])
+        self.assertEqual(parsed["failed_queries"], [])
+        self.assertNotIn("views", parsed)
+        self.assertNotIn("details", parsed["rebuild"])
+
     def test_compare_history_compact_output_keeps_only_failures_and_summary(self) -> None:
         cli = _load_cli_module()
 

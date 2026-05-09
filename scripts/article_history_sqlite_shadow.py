@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 from core.article_history_sqlite_mirror import (
     build_article_compare_queries,
     compare_article_pages,
+    compare_history_derived_views,
     compare_history_records,
     compare_history_task_reads,
     default_shadow_db_path,
@@ -146,6 +147,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Rebuild the SQLite shadow history table before comparing task reads.",
     )
+    history_derived_compare_parser = subparsers.add_parser(
+        "compare-history-derived",
+        parents=[common],
+        help="Compare derived history dashboard/report views with the SQLite shadow history table.",
+    )
+    history_derived_compare_parser.add_argument(
+        "--pending-limit",
+        type=int,
+        default=200,
+        help="Number of pending review records to compare.",
+    )
+    history_derived_compare_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Rebuild the SQLite shadow history table before comparing derived views.",
+    )
     api_compare_parser = subparsers.add_parser(
         "compare-api-articles",
         parents=[common],
@@ -264,6 +281,14 @@ def main(argv: list[str] | None = None) -> int:
             rebuild=bool(args.rebuild),
         )
         ok = bool(result.get("ok"))
+    elif args.command == "compare-history-derived":
+        result = compare_history_derived_views(
+            args.db_path,
+            max_workers=args.workers,
+            pending_limit=args.pending_limit,
+            rebuild=bool(args.rebuild),
+        )
+        ok = bool(result.get("ok"))
     elif args.command == "compare-api-articles":
         result = compare_article_api_pages(
             args.db_path,
@@ -297,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         ok = bool(result.get("ok"))
 
     output_result = result
-    if bool(args.compact) and args.command in {"compare-history", "compare-history-reads"}:
+    if bool(args.compact) and args.command in {"compare-history", "compare-history-reads", "compare-history-derived"}:
         output_result = _compact_history_compare_result(result)
     print(_to_json(output_result, compact=bool(args.compact)))
     return 0 if ok else 1
@@ -315,6 +340,11 @@ def _compact_history_compare_result(result: dict[str, Any]) -> dict[str, Any]:
         if isinstance(query, dict)
     ]
     failed_queries = [query for query in queries if not bool(query.get("ok"))]
+    views = [
+        view for view in (result.get("views") or [])
+        if isinstance(view, dict)
+    ]
+    failed_views = [view for view in views if not bool(view.get("ok"))]
     keys = result.get("keys") if isinstance(result.get("keys"), dict) else {}
     key_mismatches = keys.get("mismatches") if isinstance(keys.get("mismatches"), list) else []
     compact: dict[str, Any] = {
@@ -328,6 +358,11 @@ def _compact_history_compare_result(result: dict[str, Any]) -> dict[str, Any]:
     }
     if result.get("query_count") is not None:
         compact["query_count"] = result.get("query_count")
+    if result.get("view_count") is not None:
+        compact["view_count"] = result.get("view_count")
+        compact["failed_views"] = failed_views
+    if result.get("pending_limit") is not None:
+        compact["pending_limit"] = result.get("pending_limit")
     if result.get("storage_key_count") is not None:
         compact["storage_key_count"] = result.get("storage_key_count")
     if keys:

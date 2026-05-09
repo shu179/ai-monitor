@@ -13,6 +13,7 @@ from core.article_history_sqlite_mirror import (
     build_article_compare_queries,
     build_history_task_read_queries,
     compare_article_pages,
+    compare_history_derived_views,
     compare_history_records,
     compare_history_task_reads,
     load_json_history_sources,
@@ -420,6 +421,93 @@ class ArticleHistorySQLiteMirrorTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["failed_count"], 1)
         self.assertIn("targets", result["queries"][0]["mismatches"])
+
+    def test_compare_history_derived_views_match_runtime_semantics(self) -> None:
+        source = {
+            "task-a": [
+                {
+                    "id": "late-first",
+                    "ts": "2024-01-03 09:00",
+                    "task_name": "原始首条",
+                    "rank": "99",
+                    "success": True,
+                    "review_status": "pending",
+                },
+                {
+                    "id": "early-second",
+                    "ts": "2024-01-01 09:00",
+                    "task_name": "时间更早",
+                    "rank": 1,
+                    "success": True,
+                    "review_status": "pending",
+                },
+            ],
+            "task-b": [
+                {
+                    "id": "other",
+                    "ts": "2024-01-02 09:00",
+                    "rank": 2,
+                    "success": True,
+                },
+            ],
+        }
+        db_path = Path(self._tmpdir.name) / "shadow.sqlite3"
+
+        result = compare_history_derived_views(
+            db_path,
+            source=source,
+            pending_limit=10,
+            rebuild=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["view_count"], 2)
+        by_name = {item["name"]: item for item in result["views"]}
+        self.assertEqual(by_name["task_names"]["json"]["names"], ["原始首条", "task-b"])
+        self.assertEqual(by_name["pending_reviews"]["json"]["ids"], ["late-first", "other", "early-second"])
+
+    def test_compare_history_derived_views_reports_pending_mismatch(self) -> None:
+        source = {
+            "task-a": [
+                {
+                    "id": "pending",
+                    "ts": "2024-01-01 09:00",
+                    "task_name": "品牌A",
+                    "rank": 1,
+                    "success": True,
+                    "review_status": "pending",
+                },
+            ],
+        }
+        db_path = Path(self._tmpdir.name) / "shadow.sqlite3"
+        ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url).import_history_sources(
+            {
+                "task-a": [
+                    {
+                        "id": "approved",
+                        "ts": "2024-01-01 09:00",
+                        "task_name": "品牌A",
+                        "rank": 1,
+                        "success": True,
+                        "review_status": "approved",
+                    },
+                ],
+            },
+            replace=True,
+        )
+
+        result = compare_history_derived_views(
+            db_path,
+            source=source,
+            pending_limit=10,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failed_count"], 1)
+        by_name = {item["name"]: item for item in result["views"]}
+        self.assertIn("records", by_name["pending_reviews"]["mismatches"])
+        self.assertIn("json_records", by_name["pending_reviews"])
+        self.assertIn("sqlite_records", by_name["pending_reviews"])
 
     def _write_articles(self, articles: list[dict]) -> None:
         article_store.ARTICLES_FILE.write_text(

@@ -335,6 +335,52 @@ def compare_history_task_reads(
     }
 
 
+def compare_history_derived_views(
+    db_path: str | Path | None = None,
+    *,
+    source: dict[str, list[dict[str, Any]]] | None = None,
+    max_workers: int | None = None,
+    pending_limit: int = 200,
+    rebuild: bool = False,
+) -> dict[str, Any]:
+    """Compare dashboard/report history-derived views with structured SQLite."""
+    target_db_path = Path(db_path) if db_path is not None else default_shadow_db_path()
+    history_sources = source if source is not None else load_json_history_sources(max_workers=max_workers)
+    normalized_sources = {
+        str(storage_key): [item for item in (records or []) if isinstance(item, dict)]
+        for storage_key, records in (history_sources or {}).items()
+        if str(storage_key or "").strip()
+    }
+    resolved_pending_limit = max(1, min(1000, int(pending_limit or 200)))
+    store = ArticleHistorySQLiteStore(
+        target_db_path,
+        normalize_article_url=article_store.normalize_article_url,
+    )
+    rebuild_result = None
+    if rebuild:
+        rebuild_result = store.import_history_sources(normalized_sources, replace=True)
+
+    expected_task_names = _history_task_names_from_sources(normalized_sources)
+    sqlite_task_names = store.get_history_task_names()
+    expected_pending = _history_pending_reviews_from_sources(normalized_sources, limit=resolved_pending_limit)
+    sqlite_pending = store.get_pending_reviews(limit=resolved_pending_limit)
+    views = [
+        _compare_history_task_names_view(expected_task_names, sqlite_task_names),
+        _compare_history_pending_reviews_view(expected_pending, sqlite_pending),
+    ]
+    failed = [item for item in views if not bool(item.get("ok"))]
+    return {
+        "ok": not failed,
+        "db_path": str(target_db_path),
+        "pending_limit": resolved_pending_limit,
+        "workers": max_workers,
+        "view_count": len(views),
+        "failed_count": len(failed),
+        "rebuild": rebuild_result,
+        "views": views,
+    }
+
+
 def build_article_compare_queries(config: dict[str, Any] | None) -> list[dict[str, str]]:
     queries: list[dict[str, str]] = [{"name": "all", "task_name": "", "media_type": ""}]
     media_types = (("media", "authority"), ("self-media", "selfmedia"))
@@ -699,6 +745,55 @@ def _compare_history_task_read(
     }
 
 
+def _compare_history_task_names_view(expected_names: list[str], sqlite_names: list[str]) -> dict[str, Any]:
+    mismatches = []
+    if expected_names != sqlite_names:
+        mismatches.append("names")
+    return {
+        "ok": not mismatches,
+        "name": "task_names",
+        "mismatches": mismatches,
+        "json": {
+            "count": len(expected_names),
+            "names": expected_names,
+        },
+        "sqlite": {
+            "count": len(sqlite_names),
+            "names": sqlite_names,
+        },
+    }
+
+
+def _compare_history_pending_reviews_view(
+    expected_reviews: list[dict[str, Any]],
+    sqlite_reviews: list[dict[str, Any]],
+) -> dict[str, Any]:
+    expected_signature = _history_records_signature(expected_reviews)
+    sqlite_signature = _history_records_signature(sqlite_reviews)
+    mismatches = []
+    if len(expected_reviews) != len(sqlite_reviews):
+        mismatches.append("count")
+    if expected_signature != sqlite_signature:
+        mismatches.append("records")
+    report: dict[str, Any] = {
+        "ok": not mismatches,
+        "name": "pending_reviews",
+        "mismatches": mismatches,
+        "json": {
+            "count": len(expected_reviews),
+            "ids": [str(item.get("id") or "") for item in expected_reviews],
+        },
+        "sqlite": {
+            "count": len(sqlite_reviews),
+            "ids": [str(item.get("id") or "") for item in sqlite_reviews],
+        },
+    }
+    if mismatches:
+        report["json_records"] = expected_signature
+        report["sqlite_records"] = sqlite_signature
+    return report
+
+
 def _history_compare_windows(total: int, *, limit: int, sample_pages: int) -> list[dict[str, int | str]]:
     capped_limit = max(1, min(500, int(limit or 1)))
     if total <= 0:
@@ -858,6 +953,49 @@ def _history_record_dedupe_key(record: dict[str, Any]) -> str:
         "execution_source": str((record or {}).get("execution_source") or "").strip(),
     }
     return "raw:" + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _history_task_names_from_sources(sources: dict[str, list[dict[str, Any]]]) -> list[str]:
+    names: list[str] = []
+    seen_names: set[str] = set()
+    for storage_key in sorted(sources.keys()):
+        records = [item for item in (sources.get(storage_key) or []) if isinstance(item, dict)]
+        if records and isinstance(records[0], dict):
+            record = _normalize_history_record_for_compare(records[0], task_id="", task_name=storage_key)
+            task_name = str(record.get("task_name") or storage_key).strip()
+        else:
+            task_name = str(storage_key or "").strip()
+        if task_name and task_name not in seen_names:
+            seen_names.add(task_name)
+            names.append(task_name)
+    return names
+
+
+def _history_pending_reviews_from_sources(
+    sources: dict[str, list[dict[str, Any]]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    capped_limit = max(1, int(limit or 200))
+    items: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for storage_key in sorted(sources.keys()):
+        for raw_record in (sources.get(storage_key) or []):
+            if not isinstance(raw_record, dict):
+                continue
+            record = _normalize_history_record_for_compare(raw_record, task_id="", task_name=storage_key)
+            record_id = str(record.get("id") or "").strip()
+            if record_id and record_id in seen_ids:
+                continue
+            if record.get("review_status") != "pending":
+                continue
+            if record.get("rank", 99) == 99:
+                continue
+            if record_id:
+                seen_ids.add(record_id)
+            items.append(record)
+    items.sort(key=lambda item: (str(item.get("ts") or ""), str(item.get("task_name") or "")), reverse=True)
+    return items[:capped_limit]
 
 
 def _storage_media_type(media_type: str) -> str:
