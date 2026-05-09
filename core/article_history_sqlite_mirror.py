@@ -13,6 +13,7 @@ from . import article_store, history
 from .app_paths import resolve_app_path
 from .article_history_sqlite_store import ArticleHistorySQLiteStore
 from .config_watcher import load_config
+from .daily_task_state import derive_task_id
 from .local_account_space import account_scoped_path, current_account_config_path
 from .time_utils import local_today, parse_local_date
 
@@ -265,6 +266,75 @@ def compare_history_records(
     }
 
 
+def compare_history_task_reads(
+    db_path: str | Path | None = None,
+    *,
+    config: dict[str, Any] | None = None,
+    source: dict[str, list[dict[str, Any]]] | None = None,
+    max_workers: int | None = None,
+    limit: int = 50,
+    sample_pages: int = 3,
+    rebuild: bool = False,
+) -> dict[str, Any]:
+    """Compare config task history reads against the structured SQLite history table."""
+    target_db_path = Path(db_path) if db_path is not None else default_shadow_db_path()
+    resolved_config = config if config is not None else _load_current_config()
+    history_sources = source if source is not None else load_json_history_sources(max_workers=max_workers)
+    normalized_sources = {
+        str(storage_key): _ordered_history_records(records)
+        for storage_key, records in (history_sources or {}).items()
+        if str(storage_key or "").strip()
+    }
+    resolved_limit = max(1, min(500, int(limit or 50)))
+    resolved_sample_pages = max(0, min(20, int(sample_pages or 0)))
+    queries = build_history_task_read_queries(resolved_config)
+    store = ArticleHistorySQLiteStore(
+        target_db_path,
+        normalize_article_url=article_store.normalize_article_url,
+    )
+    rebuild_result = None
+    if rebuild:
+        rebuild_result = store.import_history_sources(normalized_sources, replace=True)
+
+    worker_count = _history_compare_worker_count([item["name"] for item in queries], max_workers=max_workers)
+    if worker_count <= 1:
+        results = [
+            _compare_history_task_read(
+                store,
+                normalized_sources,
+                query,
+                limit=resolved_limit,
+                sample_pages=resolved_sample_pages,
+            )
+            for query in queries
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(executor.map(
+                lambda query: _compare_history_task_read(
+                    store,
+                    normalized_sources,
+                    query,
+                    limit=resolved_limit,
+                    sample_pages=resolved_sample_pages,
+                ),
+                queries,
+            ))
+
+    failed = [item for item in results if not bool(item.get("ok"))]
+    return {
+        "ok": not failed,
+        "db_path": str(target_db_path),
+        "limit": resolved_limit,
+        "sample_pages": resolved_sample_pages,
+        "workers": worker_count,
+        "query_count": len(results),
+        "failed_count": len(failed),
+        "rebuild": rebuild_result,
+        "queries": results,
+    }
+
+
 def build_article_compare_queries(config: dict[str, Any] | None) -> list[dict[str, str]]:
     queries: list[dict[str, str]] = [{"name": "all", "task_name": "", "media_type": ""}]
     media_types = (("media", "authority"), ("self-media", "selfmedia"))
@@ -287,6 +357,30 @@ def build_article_compare_queries(config: dict[str, Any] | None) -> list[dict[st
                 "task_name": task_name,
                 "media_type": public_media_type,
             })
+    return queries
+
+
+def build_history_task_read_queries(config: dict[str, Any] | None) -> list[dict[str, str]]:
+    queries: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for task in (config or {}).get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        if bool(task.get("delete_pending")):
+            continue
+        task_id = str(task.get("task_id") or derive_task_id(task)).strip()
+        task_name = str(task.get("name") or task_id).strip()
+        if not task_id and not task_name:
+            continue
+        key = (task_id, task_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        queries.append({
+            "name": f"task:{task_name or task_id}",
+            "task_id": task_id,
+            "task_name": task_name,
+        })
     return queries
 
 
@@ -516,6 +610,95 @@ def _compare_history_storage_key(
     }
 
 
+def _compare_history_task_read(
+    store: ArticleHistorySQLiteStore,
+    sources: dict[str, list[dict[str, Any]]],
+    query: dict[str, str],
+    *,
+    limit: int,
+    sample_pages: int,
+) -> dict[str, Any]:
+    task_id = str(query.get("task_id") or "").strip()
+    task_name = str(query.get("task_name") or "").strip()
+    expected_targets = _history_read_targets_for_compare(
+        task_id=task_id,
+        task_name=task_name,
+        exists=lambda key: key in sources,
+    )
+    sqlite_targets = _history_read_targets_for_compare(
+        task_id=task_id,
+        task_name=task_name,
+        exists=lambda key: store.get_history_record_count(key) > 0,
+    )
+    expected_records = _history_runtime_records_from_sources(
+        sources,
+        expected_targets,
+        task_id=task_id,
+        task_name=task_name,
+    )
+    sqlite_records = _history_runtime_records_from_store(
+        store,
+        sqlite_targets,
+        task_id=task_id,
+        task_name=task_name,
+    )
+    expected_count = len(expected_records)
+    sqlite_count = len(sqlite_records)
+    windows = []
+    mismatches: list[str] = []
+    if expected_targets != sqlite_targets:
+        mismatches.append("targets")
+    if expected_count != sqlite_count:
+        mismatches.append("count")
+    for window in _history_compare_windows(expected_count, limit=limit, sample_pages=sample_pages):
+        offset = int(window["offset"])
+        window_limit = int(window["limit"])
+        expected_window = expected_records[offset:offset + window_limit]
+        sqlite_window = sqlite_records[offset:offset + window_limit]
+        expected_signature = _history_records_signature(expected_window)
+        sqlite_signature = _history_records_signature(sqlite_window)
+        window_mismatches = []
+        if expected_signature != sqlite_signature:
+            window_mismatches.append("records")
+            if "records" not in mismatches:
+                mismatches.append("records")
+        window_report: dict[str, Any] = {
+            "name": window["name"],
+            "offset": offset,
+            "limit": window_limit,
+            "ok": not window_mismatches,
+            "mismatches": window_mismatches,
+            "json": {
+                "count": len(expected_window),
+            },
+            "sqlite": {
+                "count": len(sqlite_window),
+            },
+        }
+        if window_mismatches:
+            window_report["json_records"] = expected_signature
+            window_report["sqlite_records"] = sqlite_signature
+        windows.append(window_report)
+    return {
+        "ok": not mismatches,
+        "name": str(query.get("name") or ""),
+        "query": {
+            "task_id": task_id,
+            "task_name": task_name,
+        },
+        "mismatches": mismatches,
+        "json": {
+            "count": expected_count,
+            "targets": expected_targets,
+        },
+        "sqlite": {
+            "count": sqlite_count,
+            "targets": sqlite_targets,
+        },
+        "windows": windows,
+    }
+
+
 def _history_compare_windows(total: int, *, limit: int, sample_pages: int) -> list[dict[str, int | str]]:
     capped_limit = max(1, min(500, int(limit or 1)))
     if total <= 0:
@@ -565,6 +748,116 @@ def _history_record_digest(record: dict[str, Any]) -> str:
     except Exception:
         payload = str(record)
     return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _history_read_targets_for_compare(
+    *,
+    task_id: str,
+    task_name: str,
+    exists: Any,
+) -> list[str]:
+    targets: list[str] = []
+    normalized_task_id = str(task_id or "").strip()
+    normalized_task_name = str(task_name or "").strip()
+    primary = normalized_task_id or normalized_task_name
+    if primary:
+        targets.append(primary)
+    if normalized_task_id and callable(exists) and exists(normalized_task_id):
+        return targets
+    if normalized_task_name and normalized_task_name not in targets:
+        targets.append(normalized_task_name)
+    return targets
+
+
+def _history_runtime_records_from_sources(
+    sources: dict[str, list[dict[str, Any]]],
+    targets: list[str],
+    *,
+    task_id: str,
+    task_name: str,
+) -> list[dict[str, Any]]:
+    return _history_runtime_records_from_targets(
+        targets,
+        get_records=lambda key: sources.get(key, []),
+        task_id=task_id,
+        task_name=task_name,
+    )
+
+
+def _history_runtime_records_from_store(
+    store: ArticleHistorySQLiteStore,
+    targets: list[str],
+    *,
+    task_id: str,
+    task_name: str,
+) -> list[dict[str, Any]]:
+    return _history_runtime_records_from_targets(
+        targets,
+        get_records=lambda key: store.get_history_records(key),
+        task_id=task_id,
+        task_name=task_name,
+    )
+
+
+def _history_runtime_records_from_targets(
+    targets: list[str],
+    *,
+    get_records: Any,
+    task_id: str,
+    task_name: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for target in targets:
+        for raw_record in get_records(target) or []:
+            if not isinstance(raw_record, dict):
+                continue
+            dedupe_key = _history_record_dedupe_key(raw_record)
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            records.append(_normalize_history_record_for_compare(raw_record, task_id=task_id, task_name=task_name))
+    records.sort(key=lambda item: str(item.get("ts") or ""))
+    return records
+
+
+def _normalize_history_record_for_compare(record: dict[str, Any], *, task_id: str, task_name: str) -> dict[str, Any]:
+    item = dict(record)
+    if task_id and not item.get("task_id"):
+        item["task_id"] = task_id
+    if task_name and not item.get("task_name"):
+        item["task_name"] = task_name
+    item.setdefault("id", "")
+    item.setdefault("review_status", "pending" if item.get("success") and item.get("rank", 99) != 99 else "")
+    item.setdefault("review_note", "")
+    item.setdefault("reviewed_at", "")
+    item.setdefault("screenshot", "")
+    item.setdefault("highlight_count", 0)
+    item.setdefault("answer_text", "")
+    item.setdefault("evidence", "")
+    item.setdefault("error_message", "")
+    item.setdefault("diagnostic_id", "")
+    item.setdefault("mode", "")
+    item.setdefault("execution_source", "")
+    return item
+
+
+def _history_record_dedupe_key(record: dict[str, Any]) -> str:
+    record_id = str((record or {}).get("id") or "").strip()
+    if record_id:
+        return f"id:{record_id}"
+    payload = {
+        "task_id": str((record or {}).get("task_id") or "").strip(),
+        "task_name": str((record or {}).get("task_name") or "").strip(),
+        "ts": str((record or {}).get("ts") or "").strip(),
+        "platform": str((record or {}).get("platform") or "").strip(),
+        "keyword": str((record or {}).get("keyword") or "").strip(),
+        "brand": str((record or {}).get("brand") or "").strip(),
+        "rank": int((record or {}).get("rank", 99) or 99),
+        "mode": str((record or {}).get("mode") or "").strip(),
+        "execution_source": str((record or {}).get("execution_source") or "").strip(),
+    }
+    return "raw:" + json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def _storage_media_type(media_type: str) -> str:

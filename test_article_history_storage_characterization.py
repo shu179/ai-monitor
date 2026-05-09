@@ -355,6 +355,26 @@ class HistoryStorageCharacterizationTests(unittest.TestCase):
         self.assertTrue(all(item["task_id"] == "task-import" for item in primary_records))
         self.assertTrue(all(item["task_name"] == "导入任务" for item in legacy_records))
 
+    def test_apply_review_with_task_id_updates_primary_and_legacy_history_files(self) -> None:
+        entry = history.record(
+            "复核任务",
+            "doubao",
+            "关键词",
+            "品牌A",
+            1,
+            True,
+            task_id="task-review",
+        )
+
+        changed = history.apply_review("复核任务", entry["id"], "approved", "ok", task_id="task-review")
+
+        self.assertTrue(changed)
+        primary_records = json.loads(history._task_file("task-review").read_text(encoding="utf-8"))
+        legacy_records = json.loads(history._task_file("复核任务").read_text(encoding="utf-8"))
+        self.assertEqual(primary_records[0]["review_status"], "approved")
+        self.assertEqual(legacy_records[0]["review_status"], "approved")
+        self.assertEqual(history.get_pending_reviews(), [])
+
 
 class HistorySQLiteStorageMigrationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -446,6 +466,34 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self.assertIn("history/旧任务.json", keys)
         self.assertIn("history/task-new.json", keys)
         self.assertIn("history/新任务.json", keys)
+
+    def test_sqlite_opt_in_apply_review_updates_primary_and_legacy_documents(self) -> None:
+        os.environ[history.STORAGE_BACKEND_ENV] = "sqlite"
+
+        entry = history.record(
+            "复核任务",
+            "doubao",
+            "关键词",
+            "品牌A",
+            1,
+            True,
+            task_id="task-review",
+        )
+        changed = history.apply_review("复核任务", entry["id"], "approved", "ok", task_id="task-review")
+
+        self.assertTrue(changed)
+        self.assertFalse(history._task_file("task-review").exists())
+        self.assertEqual(history.get_pending_reviews(), [])
+        with sqlite3.connect(history.LOCAL_STORE_DB_FILE) as conn:
+            rows = dict(
+                conn.execute(
+                    "SELECT key, value_json FROM json_documents WHERE key IN (?, ?)",
+                    ("history/task-review.json", "history/复核任务.json"),
+                ).fetchall()
+            )
+        self.assertEqual(sorted(rows.keys()), ["history/task-review.json", "history/复核任务.json"])
+        self.assertEqual(json.loads(rows["history/task-review.json"])[0]["review_status"], "approved")
+        self.assertEqual(json.loads(rows["history/复核任务.json"])[0]["review_status"], "approved")
 
 
 if __name__ == "__main__":

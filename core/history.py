@@ -1164,7 +1164,7 @@ def apply_review(task_name: str, record_id: str, status: str, note: str = "", *,
         return False
 
     changed = False
-    for key in _history_read_targets(task_id=str(task_id or "").strip(), task_name=str(task_name or "").strip(), include_legacy=True):
+    for key in _history_write_targets(task_id=str(task_id or "").strip(), task_name=str(task_name or "").strip()):
         path = _task_file(key)
         lock = _get_lock(key)
         with lock:

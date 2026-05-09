@@ -26,6 +26,7 @@ from core.article_history_sqlite_mirror import (
     build_article_compare_queries,
     compare_article_pages,
     compare_history_records,
+    compare_history_task_reads,
     default_shadow_db_path,
     rebuild_shadow_store,
     verify_shadow_store,
@@ -122,6 +123,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rebuild",
         action="store_true",
         help="Rebuild the SQLite shadow history table before comparing.",
+    )
+    history_reads_compare_parser = subparsers.add_parser(
+        "compare-history-reads",
+        parents=[common],
+        help="Compare config task history reads with the SQLite shadow history table.",
+    )
+    history_reads_compare_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Number of history records to compare per sampled task read page.",
+    )
+    history_reads_compare_parser.add_argument(
+        "--sample-pages",
+        type=int,
+        default=3,
+        help="Number of middle pages to sample per task history read.",
+    )
+    history_reads_compare_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Rebuild the SQLite shadow history table before comparing task reads.",
     )
     api_compare_parser = subparsers.add_parser(
         "compare-api-articles",
@@ -232,6 +255,15 @@ def main(argv: list[str] | None = None) -> int:
             rebuild=bool(args.rebuild),
         )
         ok = bool(result.get("ok"))
+    elif args.command == "compare-history-reads":
+        result = compare_history_task_reads(
+            args.db_path,
+            max_workers=args.workers,
+            limit=args.limit,
+            sample_pages=args.sample_pages,
+            rebuild=bool(args.rebuild),
+        )
+        ok = bool(result.get("ok"))
     elif args.command == "compare-api-articles":
         result = compare_article_api_pages(
             args.db_path,
@@ -265,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
         ok = bool(result.get("ok"))
 
     output_result = result
-    if bool(args.compact) and args.command == "compare-history":
+    if bool(args.compact) and args.command in {"compare-history", "compare-history-reads"}:
         output_result = _compact_history_compare_result(result)
     print(_to_json(output_result, compact=bool(args.compact)))
     return 0 if ok else 1
@@ -285,26 +317,29 @@ def _compact_history_compare_result(result: dict[str, Any]) -> dict[str, Any]:
     failed_queries = [query for query in queries if not bool(query.get("ok"))]
     keys = result.get("keys") if isinstance(result.get("keys"), dict) else {}
     key_mismatches = keys.get("mismatches") if isinstance(keys.get("mismatches"), list) else []
-    compact_keys: dict[str, Any] = {
-        "expected_count": len(keys.get("expected") or []),
-        "sqlite_count": len(keys.get("sqlite") or []),
-        "mismatches": key_mismatches,
-    }
-    if key_mismatches:
-        compact_keys["expected"] = keys.get("expected") or []
-        compact_keys["sqlite"] = keys.get("sqlite") or []
-
     compact: dict[str, Any] = {
         "ok": bool(result.get("ok")),
         "db_path": result.get("db_path"),
         "limit": result.get("limit"),
         "sample_pages": result.get("sample_pages"),
         "workers": result.get("workers"),
-        "storage_key_count": result.get("storage_key_count"),
         "failed_count": result.get("failed_count"),
-        "keys": compact_keys,
         "failed_queries": failed_queries,
     }
+    if result.get("query_count") is not None:
+        compact["query_count"] = result.get("query_count")
+    if result.get("storage_key_count") is not None:
+        compact["storage_key_count"] = result.get("storage_key_count")
+    if keys:
+        compact_keys: dict[str, Any] = {
+            "expected_count": len(keys.get("expected") or []),
+            "sqlite_count": len(keys.get("sqlite") or []),
+            "mismatches": key_mismatches,
+        }
+        if key_mismatches:
+            compact_keys["expected"] = keys.get("expected") or []
+            compact_keys["sqlite"] = keys.get("sqlite") or []
+        compact["keys"] = compact_keys
     rebuild = result.get("rebuild")
     if isinstance(rebuild, dict):
         compact["rebuild"] = {

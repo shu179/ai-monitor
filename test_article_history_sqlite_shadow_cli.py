@@ -137,6 +137,42 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
         self.assertTrue(parsed["ok"])
         self.assertEqual(parsed["queries"][0]["name"], "task-a")
 
+    def test_compare_history_reads_command_prints_report(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_compare(db_path, *, max_workers, limit, sample_pages, rebuild):
+            calls.append((db_path, max_workers, limit, sample_pages, rebuild))
+            return {
+                "ok": True,
+                "failed_count": 0,
+                "query_count": 1,
+                "queries": [{"name": "task-a", "mismatches": []}],
+            }
+
+        cli.compare_history_task_reads = fake_compare
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "compare-history-reads",
+                "--db-path",
+                "shadow.sqlite3",
+                "--workers",
+                "4",
+                "--limit",
+                "25",
+                "--sample-pages",
+                "5",
+                "--rebuild",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [("shadow.sqlite3", 4, 25, 5, True)])
+        parsed = json.loads(output.getvalue())
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["queries"][0]["name"], "task-a")
+
     def test_compare_history_compact_output_keeps_only_failures_and_summary(self) -> None:
         cli = _load_cli_module()
 

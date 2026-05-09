@@ -11,8 +11,10 @@ import core.article_store as article_store
 import core.history as history
 from core.article_history_sqlite_mirror import (
     build_article_compare_queries,
+    build_history_task_read_queries,
     compare_article_pages,
     compare_history_records,
+    compare_history_task_reads,
     load_json_history_sources,
     rebuild_shadow_store,
     verify_shadow_store,
@@ -170,6 +172,22 @@ class ArticleHistorySQLiteMirrorTests(unittest.TestCase):
         self.assertIn("task:品牌A|media:media", names)
         self.assertIn("task:品牌B|media:self-media", names)
         self.assertNotIn("task:删除中", names)
+
+    def test_build_history_task_read_queries_includes_active_config_tasks(self) -> None:
+        queries = build_history_task_read_queries({
+            "tasks": [
+                {"task_id": "task-a", "name": "品牌A"},
+                {"task_id": "task-a", "name": "品牌A"},
+                {"name": "品牌B", "keywords": [{"keyword": "词", "brand": "品牌B"}]},
+                {"task_id": "deleted", "name": "删除中", "delete_pending": True},
+            ],
+        })
+
+        self.assertEqual(len(queries), 2)
+        self.assertEqual(queries[0]["task_id"], "task-a")
+        self.assertEqual(queries[0]["task_name"], "品牌A")
+        self.assertEqual(queries[1]["task_name"], "品牌B")
+        self.assertNotEqual(queries[1]["task_id"], "")
 
     def test_load_current_config_falls_back_when_account_config_missing(self) -> None:
         missing_account_path = Path(self._tmpdir.name) / "missing" / "config.yaml"
@@ -346,6 +364,62 @@ class ArticleHistorySQLiteMirrorTests(unittest.TestCase):
         self.assertIn("json_records", by_name["task-a"]["windows"][0])
         self.assertIn("sqlite_records", by_name["task-a"]["windows"][0])
         self.assertIn("count", by_name["stale"]["mismatches"])
+
+    def test_compare_history_task_reads_matches_primary_history_runtime_semantics(self) -> None:
+        source = {
+            "task-a": [
+                {"ts": "2024-01-01 09:00", "task_id": "task-a", "task_name": "品牌A", "rank": 1},
+                {"id": "r2", "ts": "2024-01-02 09:00", "task_id": "task-a", "task_name": "品牌A", "rank": 2},
+            ],
+            "品牌A": [
+                {"id": "legacy-r1", "ts": "2024-01-03 09:00", "task_name": "品牌A", "rank": 3},
+            ],
+        }
+        config = {"tasks": [{"task_id": "task-a", "name": "品牌A"}]}
+        db_path = Path(self._tmpdir.name) / "shadow.sqlite3"
+
+        result = compare_history_task_reads(
+            db_path,
+            config=config,
+            source=source,
+            limit=10,
+            sample_pages=1,
+            rebuild=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["query_count"], 1)
+        query = result["queries"][0]
+        self.assertEqual(query["json"]["targets"], ["task-a"])
+        self.assertEqual(query["sqlite"]["targets"], ["task-a"])
+        self.assertEqual(query["json"]["count"], 2)
+
+    def test_compare_history_task_reads_reports_target_mismatch(self) -> None:
+        source = {
+            "task-a": [
+                {"id": "r1", "ts": "2024-01-01 09:00", "task_id": "task-a", "task_name": "品牌A", "rank": 1},
+            ],
+        }
+        config = {"tasks": [{"task_id": "task-a", "name": "品牌A"}]}
+        db_path = Path(self._tmpdir.name) / "shadow.sqlite3"
+        store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+        store.import_history_sources({
+            "品牌A": [
+                {"id": "r1", "ts": "2024-01-01 09:00", "task_id": "task-a", "task_name": "品牌A", "rank": 1},
+            ],
+        }, replace=True)
+
+        result = compare_history_task_reads(
+            db_path,
+            config=config,
+            source=source,
+            limit=10,
+            sample_pages=1,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failed_count"], 1)
+        self.assertIn("targets", result["queries"][0]["mismatches"])
 
     def _write_articles(self, articles: list[dict]) -> None:
         article_store.ARTICLES_FILE.write_text(
