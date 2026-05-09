@@ -4,6 +4,8 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -230,6 +232,89 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
         self.assertEqual(parsed["failed_queries"], [])
         self.assertNotIn("views", parsed)
         self.assertNotIn("details", parsed["rebuild"])
+
+    def test_compare_history_snapshot_command_prints_report(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_compare(db_path, *, max_workers, rounds, fd_growth_limit, rebuild):
+            calls.append((db_path, max_workers, rounds, fd_growth_limit, rebuild))
+            return {
+                "ok": True,
+                "failed_count": 0,
+                "comparisons": [{"round": 1, "ok": True, "mismatches": []}],
+            }
+
+        cli.compare_history_runtime_snapshot = fake_compare
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "compare-history-snapshot",
+                "--db-path",
+                "shadow.sqlite3",
+                "--workers",
+                "2",
+                "--rounds",
+                "5",
+                "--fd-growth-limit",
+                "1",
+                "--rebuild",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [("shadow.sqlite3", 2, 5, 1, True)])
+        parsed = json.loads(output.getvalue())
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["comparisons"][0]["round"], 1)
+
+    def test_compare_history_runtime_snapshot_uses_sqlite_read_env(self) -> None:
+        cli = _load_cli_module()
+
+        class FakeRuntime:
+            def snapshot(self) -> dict:
+                mode = os.environ.get("AIBRANDMONITOR_HISTORY_READ_BACKEND") or "json"
+                return {
+                    "stats": {
+                        "enabledTasks": 2,
+                        "totalTasks": 3,
+                        "todayRecords": 4,
+                        "hitRecords": 5,
+                        "errorRecords": 1,
+                    },
+                    "dashboard": {
+                        "todayTaskCount": 2,
+                        "completedCount": 1,
+                        "runningCount": 1,
+                        "failedTaskCount": 0,
+                        "todayIntercepted": 4,
+                        "trend": {
+                            "timeRange": "week",
+                            "mode": "stable",
+                            "data": [{"name": mode, "value": 10}],
+                        },
+                    },
+                    "pendingReviews": [{"id": "review-1"}],
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "shadow.sqlite3"
+            db_path.touch()
+            result = cli.compare_history_runtime_snapshot(
+                db_path,
+                max_workers=2,
+                rounds=2,
+                fd_growth_limit=4,
+                runtime_factory=FakeRuntime,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failed_checks"], ["snapshot_fields"])
+        self.assertEqual(result["mismatch_count"], 2)
+        self.assertEqual(
+            result["comparisons"][0]["field_mismatches"][0]["field"],
+            "dashboardTrend",
+        )
 
     def test_compare_history_compact_output_keeps_only_failures_and_summary(self) -> None:
         cli = _load_cli_module()

@@ -166,6 +166,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Rebuild the SQLite shadow history table before comparing derived views.",
     )
+    history_snapshot_compare_parser = subparsers.add_parser(
+        "compare-history-snapshot",
+        parents=[common],
+        help="Compare AppRuntime.snapshot() across JSON and SQLite shadow history readers.",
+    )
+    history_snapshot_compare_parser.add_argument(
+        "--rounds",
+        type=int,
+        default=3,
+        help="Number of snapshot calls to run per read mode.",
+    )
+    history_snapshot_compare_parser.add_argument(
+        "--fd-growth-limit",
+        type=int,
+        default=4,
+        help="Maximum allowed open fd growth per read mode. Negative disables the check.",
+    )
+    history_snapshot_compare_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Rebuild the SQLite shadow store before comparing snapshots.",
+    )
     api_compare_parser = subparsers.add_parser(
         "compare-api-articles",
         parents=[common],
@@ -330,6 +352,15 @@ def main(argv: list[str] | None = None) -> int:
             args.db_path,
             max_workers=args.workers,
             pending_limit=args.pending_limit,
+            rebuild=bool(args.rebuild),
+        )
+        ok = bool(result.get("ok"))
+    elif args.command == "compare-history-snapshot":
+        result = compare_history_runtime_snapshot(
+            args.db_path,
+            max_workers=args.workers,
+            rounds=args.rounds,
+            fd_growth_limit=args.fd_growth_limit,
             rebuild=bool(args.rebuild),
         )
         ok = bool(result.get("ok"))
@@ -532,6 +563,14 @@ def stress_history_shadow_writes(
                 stress_db_path,
                 config,
             )
+            runtime_snapshot_report = compare_history_runtime_snapshot(
+                stress_db_path,
+                max_workers=worker_count,
+                rounds=min(3, max(1, resolved_task_count)),
+                fd_growth_limit=fd_growth_limit,
+                rebuild=False,
+                runtime_factory=lambda: _HistorySnapshotRuntimeHarness(config),
+            )
 
     fd_after = _open_fd_count()
     fd_growth = None if fd_before is None or fd_after is None else fd_after - fd_before
@@ -543,6 +582,7 @@ def stress_history_shadow_writes(
             ("task_reads", reads_report),
             ("derived_views", derived_report),
             ("runtime_reads", runtime_read_report),
+            ("runtime_snapshot", runtime_snapshot_report),
         )
         if not bool(report.get("ok"))
     ]
@@ -572,6 +612,7 @@ def stress_history_shadow_writes(
             "task_reads": _history_guard_summary(reads_report),
             "derived_views": _history_guard_summary(derived_report),
             "runtime_reads": runtime_read_report,
+            "runtime_snapshot": _runtime_snapshot_guard_summary(runtime_snapshot_report),
         },
     }
 
@@ -768,6 +809,384 @@ def _structured_runtime_read_summary(history_module: Any, db_path: Path, config:
         },
         "failed_tasks": failed_tasks[:10],
     }
+
+
+def _runtime_snapshot_guard_summary(report: dict[str, Any]) -> dict[str, Any]:
+    comparisons = [item for item in (report.get("comparisons") or []) if isinstance(item, dict)]
+    failed = [item for item in comparisons if not bool(item.get("ok"))]
+    return {
+        "ok": bool(report.get("ok")),
+        "failed_checks": report.get("failed_checks") or [],
+        "rounds": report.get("rounds"),
+        "workers": report.get("workers"),
+        "failed_count": report.get("failed_count"),
+        "mismatch_count": report.get("mismatch_count"),
+        "json": report.get("json") or {},
+        "sqlite_shadow": report.get("sqlite_shadow") or {},
+        "failed_comparisons": failed[:10],
+    }
+
+
+class _HistorySnapshotRuntimeHarness:
+    """Small harness for running AppRuntime snapshot aggregation against isolated config."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        import web_backend
+
+        self._web_backend = web_backend
+        self._config = json.loads(json.dumps(config, ensure_ascii=False))
+        self._lock = threading.RLock()
+        self.session_token = "history-snapshot-guard"
+        self._last_run = None
+        self._monitoring_status_message = "定时任务已关闭"
+        self._recognition_test_session = None
+        self._cloud_sync_manager = _SnapshotNullCloudSyncManager()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return self._web_backend.AppRuntime._snapshot_locked(self)
+
+    def load_config(self) -> dict[str, Any]:
+        return json.loads(json.dumps(self._config, ensure_ascii=False))
+
+    def save_config(self, config: dict[str, Any]) -> Path:
+        self._config = json.loads(json.dumps(config, ensure_ascii=False))
+        return Path("<history-snapshot-guard>")
+
+    def _ensure_context_snapshots(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        force: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        del force
+        return json.loads(json.dumps(config or self._config, ensure_ascii=False)), {}
+
+    def _sync_recognition_mode(self, config: dict[str, Any]) -> None:
+        del config
+
+    def _normalize_and_store_todos(self, config: dict[str, Any], *, save: bool = False) -> list[dict[str, Any]]:
+        del save
+        todos = config.get("quick_todos") if isinstance(config.get("quick_todos"), list) else []
+        return [item for item in todos if isinstance(item, dict)]
+
+    def _get_synced_articles(self, config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        del config
+        return []
+
+    def get_public_profile(self, config: dict[str, Any]) -> dict[str, Any]:
+        profile = config.get("profile") if isinstance(config.get("profile"), dict) else {}
+        return dict(profile)
+
+    def _get_active_recognition_manager(self, *, init_if_missing: bool = False) -> tuple[None, str]:
+        del init_if_missing
+        return None, ""
+
+    def _is_monitoring_running(self) -> bool:
+        return False
+
+
+class _SnapshotNullCloudSyncManager:
+    def get_status(self) -> dict[str, Any]:
+        return {}
+
+
+def compare_history_runtime_snapshot(
+    db_path: str | Path | None = None,
+    *,
+    max_workers: int | None = None,
+    rounds: int = 3,
+    fd_growth_limit: int = 4,
+    rebuild: bool = False,
+    runtime_factory: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
+    """Compare frontend snapshot history fields across JSON and SQLite shadow reads."""
+    from core import history as history_module
+
+    target_db_path = Path(db_path) if db_path is not None else default_shadow_db_path()
+    resolved_rounds = max(1, min(100, int(rounds or 1)))
+    worker_count = _bounded_worker_count(resolved_rounds, max_workers=max_workers)
+    rebuild_report = None
+    if rebuild:
+        rebuild_report = rebuild_shadow_store(
+            target_db_path,
+            max_workers=max_workers,
+            verify_tail_limit=1,
+        )
+
+    sqlite_available = target_db_path.exists()
+    with _patched_history_shadow_db_path(history_module, target_db_path):
+        if runtime_factory is not None:
+            runtime = runtime_factory()
+        else:
+            import web_backend
+
+            runtime = web_backend.AppRuntime()
+        json_batch = _snapshot_runtime_batch(
+            runtime,
+            mode="json",
+            read_backend=None,
+            read_backend_env=history_module.STRUCTURED_READ_BACKEND_ENV,
+            rounds=resolved_rounds,
+            workers=worker_count,
+            fd_growth_limit=fd_growth_limit,
+        )
+        sqlite_batch = _snapshot_runtime_batch(
+            runtime,
+            mode="sqlite_shadow",
+            read_backend="sqlite_shadow",
+            read_backend_env=history_module.STRUCTURED_READ_BACKEND_ENV,
+            rounds=resolved_rounds,
+            workers=worker_count,
+            fd_growth_limit=fd_growth_limit,
+        )
+
+    comparisons = _compare_snapshot_batches(json_batch["results"], sqlite_batch["results"])
+    mismatch_count = sum(1 for item in comparisons if not bool(item.get("ok")))
+    request_failed_count = int(json_batch.get("failed_count") or 0) + int(sqlite_batch.get("failed_count") or 0)
+    fd_failed_count = int(not bool(json_batch.get("fd_ok", True))) + int(not bool(sqlite_batch.get("fd_ok", True)))
+    failed_checks: list[str] = []
+    if rebuild_report is not None and not bool((rebuild_report.get("verification") or {}).get("ok")):
+        failed_checks.append("rebuild")
+    if not sqlite_available:
+        failed_checks.append("sqlite_shadow_missing")
+    if request_failed_count:
+        failed_checks.append("snapshot_request")
+    if fd_failed_count:
+        failed_checks.append("fd_growth")
+    if mismatch_count:
+        failed_checks.append("snapshot_fields")
+    setup_failed_count = sum(1 for name in failed_checks if name in {"rebuild", "sqlite_shadow_missing"})
+
+    return {
+        "ok": not failed_checks,
+        "db_path": str(target_db_path),
+        "rounds": resolved_rounds,
+        "workers": worker_count,
+        "fd_growth_limit": int(fd_growth_limit),
+        "sqlite_available": sqlite_available,
+        "rebuild": _runtime_snapshot_rebuild_summary(rebuild_report),
+        "failed_checks": failed_checks,
+        "failed_count": request_failed_count + fd_failed_count + mismatch_count + setup_failed_count,
+        "request_failed_count": request_failed_count,
+        "fd_failed_count": fd_failed_count,
+        "mismatch_count": mismatch_count,
+        "json": _snapshot_batch_summary(json_batch),
+        "sqlite_shadow": _snapshot_batch_summary(sqlite_batch),
+        "comparisons": comparisons,
+    }
+
+
+def _snapshot_runtime_batch(
+    runtime: Any,
+    *,
+    mode: str,
+    read_backend: str | None,
+    read_backend_env: str,
+    rounds: int,
+    workers: int,
+    fd_growth_limit: int,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    fd_before = _open_fd_count()
+
+    def capture(round_index: int) -> dict[str, Any]:
+        round_started = time.perf_counter()
+        try:
+            snapshot = runtime.snapshot()
+            return {
+                "ok": True,
+                "round": round_index,
+                "elapsed_ms": round((time.perf_counter() - round_started) * 1000, 3),
+                "signature": _history_snapshot_signature(snapshot),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "round": round_index,
+                "elapsed_ms": round((time.perf_counter() - round_started) * 1000, 3),
+                "error": exc.__class__.__name__,
+                "message": str(exc),
+            }
+
+    with _temporary_env(read_backend_env, read_backend):
+        if workers <= 1:
+            results = [capture(index) for index in range(1, rounds + 1)]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                results = list(executor.map(capture, range(1, rounds + 1)))
+
+    fd_after = _open_fd_count()
+    fd_delta = (
+        int(fd_after) - int(fd_before)
+        if fd_before is not None and fd_after is not None
+        else None
+    )
+    fd_ok = fd_growth_limit < 0 or fd_delta is None or fd_delta <= fd_growth_limit
+    failures = [item for item in results if not bool(item.get("ok"))]
+    return {
+        "mode": mode,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+        "fd_before": fd_before,
+        "fd_after": fd_after,
+        "fd_delta": fd_delta,
+        "fd_ok": fd_ok,
+        "failed_count": len(failures),
+        "results": results,
+    }
+
+
+def _history_snapshot_signature(snapshot: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    stats = snapshot.get("stats") if isinstance(snapshot.get("stats"), dict) else {}
+    dashboard = snapshot.get("dashboard") if isinstance(snapshot.get("dashboard"), dict) else {}
+    pending_reviews = snapshot.get("pendingReviews") if isinstance(snapshot.get("pendingReviews"), list) else []
+    pending_review_items = [item for item in pending_reviews if isinstance(item, dict)]
+    return {
+        "stats": {
+            "enabledTasks": int(stats.get("enabledTasks") or 0),
+            "totalTasks": int(stats.get("totalTasks") or 0),
+            "todayRecords": int(stats.get("todayRecords") or 0),
+            "hitRecords": int(stats.get("hitRecords") or 0),
+            "errorRecords": int(stats.get("errorRecords") or 0),
+        },
+        "dashboard": {
+            "todayTaskCount": int(dashboard.get("todayTaskCount") or 0),
+            "completedCount": int(dashboard.get("completedCount") or 0),
+            "runningCount": int(dashboard.get("runningCount") or 0),
+            "failedTaskCount": int(dashboard.get("failedTaskCount") or 0),
+            "todayIntercepted": int(dashboard.get("todayIntercepted") or 0),
+        },
+        "dashboardTrend": _stable_snapshot_value(dashboard.get("trend") if isinstance(dashboard, dict) else {}),
+        "pendingReviewIds": [
+            str(item.get("id") or "")
+            for item in pending_review_items
+        ],
+        "pendingReviewCount": len(pending_review_items),
+    }
+
+
+def _stable_snapshot_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _stable_snapshot_value(value[key]) for key in sorted(value.keys(), key=str)}
+    if isinstance(value, list):
+        return [_stable_snapshot_value(item) for item in value]
+    return value
+
+
+def _compare_snapshot_batches(
+    json_results: list[dict[str, Any]],
+    sqlite_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    sqlite_by_round = {int(item.get("round") or 0): item for item in sqlite_results}
+    comparisons: list[dict[str, Any]] = []
+    for json_item in json_results:
+        round_index = int(json_item.get("round") or 0)
+        sqlite_item = sqlite_by_round.get(round_index, {})
+        comparisons.append(_compare_snapshot_result(json_item, sqlite_item))
+    return comparisons
+
+
+def _compare_snapshot_result(json_item: dict[str, Any], sqlite_item: dict[str, Any]) -> dict[str, Any]:
+    round_index = int(json_item.get("round") or sqlite_item.get("round") or 0)
+    mismatches: list[str] = []
+    field_mismatches: list[dict[str, Any]] = []
+    if not bool(json_item.get("ok")) or not bool(sqlite_item.get("ok")):
+        mismatches.append("snapshot_request")
+    else:
+        json_signature = json_item.get("signature") if isinstance(json_item.get("signature"), dict) else {}
+        sqlite_signature = sqlite_item.get("signature") if isinstance(sqlite_item.get("signature"), dict) else {}
+        field_mismatches = _snapshot_field_mismatches(json_signature, sqlite_signature)
+        if field_mismatches:
+            mismatches.append("snapshot_fields")
+
+    return {
+        "ok": not mismatches,
+        "round": round_index,
+        "mismatches": mismatches,
+        "json": {
+            "ok": bool(json_item.get("ok")),
+            "elapsed_ms": json_item.get("elapsed_ms"),
+            "error": json_item.get("error", ""),
+            "message": json_item.get("message", ""),
+        },
+        "sqlite": {
+            "ok": bool(sqlite_item.get("ok")),
+            "elapsed_ms": sqlite_item.get("elapsed_ms"),
+            "error": sqlite_item.get("error", ""),
+            "message": sqlite_item.get("message", ""),
+        },
+        "field_mismatches": field_mismatches[:10],
+    }
+
+
+def _snapshot_field_mismatches(
+    json_signature: dict[str, Any],
+    sqlite_signature: dict[str, Any],
+) -> list[dict[str, Any]]:
+    fields = sorted(set(json_signature.keys()) | set(sqlite_signature.keys()))
+    return [
+        {
+            "field": field,
+            "json": json_signature.get(field),
+            "sqlite": sqlite_signature.get(field),
+        }
+        for field in fields
+        if json_signature.get(field) != sqlite_signature.get(field)
+    ]
+
+
+def _snapshot_batch_summary(batch: dict[str, Any]) -> dict[str, Any]:
+    results = batch.get("results") if isinstance(batch.get("results"), list) else []
+    failures = [item for item in results if not bool(item.get("ok"))]
+    return {
+        "elapsed_ms": batch.get("elapsed_ms"),
+        "request_count": len(results),
+        "failed_count": len(failures),
+        "latency_ms": _latency_summary([
+            float(item.get("elapsed_ms") or 0)
+            for item in results
+            if bool(item.get("ok"))
+        ]),
+        "fd_before": batch.get("fd_before"),
+        "fd_after": batch.get("fd_after"),
+        "fd_delta": batch.get("fd_delta"),
+        "fd_ok": bool(batch.get("fd_ok", True)),
+        "failures": [
+            {
+                "round": item.get("round"),
+                "error": item.get("error", ""),
+                "message": item.get("message", ""),
+            }
+            for item in failures[:10]
+        ],
+    }
+
+
+def _runtime_snapshot_rebuild_summary(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(report, dict):
+        return None
+    history = report.get("history") if isinstance(report.get("history"), dict) else {}
+    verification = report.get("verification") if isinstance(report.get("verification"), dict) else {}
+    return {
+        "storage_keys": history.get("storage_keys"),
+        "records": history.get("records"),
+        "created": history.get("created"),
+        "updated": history.get("updated"),
+        "skipped": history.get("skipped"),
+        "verification_ok": bool(verification.get("ok")),
+    }
+
+
+@contextlib.contextmanager
+def _patched_history_shadow_db_path(history_module: Any, db_path: Path):
+    original = history_module.HISTORY_SHADOW_DB_FILE
+    history_module.HISTORY_SHADOW_DB_FILE = db_path
+    try:
+        yield
+    finally:
+        history_module.HISTORY_SHADOW_DB_FILE = original
 
 
 def compare_article_api_pages(
