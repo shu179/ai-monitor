@@ -611,6 +611,63 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             self.assertEqual(store.get_article_today_count(today, task_name="品牌A"), 2)
             self.assertEqual(store.get_article_today_count(today, task_name="品牌B"), 1)
             self.assertEqual(store.get_article_today_count(today, media_type="authority"), 1)
+            page = store.get_article_page(limit=2, offset=1, task_name="品牌A", today=today)
+            self.assertEqual(page["total"], 4)
+            self.assertEqual(page["today_total"], 2)
+            self.assertEqual(page["limit"], 2)
+            self.assertEqual(page["offset"], 1)
+            self.assertEqual(len(page["items"]), 2)
+
+    def test_article_page_dedupes_missing_url_fingerprints_with_bounded_scan(self) -> None:
+        today = local_today().isoformat()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(
+                Path(tmpdir) / "local_store.sqlite3",
+                normalize_article_url=normalize_article_url,
+            )
+
+            store.import_articles(
+                [
+                    {
+                        "id": "article-a",
+                        "url": "https://example.com/a",
+                        "title": "同一篇报道",
+                        "media_name": "示例媒体",
+                        "media_type": "authority",
+                        "published_at": today,
+                        "ts": today,
+                        "matched_tasks": ["品牌A"],
+                    },
+                    {
+                        "id": "article-b",
+                        "url": "",
+                        "title": "同一篇报道",
+                        "media_name": "示例媒体",
+                        "media_type": "authority",
+                        "published_at": today,
+                        "ts": today,
+                        "matched_tasks": ["品牌B"],
+                    },
+                ],
+                replace=True,
+            )
+
+            page = store.get_article_page(limit=10, today=today)
+            self.assertEqual(page["total"], 1)
+            self.assertEqual(page["today_total"], 1)
+            self.assertEqual([item["id"] for item in page["items"]], ["article-b"])
+            self.assertEqual(page["items"][0]["matched_tasks"], ["品牌B", "品牌A"])
+            self.assertEqual(page["dedupe_strategy"], "bounded_url_scan")
+
+            brand_b_page = store.get_article_page(task_name="品牌B", limit=10, today=today)
+            self.assertEqual(brand_b_page["total"], 1)
+            self.assertEqual(brand_b_page["today_total"], 1)
+            self.assertEqual([item["id"] for item in brand_b_page["items"]], ["article-b"])
+
+            fallback_page = store.get_article_page(limit=10, today=today, dedupe_scan_limit=1)
+            self.assertTrue(fallback_page["fallback_required"])
+            self.assertEqual(fallback_page["fallback_reason"], "url_dedupe_scan_limit")
+            self.assertEqual(fallback_page["items"], [])
 
     def test_initialize_creates_expected_tables_and_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

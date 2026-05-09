@@ -74,6 +74,60 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
         self.assertEqual(result["today_total"], 1)
         self.assertEqual([item["id"] for item in result["articles"]], ["article-a"])
 
+    def test_sqlite_shadow_article_page_uses_paged_store_query(self) -> None:
+        today = "2026-05-09"
+        runtime = self._runtime()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "shadow.sqlite3"
+            ArticleHistorySQLiteStore(db_path).import_articles(
+                [
+                    {
+                        "id": "article-a",
+                        "url": "https://example.com/a",
+                        "title": "品牌A 今日报道",
+                        "media_type": "authority",
+                        "published_at": today,
+                        "ts": today,
+                        "matched_tasks": ["品牌A"],
+                    },
+                    {
+                        "id": "article-b",
+                        "url": "https://example.com/b",
+                        "title": "品牌A 旧报道",
+                        "media_type": "authority",
+                        "published_at": "2024-01-01",
+                        "ts": "2024-01-01",
+                        "matched_tasks": ["品牌A"],
+                    },
+                ],
+                replace=True,
+            )
+            runtime._ensure_sqlite_shadow_article_index = lambda config, *, db_path: True  # type: ignore[method-assign]
+            with (
+                patch.dict(os.environ, {"AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow"}),
+                patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
+                patch("web_backend.default_shadow_db_path", lambda: db_path),
+                patch("web_backend.local_today", lambda: type("FakeDate", (), {"isoformat": lambda self: today})()),
+                patch.object(
+                    ArticleHistorySQLiteStore,
+                    "get_article_items",
+                    side_effect=AssertionError("regular page path must not read all articles"),
+                ),
+            ):
+                result = runtime._get_sqlite_shadow_article_page(
+                    {"tasks": [{"name": "品牌A"}]},
+                    media_type="media",
+                    limit=1,
+                    task_name="品牌A",
+                )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["today_total"], 1)
+        self.assertEqual([item["id"] for item in result["articles"]], ["article-a"])
+
     def test_sqlite_shadow_compare_mode_marks_page_compare_only(self) -> None:
         today = "2026-05-09"
         runtime = self._runtime()
@@ -144,6 +198,12 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
                 patch("web_backend.refresh_article_matches", lambda config: list(articles)),
                 patch("web_backend.local_today", lambda: type("FakeDate", (), {"isoformat": lambda self: today})()),
             ):
+                all_result = runtime._get_sqlite_shadow_article_page(
+                    {"tasks": [{"name": "品牌A"}, {"name": "品牌B"}]},
+                    media_type="media",
+                    limit=10,
+                    task_name="",
+                )
                 result = runtime._get_sqlite_shadow_article_page(
                     {"tasks": [{"name": "品牌B"}]},
                     media_type="media",
@@ -151,6 +211,12 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
                     task_name="品牌B",
                 )
 
+        self.assertIsNotNone(all_result)
+        assert all_result is not None
+        self.assertEqual(all_result["total"], 1)
+        self.assertEqual(all_result["today_total"], 1)
+        self.assertEqual([item["id"] for item in all_result["articles"]], ["article-b"])
+        self.assertEqual(all_result["articles"][0]["matched_tasks"], ["品牌B", "品牌A"])
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result["total"], 1)
@@ -159,6 +225,16 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
         status = runtime.get_article_sqlite_shadow_compare_status()
         self.assertFalse(status["health"].get("last_fallback_reason", ""))
         self.assertEqual(status["health"].get("fallback_count", 0), 0)
+
+    def test_sqlite_shadow_article_page_falls_back_when_limit_exceeds_guard(self) -> None:
+        runtime = self._runtime()
+
+        with patch.dict(os.environ, {"AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow"}):
+            result = runtime._get_sqlite_shadow_article_page({}, limit=501)
+
+        self.assertIsNone(result)
+        status = runtime.get_article_sqlite_shadow_compare_status()
+        self.assertEqual(status["health"]["last_fallback_reason"], "limit_exceeded")
 
     def test_sqlite_shadow_article_page_merges_duplicate_url_tasks_like_json_page(self) -> None:
         today = "2026-05-09"

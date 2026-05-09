@@ -67,7 +67,6 @@ from backend_lib.article_service import (
     _article_import_batch_to_api,
     _article_import_batches_path,
     _article_import_task_terms,
-    _article_published_date,
     _article_to_api,
     _compact_article_import_match_text,
     _dedupe_articles_by_url,
@@ -5549,29 +5548,31 @@ return changedCount
                 return None
 
             store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
-            raw_articles = store.get_article_items(
+            page = store.get_article_page(
+                limit=resolved_limit,
+                offset=0,
                 task_name=str(task_name or "").strip(),
                 media_type=normalized_media_type,
+                today=local_today().isoformat(),
             )
-            filtered_articles = _dedupe_articles_by_url(raw_articles)
-            today = local_today()
-            today_text = today.isoformat()
-
-            def is_today_article(article: dict[str, Any]) -> bool:
-                published_date = _article_published_date(article)
-                return bool(
-                    published_date == today
-                    or (published_date is not None and published_date.isoformat() == today_text)
+            if bool(page.get("fallback_required")):
+                self._record_sqlite_shadow_fallback(
+                    read_backend,
+                    str(page.get("fallback_reason") or "article_page_fallback_required"),
                 )
+                return None
 
             articles = _apply_articles_account_context(
-                filtered_articles[:resolved_limit],
+                [
+                    item for item in (page.get("items") or [])
+                    if isinstance(item, dict)
+                ],
                 config,
             )
             result = {
                 "articles": articles,
-                "total": len(filtered_articles),
-                "today_total": sum(1 for article in filtered_articles if is_today_article(article)),
+                "total": int(page.get("total") or 0),
+                "today_total": int(page.get("today_total") or 0),
                 "compare_only": read_backend == "sqlite_shadow_compare",
             }
         except Exception as exc:

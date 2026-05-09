@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from .time_utils import local_today, parse_local_date
+
 
 SCHEMA_VERSION = 1
 
@@ -387,6 +389,8 @@ class ArticleHistorySQLiteStore:
         relation: str = "matched",
         media_type: str = "",
         search: str = "",
+        today: str | None = None,
+        dedupe_scan_limit: int = 5000,
     ) -> dict[str, Any]:
         self.initialize()
         where_sql, params = self._article_query_filters(
@@ -397,11 +401,35 @@ class ArticleHistorySQLiteStore:
         )
         limit = max(1, min(500, int(limit or 100)))
         offset = max(0, int(offset or 0))
+        today_text = self._date_text(today if today is not None else local_today().isoformat())[:10]
         with self._connection() as conn:
             total = conn.execute(
                 f"SELECT COUNT(*) FROM articles a {where_sql}",
                 params,
             ).fetchone()[0]
+            empty_url_count = self._article_count_with_extra_condition(
+                conn,
+                where_sql,
+                params,
+                "(a.normalized_url IS NULL OR a.normalized_url = '')",
+            )
+            if empty_url_count:
+                return self._get_article_page_with_bounded_url_dedupe(
+                    conn,
+                    where_sql=where_sql,
+                    params=params,
+                    total=int(total or 0),
+                    limit=limit,
+                    offset=offset,
+                    today_text=today_text,
+                    dedupe_scan_limit=dedupe_scan_limit,
+                )
+            today_total = self._article_today_count_with_conn(
+                conn,
+                where_sql,
+                params,
+                today_text,
+            )
             rows = conn.execute(
                 f"""
                 SELECT a.raw_json
@@ -417,6 +445,7 @@ class ArticleHistorySQLiteStore:
             ).fetchall()
         return {
             "total": int(total or 0),
+            "today_total": int(today_total),
             "limit": limit,
             "offset": offset,
             "items": [self._json_loads(row[0]) for row in rows],
@@ -471,20 +500,96 @@ class ArticleHistorySQLiteStore:
             media_type=media_type,
             search=search,
         )
+        with self._connection() as conn:
+            return self._article_today_count_with_conn(
+                conn,
+                where_sql,
+                params,
+                date_text,
+            )
+
+    def _get_article_page_with_bounded_url_dedupe(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        where_sql: str,
+        params: list[Any],
+        total: int,
+        limit: int,
+        offset: int,
+        today_text: str,
+        dedupe_scan_limit: int,
+    ) -> dict[str, Any]:
+        scan_limit = max(0, int(dedupe_scan_limit or 0))
+        if total > scan_limit:
+            return {
+                "total": total,
+                "today_total": 0,
+                "limit": limit,
+                "offset": offset,
+                "items": [],
+                "fallback_required": True,
+                "fallback_reason": "url_dedupe_scan_limit",
+                "dedupe_scan_limit": scan_limit,
+            }
+
+        rows = conn.execute(
+            f"""
+            SELECT a.raw_json
+            FROM articles a
+            {where_sql}
+            ORDER BY
+                a.sort_published_ts DESC,
+                a.sort_imported_ts DESC,
+                a.id DESC
+            """,
+            params,
+        ).fetchall()
+        deduped = self._dedupe_articles_by_url([self._json_loads(row[0]) for row in rows])
+        return {
+            "total": len(deduped),
+            "today_total": sum(
+                1 for article in deduped
+                if self._article_matches_today(article, today_text)
+            ),
+            "limit": limit,
+            "offset": offset,
+            "items": deduped[offset:offset + limit],
+            "dedupe_strategy": "bounded_url_scan",
+        }
+
+    def _article_count_with_extra_condition(
+        self,
+        conn: sqlite3.Connection,
+        where_sql: str,
+        params: list[Any],
+        condition: str,
+    ) -> int:
+        row = conn.execute(
+            f"SELECT COUNT(*) FROM articles a {self._append_article_condition(where_sql, condition)}",
+            params,
+        ).fetchone()
+        return int((row or [0])[0] or 0)
+
+    def _article_today_count_with_conn(
+        self,
+        conn: sqlite3.Connection,
+        where_sql: str,
+        params: list[Any],
+        today_text: str,
+    ) -> int:
+        date_text = self._date_text(today_text)[:10]
+        if not date_text:
+            return 0
         today_condition = (
             "(substr(a.published_at, 1, 10) = ? "
             "OR (a.published_at = '' AND a.fetch_method != 'manual_table_import' "
             "AND substr(a.ts, 1, 10) = ?))"
         )
-        if " WHERE " in f" {where_sql} ":
-            where_sql = f"{where_sql} AND {today_condition}"
-        else:
-            where_sql = f"{where_sql} WHERE {today_condition}"
-        with self._connection() as conn:
-            row = conn.execute(
-                f"SELECT COUNT(*) FROM articles a {where_sql}",
-                [*params, date_text, date_text],
-            ).fetchone()
+        row = conn.execute(
+            f"SELECT COUNT(*) FROM articles a {self._append_article_condition(where_sql, today_condition)}",
+            [*params, date_text, date_text],
+        ).fetchone()
         return int((row or [0])[0] or 0)
 
     def import_history_records(
@@ -1099,6 +1204,75 @@ class ArticleHistorySQLiteStore:
         if conditions:
             where = f"{where} WHERE {' AND '.join(conditions)}"
         return where, params
+
+    @staticmethod
+    def _append_article_condition(where_sql: str, condition: str) -> str:
+        normalized_condition = str(condition or "").strip()
+        if not normalized_condition:
+            return where_sql
+        if " WHERE " in f" {where_sql} ":
+            return f"{where_sql} AND {normalized_condition}"
+        if where_sql:
+            return f"{where_sql} WHERE {normalized_condition}"
+        return f"WHERE {normalized_condition}"
+
+    def _dedupe_articles_by_url(self, articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduped: list[dict[str, Any]] = []
+        index_by_url: dict[str, int] = {}
+        url_by_fingerprint: dict[str, str] = {}
+        for article in articles:
+            if not isinstance(article, dict):
+                continue
+            normalized_url = self._normalized_url(article)
+            fingerprint = self._article_url_fingerprint(article)
+            if normalized_url and fingerprint and fingerprint not in url_by_fingerprint:
+                url_by_fingerprint[fingerprint] = self._text(article.get("url"))
+
+        for article in articles:
+            if not isinstance(article, dict):
+                continue
+            item = dict(article)
+            normalized_url = self._normalized_url(item)
+            if not normalized_url:
+                fallback_url = url_by_fingerprint.get(self._article_url_fingerprint(item), "")
+                if fallback_url:
+                    item["url"] = fallback_url
+                    normalized_url = self._normalized_url(item)
+            if not normalized_url:
+                deduped.append(item)
+                continue
+            existing_index = index_by_url.get(normalized_url)
+            if existing_index is None:
+                index_by_url[normalized_url] = len(deduped)
+                deduped.append(item)
+                continue
+            deduped[existing_index] = self._merge_article_for_duplicate_url(deduped[existing_index], item)
+        return deduped
+
+    @classmethod
+    def _article_url_fingerprint(cls, article: dict[str, Any]) -> str:
+        title = re.sub(r"\s+", " ", cls._text(article.get("title"))).lower()
+        source = re.sub(
+            r"\s+",
+            " ",
+            cls._text(article.get("media_name") or article.get("source") or article.get("platform")),
+        ).lower()
+        published = cls._text(article.get("published_at") or article.get("published") or article.get("ts"))[:10]
+        if not title or not source:
+            return ""
+        return "|".join([title, source, published])
+
+    @classmethod
+    def _article_matches_today(cls, article: dict[str, Any], today_text: str) -> bool:
+        date_text = cls._date_text(today_text)[:10]
+        if not date_text:
+            return False
+        published_at = article.get("published_at")
+        if published_at:
+            return parse_local_date(published_at) == parse_local_date(date_text)
+        if cls._text(article.get("fetch_method")) == "manual_table_import":
+            return False
+        return parse_local_date(article.get("ts")) == parse_local_date(date_text)
 
     def _article_id(self, article: dict[str, Any]) -> str:
         explicit = self._text(article.get("id"))
