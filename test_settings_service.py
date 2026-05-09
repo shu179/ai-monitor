@@ -35,6 +35,7 @@ def test_settings_service_projects_masked_settings(monkeypatch):
         },
         "article_export": {"show_keyword_category": True, "show_selfmedia_account": False},
         "selector_agent": {"enabled": True, "platform": "deepseek", "model": "deepseek-chat"},
+        "storage": {"history_read_backend": "auto", "history_shadow_writes_enabled": True},
     }
 
     service = SettingsService(
@@ -61,6 +62,10 @@ def test_settings_service_projects_masked_settings(monkeypatch):
     assert result["article_export"] == {
         "show_keyword_category": True,
         "show_selfmedia_account": False,
+    }
+    assert result["storage"] == {
+        "history_read_backend": "auto",
+        "history_shadow_writes_enabled": True,
     }
     assert result["selector_agent"] == {"enabled": True, "platform": "deepseek", "model": "deepseek-chat"}
     assert result["query_execution"]["browser"]["strategy"] == "platform_serial"

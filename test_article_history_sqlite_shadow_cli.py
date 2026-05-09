@@ -531,6 +531,413 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
         self.assertTrue(parsed["ok"])
         self.assertEqual(parsed["modes"]["sqlite_shadow"]["request_count"], 6)
 
+    def test_stress_api_mixed_command_prints_report(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_stress(
+            db_path,
+            *,
+            max_workers,
+            snapshot_rounds,
+            article_rounds,
+            article_limit,
+            timeout,
+            include_export_keywords,
+            fd_growth_limit,
+            max_p95_ms,
+            max_failed_requests,
+            max_mismatches,
+        ):
+            calls.append((
+                db_path,
+                max_workers,
+                snapshot_rounds,
+                article_rounds,
+                article_limit,
+                timeout,
+                include_export_keywords,
+                fd_growth_limit,
+                max_p95_ms,
+                max_failed_requests,
+                max_mismatches,
+            ))
+            return {
+                "ok": True,
+                "failed_count": 0,
+                "status": {"ok": True, "rounds": snapshot_rounds},
+                "articles": {"ok": True, "rounds": article_rounds},
+            }
+
+        cli.stress_mixed_api_guards = fake_stress
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "stress-api-mixed",
+                "--db-path",
+                "shadow.sqlite3",
+                "--workers",
+                "4",
+                "--snapshot-rounds",
+                "5",
+                "--article-rounds",
+                "6",
+                "--article-limit",
+                "40",
+                "--timeout",
+                "7.5",
+                "--fd-growth-limit",
+                "3",
+                "--max-p95-ms",
+                "100",
+                "--max-failed-requests",
+                "1",
+                "--max-mismatches",
+                "2",
+                "--include-export-keywords",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [("shadow.sqlite3", 4, 5, 6, 40, 7.5, True, 3, 100.0, 1, 2)])
+        parsed = json.loads(output.getvalue())
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["status"]["rounds"], 5)
+        self.assertEqual(parsed["articles"]["rounds"], 6)
+
+    def test_validate_history_sqlite_readiness_command_prints_report(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_validate(
+            db_path,
+            *,
+            max_workers,
+            read_limit,
+            sample_pages,
+            pending_limit,
+            snapshot_rounds,
+            api_rounds,
+            timeout,
+            fd_growth_limit,
+            max_p95_ms,
+        ):
+            calls.append((
+                db_path,
+                max_workers,
+                read_limit,
+                sample_pages,
+                pending_limit,
+                snapshot_rounds,
+                api_rounds,
+                timeout,
+                fd_growth_limit,
+                max_p95_ms,
+            ))
+            return {
+                "ok": True,
+                "failed_checks": [],
+                "checks": {"api_snapshot": {"ok": True}},
+            }
+
+        cli.validate_history_sqlite_readiness = fake_validate
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "validate-history-sqlite-readiness",
+                "--db-path",
+                "shadow.sqlite3",
+                "--workers",
+                "3",
+                "--read-limit",
+                "80",
+                "--sample-pages",
+                "4",
+                "--pending-limit",
+                "120",
+                "--snapshot-rounds",
+                "5",
+                "--api-rounds",
+                "6",
+                "--timeout",
+                "4.5",
+                "--fd-growth-limit",
+                "2",
+                "--max-p95-ms",
+                "90",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [("shadow.sqlite3", 3, 80, 4, 120, 5, 6, 4.5, 2, 90.0)])
+        parsed = json.loads(output.getvalue())
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["checks"]["api_snapshot"]["ok"], True)
+
+    def test_validate_history_sqlite_readiness_reports_failed_guard(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_rebuild(db_path, *, max_workers, verify_tail_limit):
+            calls.append(("rebuild", str(db_path), max_workers, verify_tail_limit))
+            return {
+                "history": {"storage_keys": 1, "records": 2, "created": 2, "updated": 0, "skipped": 0},
+                "verification": {"ok": True},
+            }
+
+        def fake_reads(db_path, *, max_workers, limit, sample_pages, rebuild):
+            calls.append(("reads", str(db_path), max_workers, limit, sample_pages, rebuild))
+            return {"ok": True, "failed_count": 0, "query_count": 1, "queries": []}
+
+        def fake_derived(db_path, *, max_workers, pending_limit, rebuild):
+            calls.append(("derived", str(db_path), max_workers, pending_limit, rebuild))
+            return {"ok": True, "failed_count": 0, "view_count": 2, "views": []}
+
+        def fake_snapshot(db_path, *, max_workers, rounds, fd_growth_limit, rebuild):
+            calls.append(("snapshot", str(db_path), max_workers, rounds, fd_growth_limit, rebuild))
+            return {"ok": True, "failed_checks": [], "comparisons": []}
+
+        def fake_api_snapshot(
+            db_path,
+            *,
+            max_workers,
+            rounds,
+            timeout,
+            fd_growth_limit,
+            max_p95_ms,
+            max_failed_requests,
+            max_mismatches,
+            mode,
+        ):
+            calls.append((
+                "api_snapshot",
+                str(db_path),
+                max_workers,
+                rounds,
+                timeout,
+                fd_growth_limit,
+                max_p95_ms,
+                max_failed_requests,
+                max_mismatches,
+                mode,
+            ))
+            if mode == "auto":
+                return {
+                    "ok": True,
+                    "failed_checks": [],
+                    "failed_count": 0,
+                    "rounds": rounds,
+                    "workers": max_workers,
+                    "modes": {"auto": {"request_count": rounds}},
+                }
+            return {
+                "ok": False,
+                "failed_checks": ["history_storage"],
+                "failed_count": 1,
+                "rounds": rounds,
+                "workers": max_workers,
+                "storage_mismatch_count": 1,
+                "modes": {"sqlite_shadow": {"request_count": rounds}},
+            }
+
+        cli.rebuild_shadow_store = fake_rebuild
+        cli.compare_history_task_reads = fake_reads
+        cli.compare_history_derived_views = fake_derived
+        cli.compare_history_runtime_snapshot = fake_snapshot
+        cli.stress_snapshot_api = fake_api_snapshot
+
+        result = cli.validate_history_sqlite_readiness(
+            "shadow.sqlite3",
+            max_workers=2,
+            read_limit=75,
+            sample_pages=2,
+            pending_limit=50,
+            snapshot_rounds=3,
+            api_rounds=4,
+            timeout=5.0,
+            fd_growth_limit=1,
+            max_p95_ms=100.0,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failed_checks"], ["api_snapshot"])
+        self.assertEqual(result["checks"]["api_snapshot"]["failed_checks"], ["history_storage"])
+        self.assertTrue(result["checks"]["api_snapshot_auto"]["ok"])
+        self.assertEqual(calls[0], ("rebuild", "shadow.sqlite3", 2, 1))
+        self.assertEqual(calls[-2], ("api_snapshot", "shadow.sqlite3", 2, 4, 5.0, 1, 100.0, 0, 0, "both"))
+        self.assertEqual(calls[-1], ("api_snapshot", "shadow.sqlite3", 2, 4, 5.0, 1, 100.0, 0, 0, "auto"))
+
+    def test_stress_api_snapshot_command_prints_report(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_stress(
+            db_path,
+            *,
+            max_workers,
+            rounds,
+            timeout,
+            fd_growth_limit,
+            max_p95_ms,
+            max_failed_requests,
+            max_mismatches,
+            mode,
+        ):
+            calls.append((
+                db_path,
+                max_workers,
+                rounds,
+                timeout,
+                fd_growth_limit,
+                max_p95_ms,
+                max_failed_requests,
+                max_mismatches,
+                mode,
+            ))
+            return {
+                "ok": True,
+                "failed_count": 0,
+                "modes": {"sqlite_shadow": {"request_count": 4}},
+            }
+
+        cli.stress_snapshot_api = fake_stress
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "stress-api-snapshot",
+                "--db-path",
+                "shadow.sqlite3",
+                "--workers",
+                "3",
+                "--rounds",
+                "7",
+                "--timeout",
+                "4.5",
+                "--fd-growth-limit",
+                "2",
+                "--max-p95-ms",
+                "80",
+                "--max-failed-requests",
+                "1",
+                "--max-mismatches",
+                "2",
+                "--mode",
+                "sqlite_shadow",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [("shadow.sqlite3", 3, 7, 4.5, 2, 80.0, 1, 2, "sqlite_shadow")])
+        parsed = json.loads(output.getvalue())
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["modes"]["sqlite_shadow"]["request_count"], 4)
+
+    def test_stress_api_snapshot_command_accepts_auto_mode(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_stress(
+            db_path,
+            *,
+            max_workers,
+            rounds,
+            timeout,
+            fd_growth_limit,
+            max_p95_ms,
+            max_failed_requests,
+            max_mismatches,
+            mode,
+        ):
+            calls.append((db_path, max_workers, rounds, timeout, fd_growth_limit, max_p95_ms, max_failed_requests, max_mismatches, mode))
+            return {
+                "ok": True,
+                "failed_count": 0,
+                "modes": {"auto": {"request_count": 2}},
+            }
+
+        cli.stress_snapshot_api = fake_stress
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "stress-api-snapshot",
+                "--db-path",
+                "shadow.sqlite3",
+                "--rounds",
+                "2",
+                "--mode",
+                "auto",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [("shadow.sqlite3", None, 2, 20.0, 8, 0.0, 0, 0, "auto")])
+        parsed = json.loads(output.getvalue())
+        self.assertEqual(parsed["modes"]["auto"]["request_count"], 2)
+
+    def test_sqlite_snapshot_batch_storage_mismatches_require_successful_health(self) -> None:
+        cli = _load_cli_module()
+
+        result = cli._sqlite_snapshot_batch_storage_mismatches({
+            "results": [
+                {
+                    "ok": True,
+                    "round": 1,
+                    "history_storage": {
+                        "enabled": True,
+                        "available": True,
+                        "last_status": "fallback",
+                        "success_count": 0,
+                        "fallback_count": 1,
+                        "consecutive_errors": 0,
+                    },
+                },
+                {
+                    "ok": True,
+                    "round": 2,
+                    "history_storage": {
+                        "enabled": True,
+                        "available": True,
+                        "last_status": "success",
+                        "success_count": 1,
+                        "fallback_count": 0,
+                        "consecutive_errors": 0,
+                    },
+                },
+            ],
+        })
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["round"], 1)
+        self.assertEqual(
+            result[0]["mismatches"],
+            ["last_status", "success_count", "fallback_count"],
+        )
+
+    def test_history_storage_summary_keeps_backend_guard_fields(self) -> None:
+        cli = _load_cli_module()
+
+        summary = cli._history_storage_summary({
+            "historyStorage": {
+                "enabled": True,
+                "available": True,
+                "ready": True,
+                "fresh": True,
+                "backend": "auto",
+                "backendSource": "config",
+                "requestedBackend": "auto",
+                "effectiveBackend": "sqlite_shadow",
+                "shadowWritesEnabled": True,
+                "last_status": "success",
+                "success_count": 2,
+            },
+        })
+
+        self.assertEqual(summary["backend"], "auto")
+        self.assertEqual(summary["backend_source"], "config")
+        self.assertEqual(summary["requested_backend"], "auto")
+        self.assertEqual(summary["effective_backend"], "sqlite_shadow")
+        self.assertTrue(summary["shadow_writes_enabled"])
+
     def test_stress_history_writes_command_prints_report(self) -> None:
         cli = _load_cli_module()
         calls = []

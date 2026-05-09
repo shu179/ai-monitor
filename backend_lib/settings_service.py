@@ -41,6 +41,16 @@ def _screenshot_theme_to_api(theme: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_storage_settings(config: dict[str, Any]) -> dict[str, Any]:
+    storage_cfg = config.get("storage", {}) if isinstance(config, dict) else {}
+    if not isinstance(storage_cfg, dict):
+        storage_cfg = {}
+    return {
+        "history_read_backend": str(storage_cfg.get("history_read_backend") or "").strip().lower(),
+        "history_shadow_writes_enabled": bool(storage_cfg.get("history_shadow_writes_enabled", False)),
+    }
+
+
 class SettingsService:
     """Read-only settings projection for the frontend API."""
 
@@ -121,6 +131,7 @@ class SettingsService:
                     (config.get("article_export", {}) or {}).get("show_selfmedia_account", True)
                 ),
             },
+            "storage": _normalize_storage_settings(config),
             "tavily": {
                 "api_key": self._mask_secret(search_cfg.get("tavily_api_key", "")),
             },

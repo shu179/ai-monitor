@@ -134,11 +134,28 @@ class ArticleApiSQLiteShadowCompareTests(unittest.TestCase):
     def test_stress_modes(self) -> None:
         cli = _load_cli_module()
 
-        self.assertEqual(cli._stress_modes("json"), [("json", None)])
+        self.assertEqual(cli._stress_modes("json"), [("json", "json")])
         self.assertEqual(cli._stress_modes("sqlite_shadow"), [("sqlite_shadow", "sqlite_shadow")])
         self.assertEqual(
             cli._stress_modes("both"),
-            [("json", None), ("sqlite_shadow", "sqlite_shadow")],
+            [("json", "json"), ("sqlite_shadow", "sqlite_shadow")],
+        )
+
+    def test_article_shadow_health_mismatches_detects_silent_fallback(self) -> None:
+        cli = _load_cli_module()
+
+        mismatches = cli._article_shadow_health_mismatches({
+            "health": {
+                "blocked": True,
+                "fallback_count": 2,
+                "consecutive_errors": 1,
+                "last_fallback_reason": "index_verify_failed",
+            },
+        })
+
+        self.assertEqual(
+            mismatches,
+            ["blocked", "fallback_count", "consecutive_errors", "last_fallback_reason"],
         )
 
 

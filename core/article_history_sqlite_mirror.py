@@ -33,6 +33,7 @@ def rebuild_shadow_store(
 ) -> dict[str, Any]:
     """Rebuild the structured SQLite shadow store from the current JSON stores."""
     target_db_path = Path(db_path) if db_path is not None else default_shadow_db_path()
+    source_signature = history.get_history_source_signature()
     source = load_json_source(max_workers=max_workers)
     store = ArticleHistorySQLiteStore(
         target_db_path,
@@ -42,6 +43,7 @@ def rebuild_shadow_store(
     store.clear_all()
     article_result = store.import_articles(source["articles"], replace=False)
     history_result = store.import_history_sources(source["history"], replace=False)
+    store.set_meta("history_source_signature", source_signature)
 
     verification = verify_shadow_store(
         target_db_path,
@@ -855,13 +857,50 @@ def _history_read_targets_for_compare(
     normalized_task_id = str(task_id or "").strip()
     normalized_task_name = str(task_name or "").strip()
     primary = normalized_task_id or normalized_task_name
-    if primary:
-        targets.append(primary)
-    if normalized_task_id and callable(exists) and exists(normalized_task_id):
-        return targets
-    if normalized_task_name and normalized_task_name not in targets:
-        targets.append(normalized_task_name)
+    primary_aliases = _history_storage_key_aliases_for_compare(primary)
+    for key in primary_aliases:
+        _append_unique_history_target(targets, key)
+    if normalized_task_id:
+        existing_primary_aliases = _preferred_existing_history_aliases(primary_aliases, exists)
+        if existing_primary_aliases:
+            return existing_primary_aliases
+    for key in _history_storage_key_aliases_for_compare(normalized_task_name):
+        _append_unique_history_target(targets, key)
     return targets
+
+
+def _append_unique_history_target(targets: list[str], value: str) -> None:
+    text = str(value or "").strip()
+    if text and text not in targets:
+        targets.append(text)
+
+
+def _history_storage_key_aliases_for_compare(storage_key: str) -> list[str]:
+    aliases: list[str] = []
+    normalized = str(storage_key or "").strip()
+    _append_unique_history_target(aliases, normalized)
+    if normalized:
+        _append_unique_history_target(aliases, _safe_history_storage_key_for_compare(normalized))
+    return aliases
+
+
+def _preferred_existing_history_aliases(aliases: list[str], exists: Any) -> list[str]:
+    if not callable(exists):
+        return []
+    existing = [key for key in aliases if exists(key)]
+    if not existing:
+        return []
+    canonical = aliases[-1] if aliases else ""
+    if canonical in existing:
+        return [canonical]
+    return existing[:1]
+
+
+def _safe_history_storage_key_for_compare(storage_key: str) -> str:
+    safe = str(storage_key or "").replace("/", "_").replace("\\", "_").replace(" ", "_")
+    for ch in ':*?"<>|':
+        safe = safe.replace(ch, "_")
+    return safe
 
 
 def _history_runtime_records_from_sources(

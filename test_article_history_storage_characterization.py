@@ -9,6 +9,7 @@ from pathlib import Path
 
 import core.article_store as article_store
 import core.history as history
+from core.article_history_sqlite_mirror import compare_history_task_reads
 from core.article_history_sqlite_store import ArticleHistorySQLiteStore
 
 
@@ -395,6 +396,7 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         history.LOCAL_STORE_DB_FILE = root / "logs" / "local_store.sqlite3"
         history.HISTORY_SHADOW_DB_FILE = root / "logs" / "article_history_shadow.sqlite3"
         history.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        history.configure_structured_history_storage({})
         history.reset_structured_read_health()
 
     def tearDown(self) -> None:
@@ -414,6 +416,7 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         history.HISTORY_DIR = self._original_paths["HISTORY_DIR"]
         history.LOCAL_STORE_DB_FILE = self._original_paths["LOCAL_STORE_DB_FILE"]
         history.HISTORY_SHADOW_DB_FILE = self._original_paths["HISTORY_SHADOW_DB_FILE"]
+        history.configure_structured_history_storage({})
         history.reset_structured_read_health()
         self._tmpdir.cleanup()
 
@@ -539,6 +542,25 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self.assertEqual(primary["review_note"], "ok")
         self.assertEqual(store.get_pending_reviews(), [])
 
+    def test_structured_shadow_writes_use_safe_legacy_storage_key_for_spaced_names(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_SHADOW_WRITE_ENV] = "1"
+
+        entry = history.record(
+            "Space Task",
+            "doubao",
+            "keyword",
+            "Brand",
+            1,
+            True,
+            task_id="task_space_key",
+        )
+
+        store = ArticleHistorySQLiteStore(history.HISTORY_SHADOW_DB_FILE)
+        self.assertEqual([item["id"] for item in store.get_history_records("task_space_key")], [entry["id"]])
+        self.assertEqual([item["id"] for item in store.get_history_records("Space_Task")], [entry["id"]])
+        self.assertEqual(store.get_history_records("Space Task"), [])
+
     def test_structured_shadow_writes_follow_import_trimmed_records_when_enabled(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
         os.environ[history.STRUCTURED_SHADOW_WRITE_ENV] = "1"
@@ -627,6 +649,72 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self.assertGreaterEqual(health["success_count"], 5)
         self.assertEqual(health.get("consecutive_errors"), 0)
 
+    def test_structured_read_backend_finds_safe_legacy_storage_key_for_spaced_names(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "sqlite_shadow"
+        store = ArticleHistorySQLiteStore(history.HISTORY_SHADOW_DB_FILE)
+        store.import_history_sources(
+            {
+                "Formnext_Asia": [
+                    {
+                        "id": "space-legacy-1",
+                        "ts": "2024-01-01 09:00",
+                        "task_name": "Formnext Asia",
+                        "platform": "doubao",
+                        "keyword": "keyword",
+                        "brand": "Formnext Asia",
+                        "rank": 1,
+                        "success": True,
+                    },
+                ],
+            },
+            replace=True,
+        )
+
+        records = history.get_records("Formnext Asia", task_id="cloud_17")
+        batch_records = history.get_records_many([("Formnext Asia", "cloud_17")])
+        signature = history.get_records_file_signature("Formnext Asia", task_id="cloud_17")
+
+        self.assertEqual([item["id"] for item in records], ["space-legacy-1"])
+        self.assertEqual([[item["id"] for item in batch] for batch in batch_records], [["space-legacy-1"]])
+        self.assertTrue(any(
+            "article_history_shadow.sqlite3::history_records/Formnext_Asia" in item[0]
+            for item in signature
+        ))
+
+    def test_history_task_read_compare_uses_safe_legacy_storage_key_for_spaced_names(self) -> None:
+        source = {
+            "Formnext_Asia": [
+                {
+                    "id": "space-compare-1",
+                    "ts": "2024-01-01 09:00",
+                    "task_name": "Formnext Asia",
+                    "platform": "doubao",
+                    "keyword": "keyword",
+                    "brand": "Formnext Asia",
+                    "rank": 1,
+                    "success": True,
+                },
+            ],
+        }
+        store = ArticleHistorySQLiteStore(history.HISTORY_SHADOW_DB_FILE)
+        store.import_history_sources(source, replace=True)
+
+        result = compare_history_task_reads(
+            history.HISTORY_SHADOW_DB_FILE,
+            config={"tasks": [{"task_id": "cloud_17", "name": "Formnext Asia"}]},
+            source=source,
+            limit=10,
+            sample_pages=1,
+        )
+
+        self.assertTrue(result["ok"])
+        query = result["queries"][0]
+        self.assertEqual(query["json"]["targets"], ["cloud_17", "Formnext Asia", "Formnext_Asia"])
+        self.assertEqual(query["sqlite"]["targets"], ["cloud_17", "Formnext Asia", "Formnext_Asia"])
+        self.assertEqual(query["json"]["count"], 1)
+        self.assertEqual(query["sqlite"]["count"], 1)
+
     def test_structured_read_backend_falls_back_to_json_when_shadow_db_missing(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
         os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "sqlite_shadow"
@@ -653,6 +741,229 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self.assertEqual(health["last_status"], "fallback")
         self.assertEqual(health["last_fallback_reason"], "shadow_db_missing")
         self.assertGreaterEqual(health["fallback_count"], 1)
+
+    def test_structured_read_auto_mode_uses_json_without_creating_missing_shadow_db(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "auto"
+        legacy_file = history._task_file("Auto Fallback")
+        legacy_file.write_text(
+            json.dumps([
+                {
+                    "id": "auto-json-1",
+                    "ts": "2024-01-01 09:00",
+                    "task_name": "Auto Fallback",
+                    "rank": 1,
+                    "success": True,
+                },
+            ], ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        self.assertFalse(history.HISTORY_SHADOW_DB_FILE.exists())
+        self.assertEqual([item["id"] for item in history.get_records("Auto Fallback")], ["auto-json-1"])
+        self.assertFalse(history.HISTORY_SHADOW_DB_FILE.exists())
+        health = history.get_structured_read_health()
+        self.assertFalse(health["enabled"])
+        self.assertFalse(health["available"])
+        self.assertFalse(health["ready"])
+        self.assertFalse(health["fresh"])
+        self.assertEqual(health["backend"], "auto")
+        self.assertEqual(health["last_status"], "fallback")
+        self.assertEqual(health["last_fallback_reason"], "shadow_db_missing")
+
+    def test_structured_read_auto_mode_falls_back_when_shadow_db_has_no_history_schema(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "sqlite_shadow_auto"
+        conn = sqlite3.connect(history.HISTORY_SHADOW_DB_FILE)
+        conn.close()
+        legacy_file = history._task_file("Auto No Schema")
+        legacy_file.write_text(
+            json.dumps([
+                {
+                    "id": "auto-json-2",
+                    "ts": "2024-01-01 09:00",
+                    "task_name": "Auto No Schema",
+                    "rank": 1,
+                    "success": True,
+                },
+            ], ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        self.assertEqual([item["id"] for item in history.get_records("Auto No Schema")], ["auto-json-2"])
+        health = history.get_structured_read_health()
+        self.assertFalse(health["enabled"])
+        self.assertTrue(health["available"])
+        self.assertFalse(health["ready"])
+        self.assertFalse(health["fresh"])
+        self.assertEqual(health["last_status"], "fallback")
+        self.assertEqual(health["last_fallback_reason"], "shadow_db_not_ready")
+
+    def test_structured_read_explicit_mode_falls_back_when_shadow_db_has_no_history_schema(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "sqlite_shadow"
+        conn = sqlite3.connect(history.HISTORY_SHADOW_DB_FILE)
+        conn.close()
+        legacy_file = history._task_file("Explicit No Schema")
+        legacy_file.write_text(
+            json.dumps([
+                {
+                    "id": "explicit-json-1",
+                    "ts": "2024-01-01 09:00",
+                    "task_name": "Explicit No Schema",
+                    "rank": 1,
+                    "success": True,
+                },
+            ], ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        self.assertEqual([item["id"] for item in history.get_records("Explicit No Schema")], ["explicit-json-1"])
+        health = history.get_structured_read_health()
+        self.assertTrue(health["enabled"])
+        self.assertTrue(health["available"])
+        self.assertFalse(health["ready"])
+        self.assertFalse(health["fresh"])
+        self.assertEqual(health["effectiveBackend"], "json")
+        self.assertEqual(health["last_status"], "fallback")
+        self.assertEqual(health["last_fallback_reason"], "shadow_db_not_ready")
+
+    def test_structured_read_auto_mode_uses_sqlite_when_shadow_db_is_ready(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "auto"
+        source_records = [
+            {
+                "id": "auto-sqlite-1",
+                "ts": "2024-01-01 09:00",
+                "task_id": "auto_task",
+                "task_name": "Auto Read",
+                "rank": 1,
+                "success": True,
+            },
+        ]
+        history._task_file("auto_task").write_text(json.dumps(source_records, ensure_ascii=False), encoding="utf-8")
+        store = ArticleHistorySQLiteStore(history.HISTORY_SHADOW_DB_FILE)
+        store.import_history_sources({"auto_task": source_records}, replace=True)
+        store.set_meta("history_source_signature", history.get_history_source_signature())
+
+        self.assertEqual([item["id"] for item in history.get_records("Auto Read", task_id="auto_task")], ["auto-sqlite-1"])
+        health = history.get_structured_read_health()
+        self.assertTrue(health["enabled"])
+        self.assertTrue(health["available"])
+        self.assertTrue(health["ready"])
+        self.assertTrue(health["fresh"])
+        self.assertEqual(health["backend"], "auto")
+        self.assertEqual(health["last_status"], "success")
+        self.assertGreaterEqual(health["success_count"], 1)
+
+    def test_structured_read_config_auto_mode_uses_sqlite_when_shadow_db_is_ready(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ.pop(history.STRUCTURED_READ_BACKEND_ENV, None)
+        source_records = [
+            {
+                "id": "auto-config-sqlite-1",
+                "ts": "2024-01-01 09:00",
+                "task_id": "auto_config_task",
+                "task_name": "Auto Config Read",
+                "rank": 1,
+                "success": True,
+            },
+        ]
+        history._task_file("auto_config_task").write_text(json.dumps(source_records, ensure_ascii=False), encoding="utf-8")
+        store = ArticleHistorySQLiteStore(history.HISTORY_SHADOW_DB_FILE)
+        store.import_history_sources({"auto_config_task": source_records}, replace=True)
+        store.set_meta("history_source_signature", history.get_history_source_signature())
+
+        history.configure_structured_history_storage({
+            "storage": {
+                "history_read_backend": "auto",
+                "history_shadow_writes_enabled": True,
+            },
+        })
+
+        self.assertEqual(
+            [item["id"] for item in history.get_records("Auto Config Read", task_id="auto_config_task")],
+            ["auto-config-sqlite-1"],
+        )
+        health = history.get_structured_read_health()
+        self.assertTrue(health["enabled"])
+        self.assertEqual(health["backend"], "auto")
+        self.assertEqual(health["backendSource"], "config")
+        self.assertEqual(health["requestedBackend"], "auto")
+        self.assertEqual(health["effectiveBackend"], "sqlite_shadow")
+        self.assertTrue(health["shadowWritesEnabled"])
+
+    def test_structured_read_env_backend_overrides_config_auto_mode(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "json"
+        history.configure_structured_history_storage({"storage": {"history_read_backend": "auto"}})
+
+        health = history.get_structured_read_health()
+
+        self.assertFalse(health["enabled"])
+        self.assertEqual(health["backendSource"], "env")
+        self.assertEqual(health["requestedBackend"], "json")
+        self.assertEqual(health["effectiveBackend"], "json")
+
+    def test_structured_read_config_disable_overrides_legacy_read_backend(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ.pop(history.STRUCTURED_READ_BACKEND_ENV, None)
+
+        history.configure_structured_history_storage({
+            "storage": {
+                "history_read_backend": "json",
+                "read_backend": "sqlite_shadow",
+            },
+        })
+
+        health = history.get_structured_read_health()
+        self.assertFalse(health["enabled"])
+        self.assertEqual(health["requestedBackend"], "json")
+        self.assertEqual(health["effectiveBackend"], "json")
+
+    def test_structured_read_auto_mode_falls_back_when_shadow_db_is_stale(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "auto"
+        source_records = [
+            {
+                "id": "auto-stale-1",
+                "ts": "2024-01-01 09:00",
+                "task_id": "auto_stale",
+                "task_name": "Auto Stale",
+                "rank": 1,
+                "success": True,
+            },
+        ]
+        source_file = history._task_file("auto_stale")
+        source_file.write_text(json.dumps(source_records, ensure_ascii=False), encoding="utf-8")
+        store = ArticleHistorySQLiteStore(history.HISTORY_SHADOW_DB_FILE)
+        store.import_history_sources({"auto_stale": source_records}, replace=True)
+        store.set_meta("history_source_signature", history.get_history_source_signature())
+        self.assertTrue(history.get_structured_read_health()["fresh"])
+
+        updated_records = source_records + [
+            {
+                "id": "auto-stale-2",
+                "ts": "2024-01-02 09:00",
+                "task_id": "auto_stale",
+                "task_name": "Auto Stale",
+                "rank": 1,
+                "success": True,
+            },
+        ]
+        source_file.write_text(json.dumps(updated_records, ensure_ascii=False), encoding="utf-8")
+
+        self.assertEqual(
+            [item["id"] for item in history.get_records("Auto Stale", task_id="auto_stale")],
+            ["auto-stale-1", "auto-stale-2"],
+        )
+        health = history.get_structured_read_health()
+        self.assertFalse(health["enabled"])
+        self.assertTrue(health["available"])
+        self.assertTrue(health["ready"])
+        self.assertFalse(health["fresh"])
+        self.assertEqual(health["last_status"], "fallback")
+        self.assertEqual(health["last_fallback_reason"], "shadow_db_stale")
 
 
 if __name__ == "__main__":

@@ -188,6 +188,106 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Rebuild the SQLite shadow store before comparing snapshots.",
     )
+    api_snapshot_stress_parser = subparsers.add_parser(
+        "stress-api-snapshot",
+        parents=[common],
+        help="Stress /api/status snapshots through JSON and SQLite shadow history readers.",
+    )
+    api_snapshot_stress_parser.add_argument(
+        "--rounds",
+        type=int,
+        default=20,
+        help="Number of /api/status requests to run per read mode.",
+    )
+    api_snapshot_stress_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=20.0,
+        help="HTTP timeout in seconds for each API request.",
+    )
+    api_snapshot_stress_parser.add_argument(
+        "--fd-growth-limit",
+        type=int,
+        default=8,
+        help="Maximum allowed open fd growth per mode. Negative disables the check.",
+    )
+    api_snapshot_stress_parser.add_argument(
+        "--max-p95-ms",
+        type=float,
+        default=0.0,
+        help="Maximum allowed p95 latency per mode in milliseconds. Non-positive disables the check.",
+    )
+    api_snapshot_stress_parser.add_argument(
+        "--max-failed-requests",
+        type=int,
+        default=0,
+        help="Maximum allowed failed HTTP requests across all modes.",
+    )
+    api_snapshot_stress_parser.add_argument(
+        "--max-mismatches",
+        type=int,
+        default=0,
+        help="Maximum allowed JSON vs SQLite snapshot mismatches.",
+    )
+    api_snapshot_stress_parser.add_argument(
+        "--mode",
+        choices=("both", "json", "sqlite_shadow", "auto"),
+        default="both",
+        help="Which read mode to stress. 'both' also compares JSON with explicit sqlite_shadow.",
+    )
+    readiness_parser = subparsers.add_parser(
+        "validate-history-sqlite-readiness",
+        parents=[common],
+        help="Run the full guarded checklist before enabling SQLite shadow history reads.",
+    )
+    readiness_parser.add_argument(
+        "--read-limit",
+        type=int,
+        default=100,
+        help="Number of history records to compare per sampled task read page.",
+    )
+    readiness_parser.add_argument(
+        "--sample-pages",
+        type=int,
+        default=3,
+        help="Number of middle pages to sample per task history read.",
+    )
+    readiness_parser.add_argument(
+        "--pending-limit",
+        type=int,
+        default=200,
+        help="Number of pending review records to compare.",
+    )
+    readiness_parser.add_argument(
+        "--snapshot-rounds",
+        type=int,
+        default=2,
+        help="Number of AppRuntime snapshot calls to run per read mode.",
+    )
+    readiness_parser.add_argument(
+        "--api-rounds",
+        type=int,
+        default=3,
+        help="Number of /api/status requests to run per read mode.",
+    )
+    readiness_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=20.0,
+        help="HTTP timeout in seconds for each API snapshot request.",
+    )
+    readiness_parser.add_argument(
+        "--fd-growth-limit",
+        type=int,
+        default=4,
+        help="Maximum allowed open fd growth per snapshot mode. Negative disables the check.",
+    )
+    readiness_parser.add_argument(
+        "--max-p95-ms",
+        type=float,
+        default=0.0,
+        help="Maximum allowed /api/status p95 latency per mode in milliseconds. Non-positive disables the check.",
+    )
     api_compare_parser = subparsers.add_parser(
         "compare-api-articles",
         parents=[common],
@@ -264,6 +364,64 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Which read mode to stress. 'both' also compares response equivalence.",
     )
     api_stress_parser.add_argument(
+        "--include-export-keywords",
+        action="store_true",
+        help="Ask /api/articles to include export keyword fields in the stressed payload.",
+    )
+    mixed_stress_parser = subparsers.add_parser(
+        "stress-api-mixed",
+        parents=[common],
+        help="Run the combined /api/status auto and /api/articles SQLite shadow soak guards.",
+    )
+    mixed_stress_parser.add_argument(
+        "--snapshot-rounds",
+        type=int,
+        default=10,
+        help="Number of /api/status auto-mode requests to run.",
+    )
+    mixed_stress_parser.add_argument(
+        "--article-rounds",
+        type=int,
+        default=10,
+        help="Number of times to request each /api/articles query in each mode.",
+    )
+    mixed_stress_parser.add_argument(
+        "--article-limit",
+        type=int,
+        default=100,
+        help="Number of articles to request per /api/articles query.",
+    )
+    mixed_stress_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=20.0,
+        help="HTTP timeout in seconds for each API request.",
+    )
+    mixed_stress_parser.add_argument(
+        "--fd-growth-limit",
+        type=int,
+        default=8,
+        help="Maximum allowed open fd growth per guard mode. Negative disables the check.",
+    )
+    mixed_stress_parser.add_argument(
+        "--max-p95-ms",
+        type=float,
+        default=0.0,
+        help="Maximum allowed p95 latency per guard mode in milliseconds. Non-positive disables the check.",
+    )
+    mixed_stress_parser.add_argument(
+        "--max-failed-requests",
+        type=int,
+        default=0,
+        help="Maximum allowed failed HTTP requests per guard.",
+    )
+    mixed_stress_parser.add_argument(
+        "--max-mismatches",
+        type=int,
+        default=0,
+        help="Maximum allowed JSON vs SQLite response mismatches per guard.",
+    )
+    mixed_stress_parser.add_argument(
         "--include-export-keywords",
         action="store_true",
         help="Ask /api/articles to include export keyword fields in the stressed payload.",
@@ -364,6 +522,33 @@ def main(argv: list[str] | None = None) -> int:
             rebuild=bool(args.rebuild),
         )
         ok = bool(result.get("ok"))
+    elif args.command == "stress-api-snapshot":
+        result = stress_snapshot_api(
+            args.db_path,
+            max_workers=args.workers,
+            rounds=args.rounds,
+            timeout=args.timeout,
+            fd_growth_limit=args.fd_growth_limit,
+            max_p95_ms=args.max_p95_ms,
+            max_failed_requests=args.max_failed_requests,
+            max_mismatches=args.max_mismatches,
+            mode=args.mode,
+        )
+        ok = bool(result.get("ok"))
+    elif args.command == "validate-history-sqlite-readiness":
+        result = validate_history_sqlite_readiness(
+            args.db_path,
+            max_workers=args.workers,
+            read_limit=args.read_limit,
+            sample_pages=args.sample_pages,
+            pending_limit=args.pending_limit,
+            snapshot_rounds=args.snapshot_rounds,
+            api_rounds=args.api_rounds,
+            timeout=args.timeout,
+            fd_growth_limit=args.fd_growth_limit,
+            max_p95_ms=args.max_p95_ms,
+        )
+        ok = bool(result.get("ok"))
     elif args.command == "compare-api-articles":
         result = compare_article_api_pages(
             args.db_path,
@@ -386,6 +571,21 @@ def main(argv: list[str] | None = None) -> int:
             max_failed_requests=args.max_failed_requests,
             max_mismatches=args.max_mismatches,
             mode=args.mode,
+        )
+        ok = bool(result.get("ok"))
+    elif args.command == "stress-api-mixed":
+        result = stress_mixed_api_guards(
+            args.db_path,
+            max_workers=args.workers,
+            snapshot_rounds=args.snapshot_rounds,
+            article_rounds=args.article_rounds,
+            article_limit=args.article_limit,
+            timeout=args.timeout,
+            include_export_keywords=bool(args.include_export_keywords),
+            fd_growth_limit=args.fd_growth_limit,
+            max_p95_ms=args.max_p95_ms,
+            max_failed_requests=args.max_failed_requests,
+            max_mismatches=args.max_mismatches,
         )
         ok = bool(result.get("ok"))
     elif args.command == "stress-history-writes":
@@ -473,6 +673,116 @@ def _compact_history_compare_result(result: dict[str, Any]) -> dict[str, Any]:
     else:
         compact["rebuild"] = rebuild
     return compact
+
+
+def validate_history_sqlite_readiness(
+    db_path: str | Path | None = None,
+    *,
+    max_workers: int | None = None,
+    read_limit: int = 100,
+    sample_pages: int = 3,
+    pending_limit: int = 200,
+    snapshot_rounds: int = 2,
+    api_rounds: int = 3,
+    timeout: float = 20.0,
+    fd_growth_limit: int = 4,
+    max_p95_ms: float = 0.0,
+) -> dict[str, Any]:
+    """Run the guarded checklist used to decide if SQLite shadow history reads are ready."""
+    started_at = time.perf_counter()
+    target_db_path = Path(db_path) if db_path is not None else default_shadow_db_path()
+    resolved_read_limit = max(1, min(500, int(read_limit or 100)))
+    resolved_sample_pages = max(0, min(20, int(sample_pages or 0)))
+    resolved_pending_limit = max(1, min(1000, int(pending_limit or 200)))
+    resolved_snapshot_rounds = max(1, min(100, int(snapshot_rounds or 1)))
+    resolved_api_rounds = max(1, min(1000, int(api_rounds or 1)))
+    resolved_fd_growth_limit = int(fd_growth_limit)
+    resolved_timeout = float(timeout or 20.0)
+    resolved_max_p95_ms = float(max_p95_ms or 0.0)
+
+    rebuild_report = rebuild_shadow_store(
+        target_db_path,
+        max_workers=max_workers,
+        verify_tail_limit=1,
+    )
+    history_reads_report = compare_history_task_reads(
+        target_db_path,
+        max_workers=max_workers,
+        limit=resolved_read_limit,
+        sample_pages=resolved_sample_pages,
+        rebuild=False,
+    )
+    derived_report = compare_history_derived_views(
+        target_db_path,
+        max_workers=max_workers,
+        pending_limit=resolved_pending_limit,
+        rebuild=False,
+    )
+    runtime_snapshot_report = compare_history_runtime_snapshot(
+        target_db_path,
+        max_workers=max_workers,
+        rounds=resolved_snapshot_rounds,
+        fd_growth_limit=resolved_fd_growth_limit,
+        rebuild=False,
+    )
+    api_snapshot_report = stress_snapshot_api(
+        target_db_path,
+        max_workers=max_workers,
+        rounds=resolved_api_rounds,
+        timeout=resolved_timeout,
+        fd_growth_limit=resolved_fd_growth_limit,
+        max_p95_ms=resolved_max_p95_ms,
+        max_failed_requests=0,
+        max_mismatches=0,
+        mode="both",
+    )
+    api_snapshot_auto_report = stress_snapshot_api(
+        target_db_path,
+        max_workers=max_workers,
+        rounds=resolved_api_rounds,
+        timeout=resolved_timeout,
+        fd_growth_limit=resolved_fd_growth_limit,
+        max_p95_ms=resolved_max_p95_ms,
+        max_failed_requests=0,
+        max_mismatches=0,
+        mode="auto",
+    )
+
+    failed_checks: list[str] = []
+    if not bool((rebuild_report.get("verification") or {}).get("ok")):
+        failed_checks.append("rebuild")
+    for name, report in (
+        ("history_reads", history_reads_report),
+        ("derived_views", derived_report),
+        ("runtime_snapshot", runtime_snapshot_report),
+        ("api_snapshot", api_snapshot_report),
+        ("api_snapshot_auto", api_snapshot_auto_report),
+    ):
+        if not bool(report.get("ok")):
+            failed_checks.append(name)
+
+    return {
+        "ok": not failed_checks,
+        "db_path": str(target_db_path),
+        "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        "workers": max_workers,
+        "read_limit": resolved_read_limit,
+        "sample_pages": resolved_sample_pages,
+        "pending_limit": resolved_pending_limit,
+        "snapshot_rounds": resolved_snapshot_rounds,
+        "api_rounds": resolved_api_rounds,
+        "fd_growth_limit": resolved_fd_growth_limit,
+        "max_p95_ms": resolved_max_p95_ms,
+        "failed_checks": failed_checks,
+        "checks": {
+            "rebuild": _runtime_snapshot_rebuild_summary(rebuild_report),
+            "history_reads": _history_guard_summary(history_reads_report),
+            "derived_views": _history_guard_summary(derived_report),
+            "runtime_snapshot": _runtime_snapshot_guard_summary(runtime_snapshot_report),
+            "api_snapshot": _api_snapshot_guard_summary(api_snapshot_report),
+            "api_snapshot_auto": _api_snapshot_guard_summary(api_snapshot_auto_report),
+        },
+    }
 
 
 def stress_history_shadow_writes(
@@ -827,6 +1137,26 @@ def _runtime_snapshot_guard_summary(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _api_snapshot_guard_summary(report: dict[str, Any]) -> dict[str, Any]:
+    mismatches = [item for item in (report.get("mismatches") or []) if isinstance(item, dict)]
+    storage_mismatches = [item for item in (report.get("storage_mismatches") or []) if isinstance(item, dict)]
+    return {
+        "ok": bool(report.get("ok")),
+        "failed_checks": report.get("failed_checks") or [],
+        "rounds": report.get("rounds"),
+        "workers": report.get("workers"),
+        "failed_count": report.get("failed_count"),
+        "request_failed_count": report.get("request_failed_count"),
+        "fd_failed_count": report.get("fd_failed_count"),
+        "mismatch_count": report.get("mismatch_count"),
+        "field_mismatch_count": report.get("field_mismatch_count"),
+        "storage_mismatch_count": report.get("storage_mismatch_count"),
+        "modes": report.get("modes") or {},
+        "mismatches": mismatches[:10],
+        "storage_mismatches": storage_mismatches[:10],
+    }
+
+
 class _HistorySnapshotRuntimeHarness:
     """Small harness for running AppRuntime snapshot aggregation against isolated config."""
 
@@ -925,7 +1255,7 @@ def compare_history_runtime_snapshot(
         json_batch = _snapshot_runtime_batch(
             runtime,
             mode="json",
-            read_backend=None,
+            read_backend="json",
             read_backend_env=history_module.STRUCTURED_READ_BACKEND_ENV,
             rounds=resolved_rounds,
             workers=worker_count,
@@ -1017,6 +1347,7 @@ def _snapshot_runtime_batch(
             }
 
     with _temporary_env(read_backend_env, read_backend):
+        _reset_structured_read_health()
         if workers <= 1:
             results = [capture(index) for index in range(1, rounds + 1)]
         else:
@@ -1081,7 +1412,15 @@ def _history_storage_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         "enabled": bool(storage.get("enabled")),
         "available": bool(storage.get("available")),
+        "ready": bool(storage.get("ready")),
+        "fresh": bool(storage.get("fresh")),
         "backend": str(storage.get("backend") or ""),
+        "backend_source": str(storage.get("backendSource") or storage.get("backend_source") or ""),
+        "requested_backend": str(storage.get("requestedBackend") or storage.get("requested_backend") or ""),
+        "effective_backend": str(storage.get("effectiveBackend") or storage.get("effective_backend") or ""),
+        "shadow_writes_enabled": bool(
+            storage.get("shadowWritesEnabled", storage.get("shadow_writes_enabled", False))
+        ),
         "last_status": str(storage.get("last_status") or ""),
         "last_operation": str(storage.get("last_operation") or ""),
         "last_fallback_reason": str(storage.get("last_fallback_reason") or ""),
@@ -1190,6 +1529,11 @@ def _snapshot_field_mismatches(
 def _snapshot_batch_summary(batch: dict[str, Any]) -> dict[str, Any]:
     results = batch.get("results") if isinstance(batch.get("results"), list) else []
     failures = [item for item in results if not bool(item.get("ok"))]
+    storage_samples = [
+        item.get("history_storage")
+        for item in results
+        if bool(item.get("ok")) and isinstance(item.get("history_storage"), dict)
+    ]
     return {
         "elapsed_ms": batch.get("elapsed_ms"),
         "request_count": len(results),
@@ -1203,6 +1547,7 @@ def _snapshot_batch_summary(batch: dict[str, Any]) -> dict[str, Any]:
         "fd_after": batch.get("fd_after"),
         "fd_delta": batch.get("fd_delta"),
         "fd_ok": bool(batch.get("fd_ok", True)),
+        "history_storage": storage_samples[-1] if storage_samples else {},
         "failures": [
             {
                 "round": item.get("round"),
@@ -1212,6 +1557,15 @@ def _snapshot_batch_summary(batch: dict[str, Any]) -> dict[str, Any]:
             for item in failures[:10]
         ],
     }
+
+
+def _reset_structured_read_health() -> None:
+    try:
+        from core.history import reset_structured_read_health
+
+        reset_structured_read_health()
+    except Exception:
+        return
 
 
 def _runtime_snapshot_rebuild_summary(report: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1237,6 +1591,255 @@ def _patched_history_shadow_db_path(history_module: Any, db_path: Path):
         yield
     finally:
         history_module.HISTORY_SHADOW_DB_FILE = original
+
+
+def stress_snapshot_api(
+    db_path: str | Path | None = None,
+    *,
+    max_workers: int | None = None,
+    rounds: int = 20,
+    timeout: float = 20.0,
+    fd_growth_limit: int = 8,
+    max_p95_ms: float = 0.0,
+    max_failed_requests: int = 0,
+    max_mismatches: int = 0,
+    mode: str = "both",
+    runtime_factory: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
+    """Run repeated HTTP /api/status snapshot reads and summarize stability."""
+    from http.server import ThreadingHTTPServer
+
+    import web_backend
+    from core import history as history_module
+
+    target_db_path = Path(db_path) if db_path is not None else default_shadow_db_path()
+    resolved_rounds = max(1, int(rounds or 1))
+    modes = _stress_modes(str(mode or "both"))
+    worker_count = _api_compare_worker_count([{} for _ in range(resolved_rounds)], max_workers=max_workers)
+    sqlite_required = any(mode_name == "sqlite_shadow" for mode_name, _ in modes)
+    sqlite_available = target_db_path.exists()
+
+    with (
+        _patched_web_backend_shadow_db_path(web_backend, target_db_path),
+        _patched_history_shadow_db_path(history_module, target_db_path),
+    ):
+        runtime = runtime_factory() if runtime_factory is not None else web_backend.AppRuntime()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), web_backend.WebRequestHandler)
+        server.runtime = runtime  # type: ignore[attr-defined]
+        runtime.port = int(server.server_address[1])
+        if hasattr(runtime, "_server"):
+            runtime._server = server
+        thread = threading.Thread(target=server.serve_forever, name="snapshot-api-shadow-stress", daemon=True)
+        thread.start()
+        try:
+            batches = [
+                _stress_snapshot_api_batch(
+                    int(server.server_address[1]),
+                    mode=mode_name,
+                    read_backend=read_backend,
+                    read_backend_env=history_module.STRUCTURED_READ_BACKEND_ENV,
+                    rounds=resolved_rounds,
+                    timeout=float(timeout or 20.0),
+                    workers=worker_count,
+                    fd_growth_limit=int(fd_growth_limit),
+                )
+                for mode_name, read_backend in modes
+            ]
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    by_mode = {str(batch.get("mode") or ""): batch for batch in batches}
+    comparisons: list[dict[str, Any]] = []
+    if "json" in by_mode and "sqlite_shadow" in by_mode:
+        comparisons = _compare_snapshot_batches(
+            by_mode["json"].get("results", []),
+            by_mode["sqlite_shadow"].get("results", []),
+        )
+
+    sqlite_storage_mismatches: list[dict[str, Any]] = []
+    for storage_mode in ("sqlite_shadow", "auto"):
+        for mismatch in _sqlite_snapshot_batch_storage_mismatches(by_mode.get(storage_mode) or {}):
+            item = dict(mismatch)
+            item["mode"] = storage_mode
+            sqlite_storage_mismatches.append(item)
+    request_failed_count = sum(int(batch.get("failed_count") or 0) for batch in batches)
+    fd_failed_count = sum(1 for batch in batches if not bool(batch.get("fd_ok", True)))
+    mismatch_count = sum(1 for item in comparisons if not bool(item.get("ok")))
+    field_mismatch_count = sum(1 for item in comparisons if "snapshot_fields" in (item.get("mismatches") or []))
+    storage_mismatch_count = len(sqlite_storage_mismatches)
+    mode_summaries = {
+        str(batch.get("mode") or ""): _stress_snapshot_batch_summary(batch, max_p95_ms=max_p95_ms)
+        for batch in batches
+    }
+    latency_failed_count = sum(
+        1 for summary in mode_summaries.values()
+        if not bool(summary.get("latency_ok", True))
+    )
+    allowed_failed_requests = max(0, int(max_failed_requests or 0))
+    allowed_mismatches = max(0, int(max_mismatches or 0))
+
+    failed_checks: list[str] = []
+    if sqlite_required and not sqlite_available:
+        failed_checks.append("sqlite_shadow_missing")
+    if request_failed_count > allowed_failed_requests:
+        failed_checks.append("snapshot_request")
+    if fd_failed_count:
+        failed_checks.append("fd_growth")
+    if field_mismatch_count > allowed_mismatches:
+        failed_checks.append("snapshot_fields")
+    if storage_mismatch_count:
+        failed_checks.append("history_storage")
+    if latency_failed_count:
+        failed_checks.append("latency")
+    standalone_storage_failed_count = storage_mismatch_count if not comparisons else 0
+
+    return {
+        "ok": not failed_checks,
+        "db_path": str(target_db_path),
+        "rounds": resolved_rounds,
+        "workers": worker_count,
+        "sqlite_available": sqlite_available,
+        "fd_growth_limit": int(fd_growth_limit),
+        "max_p95_ms": float(max_p95_ms or 0.0),
+        "max_failed_requests": allowed_failed_requests,
+        "max_mismatches": allowed_mismatches,
+        "failed_checks": failed_checks,
+        "failed_count": (
+            request_failed_count
+            + fd_failed_count
+            + mismatch_count
+            + standalone_storage_failed_count
+            + latency_failed_count
+            + int(sqlite_required and not sqlite_available)
+        ),
+        "request_failed_count": request_failed_count,
+        "fd_failed_count": fd_failed_count,
+        "latency_failed_count": latency_failed_count,
+        "mismatch_count": mismatch_count,
+        "field_mismatch_count": field_mismatch_count,
+        "storage_mismatch_count": storage_mismatch_count,
+        "modes": mode_summaries,
+        "mismatches": [item for item in comparisons if not bool(item.get("ok"))][:10],
+        "storage_mismatches": sqlite_storage_mismatches[:10],
+    }
+
+
+def _stress_snapshot_api_batch(
+    port: int,
+    *,
+    mode: str,
+    read_backend: str | None,
+    read_backend_env: str,
+    rounds: int,
+    timeout: float,
+    workers: int,
+    fd_growth_limit: int,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    fd_before = _open_fd_count()
+
+    def fetch(round_index: int) -> dict[str, Any]:
+        return _fetch_snapshot_api_request(port, round_index=round_index, timeout=timeout)
+
+    with _temporary_env(read_backend_env, read_backend):
+        _reset_structured_read_health()
+        if workers <= 1:
+            results = [fetch(index) for index in range(1, rounds + 1)]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                results = list(executor.map(fetch, range(1, rounds + 1)))
+
+    fd_after = _open_fd_count()
+    fd_delta = (
+        int(fd_after) - int(fd_before)
+        if fd_before is not None and fd_after is not None
+        else None
+    )
+    fd_ok = fd_growth_limit < 0 or fd_delta is None or fd_delta <= fd_growth_limit
+    failures = [item for item in results if not bool(item.get("ok"))]
+    return {
+        "mode": mode,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+        "fd_before": fd_before,
+        "fd_after": fd_after,
+        "fd_delta": fd_delta,
+        "fd_ok": fd_ok,
+        "failed_count": len(failures),
+        "request_count": len(results),
+        "results": results,
+    }
+
+
+def _fetch_snapshot_api_request(port: int, *, round_index: int, timeout: float) -> dict[str, Any]:
+    url = f"http://127.0.0.1:{port}/api/status"
+    started = time.perf_counter()
+    try:
+        with urlrequest.urlopen(url, timeout=timeout) as response:
+            raw = response.read()
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                payload = {}
+            return {
+                "ok": True,
+                "round": round_index,
+                "status": int(getattr(response, "status", 0) or 0),
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+                "signature": _history_snapshot_signature(payload),
+                "history_storage": _history_storage_summary(payload),
+            }
+    except urlerror.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return _snapshot_api_error_result(round_index, started, exc, status=int(exc.code), body=body)
+    except Exception as exc:
+        return _snapshot_api_error_result(round_index, started, exc)
+
+
+def _snapshot_api_error_result(
+    round_index: int,
+    started: float,
+    exc: Exception,
+    *,
+    status: int = 0,
+    body: str = "",
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "round": round_index,
+        "status": status,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+        "error": exc.__class__.__name__,
+        "message": str(exc),
+        "body": body[:500],
+    }
+
+
+def _sqlite_snapshot_batch_storage_mismatches(batch: dict[str, Any]) -> list[dict[str, Any]]:
+    results = batch.get("results") if isinstance(batch.get("results"), list) else []
+    mismatches: list[dict[str, Any]] = []
+    for item in results:
+        if not bool(item.get("ok")):
+            continue
+        storage = item.get("history_storage") if isinstance(item.get("history_storage"), dict) else {}
+        storage_mismatches = _sqlite_history_storage_mismatches(storage)
+        if storage_mismatches:
+            mismatches.append({
+                "round": item.get("round"),
+                "mismatches": storage_mismatches,
+                "history_storage": storage,
+            })
+    return mismatches
+
+
+def _stress_snapshot_batch_summary(batch: dict[str, Any], *, max_p95_ms: float = 0.0) -> dict[str, Any]:
+    summary = _snapshot_batch_summary(batch)
+    latency = summary.get("latency_ms") if isinstance(summary.get("latency_ms"), dict) else {}
+    p95 = latency.get("p95")
+    latency_limit = float(max_p95_ms or 0.0)
+    summary["latency_ok"] = latency_limit <= 0 or p95 is None or float(p95) <= latency_limit
+    summary["max_p95_ms"] = latency_limit
+    return summary
 
 
 def compare_article_api_pages(
@@ -1346,6 +1949,7 @@ def stress_article_api_pages(
             runtime._server = server
         thread = threading.Thread(target=server.serve_forever, name="article-api-shadow-stress", daemon=True)
         thread.start()
+        article_shadow_status: dict[str, Any] = {}
         try:
             batches = [
                 _stress_article_api_batch(
@@ -1362,6 +1966,8 @@ def stress_article_api_pages(
                 )
                 for mode_name, read_backend in modes
             ]
+            if hasattr(runtime, "get_article_sqlite_shadow_compare_status"):
+                article_shadow_status = runtime.get_article_sqlite_shadow_compare_status() or {}
         finally:
             server.shutdown()
             server.server_close()
@@ -1378,6 +1984,7 @@ def stress_article_api_pages(
     request_failed_count = sum(int(batch.get("failed_count") or 0) for batch in batches)
     fd_failed_count = sum(1 for batch in batches if not bool(batch.get("fd_ok", True)))
     mismatch_count = sum(1 for item in comparisons if not bool(item.get("ok")))
+    article_shadow_mismatches = _article_shadow_health_mismatches(article_shadow_status)
     mode_summaries = {
         str(batch.get("mode") or ""): _stress_batch_summary(batch, max_p95_ms=max_p95_ms)
         for batch in batches
@@ -1393,6 +2000,7 @@ def stress_article_api_pages(
             request_failed_count <= allowed_failed_requests
             and fd_failed_count == 0
             and mismatch_count <= allowed_mismatches
+            and not article_shadow_mismatches
             and latency_failed_count == 0
         ),
         "db_path": str(target_db_path),
@@ -1406,13 +2014,161 @@ def stress_article_api_pages(
         "max_p95_ms": float(max_p95_ms or 0.0),
         "max_failed_requests": allowed_failed_requests,
         "max_mismatches": allowed_mismatches,
-        "failed_count": request_failed_count + fd_failed_count + mismatch_count + latency_failed_count,
+        "failed_count": (
+            request_failed_count
+            + fd_failed_count
+            + mismatch_count
+            + len(article_shadow_mismatches)
+            + latency_failed_count
+        ),
         "request_failed_count": request_failed_count,
         "fd_failed_count": fd_failed_count,
         "latency_failed_count": latency_failed_count,
         "mismatch_count": mismatch_count,
+        "article_shadow_health": _article_shadow_health_summary(article_shadow_status),
+        "article_shadow_health_mismatches": article_shadow_mismatches,
         "modes": mode_summaries,
         "mismatches": [item for item in comparisons if not bool(item.get("ok"))][:10],
+    }
+
+
+def _article_shadow_health_mismatches(status: dict[str, Any]) -> list[str]:
+    health = status.get("health") if isinstance(status.get("health"), dict) else {}
+    mismatches: list[str] = []
+    if bool(health.get("blocked")):
+        mismatches.append("blocked")
+    if int(health.get("fallback_count") or 0) > 0:
+        mismatches.append("fallback_count")
+    if int(health.get("consecutive_errors") or 0) > 0:
+        mismatches.append("consecutive_errors")
+    if str(health.get("last_fallback_reason") or "").strip():
+        mismatches.append("last_fallback_reason")
+    return mismatches
+
+
+def _article_shadow_health_summary(status: dict[str, Any]) -> dict[str, Any]:
+    health = status.get("health") if isinstance(status.get("health"), dict) else {}
+    return {
+        "mode": str(status.get("mode") or ""),
+        "checked": int(status.get("checked") or 0),
+        "mismatches": int(status.get("mismatches") or 0),
+        "blocked": bool(health.get("blocked")),
+        "fallback_count": int(health.get("fallback_count") or 0),
+        "consecutive_errors": int(health.get("consecutive_errors") or 0),
+        "last_fallback_reason": str(health.get("last_fallback_reason") or ""),
+        "last_error": str(health.get("last_error") or ""),
+        "last_fd_delta": health.get("last_fd_delta"),
+        "last_elapsed_ms": health.get("last_elapsed_ms"),
+        "last_db_path": str(health.get("last_db_path") or ""),
+    }
+
+
+def stress_mixed_api_guards(
+    db_path: str | Path | None = None,
+    *,
+    max_workers: int | None = None,
+    snapshot_rounds: int = 10,
+    article_rounds: int = 10,
+    article_limit: int = 100,
+    timeout: float = 20.0,
+    include_export_keywords: bool = False,
+    fd_growth_limit: int = 8,
+    max_p95_ms: float = 0.0,
+    max_failed_requests: int = 0,
+    max_mismatches: int = 0,
+) -> dict[str, Any]:
+    """Run the API guards needed before enabling SQLite-backed reads."""
+    target_db_path = Path(db_path) if db_path is not None else default_shadow_db_path()
+    status_report = stress_snapshot_api(
+        target_db_path,
+        max_workers=max_workers,
+        rounds=snapshot_rounds,
+        timeout=timeout,
+        fd_growth_limit=fd_growth_limit,
+        max_p95_ms=max_p95_ms,
+        max_failed_requests=max_failed_requests,
+        max_mismatches=max_mismatches,
+        mode="auto",
+    )
+    article_report = stress_article_api_pages(
+        target_db_path,
+        max_workers=max_workers,
+        limit=article_limit,
+        rounds=article_rounds,
+        timeout=timeout,
+        include_export_keywords=include_export_keywords,
+        fd_growth_limit=fd_growth_limit,
+        max_p95_ms=max_p95_ms,
+        max_failed_requests=max_failed_requests,
+        max_mismatches=max_mismatches,
+        mode="both",
+    )
+
+    failed_checks: list[str] = []
+    failed_sections: list[str] = []
+    if not bool(status_report.get("ok")):
+        failed_sections.append("status")
+        failed_checks.extend(f"status:{check}" for check in (status_report.get("failed_checks") or ["failed"]))
+    if not bool(article_report.get("ok")):
+        failed_sections.append("articles")
+        article_checks = []
+        if int(article_report.get("request_failed_count") or 0) > int(article_report.get("max_failed_requests") or 0):
+            article_checks.append("request")
+        if int(article_report.get("fd_failed_count") or 0) > 0:
+            article_checks.append("fd_growth")
+        if int(article_report.get("mismatch_count") or 0) > int(article_report.get("max_mismatches") or 0):
+            article_checks.append("mismatch")
+        if int(article_report.get("latency_failed_count") or 0) > 0:
+            article_checks.append("latency")
+        if article_report.get("article_shadow_health_mismatches"):
+            article_checks.append("article_shadow_health")
+        failed_checks.extend(f"articles:{check}" for check in (article_checks or ["failed"]))
+
+    return {
+        "ok": not failed_sections,
+        "db_path": str(target_db_path),
+        "workers": max_workers,
+        "failed_sections": failed_sections,
+        "failed_checks": failed_checks,
+        "failed_count": int(status_report.get("failed_count") or 0) + int(article_report.get("failed_count") or 0),
+        "status": _mixed_status_guard_summary(status_report),
+        "articles": _mixed_article_guard_summary(article_report),
+    }
+
+
+def _mixed_status_guard_summary(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": bool(report.get("ok")),
+        "rounds": int(report.get("rounds") or 0),
+        "workers": int(report.get("workers") or 0),
+        "failed_checks": list(report.get("failed_checks") or []),
+        "failed_count": int(report.get("failed_count") or 0),
+        "request_failed_count": int(report.get("request_failed_count") or 0),
+        "fd_failed_count": int(report.get("fd_failed_count") or 0),
+        "latency_failed_count": int(report.get("latency_failed_count") or 0),
+        "storage_mismatch_count": int(report.get("storage_mismatch_count") or 0),
+        "modes": report.get("modes") if isinstance(report.get("modes"), dict) else {},
+    }
+
+
+def _mixed_article_guard_summary(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": bool(report.get("ok")),
+        "limit": int(report.get("limit") or 0),
+        "rounds": int(report.get("rounds") or 0),
+        "workers": int(report.get("workers") or 0),
+        "query_count": int(report.get("query_count") or 0),
+        "request_count_per_mode": int(report.get("request_count_per_mode") or 0),
+        "include_export_keywords": bool(report.get("include_export_keywords")),
+        "failed_count": int(report.get("failed_count") or 0),
+        "request_failed_count": int(report.get("request_failed_count") or 0),
+        "fd_failed_count": int(report.get("fd_failed_count") or 0),
+        "latency_failed_count": int(report.get("latency_failed_count") or 0),
+        "mismatch_count": int(report.get("mismatch_count") or 0),
+        "article_shadow_health": report.get("article_shadow_health") if isinstance(report.get("article_shadow_health"), dict) else {},
+        "article_shadow_health_mismatches": list(report.get("article_shadow_health_mismatches") or []),
+        "modes": report.get("modes") if isinstance(report.get("modes"), dict) else {},
+        "mismatches": list(report.get("mismatches") or [])[:10],
     }
 
 
@@ -1864,10 +2620,12 @@ def _api_compare_worker_count(queries: list[dict[str, str]], *, max_workers: int
 def _stress_modes(mode: str) -> list[tuple[str, str | None]]:
     normalized = str(mode or "both").strip().lower()
     if normalized == "json":
-        return [("json", None)]
+        return [("json", "json")]
     if normalized == "sqlite_shadow":
         return [("sqlite_shadow", "sqlite_shadow")]
-    return [("json", None), ("sqlite_shadow", "sqlite_shadow")]
+    if normalized == "auto":
+        return [("auto", "auto")]
+    return [("json", "json"), ("sqlite_shadow", "sqlite_shadow")]
 
 
 def _open_fd_count() -> int | None:

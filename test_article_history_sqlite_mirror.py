@@ -115,6 +115,23 @@ class ArticleHistorySQLiteMirrorTests(unittest.TestCase):
         self.assertEqual(store.get_article_page(task_name="品牌B")["total"], 1)
         self.assertTrue(verify_shadow_store(db_path, max_workers=2)["ok"])
 
+    def test_rebuild_shadow_store_uses_signature_captured_before_import(self) -> None:
+        self._write_history_file("task-a", [
+            {
+                "id": "r1",
+                "ts": "2024-01-01 09:00",
+                "task_name": "品牌A",
+                "success": True,
+            },
+        ])
+        db_path = Path(self._tmpdir.name) / "shadow.sqlite3"
+
+        with patch.object(sqlite_mirror.history, "get_history_source_signature", return_value="source-before-import"):
+            rebuild_shadow_store(db_path)
+
+        store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+        self.assertEqual(store.get_meta("history_source_signature"), "source-before-import")
+
     def test_verify_shadow_store_reports_mismatches(self) -> None:
         self._write_articles([
             {

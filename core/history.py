@@ -8,6 +8,7 @@ import json
 import hashlib
 import os
 import random
+import sqlite3
 import tempfile
 import threading
 import uuid
@@ -31,6 +32,8 @@ MAX_RECORDS = 500  # 每个任务最多保留原始记录数
 STORAGE_BACKEND_ENV = "AIBRANDMONITOR_STORAGE_BACKEND"
 STRUCTURED_SHADOW_WRITE_ENV = "AIBRANDMONITOR_HISTORY_STRUCTURED_SHADOW_WRITES"
 STRUCTURED_READ_BACKEND_ENV = "AIBRANDMONITOR_HISTORY_READ_BACKEND"
+STRUCTURED_READ_BACKEND_SQLITE_VALUES = {"sqlite_shadow", "sqlite_structured", "structured", "sqlite"}
+STRUCTURED_READ_BACKEND_AUTO_VALUES = {"auto", "sqlite_auto", "sqlite_shadow_auto", "auto_sqlite_shadow"}
 
 _PLATFORM_ID_ALIASES: dict[str, str] = {
     "豆包": "doubao",
@@ -85,6 +88,11 @@ _locks_mutex = threading.Lock()
 _structured_shadow_write_lock = threading.RLock()
 _structured_read_health_lock = threading.RLock()
 _structured_read_health: dict[str, object] = {}
+_structured_read_store_status_lock = threading.RLock()
+_structured_read_store_status_cache: dict[str, object] = {}
+_structured_read_config_lock = threading.RLock()
+_structured_read_config_backend = ""
+_structured_shadow_write_config_enabled = False
 _MAX_LOCKS = 500  # 锁字典的最大容量，超出时清理最旧的 25%
 
 
@@ -110,23 +118,116 @@ def _history_uses_sqlite() -> bool:
 
 
 def _history_structured_shadow_writes_enabled() -> bool:
-    value = os.environ.get(STRUCTURED_SHADOW_WRITE_ENV, "").strip().lower()
+    env_value = os.environ.get(STRUCTURED_SHADOW_WRITE_ENV)
+    if env_value is None:
+        with _structured_read_config_lock:
+            return bool(_structured_shadow_write_config_enabled)
+    value = str(env_value or "").strip().lower()
     return value in {"1", "true", "yes", "on", "sqlite", "structured"}
 
 
+def _normalize_structured_read_backend(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"", "0", "false", "no", "off", "disabled", "json", "file", "files"}:
+        return ""
+    if normalized in STRUCTURED_READ_BACKEND_AUTO_VALUES:
+        return "auto"
+    if normalized in STRUCTURED_READ_BACKEND_SQLITE_VALUES:
+        return "sqlite_shadow"
+    return ""
+
+
+def _history_config_storage_section(config: dict | None) -> dict:
+    if not isinstance(config, dict):
+        return {}
+    storage_cfg = config.get("storage")
+    if isinstance(storage_cfg, dict):
+        return storage_cfg
+    legacy_cfg = config.get("history_storage")
+    return legacy_cfg if isinstance(legacy_cfg, dict) else {}
+
+
+def configure_structured_history_storage(config: dict | None) -> None:
+    """Apply optional config-driven structured history settings.
+
+    Environment variables keep precedence. Config only provides an opt-in path
+    for packaged/runtime launches where editing environment variables is awkward.
+    """
+    storage_cfg = _history_config_storage_section(config)
+    if "history_read_backend" in storage_cfg:
+        backend = _normalize_structured_read_backend(storage_cfg.get("history_read_backend"))
+    else:
+        backend = _normalize_structured_read_backend(storage_cfg.get("read_backend"))
+    shadow_writes = bool(
+        storage_cfg.get(
+            "history_shadow_writes_enabled",
+            storage_cfg.get("structured_shadow_writes_enabled", False),
+        )
+    )
+    with _structured_read_config_lock:
+        global _structured_read_config_backend, _structured_shadow_write_config_enabled
+        _structured_read_config_backend = backend
+        _structured_shadow_write_config_enabled = shadow_writes
+    _clear_structured_read_store_status_cache()
+
+
+def _history_structured_read_backend_with_source() -> tuple[str, str]:
+    env_value = os.environ.get(STRUCTURED_READ_BACKEND_ENV)
+    if env_value is not None:
+        return _normalize_structured_read_backend(env_value), "env"
+    with _structured_read_config_lock:
+        configured = _structured_read_config_backend
+    if configured:
+        return configured, "config"
+    return "", "default"
+
+
+def _history_structured_read_backend() -> str:
+    return _history_structured_read_backend_with_source()[0]
+
+
+def _history_structured_read_explicit_enabled() -> bool:
+    return _history_structured_read_backend() in STRUCTURED_READ_BACKEND_SQLITE_VALUES
+
+
+def _history_structured_read_auto_configured() -> bool:
+    return _history_structured_read_backend() in STRUCTURED_READ_BACKEND_AUTO_VALUES
+
+
+def _history_structured_read_configured() -> bool:
+    return _history_structured_read_explicit_enabled() or _history_structured_read_auto_configured()
+
+
 def _history_structured_read_enabled() -> bool:
-    value = os.environ.get(STRUCTURED_READ_BACKEND_ENV, "").strip().lower()
-    return value in {"sqlite_shadow", "sqlite_structured", "structured", "sqlite"}
+    if _history_structured_read_explicit_enabled():
+        return True
+    if _history_structured_read_auto_configured():
+        return _structured_read_store_fresh(_structured_read_store_status())
+    return False
 
 
 def get_structured_read_health() -> dict:
     """Return process-local health for the opt-in structured history reader."""
     with _structured_read_health_lock:
         health = dict(_structured_read_health)
+    store_status = _structured_read_store_status()
+    fresh = _structured_read_store_fresh(store_status)
+    requested_backend, backend_source = _history_structured_read_backend_with_source()
+    explicit_enabled = requested_backend in STRUCTURED_READ_BACKEND_SQLITE_VALUES
+    auto_configured = requested_backend in STRUCTURED_READ_BACKEND_AUTO_VALUES
+    enabled = explicit_enabled or (auto_configured and fresh)
+    ready = bool(store_status.get("ready"))
+    effective_backend = "sqlite_shadow" if enabled and ready and (explicit_enabled or fresh) else "json"
     health.update({
-        "enabled": _history_structured_read_enabled(),
-        "backend": os.environ.get(STRUCTURED_READ_BACKEND_ENV, "").strip(),
-        "available": _structured_read_store_available(),
+        "enabled": enabled,
+        "backend": requested_backend,
+        "backendSource": backend_source,
+        "requestedBackend": requested_backend or "json",
+        "effectiveBackend": effective_backend,
+        "available": bool(store_status.get("available")),
+        "ready": ready,
+        "fresh": fresh,
+        "shadowWritesEnabled": _history_structured_shadow_writes_enabled(),
         "db_path": str(_history_shadow_db_file()),
     })
     return health
@@ -135,6 +236,7 @@ def get_structured_read_health() -> dict:
 def reset_structured_read_health() -> None:
     with _structured_read_health_lock:
         _structured_read_health.clear()
+    _clear_structured_read_store_status_cache()
 
 
 def _record_structured_read_success(operation: str) -> None:
@@ -169,11 +271,25 @@ def _record_structured_read_fallback(operation: str, reason: str, detail: str = 
 
 
 def _structured_read_ready(operation: str) -> bool:
-    if not _history_structured_read_enabled():
+    if not _history_structured_read_configured():
         return False
-    if _structured_read_store_available():
+    if _history_structured_read_auto_configured():
+        store_status = _structured_read_store_status()
+        if not store_status.get("available"):
+            reason = "shadow_db_missing"
+        elif not store_status.get("ready"):
+            reason = "shadow_db_not_ready"
+        elif not _structured_read_store_fresh(store_status):
+            reason = "shadow_db_stale"
+        else:
+            return True
+        _record_structured_read_fallback(operation, reason)
+        return False
+    store_status = _structured_read_store_status()
+    if store_status.get("ready"):
         return True
-    _record_structured_read_fallback(operation, "shadow_db_missing")
+    reason = "shadow_db_missing" if not store_status.get("available") else "shadow_db_not_ready"
+    _record_structured_read_fallback(operation, reason)
     return False
 
 
@@ -185,6 +301,41 @@ def _structured_shadow_store():
     from .article_history_sqlite_store import ArticleHistorySQLiteStore
 
     return ArticleHistorySQLiteStore(_history_shadow_db_file())
+
+
+def _clear_structured_read_store_status_cache() -> None:
+    with _structured_read_store_status_lock:
+        _structured_read_store_status_cache.clear()
+
+
+def _append_unique_text(items: list[str], value: str) -> None:
+    text = str(value or "").strip()
+    if text and text not in items:
+        items.append(text)
+
+
+def _structured_storage_key_aliases(storage_key: str) -> list[str]:
+    aliases: list[str] = []
+    normalized = str(storage_key or "").strip()
+    _append_unique_text(aliases, normalized)
+    if normalized:
+        _append_unique_text(aliases, _safe_name(normalized))
+    return aliases
+
+
+def _structured_canonical_storage_key(storage_key: str) -> str:
+    aliases = _structured_storage_key_aliases(storage_key)
+    return aliases[-1] if aliases else ""
+
+
+def _preferred_existing_structured_aliases(aliases: list[str], has_records) -> list[str]:
+    existing = [key for key in aliases if callable(has_records) and has_records(key)]
+    if not existing:
+        return []
+    canonical = aliases[-1] if aliases else ""
+    if canonical in existing:
+        return [canonical]
+    return existing[:1]
 
 
 def _history_doc_key(path: Path) -> str:
@@ -245,7 +396,10 @@ def _shadow_append_history_record(storage_key: str, entry: dict) -> None:
         return
     try:
         with _structured_shadow_write_lock:
-            _structured_shadow_store().append_history_record(storage_key, entry, max_records=MAX_RECORDS)
+            key = _structured_canonical_storage_key(storage_key)
+            if key:
+                _structured_shadow_store().append_history_record(key, entry, max_records=MAX_RECORDS)
+                _clear_structured_read_store_status_cache()
     except Exception as e:
         print(f"[History] 写入结构化 SQLite 影子历史失败 {storage_key}: {e}")
 
@@ -255,7 +409,10 @@ def _shadow_replace_history_records(storage_key: str, records: list[dict]) -> No
         return
     try:
         with _structured_shadow_write_lock:
-            _structured_shadow_store().import_history_records(storage_key, records, replace=True)
+            key = _structured_canonical_storage_key(storage_key)
+            if key:
+                _structured_shadow_store().import_history_records(key, records, replace=True)
+                _clear_structured_read_store_status_cache()
     except Exception as e:
         print(f"[History] 替换结构化 SQLite 影子历史失败 {storage_key}: {e}")
 
@@ -270,20 +427,121 @@ def _shadow_apply_history_review(
     if not _history_structured_shadow_writes_enabled():
         return
     try:
+        expanded_storage_keys: list[str] = []
+        for key in storage_keys:
+            for alias in _structured_storage_key_aliases(key):
+                _append_unique_text(expanded_storage_keys, alias)
         with _structured_shadow_write_lock:
             _structured_shadow_store().apply_history_review(
-                storage_keys,
+                expanded_storage_keys,
                 record_id,
                 status,
                 note,
                 reviewed_at=reviewed_at,
             )
+            _clear_structured_read_store_status_cache()
     except Exception as e:
         print(f"[History] 更新结构化 SQLite 影子复核失败 {record_id}: {e}")
 
 
 def _structured_read_store_available() -> bool:
     return _history_shadow_db_file().exists()
+
+
+def _structured_read_db_signature(db_path: Path) -> tuple[str, int, int]:
+    source = str(db_path)
+    mtime_ns = 0
+    byte_size = 0
+    exists = False
+    for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        except Exception:
+            return (source, -1, -1)
+        exists = True
+        mtime_ns = max(mtime_ns, int(stat.st_mtime_ns))
+        byte_size += int(stat.st_size)
+    if not exists:
+        return (source, 0, 0)
+    return (source, mtime_ns, byte_size)
+
+
+def _structured_read_store_status() -> dict[str, object]:
+    db_path = _history_shadow_db_file()
+    if not db_path.exists():
+        return {"available": False, "ready": False, "stored_signature": ""}
+
+    db_signature = _structured_read_db_signature(db_path)
+    cache_key = str(db_path)
+    with _structured_read_store_status_lock:
+        if (
+            _structured_read_store_status_cache.get("key") == cache_key
+            and _structured_read_store_status_cache.get("signature") == db_signature
+        ):
+            cached_status = _structured_read_store_status_cache.get("status")
+            if isinstance(cached_status, dict):
+                return dict(cached_status)
+
+    status: dict[str, object] = {"available": True, "ready": False, "stored_signature": ""}
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'history_records' LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            status["ready"] = True
+            try:
+                meta_row = conn.execute(
+                    "SELECT value FROM store_meta WHERE key = 'history_source_signature'"
+                ).fetchone()
+            except Exception:
+                meta_row = None
+            status["stored_signature"] = str(meta_row[0] or "").strip() if meta_row else ""
+    except Exception:
+        status["ready"] = False
+        status["stored_signature"] = ""
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    with _structured_read_store_status_lock:
+        _structured_read_store_status_cache.update({
+            "key": cache_key,
+            "signature": db_signature,
+            "status": dict(status),
+        })
+    return status
+
+
+def _structured_read_store_ready() -> bool:
+    return bool(_structured_read_store_status().get("ready"))
+
+
+def _structured_read_store_fresh(store_status: dict[str, object] | None = None) -> bool:
+    status = store_status if isinstance(store_status, dict) else _structured_read_store_status()
+    if not status.get("ready"):
+        return False
+    stored_signature = str(status.get("stored_signature") or "").strip()
+    return bool(stored_signature) and stored_signature == get_history_source_signature()
+
+
+def get_history_source_signature() -> str:
+    signatures = []
+    history_dir = _history_dir()
+    for filename in _iter_history_json_filenames():
+        stem = Path(filename).stem
+        if stem.endswith("_rates") or stem.endswith("_periods") or "_trend_" in stem:
+            continue
+        path = history_dir / filename
+        signatures.append((filename, _history_document_signature(path)))
+    payload = json.dumps(signatures, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def _structured_history_candidate_targets(
@@ -295,11 +553,12 @@ def _structured_history_candidate_targets(
     targets: list[str] = []
     normalized_task_id = str(task_id or "").strip()
     primary = _history_storage_key(task_id=normalized_task_id, task_name=task_name)
-    if primary:
-        targets.append(primary)
+    for key in _structured_storage_key_aliases(primary):
+        _append_unique_text(targets, key)
     legacy = str(task_name or "").strip()
-    if include_legacy and legacy and legacy not in targets:
-        targets.append(legacy)
+    if include_legacy:
+        for key in _structured_storage_key_aliases(legacy):
+            _append_unique_text(targets, key)
     return targets
 
 
@@ -316,8 +575,16 @@ def _structured_history_read_targets(
         include_legacy=include_legacy,
     )
     normalized_task_id = str(task_id or "").strip()
-    if normalized_task_id and store.get_history_record_count(normalized_task_id) > 0:
-        return targets[:1]
+    primary_aliases = _structured_storage_key_aliases(
+        _history_storage_key(task_id=normalized_task_id, task_name=task_name)
+    )
+    if normalized_task_id:
+        existing_primary_aliases = _preferred_existing_structured_aliases(
+            primary_aliases,
+            lambda key: store.get_history_record_count(key) > 0,
+        )
+        if existing_primary_aliases:
+            return [key for key in existing_primary_aliases if key in targets]
     return targets
 
 
@@ -360,9 +627,32 @@ def _structured_records_from_keyed_rows(
 ) -> list[dict]:
     targets = target_candidates
     normalized_task_id = str(task_id or "").strip()
-    primary = target_candidates[0] if target_candidates else ""
-    if normalized_task_id and primary and records_by_key.get(primary):
-        targets = [primary]
+    primary_aliases = _structured_storage_key_aliases(
+        _history_storage_key(task_id=normalized_task_id, task_name=task_name)
+    )
+    if normalized_task_id:
+        existing_primary_aliases = _preferred_existing_structured_aliases(
+            primary_aliases,
+            lambda key: bool(records_by_key.get(key)),
+        )
+        if existing_primary_aliases:
+            targets = [key for key in existing_primary_aliases if key in target_candidates]
+        else:
+            legacy_aliases = _structured_storage_key_aliases(task_name)
+            existing_legacy_aliases = _preferred_existing_structured_aliases(
+                legacy_aliases,
+                lambda key: bool(records_by_key.get(key)),
+            )
+            if existing_legacy_aliases:
+                targets = [key for key in existing_legacy_aliases if key in target_candidates]
+    else:
+        legacy_aliases = _structured_storage_key_aliases(task_name)
+        existing_legacy_aliases = _preferred_existing_structured_aliases(
+            legacy_aliases,
+            lambda key: bool(records_by_key.get(key)),
+        )
+        if existing_legacy_aliases:
+            targets = [key for key in existing_legacy_aliases if key in target_candidates]
     records: list[dict] = []
     seen_keys: set[str] = set()
     for key in targets:

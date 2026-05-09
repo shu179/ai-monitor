@@ -134,7 +134,7 @@ from backend_lib.snapshot_fragments import (
 from backend_lib.task_overview_service import TaskOverviewService
 from backend_lib.todo_service import TodoService, _todo_to_api
 from core import SmartScheduler
-from core.article_history_sqlite_mirror import default_shadow_db_path
+from core.article_history_sqlite_mirror import default_shadow_db_path, rebuild_shadow_store
 from core.article_history_sqlite_store import ArticleHistorySQLiteStore
 from core.app_paths import get_app_root, get_data_root, resolve_app_path
 from core.account_crawler import (
@@ -230,6 +230,7 @@ from core.daily_task_state import (
 from core.logging_utils import redact_secret_text, redact_secrets
 from core.diagnostics import get_events
 from core.history import (
+    configure_structured_history_storage,
     get_task_daily_query_state_bundle,
     get_task_daily_success_bundle,
     get_all_task_names,
@@ -240,6 +241,7 @@ from core.history import (
     get_task_brand_names,
     is_manual_test_failure_record,
     is_success_record,
+    reset_structured_read_health,
     save_optimization_period,
 )
 from core.local_model_manager import get_local_model_manager
@@ -391,6 +393,7 @@ GET_EXACT_RUNTIME_METHODS = {
     "/api/account-crawling/exclusions": "get_account_crawl_exclusions",
     "/api/recognition/status": "get_recognition_status",
     "/api/assistant/tools": "get_assistant_tools",
+    "/api/history-storage/status": "get_history_storage_status",
 }
 
 GET_EXACT_SESSION_TOKEN_REQUIRED_PATHS = frozenset(GET_EXACT_RUNTIME_METHODS.keys())
@@ -449,6 +452,7 @@ POST_JSON_RUNTIME_METHODS = {
     "/api/sync/import": "import_sync_bundle",
     "/api/recognition/action": "recognition_action",
     "/api/assistant/action": "assistant_action",
+    "/api/history-storage/rebuild-shadow": "rebuild_history_sqlite_shadow",
 }
 
 PUT_DYNAMIC_RUNTIME_METHODS = (
@@ -591,6 +595,66 @@ def _open_fd_count() -> int | None:
         except Exception:
             continue
     return None
+
+
+def _open_sqlite_fd_count(db_path: Path) -> int | None:
+    target_paths = {
+        str(db_path),
+        f"{db_path}-wal",
+        f"{db_path}-shm",
+    }
+    fd_dirs = (Path("/dev/fd"), Path("/proc/self/fd"))
+    saw_fd_dir = False
+    count = 0
+    for fd_dir in fd_dirs:
+        try:
+            entries = list(fd_dir.iterdir())
+        except Exception:
+            continue
+        saw_fd_dir = True
+        for entry in entries:
+            try:
+                target = os.readlink(entry)
+            except Exception:
+                continue
+            if target in target_paths:
+                count += 1
+        break
+    return count if saw_fd_dir else None
+
+
+def _sqlite_shadow_db_summary(db_path: Path) -> dict[str, Any]:
+    files: list[dict[str, Any]] = []
+    total_bytes = 0
+    for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            files.append({"path": str(path), "exists": False, "bytes": 0})
+            continue
+        except Exception as exc:
+            files.append({
+                "path": str(path),
+                "exists": False,
+                "bytes": 0,
+                "error": f"{exc.__class__.__name__}: {exc}",
+            })
+            continue
+        byte_size = int(stat.st_size)
+        total_bytes += byte_size
+        files.append({
+            "path": str(path),
+            "exists": True,
+            "bytes": byte_size,
+            "mtime_ns": int(stat.st_mtime_ns),
+        })
+    return {
+        "path": str(db_path),
+        "exists": any(bool(item.get("exists")) for item in files),
+        "totalBytes": total_bytes,
+        "files": files,
+        "openFdCount": _open_sqlite_fd_count(db_path),
+    }
 
 
 def _elapsed_ms_since(started: float) -> float:
@@ -1810,7 +1874,7 @@ class AppRuntime:
         self.config_path = current_account_config_path()
         self.config_provider = RuntimeConfigProvider(
             self.config_path,
-            on_load=lambda config: get_local_model_manager().sync_config(config),
+            on_load=self._sync_loaded_config,
         )
         self.frontend_dist = resolve_app_path("web-ui/dist")
         self._lock = threading.RLock()
@@ -1872,6 +1936,7 @@ class AppRuntime:
         self._article_sqlite_shadow_compare_recent: list[dict[str, Any]] = []
         self._article_sqlite_shadow_health_lock = threading.RLock()
         self._article_sqlite_shadow_health: dict[str, Any] = {}
+        self._history_sqlite_shadow_rebuild_lock = threading.RLock()
         self._synced_articles_cache: dict[str, Any] | None = None
         self._article_cloud_enqueue_lock = threading.RLock()
         self._last_article_cloud_enqueue_key: tuple[Any, ...] | None = None
@@ -1893,6 +1958,7 @@ class AppRuntime:
             cache_ttl_seconds=TASKS_FULL_CACHE_TTL_SECONDS,
         )
         self._scheduler: SmartScheduler | None = None
+
         self._account_crawl_thread: threading.Thread | None = None
         self._account_crawl_stop_event = threading.Event()
         self._account_crawl_lock = threading.Lock()
@@ -1936,6 +2002,11 @@ class AppRuntime:
             logger=lambda message: print(redact_secret_text(message)),
         )
         self._isolate_ordinary_cloud_account_config(CloudSessionStore().load())
+
+    @staticmethod
+    def _sync_loaded_config(config: dict[str, Any]) -> None:
+        get_local_model_manager().sync_config(config)
+        configure_structured_history_storage(config)
 
     def _activate_current_account_space(self, *, copy_legacy: bool = True) -> None:
         ensure_current_account_space(copy_legacy=copy_legacy)
@@ -5400,8 +5471,8 @@ return changedCount
             self._record_sqlite_shadow_fallback(read_backend, cooldown_reason)
             return None
         started = time.perf_counter()
-        fd_before = _open_fd_count()
         db_path = default_shadow_db_path()
+        fd_before = _open_sqlite_fd_count(db_path)
         session = CloudSessionStore().load()
         if self._is_ordinary_cloud_session(session):
             self._record_sqlite_shadow_fallback(read_backend, "ordinary_cloud_session")
@@ -5416,29 +5487,35 @@ return changedCount
                     "index_verify_failed",
                     elapsed_ms=_elapsed_ms_since(started),
                     fd_before=fd_before,
-                    fd_after=_open_fd_count(),
+                    fd_after=_open_sqlite_fd_count(db_path),
                     db_path=db_path,
                 )
                 return None
 
             store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
-            page = store.get_article_page(
-                limit=resolved_limit,
+            raw_articles = store.get_article_items(
                 task_name=str(task_name or "").strip(),
                 media_type=normalized_media_type,
             )
+            filtered_articles = _dedupe_articles_by_url(raw_articles)
+            today = local_today()
+            today_text = today.isoformat()
+
+            def is_today_article(article: dict[str, Any]) -> bool:
+                published_date = _article_published_date(article)
+                return bool(
+                    published_date == today
+                    or (published_date is not None and published_date.isoformat() == today_text)
+                )
+
             articles = _apply_articles_account_context(
-                [item for item in page.get("items", []) if isinstance(item, dict)],
+                filtered_articles[:resolved_limit],
                 config,
             )
             result = {
                 "articles": articles,
-                "total": int(page.get("total") or 0),
-                "today_total": store.get_article_today_count(
-                    local_today().isoformat(),
-                    task_name=str(task_name or "").strip(),
-                    media_type=normalized_media_type,
-                ),
+                "total": len(filtered_articles),
+                "today_total": sum(1 for article in filtered_articles if is_today_article(article)),
                 "compare_only": read_backend == "sqlite_shadow_compare",
             }
         except Exception as exc:
@@ -5448,13 +5525,13 @@ return changedCount
                 detail=f"{exc.__class__.__name__}: {exc}",
                 elapsed_ms=_elapsed_ms_since(started),
                 fd_before=fd_before,
-                fd_after=_open_fd_count(),
+                fd_after=_open_sqlite_fd_count(db_path),
                 db_path=db_path,
             )
             print(f"[WebBackend] SQLite 文章页读取失败，回退 JSON: {exc}")
             return None
 
-        fd_after = _open_fd_count()
+        fd_after = _open_sqlite_fd_count(db_path)
         elapsed_ms = _elapsed_ms_since(started)
         if self._sqlite_shadow_fd_growth_exceeded(fd_before, fd_after):
             self._record_sqlite_shadow_failure(
@@ -5694,15 +5771,16 @@ return changedCount
         store: ArticleHistorySQLiteStore,
         articles: list[dict[str, Any]],
     ) -> bool:
-        expected_articles = _dedupe_articles_by_url([
+        raw_articles = [
             item for item in articles
             if isinstance(item, dict)
-        ])
-        page = store.get_article_page(limit=1)
-        if int(page.get("total") or 0) != len(expected_articles):
+        ]
+        expected_articles = _dedupe_articles_by_url(raw_articles)
+        actual_articles = _dedupe_articles_by_url(store.get_article_items())
+        if len(actual_articles) != len(expected_articles):
             return False
         expected_task_counts: dict[str, int] = {}
-        for article in expected_articles:
+        for article in raw_articles:
             seen: set[str] = set()
             for raw_name in article.get("matched_tasks") or []:
                 task_name = str(raw_name or "").strip()
@@ -6032,6 +6110,42 @@ return changedCount
         return {
             "ok": True,
             "session": _build_snapshot_session(self.session_token, SESSION_TOKEN_HEADER),
+        }
+
+    def get_history_storage_status(self) -> dict[str, Any]:
+        db_path = default_shadow_db_path()
+        return {
+            "ok": True,
+            "history": get_structured_read_health(),
+            "articles": self.get_article_sqlite_shadow_compare_status(),
+            "shadowDb": _sqlite_shadow_db_summary(db_path),
+        }
+
+    def rebuild_history_sqlite_shadow(self, payload: dict | None = None) -> dict[str, Any]:
+        payload = payload if isinstance(payload, dict) else {}
+        max_workers_raw = payload.get("workers", payload.get("max_workers"))
+        max_workers = _safe_int(max_workers_raw, 0)
+        max_workers_arg = max(1, min(16, max_workers)) if max_workers > 0 else None
+        verify_tail_limit = max(1, min(100, _safe_int(payload.get("tail_limit"), 20)))
+        started = time.perf_counter()
+        db_path = default_shadow_db_path()
+        with self._history_sqlite_shadow_rebuild_lock:
+            result = rebuild_shadow_store(
+                db_path,
+                max_workers=max_workers_arg,
+                verify_tail_limit=verify_tail_limit,
+            )
+            reset_structured_read_health()
+        verification = result.get("verification") if isinstance(result.get("verification"), dict) else {}
+        return {
+            "ok": bool(verification.get("ok")),
+            "duration_ms": _elapsed_ms_since(started),
+            "db_path": str(db_path),
+            "workers": max_workers_arg,
+            "tail_limit": verify_tail_limit,
+            "configChanged": False,
+            "rebuild": result,
+            "status": self.get_history_storage_status(),
         }
 
     def _snapshot_locked(self) -> dict:
@@ -8736,6 +8850,22 @@ return changedCount
                         article_export_payload.get("show_selfmedia_account", True)
                     )
 
+            storage_payload = normalized_payload.get("storage")
+            if isinstance(storage_payload, dict):
+                history_read_backend = str(storage_payload.get("history_read_backend") or "").strip().lower()
+                if history_read_backend in {"0", "false", "no", "off", "disabled", "json", "file", "files"}:
+                    history_read_backend = ""
+                elif history_read_backend in {"auto", "sqlite_auto", "sqlite_shadow_auto", "auto_sqlite_shadow"}:
+                    history_read_backend = "auto"
+                elif history_read_backend in {"sqlite_shadow", "sqlite_structured", "structured", "sqlite"}:
+                    history_read_backend = "sqlite_shadow"
+                else:
+                    history_read_backend = ""
+                storage_payload["history_read_backend"] = history_read_backend
+                storage_payload["history_shadow_writes_enabled"] = bool(
+                    storage_payload.get("history_shadow_writes_enabled", False)
+                )
+
             allowed_sections = [
                 "scheduler", "ai_assistant", "local_model", "recognition",
                 "search", "smart_vision", "selector_agent", "profile", "cloud_sync",
@@ -8745,6 +8875,7 @@ return changedCount
                 "account_crawling",
                 "article_export",
                 "app_update",
+                "storage",
             ]
             query_execution_payload = normalized_payload.get("query_execution")
             if isinstance(query_execution_payload, dict):
@@ -8806,6 +8937,7 @@ return changedCount
                 config["detection_mode"] = normalized_payload["detection_mode"]
             self.save_config(config)
             get_local_model_manager().sync_config(config)
+            configure_structured_history_storage(config)
             self._sync_recognition_mode(config)
         self._refresh_monitoring_runtime(restart_scheduler=False)
         return {"ok": True}

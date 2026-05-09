@@ -230,6 +230,32 @@ class ArticleHistorySQLiteStore:
         with self._connection() as conn:
             conn.execute("DELETE FROM history_records")
 
+    def set_meta(self, key: str, value: str) -> None:
+        self.initialize()
+        normalized_key = self._text(key)
+        if not normalized_key:
+            return
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO store_meta(key, value) VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (normalized_key, str(value or "")),
+            )
+
+    def get_meta(self, key: str) -> str:
+        self.initialize()
+        normalized_key = self._text(key)
+        if not normalized_key:
+            return ""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM store_meta WHERE key = ?",
+                (normalized_key,),
+            ).fetchone()
+        return self._text(row[0]) if row else ""
+
     def get_article_page(
         self,
         *,
@@ -273,6 +299,36 @@ class ArticleHistorySQLiteStore:
             "offset": offset,
             "items": [self._json_loads(row[0]) for row in rows],
         }
+
+    def get_article_items(
+        self,
+        *,
+        task_name: str = "",
+        relation: str = "matched",
+        media_type: str = "",
+        search: str = "",
+    ) -> list[dict[str, Any]]:
+        self.initialize()
+        where_sql, params = self._article_query_filters(
+            task_name=task_name,
+            relation=relation,
+            media_type=media_type,
+            search=search,
+        )
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT a.raw_json
+                FROM articles a
+                {where_sql}
+                ORDER BY
+                    a.sort_published_ts DESC,
+                    a.sort_imported_ts DESC,
+                    a.id DESC
+                """,
+                params,
+            ).fetchall()
+        return [self._json_loads(row[0]) for row in rows]
 
     def get_article_today_count(
         self,

@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from core.article_history_sqlite_store import ArticleHistorySQLiteStore
 from web_backend import AppRuntime
 
 
@@ -108,6 +109,57 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
         self.assertTrue(result["compare_only"])
         self.assertEqual([item["id"] for item in result["articles"]], ["article-a"])
 
+    def test_sqlite_shadow_article_index_uses_json_page_deduping(self) -> None:
+        today = "2026-05-09"
+        articles = [
+            {
+                "id": "article-a",
+                "url": "https://example.com/a",
+                "title": "同一篇报道",
+                "media_name": "示例媒体",
+                "media_type": "authority",
+                "published_at": today,
+                "ts": today,
+                "matched_tasks": ["品牌A"],
+            },
+            {
+                "id": "article-b",
+                "url": "",
+                "title": "同一篇报道",
+                "media_name": "示例媒体",
+                "media_type": "authority",
+                "published_at": today,
+                "ts": today,
+                "matched_tasks": ["品牌B"],
+            },
+        ]
+        runtime = self._runtime()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "shadow.sqlite3"
+            with (
+                patch.dict(os.environ, {"AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow"}),
+                patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
+                patch("web_backend.default_shadow_db_path", lambda: db_path),
+                patch("web_backend.refresh_article_matches", lambda config: list(articles)),
+                patch("web_backend.local_today", lambda: type("FakeDate", (), {"isoformat": lambda self: today})()),
+            ):
+                result = runtime._get_sqlite_shadow_article_page(
+                    {"tasks": [{"name": "品牌B"}]},
+                    media_type="media",
+                    limit=10,
+                    task_name="品牌B",
+                )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["today_total"], 1)
+        self.assertEqual([item["id"] for item in result["articles"]], ["article-b"])
+        status = runtime.get_article_sqlite_shadow_compare_status()
+        self.assertFalse(status["health"].get("last_fallback_reason", ""))
+        self.assertEqual(status["health"].get("fallback_count", 0), 0)
+
     def test_compare_recorder_tracks_recent_mismatches_for_diagnostics(self) -> None:
         runtime = self._runtime()
 
@@ -195,7 +247,8 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
                 }),
                 patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
                 patch("web_backend.default_shadow_db_path", lambda: db_path),
-                patch("web_backend._open_fd_count", side_effect=[4, 20]),
+                patch("web_backend._open_fd_count", return_value=4),
+                patch("web_backend._open_sqlite_fd_count", side_effect=[4, 20]),
                 patch("web_backend.refresh_article_matches", lambda config: [
                     {
                         "id": "article-a",
@@ -207,6 +260,57 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
                         "matched_tasks": ["品牌A"],
                     }
                 ]),
+                patch("web_backend.local_today", lambda: type("FakeDate", (), {"isoformat": lambda self: today})()),
+            ):
+                result = runtime._get_sqlite_shadow_article_page(
+                    {"tasks": [{"name": "品牌A"}]},
+                    media_type="media",
+                    limit=10,
+                    task_name="品牌A",
+                )
+
+        status = runtime.get_article_sqlite_shadow_compare_status()
+        self.assertIsNone(result)
+        self.assertTrue(status["health"]["blocked"])
+        self.assertEqual(status["health"]["last_fallback_reason"], "fd_growth")
+        self.assertEqual(status["health"]["last_fd_delta"], 16)
+
+    def test_sqlite_shadow_fd_growth_in_index_rebuild_falls_back(self) -> None:
+        today = "2026-05-09"
+        runtime = self._runtime()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "shadow.sqlite3"
+            fd_state = {"count": 4}
+
+            def fake_ensure_index(config, *, db_path):
+                ArticleHistorySQLiteStore(db_path).import_articles(
+                    [
+                        {
+                            "id": "article-a",
+                            "url": "https://example.com/a",
+                            "title": "品牌A 今日报道",
+                            "media_type": "authority",
+                            "published_at": today,
+                            "ts": today,
+                            "matched_tasks": ["品牌A"],
+                        }
+                    ],
+                    replace=True,
+                )
+                fd_state["count"] = 20
+                return True
+
+            runtime._ensure_sqlite_shadow_article_index = fake_ensure_index  # type: ignore[method-assign]
+            with (
+                patch.dict(os.environ, {
+                    "AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow",
+                    "AIBRANDMONITOR_ARTICLE_SQLITE_FD_GROWTH_LIMIT": "1",
+                    "AIBRANDMONITOR_ARTICLE_SQLITE_COOLDOWN_SECONDS": "120",
+                }),
+                patch("web_backend.CloudSessionStore", _FakeCloudSessionStore),
+                patch("web_backend.default_shadow_db_path", lambda: db_path),
+                patch("web_backend._open_sqlite_fd_count", lambda path: fd_state["count"]),
                 patch("web_backend.local_today", lambda: type("FakeDate", (), {"isoformat": lambda self: today})()),
             ):
                 result = runtime._get_sqlite_shadow_article_page(
