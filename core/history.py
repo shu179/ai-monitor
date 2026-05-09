@@ -1311,6 +1311,33 @@ def get_brand_trend_series(
 
     brand_names = _normalize_brand_names(brands)
     records = get_records(task_name, task_id=task_id)
+    return get_brand_trend_series_from_records(
+        task_name,
+        brand_names,
+        days,
+        records,
+        task_id=task_id,
+        task_created_at=task_created_at,
+    )
+
+
+def get_brand_trend_series_from_records(
+    task_name: str,
+    brands: list[str] | None,
+    days: int,
+    records: list[dict] | None,
+    *,
+    task_id: str = "",
+    task_created_at: str = "",
+) -> dict | None:
+    """生成品牌趋势展示序列，使用调用方已加载的原始历史记录。"""
+    task_name = str(task_name or "").strip()
+    task_id = str(task_id or "").strip()
+    if not task_name:
+        return None
+
+    brand_names = _normalize_brand_names(brands)
+    records = [record for record in (records or []) if isinstance(record, dict)]
     if brand_names:
         allowed = set(brand_names)
         records = [

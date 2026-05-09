@@ -2,6 +2,7 @@ import unittest
 from collections import Counter
 from datetime import date, timedelta
 
+import backend_lib.dashboard_trends as dashboard_trends
 from backend_lib.dashboard import (
     _build_dashboard_failed_tasks,
     _build_dashboard_media_stats,
@@ -310,6 +311,72 @@ class DashboardHelperTests(unittest.TestCase):
         self.assertEqual(payload["avg"], 91)
         self.assertEqual(payload["peak"], 91)
         self.assertEqual(len(payload["data"]), 2)
+
+    def test_dashboard_trend_batches_history_reads(self) -> None:
+        original_get_records_many = dashboard_trends.get_records_many
+        original_series_from_records = dashboard_trends.get_brand_trend_series_from_records
+        read_calls = []
+        series_calls = []
+
+        def fake_get_records_many(specs):
+            read_calls.append(list(specs))
+            return [
+                [{"id": "a", "brand": "品牌A"}],
+                [{"id": "b", "brand": "品牌B"}],
+            ]
+
+        def fake_series_from_records(
+            task_name,
+            brands,
+            days,
+            records,
+            *,
+            task_id="",
+            task_created_at="",
+        ):
+            series_calls.append((task_name, brands, days, records, task_id, task_created_at))
+            return {
+                "dates": [date(2026, 1, 1)],
+                "actual": [90 if task_id == "task-a" else 70],
+                "predicted": [90 if task_id == "task-a" else 70],
+                "recorded_dates": ["2026-01-01"],
+            }
+
+        dashboard_trends.get_records_many = fake_get_records_many
+        dashboard_trends.get_brand_trend_series_from_records = fake_series_from_records
+        self.addCleanup(setattr, dashboard_trends, "get_records_many", original_get_records_many)
+        self.addCleanup(
+            setattr,
+            dashboard_trends,
+            "get_brand_trend_series_from_records",
+            original_series_from_records,
+        )
+
+        payload = dashboard_trends._build_dashboard_trend(
+            [
+                {
+                    "task_id": "task-a",
+                    "name": "任务A",
+                    "keywords": [{"brand": "品牌A"}],
+                    "created_at": "2025-12-01",
+                },
+                {
+                    "task_id": "task-b",
+                    "name": "任务B",
+                    "keywords": [{"brand": "品牌B"}],
+                },
+                {"task_id": "disabled", "name": "禁用", "enabled": False},
+            ],
+            "week",
+        )
+
+        self.assertEqual(read_calls, [[("任务A", "task-a"), ("任务B", "task-b")]])
+        self.assertEqual([call[0] for call in series_calls], ["任务A", "任务B"])
+        self.assertEqual([call[3] for call in series_calls], [
+            [{"id": "a", "brand": "品牌A"}],
+            [{"id": "b", "brand": "品牌B"}],
+        ])
+        self.assertEqual(payload["current"], 80)
 
     def test_media_stats_count_authority_and_self_articles(self) -> None:
         today = date.today()

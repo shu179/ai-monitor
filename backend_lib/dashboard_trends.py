@@ -6,7 +6,12 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from core.daily_task_state import derive_task_id
-from core.history import get_brand_trend_series, get_task_brand_names
+from core.history import (
+    get_brand_trend_series,
+    get_brand_trend_series_from_records,
+    get_records_many,
+    get_task_brand_names,
+)
 
 
 DEFAULT_MEDIA_STAT_PLATFORM_LABELS: dict[str, str] = {
@@ -260,6 +265,7 @@ def _build_dashboard_trend(tasks: list[dict[str, Any]], range_key: str) -> dict[
     actual_map: dict[str, list[float]] = {}
     predicted_map: dict[str, list[float]] = {}
     recorded_dates: set[str] = set()
+    eligible_tasks: list[tuple[dict[str, Any], str, str]] = []
 
     for task in tasks:
         if not task.get("enabled", True):
@@ -267,12 +273,25 @@ def _build_dashboard_trend(tasks: list[dict[str, Any]], range_key: str) -> dict[
         task_name = str(task.get("name") or derive_task_id(task)).strip()
         if not task_name:
             continue
+        task_id = str(task.get("task_id") or derive_task_id(task)).strip()
+        eligible_tasks.append((task, task_name, task_id))
+
+    try:
+        history_batches = get_records_many([
+            (task_name, task_id)
+            for _task, task_name, task_id in eligible_tasks
+        ])
+    except Exception:
+        history_batches = [[] for _task, _task_name, _task_id in eligible_tasks]
+
+    for (task, task_name, task_id), records in zip(eligible_tasks, history_batches):
         try:
-            series = get_brand_trend_series(
+            series = get_brand_trend_series_from_records(
                 task_name,
                 get_task_brand_names(task),
                 days,
-                task_id=str(task.get("task_id") or derive_task_id(task)).strip(),
+                records,
+                task_id=task_id,
                 task_created_at=_task_created_at(task),
             )
         except Exception:
