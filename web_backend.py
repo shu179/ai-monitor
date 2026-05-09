@@ -576,6 +576,32 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _open_fd_count() -> int | None:
+    for path in (Path("/dev/fd"), Path("/proc/self/fd")):
+        try:
+            return len(list(path.iterdir()))
+        except Exception:
+            continue
+    return None
+
+
+def _elapsed_ms_since(started: float) -> float:
+    return round((time.perf_counter() - float(started)) * 1000, 3)
+
+
+def _fd_delta(fd_before: int | None, fd_after: int | None) -> int | None:
+    if fd_before is None or fd_after is None:
+        return None
+    return int(fd_after) - int(fd_before)
+
+
 def _normalize_cloud_task_id_list(values: Any) -> list[int]:
     if not isinstance(values, list):
         return []
@@ -1843,6 +1869,8 @@ class AppRuntime:
         self._article_sqlite_shadow_cache_key: tuple[Any, ...] | None = None
         self._article_sqlite_shadow_compare_lock = threading.RLock()
         self._article_sqlite_shadow_compare_recent: list[dict[str, Any]] = []
+        self._article_sqlite_shadow_health_lock = threading.RLock()
+        self._article_sqlite_shadow_health: dict[str, Any] = {}
         self._synced_articles_cache: dict[str, Any] | None = None
         self._article_cloud_enqueue_lock = threading.RLock()
         self._last_article_cloud_enqueue_key: tuple[Any, ...] | None = None
@@ -5364,37 +5392,88 @@ return changedCount
             return None
         resolved_limit = max(1, int(limit or 50))
         if resolved_limit > 500:
+            self._record_sqlite_shadow_fallback(read_backend, "limit_exceeded")
             return None
+        cooldown_reason = self._sqlite_shadow_cooldown_reason()
+        if cooldown_reason:
+            self._record_sqlite_shadow_fallback(read_backend, cooldown_reason)
+            return None
+        started = time.perf_counter()
+        fd_before = _open_fd_count()
+        db_path = default_shadow_db_path()
         session = CloudSessionStore().load()
         if self._is_ordinary_cloud_session(session):
+            self._record_sqlite_shadow_fallback(read_backend, "ordinary_cloud_session")
             return None
 
-        type_map = {"media": "authority", "self-media": "selfmedia"}
-        normalized_media_type = type_map.get(str(media_type or "").strip(), str(media_type or "").strip())
-        db_path = default_shadow_db_path()
-        if not self._ensure_sqlite_shadow_article_index(config, db_path=db_path):
-            return None
+        try:
+            type_map = {"media": "authority", "self-media": "selfmedia"}
+            normalized_media_type = type_map.get(str(media_type or "").strip(), str(media_type or "").strip())
+            if not self._ensure_sqlite_shadow_article_index(config, db_path=db_path):
+                self._record_sqlite_shadow_failure(
+                    read_backend,
+                    "index_verify_failed",
+                    elapsed_ms=_elapsed_ms_since(started),
+                    fd_before=fd_before,
+                    fd_after=_open_fd_count(),
+                    db_path=db_path,
+                )
+                return None
 
-        store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
-        page = store.get_article_page(
-            limit=resolved_limit,
-            task_name=str(task_name or "").strip(),
-            media_type=normalized_media_type,
-        )
-        articles = _apply_articles_account_context(
-            [item for item in page.get("items", []) if isinstance(item, dict)],
-            config,
-        )
-        return {
-            "articles": articles,
-            "total": int(page.get("total") or 0),
-            "today_total": store.get_article_today_count(
-                local_today().isoformat(),
+            store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+            page = store.get_article_page(
+                limit=resolved_limit,
                 task_name=str(task_name or "").strip(),
                 media_type=normalized_media_type,
-            ),
-            "compare_only": read_backend == "sqlite_shadow_compare",
-        }
+            )
+            articles = _apply_articles_account_context(
+                [item for item in page.get("items", []) if isinstance(item, dict)],
+                config,
+            )
+            result = {
+                "articles": articles,
+                "total": int(page.get("total") or 0),
+                "today_total": store.get_article_today_count(
+                    local_today().isoformat(),
+                    task_name=str(task_name or "").strip(),
+                    media_type=normalized_media_type,
+                ),
+                "compare_only": read_backend == "sqlite_shadow_compare",
+            }
+        except Exception as exc:
+            self._record_sqlite_shadow_failure(
+                read_backend,
+                "read_error",
+                detail=f"{exc.__class__.__name__}: {exc}",
+                elapsed_ms=_elapsed_ms_since(started),
+                fd_before=fd_before,
+                fd_after=_open_fd_count(),
+                db_path=db_path,
+            )
+            print(f"[WebBackend] SQLite 文章页读取失败，回退 JSON: {exc}")
+            return None
+
+        fd_after = _open_fd_count()
+        elapsed_ms = _elapsed_ms_since(started)
+        if self._sqlite_shadow_fd_growth_exceeded(fd_before, fd_after):
+            self._record_sqlite_shadow_failure(
+                read_backend,
+                "fd_growth",
+                detail=f"{fd_before}->{fd_after}",
+                elapsed_ms=elapsed_ms,
+                fd_before=fd_before,
+                fd_after=fd_after,
+                db_path=db_path,
+            )
+            return None
+        self._record_sqlite_shadow_success(
+            read_backend,
+            elapsed_ms=elapsed_ms,
+            fd_before=fd_before,
+            fd_after=fd_after,
+            db_path=db_path,
+        )
+        return result
 
     def _record_sqlite_shadow_article_compare(
         self,
@@ -5446,6 +5525,11 @@ return changedCount
             self._article_sqlite_shadow_compare_recent.append(entry)
             self._article_sqlite_shadow_compare_recent = self._article_sqlite_shadow_compare_recent[-50:]
         if mismatches:
+            self._record_sqlite_shadow_failure(
+                str(os.environ.get("AIBRANDMONITOR_ARTICLE_READ_BACKEND", "") or "").strip().lower(),
+                "compare_mismatch",
+                detail=",".join(mismatches),
+            )
             print("[WebBackend] SQLite 文章页影子比对不一致", entry)
 
     def get_article_sqlite_shadow_compare_status(self) -> dict[str, Any]:
@@ -5457,9 +5541,127 @@ return changedCount
             "mode": str(os.environ.get("AIBRANDMONITOR_ARTICLE_READ_BACKEND", "") or "").strip().lower(),
             "checked": len(recent),
             "mismatches": mismatch_count,
+            "health": self._article_sqlite_shadow_health_snapshot(),
             "last": recent[-1] if recent else None,
             "recent": recent,
         }
+
+    def _sqlite_shadow_cooldown_reason(self) -> str:
+        now_ts = time.time()
+        with self._article_sqlite_shadow_health_lock:
+            disabled_until = _safe_float(self._article_sqlite_shadow_health.get("disabled_until"), 0.0)
+            if disabled_until > now_ts:
+                return str(self._article_sqlite_shadow_health.get("last_fallback_reason") or "health_cooldown")
+        return ""
+
+    def _record_sqlite_shadow_success(
+        self,
+        mode: str,
+        *,
+        elapsed_ms: float,
+        fd_before: int | None,
+        fd_after: int | None,
+        db_path: Path,
+    ) -> None:
+        with self._article_sqlite_shadow_health_lock:
+            self._article_sqlite_shadow_health.update({
+                "consecutive_errors": 0,
+                "disabled_until": 0.0,
+                "disabled_until_iso": "",
+                "last_mode": str(mode or ""),
+                "last_success_at": local_now().isoformat(timespec="seconds"),
+                "last_elapsed_ms": round(float(elapsed_ms), 3),
+                "last_fd_before": fd_before,
+                "last_fd_after": fd_after,
+                "last_fd_delta": _fd_delta(fd_before, fd_after),
+                "last_db_path": str(db_path),
+            })
+
+    def _record_sqlite_shadow_fallback(self, mode: str, reason: str) -> None:
+        with self._article_sqlite_shadow_health_lock:
+            self._article_sqlite_shadow_health.update({
+                "last_mode": str(mode or ""),
+                "last_fallback_reason": str(reason or ""),
+                "last_fallback_at": local_now().isoformat(timespec="seconds"),
+                "fallback_count": _safe_int(self._article_sqlite_shadow_health.get("fallback_count"), 0) + 1,
+            })
+
+    def _record_sqlite_shadow_failure(
+        self,
+        mode: str,
+        reason: str,
+        *,
+        detail: str = "",
+        elapsed_ms: float | None = None,
+        fd_before: int | None = None,
+        fd_after: int | None = None,
+        db_path: Path | None = None,
+    ) -> None:
+        now_ts = time.time()
+        error_limit = self._sqlite_shadow_error_limit()
+        cooldown_seconds = self._sqlite_shadow_cooldown_seconds()
+        with self._article_sqlite_shadow_health_lock:
+            consecutive = _safe_int(self._article_sqlite_shadow_health.get("consecutive_errors"), 0) + 1
+            force_cooldown = str(reason or "") in {"compare_mismatch", "fd_growth", "index_verify_failed"}
+            disabled_until = now_ts + cooldown_seconds if force_cooldown or consecutive >= error_limit else 0.0
+            self._article_sqlite_shadow_health.update({
+                "consecutive_errors": consecutive,
+                "last_mode": str(mode or ""),
+                "last_fallback_reason": str(reason or ""),
+                "last_fallback_at": local_now().isoformat(timespec="seconds"),
+                "last_error": str(detail or reason or ""),
+                "last_error_at": local_now().isoformat(timespec="seconds"),
+                "fallback_count": _safe_int(self._article_sqlite_shadow_health.get("fallback_count"), 0) + 1,
+                "disabled_until": disabled_until,
+                "disabled_until_iso": (
+                    datetime.fromtimestamp(disabled_until).isoformat(timespec="seconds")
+                    if disabled_until > 0
+                    else ""
+                ),
+                "tripped_count": (
+                    _safe_int(self._article_sqlite_shadow_health.get("tripped_count"), 0) + 1
+                    if disabled_until > 0
+                    else _safe_int(self._article_sqlite_shadow_health.get("tripped_count"), 0)
+                ),
+            })
+            if elapsed_ms is not None:
+                self._article_sqlite_shadow_health["last_elapsed_ms"] = round(float(elapsed_ms), 3)
+            if fd_before is not None or fd_after is not None:
+                self._article_sqlite_shadow_health["last_fd_before"] = fd_before
+                self._article_sqlite_shadow_health["last_fd_after"] = fd_after
+                self._article_sqlite_shadow_health["last_fd_delta"] = _fd_delta(fd_before, fd_after)
+            if db_path is not None:
+                self._article_sqlite_shadow_health["last_db_path"] = str(db_path)
+
+    def _article_sqlite_shadow_health_snapshot(self) -> dict[str, Any]:
+        now_ts = time.time()
+        with self._article_sqlite_shadow_health_lock:
+            health = dict(self._article_sqlite_shadow_health)
+        disabled_until = _safe_float(health.get("disabled_until"), 0.0)
+        health["blocked"] = disabled_until > now_ts
+        health["cooldown_remaining_seconds"] = max(0, round(disabled_until - now_ts, 3)) if disabled_until > now_ts else 0
+        health["error_limit"] = self._sqlite_shadow_error_limit()
+        health["cooldown_seconds"] = self._sqlite_shadow_cooldown_seconds()
+        health["fd_growth_limit"] = self._sqlite_shadow_fd_growth_limit()
+        return health
+
+    @staticmethod
+    def _sqlite_shadow_error_limit() -> int:
+        return max(1, _safe_int(os.environ.get("AIBRANDMONITOR_ARTICLE_SQLITE_ERROR_LIMIT"), 3))
+
+    @staticmethod
+    def _sqlite_shadow_cooldown_seconds() -> int:
+        return max(1, _safe_int(os.environ.get("AIBRANDMONITOR_ARTICLE_SQLITE_COOLDOWN_SECONDS"), 60))
+
+    @staticmethod
+    def _sqlite_shadow_fd_growth_limit() -> int:
+        return _safe_int(os.environ.get("AIBRANDMONITOR_ARTICLE_SQLITE_FD_GROWTH_LIMIT"), 8)
+
+    def _sqlite_shadow_fd_growth_exceeded(self, fd_before: int | None, fd_after: int | None) -> bool:
+        limit = self._sqlite_shadow_fd_growth_limit()
+        if limit < 0 or fd_before is None or fd_after is None:
+            return False
+        return int(fd_after) - int(fd_before) > limit
 
     def _ensure_sqlite_shadow_article_index(self, config: dict[str, Any], *, db_path: Path) -> bool:
         match_key = self._article_match_config_key(config)

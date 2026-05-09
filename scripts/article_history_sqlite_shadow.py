@@ -152,6 +152,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Maximum allowed open fd growth per mode. Negative disables the check.",
     )
     api_stress_parser.add_argument(
+        "--max-p95-ms",
+        type=float,
+        default=0.0,
+        help="Maximum allowed p95 latency per mode in milliseconds. Non-positive disables the check.",
+    )
+    api_stress_parser.add_argument(
+        "--max-failed-requests",
+        type=int,
+        default=0,
+        help="Maximum allowed failed HTTP requests across all modes.",
+    )
+    api_stress_parser.add_argument(
+        "--max-mismatches",
+        type=int,
+        default=0,
+        help="Maximum allowed JSON vs SQLite response mismatches.",
+    )
+    api_stress_parser.add_argument(
         "--mode",
         choices=("both", "json", "sqlite_shadow"),
         default="both",
@@ -200,6 +218,9 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             include_export_keywords=bool(args.include_export_keywords),
             fd_growth_limit=args.fd_growth_limit,
+            max_p95_ms=args.max_p95_ms,
+            max_failed_requests=args.max_failed_requests,
+            max_mismatches=args.max_mismatches,
             mode=args.mode,
         )
         ok = bool(result.get("ok"))
@@ -300,6 +321,9 @@ def stress_article_api_pages(
     timeout: float = 20.0,
     include_export_keywords: bool = False,
     fd_growth_limit: int = 8,
+    max_p95_ms: float = 0.0,
+    max_failed_requests: int = 0,
+    max_mismatches: int = 0,
     mode: str = "both",
     runtime_factory: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
@@ -357,8 +381,23 @@ def stress_article_api_pages(
     request_failed_count = sum(int(batch.get("failed_count") or 0) for batch in batches)
     fd_failed_count = sum(1 for batch in batches if not bool(batch.get("fd_ok", True)))
     mismatch_count = sum(1 for item in comparisons if not bool(item.get("ok")))
+    mode_summaries = {
+        str(batch.get("mode") or ""): _stress_batch_summary(batch, max_p95_ms=max_p95_ms)
+        for batch in batches
+    }
+    latency_failed_count = sum(
+        1 for summary in mode_summaries.values()
+        if not bool(summary.get("latency_ok", True))
+    )
+    allowed_failed_requests = max(0, int(max_failed_requests or 0))
+    allowed_mismatches = max(0, int(max_mismatches or 0))
     return {
-        "ok": request_failed_count == 0 and fd_failed_count == 0 and mismatch_count == 0,
+        "ok": (
+            request_failed_count <= allowed_failed_requests
+            and fd_failed_count == 0
+            and mismatch_count <= allowed_mismatches
+            and latency_failed_count == 0
+        ),
         "db_path": str(target_db_path),
         "limit": resolved_limit,
         "rounds": resolved_rounds,
@@ -367,14 +406,15 @@ def stress_article_api_pages(
         "request_count_per_mode": request_count,
         "include_export_keywords": bool(include_export_keywords),
         "fd_growth_limit": int(fd_growth_limit),
-        "failed_count": request_failed_count + fd_failed_count + mismatch_count,
+        "max_p95_ms": float(max_p95_ms or 0.0),
+        "max_failed_requests": allowed_failed_requests,
+        "max_mismatches": allowed_mismatches,
+        "failed_count": request_failed_count + fd_failed_count + mismatch_count + latency_failed_count,
         "request_failed_count": request_failed_count,
         "fd_failed_count": fd_failed_count,
+        "latency_failed_count": latency_failed_count,
         "mismatch_count": mismatch_count,
-        "modes": {
-            str(batch.get("mode") or ""): _stress_batch_summary(batch)
-            for batch in batches
-        },
+        "modes": mode_summaries,
         "mismatches": [item for item in comparisons if not bool(item.get("ok"))][:10],
     }
 
@@ -735,18 +775,24 @@ def _batch_summary(batch: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _stress_batch_summary(batch: dict[str, Any]) -> dict[str, Any]:
+def _stress_batch_summary(batch: dict[str, Any], *, max_p95_ms: float = 0.0) -> dict[str, Any]:
     results = batch.get("results") if isinstance(batch.get("results"), list) else []
     failures = [item for item in results if not bool(item.get("ok"))]
+    latency = _latency_summary([
+        float(item.get("elapsed_ms") or 0)
+        for item in results
+        if bool(item.get("ok"))
+    ])
+    p95 = latency.get("p95")
+    latency_limit = float(max_p95_ms or 0.0)
+    latency_ok = latency_limit <= 0 or p95 is None or float(p95) <= latency_limit
     return {
         "elapsed_ms": batch.get("elapsed_ms"),
         "request_count": len(results),
         "failed_count": len(failures),
-        "latency_ms": _latency_summary([
-            float(item.get("elapsed_ms") or 0)
-            for item in results
-            if bool(item.get("ok"))
-        ]),
+        "latency_ms": latency,
+        "latency_ok": latency_ok,
+        "max_p95_ms": latency_limit,
         "fd_before": batch.get("fd_before"),
         "fd_after": batch.get("fd_after"),
         "fd_delta": batch.get("fd_delta"),

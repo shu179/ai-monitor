@@ -85,32 +85,37 @@ class ArticleApiSQLiteShadowCompareTests(unittest.TestCase):
 
     def test_stress_batch_summary_reports_latency_and_fd_growth(self) -> None:
         cli = _load_cli_module()
-        summary = cli._stress_batch_summary({
-            "mode": "sqlite_shadow",
-            "elapsed_ms": 100.0,
-            "fd_before": 4,
-            "fd_after": 9,
-            "fd_delta": 5,
-            "fd_ok": False,
-            "results": [
-                {**_api_result("all", "a1"), "round": 1, "elapsed_ms": 10.0},
-                {**_api_result("media:media", "a2"), "round": 1, "elapsed_ms": 20.0},
-                {
-                    "ok": False,
-                    "round": 2,
-                    "name": "all",
-                    "status": 500,
-                    "error": "HTTPError",
-                    "message": "boom",
-                    "elapsed_ms": 30.0,
-                },
-            ],
-        })
+        summary = cli._stress_batch_summary(
+            {
+                "mode": "sqlite_shadow",
+                "elapsed_ms": 100.0,
+                "fd_before": 4,
+                "fd_after": 9,
+                "fd_delta": 5,
+                "fd_ok": False,
+                "results": [
+                    {**_api_result("all", "a1"), "round": 1, "elapsed_ms": 10.0},
+                    {**_api_result("media:media", "a2"), "round": 1, "elapsed_ms": 20.0},
+                    {
+                        "ok": False,
+                        "round": 2,
+                        "name": "all",
+                        "status": 500,
+                        "error": "HTTPError",
+                        "message": "boom",
+                        "elapsed_ms": 30.0,
+                    },
+                ],
+            },
+            max_p95_ms=15.0,
+        )
 
         self.assertEqual(summary["request_count"], 3)
         self.assertEqual(summary["failed_count"], 1)
         self.assertEqual(summary["latency_ms"]["p50"], 10.0)
         self.assertEqual(summary["latency_ms"]["p95"], 20.0)
+        self.assertFalse(summary["latency_ok"])
+        self.assertEqual(summary["max_p95_ms"], 15.0)
         self.assertFalse(summary["fd_ok"])
         self.assertEqual(summary["fd_delta"], 5)
         self.assertEqual(summary["failures"][0]["status"], 500)

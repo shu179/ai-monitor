@@ -150,6 +150,9 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
             timeout,
             include_export_keywords,
             fd_growth_limit,
+            max_p95_ms,
+            max_failed_requests,
+            max_mismatches,
             mode,
         ):
             calls.append((
@@ -160,6 +163,9 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
                 timeout,
                 include_export_keywords,
                 fd_growth_limit,
+                max_p95_ms,
+                max_failed_requests,
+                max_mismatches,
                 mode,
             ))
             return {
@@ -186,13 +192,19 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
                 "4.5",
                 "--fd-growth-limit",
                 "2",
+                "--max-p95-ms",
+                "80",
+                "--max-failed-requests",
+                "1",
+                "--max-mismatches",
+                "2",
                 "--mode",
                 "sqlite_shadow",
                 "--include-export-keywords",
             ])
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(calls, [("shadow.sqlite3", 3, 30, 7, 4.5, True, 2, "sqlite_shadow")])
+        self.assertEqual(calls, [("shadow.sqlite3", 3, 30, 7, 4.5, True, 2, 80.0, 1, 2, "sqlite_shadow")])
         parsed = json.loads(output.getvalue())
         self.assertTrue(parsed["ok"])
         self.assertEqual(parsed["modes"]["sqlite_shadow"]["request_count"], 6)
