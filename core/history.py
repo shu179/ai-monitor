@@ -277,29 +277,44 @@ def _load_structured_history_records(
             include_legacy=include_legacy,
         )
         records_by_key = store.get_history_records_for_keys(target_candidates)
-        targets = target_candidates
-        normalized_task_id = str(task_id or "").strip()
-        primary = target_candidates[0] if target_candidates else ""
-        if normalized_task_id and primary and records_by_key.get(primary):
-            targets = [primary]
-        records: list[dict] = []
-        seen_keys: set[str] = set()
-        for key in targets:
-            for raw_record in records_by_key.get(key, []):
-                if not isinstance(raw_record, dict):
-                    continue
-                dedupe_key = _history_record_dedupe_key(raw_record)
-                if dedupe_key in seen_keys:
-                    continue
-                seen_keys.add(dedupe_key)
-                record = dict(raw_record)
-                _normalize_record(record, task_name=task_name, task_id=task_id)
-                records.append(record)
-        records.sort(key=lambda item: str(item.get("ts") or ""))
-        return records
+        return _structured_records_from_keyed_rows(
+            records_by_key,
+            target_candidates,
+            task_name=task_name,
+            task_id=task_id,
+        )
     except Exception as e:
         print(f"[History] 读取结构化 SQLite 影子历史失败，回退 JSON: {e}")
         return None
+
+
+def _structured_records_from_keyed_rows(
+    records_by_key: dict[str, list[dict]],
+    target_candidates: list[str],
+    *,
+    task_name: str = "",
+    task_id: str = "",
+) -> list[dict]:
+    targets = target_candidates
+    normalized_task_id = str(task_id or "").strip()
+    primary = target_candidates[0] if target_candidates else ""
+    if normalized_task_id and primary and records_by_key.get(primary):
+        targets = [primary]
+    records: list[dict] = []
+    seen_keys: set[str] = set()
+    for key in targets:
+        for raw_record in records_by_key.get(key, []):
+            if not isinstance(raw_record, dict):
+                continue
+            dedupe_key = _history_record_dedupe_key(raw_record)
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            record = dict(raw_record)
+            _normalize_record(record, task_name=task_name, task_id=task_id)
+            records.append(record)
+    records.sort(key=lambda item: str(item.get("ts") or ""))
+    return records
 
 
 def _write_json_path(path: Path, data) -> None:
@@ -533,6 +548,79 @@ def get_records(
     if structured_records is not None:
         return structured_records
 
+    return _load_json_history_records(task_name=task_name, task_id=task_id, include_legacy=include_legacy)
+
+
+def get_records_many(
+    task_specs,
+    *,
+    include_legacy: bool = True,
+) -> list[list]:
+    """Batch-read history records for ``(task_name, task_id)`` specs.
+
+    The JSON backend keeps the existing per-task semantics. The SQLite shadow
+    backend reads all candidate storage keys in one query and then assembles
+    each task result with the same primary/legacy and dedupe rules as
+    get_records().
+    """
+    normalized_specs: list[tuple[str, str]] = []
+    for spec in task_specs or []:
+        task_name = ""
+        task_id = ""
+        if isinstance(spec, dict):
+            task_name = str(spec.get("task_name") or spec.get("name") or "").strip()
+            task_id = str(spec.get("task_id") or spec.get("id") or "").strip()
+        elif isinstance(spec, (list, tuple)):
+            task_name = str(spec[0] if len(spec) >= 1 else "").strip()
+            task_id = str(spec[1] if len(spec) >= 2 else "").strip()
+        normalized_specs.append((task_name, task_id))
+
+    if not normalized_specs:
+        return []
+
+    if _history_structured_read_enabled() and _structured_read_store_available():
+        try:
+            store = _structured_shadow_store()
+            candidates_by_spec = [
+                _structured_history_candidate_targets(
+                    task_id=task_id,
+                    task_name=task_name,
+                    include_legacy=include_legacy,
+                )
+                for task_name, task_id in normalized_specs
+            ]
+            all_candidates: list[str] = []
+            for candidates in candidates_by_spec:
+                all_candidates.extend(candidates)
+            records_by_key = store.get_history_records_for_keys(all_candidates)
+            return [
+                _structured_records_from_keyed_rows(
+                    records_by_key,
+                    candidates,
+                    task_name=task_name,
+                    task_id=task_id,
+                )
+                for (task_name, task_id), candidates in zip(normalized_specs, candidates_by_spec)
+            ]
+        except Exception as e:
+            print(f"[History] 批量读取结构化 SQLite 影子历史失败，回退 JSON: {e}")
+
+    return [
+        _load_json_history_records(
+            task_name=task_name,
+            task_id=task_id,
+            include_legacy=include_legacy,
+        )
+        for task_name, task_id in normalized_specs
+    ]
+
+
+def _load_json_history_records(
+    *,
+    task_name: str = "",
+    task_id: str = "",
+    include_legacy: bool = True,
+) -> list:
     records: list[dict] = []
     seen_keys: set[str] = set()
 

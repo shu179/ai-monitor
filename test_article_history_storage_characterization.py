@@ -604,6 +604,16 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             ["pending-1"],
         )
         self.assertEqual([item["id"] for item in history.get_records("读取影子")], ["legacy-1"])
+        batch_records = history.get_records_many([
+            ("读取影子", "task_read_path"),
+            ("读取影子", ""),
+            {"task_name": "读取影子", "task_id": "task_read_path"},
+        ])
+        self.assertEqual([[item["id"] for item in records] for records in batch_records], [
+            ["pending-1"],
+            ["legacy-1"],
+            ["pending-1"],
+        ])
         self.assertIn("读取影子", history.get_all_task_names())
         self.assertEqual([item["id"] for item in history.get_pending_reviews(limit=10)], ["pending-1"])
         signature = history.get_records_file_signature("读取影子", task_id="task_read_path")

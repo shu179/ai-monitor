@@ -234,7 +234,7 @@ from core.history import (
     get_task_daily_success_bundle,
     get_all_task_names,
     get_brand_trend_series,
-    get_records,
+    get_records_many,
     get_pending_reviews,
     get_task_brand_names,
     is_manual_test_failure_record,
@@ -6049,15 +6049,17 @@ return changedCount
         platform_counter: Counter[str] = Counter()
         hit_records = 0
         error_records = 0
+        history_specs: list[tuple[str, str]] = []
         for task in enabled_tasks:
             task_id = str(task.get("task_id") or derive_task_id(task)).strip()
             task_name = str(task.get("name") or derive_task_id(task)).strip()
+            history_specs.append((task_name, task_id))
+        try:
+            history_batches = get_records_many(history_specs)
+        except Exception:
+            history_batches = [[] for _ in history_specs]
 
-            try:
-                records = get_records(task_name, task_id=task_id)
-            except Exception:
-                records = []
-
+        for records in history_batches:
             for record in records:
                 if is_manual_test_failure_record(record):
                     continue
