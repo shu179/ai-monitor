@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core.article_history_sqlite_store import ArticleHistorySQLiteStore
 from core.article_history_sqlite_mirror import (
     build_article_compare_queries,
     compare_article_pages,
@@ -526,6 +527,11 @@ def stress_history_shadow_writes(
                 pending_limit=200,
                 rebuild=False,
             )
+            runtime_read_report = _structured_runtime_read_summary(
+                history_module,
+                stress_db_path,
+                config,
+            )
 
     fd_after = _open_fd_count()
     fd_growth = None if fd_before is None or fd_after is None else fd_after - fd_before
@@ -536,6 +542,7 @@ def stress_history_shadow_writes(
             ("records", records_report),
             ("task_reads", reads_report),
             ("derived_views", derived_report),
+            ("runtime_reads", runtime_read_report),
         )
         if not bool(report.get("ok"))
     ]
@@ -564,6 +571,7 @@ def stress_history_shadow_writes(
             "records": _history_guard_summary(records_report),
             "task_reads": _history_guard_summary(reads_report),
             "derived_views": _history_guard_summary(derived_report),
+            "runtime_reads": runtime_read_report,
         },
     }
 
@@ -703,6 +711,63 @@ def _history_guard_summary(report: dict[str, Any]) -> dict[str, Any]:
     if failed_views:
         summary["failed_views"] = failed_views
     return summary
+
+
+def _structured_runtime_read_summary(history_module: Any, db_path: Path, config: dict[str, Any]) -> dict[str, Any]:
+    store = ArticleHistorySQLiteStore(db_path)
+    task_checks = []
+    with _temporary_env(history_module.STRUCTURED_READ_BACKEND_ENV, "sqlite_shadow"):
+        task_names = history_module.get_all_task_names()
+        expected_task_names = store.get_history_task_names()
+        pending_ids = [str(item.get("id") or "") for item in history_module.get_pending_reviews(limit=200)]
+        expected_pending_ids = [str(item.get("id") or "") for item in store.get_pending_reviews(limit=200)]
+        for task in (config.get("tasks") or []):
+            if not isinstance(task, dict):
+                continue
+            task_id = str(task.get("task_id") or "").strip()
+            task_name = str(task.get("name") or "").strip()
+            runtime_ids = [
+                str(item.get("id") or "")
+                for item in history_module.get_records(task_name, task_id=task_id)
+            ]
+            if task_id and store.get_history_record_count(task_id) > 0:
+                expected_records = store.get_history_records(task_id)
+                expected_targets = [task_id]
+            else:
+                expected_records = store.get_history_records(task_name)
+                expected_targets = [task_name] if task_name else []
+            expected_ids = [str(item.get("id") or "") for item in expected_records]
+            task_checks.append({
+                "task_id": task_id,
+                "task_name": task_name,
+                "ok": runtime_ids == expected_ids,
+                "targets": expected_targets,
+                "runtime_count": len(runtime_ids),
+                "sqlite_count": len(expected_ids),
+            })
+    failed_tasks = [item for item in task_checks if not bool(item.get("ok"))]
+    mismatches = []
+    if task_names != expected_task_names:
+        mismatches.append("task_names")
+    if pending_ids != expected_pending_ids:
+        mismatches.append("pending_reviews")
+    if failed_tasks:
+        mismatches.append("task_records")
+    return {
+        "ok": not mismatches,
+        "mismatches": mismatches,
+        "task_count": len(task_checks),
+        "failed_task_count": len(failed_tasks),
+        "task_names": {
+            "runtime_count": len(task_names),
+            "sqlite_count": len(expected_task_names),
+        },
+        "pending_reviews": {
+            "runtime_count": len(pending_ids),
+            "sqlite_count": len(expected_pending_ids),
+        },
+        "failed_tasks": failed_tasks[:10],
+    }
 
 
 def compare_article_api_pages(

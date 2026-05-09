@@ -383,6 +383,7 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         root = Path(self._tmpdir.name)
         self._original_storage_backend = os.environ.get(history.STORAGE_BACKEND_ENV)
         self._original_shadow_write = os.environ.get(history.STRUCTURED_SHADOW_WRITE_ENV)
+        self._original_read_backend = os.environ.get(history.STRUCTURED_READ_BACKEND_ENV)
         self._original_paths = {
             "DEFAULT_HISTORY_DIR": history.DEFAULT_HISTORY_DIR,
             "HISTORY_DIR": history.HISTORY_DIR,
@@ -404,6 +405,10 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             os.environ.pop(history.STRUCTURED_SHADOW_WRITE_ENV, None)
         else:
             os.environ[history.STRUCTURED_SHADOW_WRITE_ENV] = self._original_shadow_write
+        if self._original_read_backend is None:
+            os.environ.pop(history.STRUCTURED_READ_BACKEND_ENV, None)
+        else:
+            os.environ[history.STRUCTURED_READ_BACKEND_ENV] = self._original_read_backend
         history.DEFAULT_HISTORY_DIR = self._original_paths["DEFAULT_HISTORY_DIR"]
         history.HISTORY_DIR = self._original_paths["HISTORY_DIR"]
         history.LOCAL_STORE_DB_FILE = self._original_paths["LOCAL_STORE_DB_FILE"]
@@ -557,6 +562,73 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             [item["id"] for item in store.get_history_records("导入影子")],
             ["r2", "r3"],
         )
+
+    def test_structured_read_backend_reads_records_and_derived_views_when_enabled(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "sqlite_shadow"
+        store = ArticleHistorySQLiteStore(history.HISTORY_SHADOW_DB_FILE)
+        pending = {
+            "id": "pending-1",
+            "ts": "2024-01-02 09:00",
+            "task_id": "task_read_path",
+            "task_name": "读取影子",
+            "platform": "doubao",
+            "keyword": "关键词",
+            "brand": "品牌A",
+            "rank": 1,
+            "success": True,
+            "review_status": "pending",
+        }
+        legacy = {
+            "id": "legacy-1",
+            "ts": "2024-01-01 09:00",
+            "task_name": "读取影子",
+            "platform": "doubao",
+            "keyword": "旧关键词",
+            "brand": "品牌A",
+            "rank": 1,
+            "success": True,
+            "review_status": "approved",
+        }
+        store.import_history_sources(
+            {
+                "task_read_path": [pending],
+                "读取影子": [legacy],
+            },
+            replace=True,
+        )
+
+        self.assertFalse(history._task_file("task_read_path").exists())
+        self.assertEqual(
+            [item["id"] for item in history.get_records("读取影子", task_id="task_read_path")],
+            ["pending-1"],
+        )
+        self.assertEqual([item["id"] for item in history.get_records("读取影子")], ["legacy-1"])
+        self.assertIn("读取影子", history.get_all_task_names())
+        self.assertEqual([item["id"] for item in history.get_pending_reviews(limit=10)], ["pending-1"])
+        signature = history.get_records_file_signature("读取影子", task_id="task_read_path")
+        self.assertIn("article_history_shadow.sqlite3::history_records/task_read_path", signature[0][0])
+
+    def test_structured_read_backend_falls_back_to_json_when_shadow_db_missing(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "sqlite_shadow"
+        legacy_file = history._task_file("json-fallback")
+        legacy_file.write_text(
+            json.dumps([
+                {
+                    "id": "json-1",
+                    "ts": "2024-01-01 09:00",
+                    "task_name": "JSON 回退",
+                    "rank": 1,
+                    "success": True,
+                },
+            ], ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        self.assertFalse(history.HISTORY_SHADOW_DB_FILE.exists())
+        self.assertEqual([item["id"] for item in history.get_records("json-fallback")], ["json-1"])
+        self.assertIn("JSON 回退", history.get_all_task_names())
 
 
 if __name__ == "__main__":

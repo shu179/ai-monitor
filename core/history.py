@@ -30,6 +30,7 @@ HISTORY_SHADOW_DB_FILE = DEFAULT_HISTORY_SHADOW_DB_FILE
 MAX_RECORDS = 500  # 每个任务最多保留原始记录数
 STORAGE_BACKEND_ENV = "AIBRANDMONITOR_STORAGE_BACKEND"
 STRUCTURED_SHADOW_WRITE_ENV = "AIBRANDMONITOR_HISTORY_STRUCTURED_SHADOW_WRITES"
+STRUCTURED_READ_BACKEND_ENV = "AIBRANDMONITOR_HISTORY_READ_BACKEND"
 
 _PLATFORM_ID_ALIASES: dict[str, str] = {
     "豆包": "doubao",
@@ -109,6 +110,11 @@ def _history_uses_sqlite() -> bool:
 def _history_structured_shadow_writes_enabled() -> bool:
     value = os.environ.get(STRUCTURED_SHADOW_WRITE_ENV, "").strip().lower()
     return value in {"1", "true", "yes", "on", "sqlite", "structured"}
+
+
+def _history_structured_read_enabled() -> bool:
+    value = os.environ.get(STRUCTURED_READ_BACKEND_ENV, "").strip().lower()
+    return value in {"sqlite_shadow", "sqlite_structured", "structured", "sqlite"}
 
 
 def _sqlite_store() -> SQLiteJsonDocumentStore:
@@ -216,6 +222,65 @@ def _shadow_apply_history_review(
         print(f"[History] 更新结构化 SQLite 影子复核失败 {record_id}: {e}")
 
 
+def _structured_read_store_available() -> bool:
+    return _history_shadow_db_file().exists()
+
+
+def _structured_history_read_targets(
+    store,
+    *,
+    task_id: str = "",
+    task_name: str = "",
+    include_legacy: bool = True,
+) -> list[str]:
+    targets: list[str] = []
+    normalized_task_id = str(task_id or "").strip()
+    primary = _history_storage_key(task_id=normalized_task_id, task_name=task_name)
+    if primary:
+        targets.append(primary)
+    if normalized_task_id and store.get_history_record_count(normalized_task_id) > 0:
+        return targets
+    legacy = str(task_name or "").strip()
+    if include_legacy and legacy and legacy not in targets:
+        targets.append(legacy)
+    return targets
+
+
+def _load_structured_history_records(
+    *,
+    task_name: str = "",
+    task_id: str = "",
+    include_legacy: bool = True,
+) -> list[dict] | None:
+    if not _history_structured_read_enabled() or not _structured_read_store_available():
+        return None
+    try:
+        store = _structured_shadow_store()
+        records: list[dict] = []
+        seen_keys: set[str] = set()
+        for key in _structured_history_read_targets(
+            store,
+            task_id=task_id,
+            task_name=task_name,
+            include_legacy=include_legacy,
+        ):
+            for raw_record in store.get_history_records(key):
+                if not isinstance(raw_record, dict):
+                    continue
+                dedupe_key = _history_record_dedupe_key(raw_record)
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+                record = dict(raw_record)
+                _normalize_record(record, task_name=task_name, task_id=task_id)
+                records.append(record)
+        records.sort(key=lambda item: str(item.get("ts") or ""))
+        return records
+    except Exception as e:
+        print(f"[History] 读取结构化 SQLite 影子历史失败，回退 JSON: {e}")
+        return None
+
+
 def _write_json_path(path: Path, data) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -261,6 +326,23 @@ def _history_document_signature(path: Path) -> tuple[str, int, int]:
         return (str(path), 0, 0)
     except Exception:
         return (str(path), -1, -1)
+
+
+def _history_shadow_db_signature(storage_key: str) -> tuple[str, int, int]:
+    db_path = _history_shadow_db_file()
+    source = f"{db_path}::history_records/{str(storage_key or '').strip()}"
+    mtime_ns = 0
+    byte_size = 0
+    for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        except Exception:
+            return (source, -1, -1)
+        mtime_ns = max(mtime_ns, int(stat.st_mtime_ns))
+        byte_size += int(stat.st_size)
+    return (source, mtime_ns, byte_size)
 
 
 def _iter_history_json_filenames() -> list[str]:
@@ -422,6 +504,14 @@ def get_records(
     """读取某任务的所有原始历史记录，按时间升序。"""
     task_name = str(task_name or "").strip()
     task_id = str(task_id or "").strip()
+    structured_records = _load_structured_history_records(
+        task_name=task_name,
+        task_id=task_id,
+        include_legacy=include_legacy,
+    )
+    if structured_records is not None:
+        return structured_records
+
     records: list[dict] = []
     seen_keys: set[str] = set()
 
@@ -503,6 +593,20 @@ def get_records_file_signature(
     """Return a cheap source signature for the files read by get_records()."""
     task_name = str(task_name or "").strip()
     task_id = str(task_id or "").strip()
+    if _history_structured_read_enabled() and _structured_read_store_available():
+        try:
+            store = _structured_shadow_store()
+            return tuple(
+                _history_shadow_db_signature(key)
+                for key in _structured_history_read_targets(
+                    store,
+                    task_id=task_id,
+                    task_name=task_name,
+                    include_legacy=include_legacy,
+                )
+            )
+        except Exception as e:
+            print(f"[History] 读取结构化 SQLite 签名失败，回退 JSON: {e}")
     signatures: list[tuple[str, int, int]] = []
     for key in _history_read_targets(task_id=task_id, task_name=task_name, include_legacy=include_legacy):
         path = _task_file(key)
@@ -1023,6 +1127,12 @@ def _compute_rates_locked(task_name: str, records: list):
 
 def get_all_task_names() -> list:
     """返回所有有历史记录的任务名列表"""
+    if _history_structured_read_enabled() and _structured_read_store_available():
+        try:
+            return _structured_shadow_store().get_history_task_names()
+        except Exception as e:
+            print(f"[History] 读取结构化 SQLite 任务名失败，回退 JSON: {e}")
+
     history_dir = _history_dir()
     if not history_dir.exists() and not _history_uses_sqlite():
         return []
@@ -1178,6 +1288,12 @@ def get_brand_trend_series(
 
 def get_pending_reviews(limit: int = 200) -> list[dict]:
     """返回待人工复核的命中记录。"""
+    if _history_structured_read_enabled() and _structured_read_store_available():
+        try:
+            return _structured_shadow_store().get_pending_reviews(limit=limit)
+        except Exception as e:
+            print(f"[History] 读取结构化 SQLite 待复核失败，回退 JSON: {e}")
+
     items = []
     seen_ids: set[str] = set()
     history_dir = _history_dir()
