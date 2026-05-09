@@ -243,6 +243,41 @@ class ArticleHistorySQLiteStore:
             "items": [self._json_loads(row[0]) for row in rows],
         }
 
+    def get_article_today_count(
+        self,
+        today: str,
+        *,
+        task_name: str = "",
+        relation: str = "matched",
+        media_type: str = "",
+        search: str = "",
+    ) -> int:
+        self.initialize()
+        date_text = self._date_text(today)[:10]
+        if not date_text:
+            return 0
+        where_sql, params = self._article_query_filters(
+            task_name=task_name,
+            relation=relation,
+            media_type=media_type,
+            search=search,
+        )
+        today_condition = (
+            "(substr(a.published_at, 1, 10) = ? "
+            "OR (a.published_at = '' AND a.fetch_method != 'manual_table_import' "
+            "AND substr(a.ts, 1, 10) = ?))"
+        )
+        if " WHERE " in f" {where_sql} ":
+            where_sql = f"{where_sql} AND {today_condition}"
+        else:
+            where_sql = f"{where_sql} WHERE {today_condition}"
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM articles a {where_sql}",
+                [*params, date_text, date_text],
+            ).fetchone()
+        return int((row or [0])[0] or 0)
+
     def import_history_records(
         self,
         storage_key: str,

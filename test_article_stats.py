@@ -10,10 +10,11 @@ class _ArticleStatsConfigProvider:
         return {}
 
 
-def _article_service(articles):
+def _article_service(articles, sqlite_article_page_loader=None):
     return ArticleService(
         config_provider=_ArticleStatsConfigProvider(),
         synced_articles_loader=lambda config: list(articles),
+        sqlite_article_page_loader=sqlite_article_page_loader,
         invalidate_article_cache=lambda: None,
         lock=threading.RLock(),
         import_batch_store=ArticleImportBatchStore(),
@@ -112,6 +113,74 @@ class ArticleStatsTests(unittest.TestCase):
         result = service.get_articles_filtered(limit=20)
 
         self.assertEqual(result["articles"][0]["url"], "https://example.com/same")
+
+    def test_article_list_can_use_sqlite_page_loader_when_available(self):
+        calls = []
+
+        def sqlite_loader(config, *, media_type, limit, task_name):
+            calls.append({
+                "media_type": media_type,
+                "limit": limit,
+                "task_name": task_name,
+            })
+            return {
+                "articles": [
+                    {
+                        "id": "sqlite-article",
+                        "url": "https://example.com/sqlite",
+                        "title": "SQLite 文章",
+                        "media_type": "authority",
+                        "matched_tasks": ["品牌A"],
+                        "published_at": local_today().isoformat(),
+                        "ts": local_today().isoformat(),
+                    }
+                ],
+                "total": 9,
+                "today_total": 2,
+            }
+
+        service = _article_service(
+            [
+                {
+                    "id": "json-article",
+                    "url": "https://example.com/json",
+                    "title": "JSON 文章",
+                    "media_type": "selfmedia",
+                    "matched_tasks": ["品牌B"],
+                    "published_at": "2024-03-04",
+                    "ts": "2024-03-04",
+                }
+            ],
+            sqlite_article_page_loader=sqlite_loader,
+        )
+
+        result = service.get_articles_filtered(media_type="media", limit=20, task_name="品牌A")
+
+        self.assertEqual(calls, [{"media_type": "media", "limit": 20, "task_name": "品牌A"}])
+        self.assertEqual(result["total"], 9)
+        self.assertEqual(result["today_total"], 2)
+        self.assertEqual([article["id"] for article in result["articles"]], ["sqlite-article"])
+
+    def test_article_list_falls_back_to_json_when_sqlite_loader_unavailable(self):
+        service = _article_service(
+            [
+                {
+                    "id": "json-article",
+                    "url": "https://example.com/json",
+                    "title": "JSON 文章",
+                    "media_type": "selfmedia",
+                    "matched_tasks": ["品牌B"],
+                    "published_at": "2024-03-04",
+                    "ts": "2024-03-04",
+                }
+            ],
+            sqlite_article_page_loader=lambda config, **kwargs: None,
+        )
+
+        result = service.get_articles_filtered(limit=20)
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual([article["id"] for article in result["articles"]], ["json-article"])
 
 
 if __name__ == "__main__":

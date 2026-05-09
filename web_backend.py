@@ -70,6 +70,7 @@ from backend_lib.article_service import (
     _article_published_date,
     _article_to_api,
     _compact_article_import_match_text,
+    _dedupe_articles_by_url,
     _load_article_import_batches_file,
     _merge_article_import_matches,
     _normalize_article_import_batch,
@@ -133,6 +134,8 @@ from backend_lib.snapshot_fragments import (
 from backend_lib.task_overview_service import TaskOverviewService
 from backend_lib.todo_service import TodoService, _todo_to_api
 from core import SmartScheduler
+from core.article_history_sqlite_mirror import default_shadow_db_path
+from core.article_history_sqlite_store import ArticleHistorySQLiteStore
 from core.app_paths import get_app_root, get_data_root, resolve_app_path
 from core.account_crawler import (
     crawl_account_articles,
@@ -144,6 +147,7 @@ from core.article_store import (
     get_articles,
     get_articles_file_path,
     get_excluded_article_urls,
+    normalize_article_url,
     refresh_article_matches,
     restore_excluded_article_urls,
 )
@@ -1804,6 +1808,7 @@ class AppRuntime:
         self.article_service = ArticleService(
             config_provider=self.config_provider,
             synced_articles_loader=self._get_synced_articles,
+            sqlite_article_page_loader=self._get_sqlite_shadow_article_page,
             invalidate_article_cache=self._invalidate_article_cache,
             lock=self._lock,
             import_batch_store=self.article_import_batch_store,
@@ -1833,6 +1838,8 @@ class AppRuntime:
         self._test_failure_notices: dict[str, dict[str, Any]] = {}
         self._context_snapshot_lock = threading.RLock()
         self._article_cache_lock = threading.RLock()
+        self._article_sqlite_shadow_lock = threading.RLock()
+        self._article_sqlite_shadow_cache_key: tuple[Any, ...] | None = None
         self._synced_articles_cache: dict[str, Any] | None = None
         self._article_cloud_enqueue_lock = threading.RLock()
         self._last_article_cloud_enqueue_key: tuple[Any, ...] | None = None
@@ -5340,6 +5347,97 @@ return changedCount
                 "articles": articles,
             }
             return list(articles)
+
+    def _get_sqlite_shadow_article_page(
+        self,
+        config: dict[str, Any],
+        *,
+        media_type: str = "",
+        limit: int = 50,
+        task_name: str = "",
+    ) -> dict[str, Any] | None:
+        if str(os.environ.get("AIBRANDMONITOR_ARTICLE_READ_BACKEND", "") or "").strip().lower() != "sqlite_shadow":
+            return None
+        resolved_limit = max(1, int(limit or 50))
+        if resolved_limit > 500:
+            return None
+        session = CloudSessionStore().load()
+        if self._is_ordinary_cloud_session(session):
+            return None
+
+        type_map = {"media": "authority", "self-media": "selfmedia"}
+        normalized_media_type = type_map.get(str(media_type or "").strip(), str(media_type or "").strip())
+        db_path = default_shadow_db_path()
+        if not self._ensure_sqlite_shadow_article_index(config, db_path=db_path):
+            return None
+
+        store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+        page = store.get_article_page(
+            limit=resolved_limit,
+            task_name=str(task_name or "").strip(),
+            media_type=normalized_media_type,
+        )
+        articles = _apply_articles_account_context(
+            [item for item in page.get("items", []) if isinstance(item, dict)],
+            config,
+        )
+        return {
+            "articles": articles,
+            "total": int(page.get("total") or 0),
+            "today_total": store.get_article_today_count(
+                local_today().isoformat(),
+                task_name=str(task_name or "").strip(),
+                media_type=normalized_media_type,
+            ),
+        }
+
+    def _ensure_sqlite_shadow_article_index(self, config: dict[str, Any], *, db_path: Path) -> bool:
+        match_key = self._article_match_config_key(config)
+        current_key = (str(db_path), self._article_store_version_key(), match_key)
+        with self._article_sqlite_shadow_lock:
+            if self._article_sqlite_shadow_cache_key == current_key and db_path.exists():
+                return True
+
+            articles = refresh_article_matches(config)
+            refreshed_key = (str(db_path), self._article_store_version_key(), match_key)
+            store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+            import_result = store.import_articles(articles, replace=True)
+            if not self._verify_sqlite_shadow_article_index(store, articles):
+                print(
+                    "[WebBackend] SQLite 文章影子索引校验失败，回退 JSON",
+                    {
+                        "db_path": str(db_path),
+                        "import_result": import_result,
+                    },
+                )
+                self._article_sqlite_shadow_cache_key = None
+                return False
+
+            self._article_sqlite_shadow_cache_key = refreshed_key
+            return True
+
+    @staticmethod
+    def _verify_sqlite_shadow_article_index(
+        store: ArticleHistorySQLiteStore,
+        articles: list[dict[str, Any]],
+    ) -> bool:
+        expected_articles = _dedupe_articles_by_url([
+            item for item in articles
+            if isinstance(item, dict)
+        ])
+        page = store.get_article_page(limit=1)
+        if int(page.get("total") or 0) != len(expected_articles):
+            return False
+        expected_task_counts: dict[str, int] = {}
+        for article in expected_articles:
+            seen: set[str] = set()
+            for raw_name in article.get("matched_tasks") or []:
+                task_name = str(raw_name or "").strip()
+                if not task_name or task_name in seen:
+                    continue
+                seen.add(task_name)
+                expected_task_counts[task_name] = expected_task_counts.get(task_name, 0) + 1
+        return store.get_article_task_counts(relation="matched") == dict(sorted(expected_task_counts.items()))
 
     def _ensure_recognition_manager(self):
         if self._is_cloud_viewer_account():

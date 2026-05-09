@@ -491,12 +491,14 @@ class ArticleService:
         *,
         config_provider: RuntimeConfigProvider,
         synced_articles_loader: Callable[[dict | None], list[dict[str, Any]]],
+        sqlite_article_page_loader: Callable[..., dict[str, Any] | None] | None = None,
         invalidate_article_cache: Callable[[], None],
         lock: Any,
         import_batch_store: ArticleImportBatchStore,
     ) -> None:
         self._config_provider = config_provider
         self._get_synced_articles = synced_articles_loader
+        self._get_sqlite_article_page = sqlite_article_page_loader
         self._invalidate_article_cache_callback = invalidate_article_cache
         self._lock = lock
         self._import_batch_store = import_batch_store
@@ -570,6 +572,27 @@ class ArticleService:
         include_export_keywords: bool = False,
     ) -> dict:
         config = self._config_provider.load()
+        sqlite_page = self._load_sqlite_article_page(
+            config,
+            media_type=media_type,
+            limit=limit,
+            task_name=task_name,
+        )
+        if sqlite_page is not None:
+            return {
+                "articles": [
+                    _article_to_api(
+                        article,
+                        config,
+                        task_name,
+                        include_export_keywords=include_export_keywords,
+                    )
+                    for article in sqlite_page["articles"]
+                ],
+                "total": int(sqlite_page.get("total") or 0),
+                "today_total": int(sqlite_page.get("today_total") or 0),
+            }
+
         articles = self._get_synced_articles(config)
         if task_name:
             articles = [article for article in articles if task_name in (article.get("matched_tasks") or [])]
@@ -594,6 +617,38 @@ class ArticleService:
             ],
             "total": total,
             "today_total": today_total,
+        }
+
+    def _load_sqlite_article_page(
+        self,
+        config: dict[str, Any],
+        *,
+        media_type: str,
+        limit: int,
+        task_name: str,
+    ) -> dict[str, Any] | None:
+        if not callable(self._get_sqlite_article_page):
+            return None
+        try:
+            page = self._get_sqlite_article_page(
+                config,
+                media_type=media_type,
+                limit=limit,
+                task_name=task_name,
+            )
+        except Exception as exc:
+            print(f"[ArticleService] SQLite 文章页读取失败，回退 JSON: {exc}")
+            return None
+        if not isinstance(page, dict):
+            return None
+        raw_articles = page.get("articles")
+        if not isinstance(raw_articles, list):
+            return None
+        articles = [item for item in raw_articles if isinstance(item, dict)]
+        return {
+            "articles": articles,
+            "total": int(page.get("total") or len(articles)),
+            "today_total": int(page.get("today_total") or 0),
         }
 
     def import_article(self, payload: dict) -> dict:

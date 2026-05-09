@@ -7,6 +7,7 @@ from pathlib import Path
 
 from core.article_history_sqlite_store import ArticleHistorySQLiteStore
 from core.article_store import normalize_article_url
+from core.time_utils import local_today
 
 
 class _FakeConnection:
@@ -188,6 +189,63 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             self.assertEqual(len(page["items"]), 50)
             self.assertEqual(brand_page["total"], 1000)
             self.assertEqual(len(brand_page["items"]), 25)
+
+    def test_article_today_count_matches_runtime_published_date_rules(self) -> None:
+        today = local_today().isoformat()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(
+                Path(tmpdir) / "local_store.sqlite3",
+                normalize_article_url=normalize_article_url,
+            )
+
+            store.import_articles(
+                [
+                    {
+                        "id": "published-today",
+                        "url": "https://example.com/today",
+                        "title": "今日发布",
+                        "media_type": "authority",
+                        "published_at": today,
+                        "ts": "2024-01-01",
+                        "matched_tasks": ["品牌A"],
+                    },
+                    {
+                        "id": "auto-ts-today",
+                        "url": "https://example.com/auto",
+                        "title": "自动抓取今日",
+                        "media_type": "selfmedia",
+                        "published_at": "",
+                        "ts": today,
+                        "fetch_method": "html",
+                        "matched_tasks": ["品牌A", "品牌B"],
+                    },
+                    {
+                        "id": "manual-ts-today",
+                        "url": "https://example.com/manual",
+                        "title": "手工导入今日",
+                        "media_type": "selfmedia",
+                        "published_at": "",
+                        "ts": today,
+                        "fetch_method": "manual_table_import",
+                        "matched_tasks": ["品牌A"],
+                    },
+                    {
+                        "id": "old",
+                        "url": "https://example.com/old",
+                        "title": "旧文章",
+                        "media_type": "authority",
+                        "published_at": "2024-01-01",
+                        "ts": "2024-01-01",
+                        "matched_tasks": ["品牌A"],
+                    },
+                ],
+                replace=True,
+            )
+
+            self.assertEqual(store.get_article_today_count(today), 2)
+            self.assertEqual(store.get_article_today_count(today, task_name="品牌A"), 2)
+            self.assertEqual(store.get_article_today_count(today, task_name="品牌B"), 1)
+            self.assertEqual(store.get_article_today_count(today, media_type="authority"), 1)
 
     def test_initialize_creates_expected_tables_and_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
