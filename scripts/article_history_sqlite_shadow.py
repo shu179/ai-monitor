@@ -40,6 +40,7 @@ ARTICLE_API_COMPARE_FIELDS = (
     "ts",
     "media_name",
     "matchedTasks",
+    "exportKeywords",
 )
 
 
@@ -121,6 +122,46 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Ask /api/articles to include export keyword fields in the compared payload.",
     )
+    api_stress_parser = subparsers.add_parser(
+        "stress-api-articles",
+        parents=[common],
+        help="Stress /api/articles through JSON and SQLite shadow article readers.",
+    )
+    api_stress_parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Number of articles to request per API query.",
+    )
+    api_stress_parser.add_argument(
+        "--rounds",
+        type=int,
+        default=20,
+        help="Number of times to request each query in each mode.",
+    )
+    api_stress_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=20.0,
+        help="HTTP timeout in seconds for each API request.",
+    )
+    api_stress_parser.add_argument(
+        "--fd-growth-limit",
+        type=int,
+        default=8,
+        help="Maximum allowed open fd growth per mode. Negative disables the check.",
+    )
+    api_stress_parser.add_argument(
+        "--mode",
+        choices=("both", "json", "sqlite_shadow"),
+        default="both",
+        help="Which read mode to stress. 'both' also compares response equivalence.",
+    )
+    api_stress_parser.add_argument(
+        "--include-export-keywords",
+        action="store_true",
+        help="Ask /api/articles to include export keyword fields in the stressed payload.",
+    )
     return parser.parse_args(argv)
 
 
@@ -148,6 +189,18 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             timeout=args.timeout,
             include_export_keywords=bool(args.include_export_keywords),
+        )
+        ok = bool(result.get("ok"))
+    elif args.command == "stress-api-articles":
+        result = stress_article_api_pages(
+            args.db_path,
+            max_workers=args.workers,
+            limit=args.limit,
+            rounds=args.rounds,
+            timeout=args.timeout,
+            include_export_keywords=bool(args.include_export_keywords),
+            fd_growth_limit=args.fd_growth_limit,
+            mode=args.mode,
         )
         ok = bool(result.get("ok"))
     else:
@@ -238,6 +291,94 @@ def compare_article_api_pages(
     }
 
 
+def stress_article_api_pages(
+    db_path: str | Path | None = None,
+    *,
+    max_workers: int | None = None,
+    limit: int = 100,
+    rounds: int = 20,
+    timeout: float = 20.0,
+    include_export_keywords: bool = False,
+    fd_growth_limit: int = 8,
+    mode: str = "both",
+    runtime_factory: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
+    """Run repeated HTTP reads through /api/articles and summarize stability."""
+    from http.server import ThreadingHTTPServer
+
+    import web_backend
+
+    target_db_path = Path(db_path) if db_path is not None else default_shadow_db_path()
+    queries = build_article_compare_queries(_load_api_compare_config())
+    resolved_limit = max(1, min(500, int(limit or 100)))
+    resolved_rounds = max(1, int(rounds or 1))
+    modes = _stress_modes(str(mode or "both"))
+    request_count = len(queries) * resolved_rounds
+    worker_count = _api_compare_worker_count([{} for _ in range(request_count)], max_workers=max_workers)
+
+    with _patched_web_backend_shadow_db_path(web_backend, target_db_path):
+        runtime = runtime_factory() if runtime_factory is not None else web_backend.AppRuntime()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), web_backend.WebRequestHandler)
+        server.runtime = runtime  # type: ignore[attr-defined]
+        runtime.port = int(server.server_address[1])
+        if hasattr(runtime, "_server"):
+            runtime._server = server
+        thread = threading.Thread(target=server.serve_forever, name="article-api-shadow-stress", daemon=True)
+        thread.start()
+        try:
+            batches = [
+                _stress_article_api_batch(
+                    int(server.server_address[1]),
+                    queries,
+                    mode=mode_name,
+                    read_backend=read_backend,
+                    limit=resolved_limit,
+                    rounds=resolved_rounds,
+                    timeout=float(timeout or 20.0),
+                    include_export_keywords=include_export_keywords,
+                    workers=worker_count,
+                    fd_growth_limit=int(fd_growth_limit),
+                )
+                for mode_name, read_backend in modes
+            ]
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    by_mode = {str(batch.get("mode") or ""): batch for batch in batches}
+    comparisons: list[dict[str, Any]] = []
+    if "json" in by_mode and "sqlite_shadow" in by_mode:
+        comparisons = _compare_stress_article_api_batches(
+            by_mode["json"].get("results", []),
+            by_mode["sqlite_shadow"].get("results", []),
+        )
+
+    request_failed_count = sum(int(batch.get("failed_count") or 0) for batch in batches)
+    fd_failed_count = sum(1 for batch in batches if not bool(batch.get("fd_ok", True)))
+    mismatch_count = sum(1 for item in comparisons if not bool(item.get("ok")))
+    return {
+        "ok": request_failed_count == 0 and fd_failed_count == 0 and mismatch_count == 0,
+        "db_path": str(target_db_path),
+        "limit": resolved_limit,
+        "rounds": resolved_rounds,
+        "workers": worker_count,
+        "query_count": len(queries),
+        "request_count_per_mode": request_count,
+        "include_export_keywords": bool(include_export_keywords),
+        "fd_growth_limit": int(fd_growth_limit),
+        "failed_count": request_failed_count + fd_failed_count + mismatch_count,
+        "request_failed_count": request_failed_count,
+        "fd_failed_count": fd_failed_count,
+        "mismatch_count": mismatch_count,
+        "modes": {
+            str(batch.get("mode") or ""): _stress_batch_summary(batch)
+            for batch in batches
+        },
+        "mismatches": [item for item in comparisons if not bool(item.get("ok"))][:10],
+    }
+
+
 def _load_api_compare_config() -> dict[str, Any] | None:
     try:
         from core.article_history_sqlite_mirror import _load_current_config
@@ -300,6 +441,66 @@ def _fetch_article_api_batch(
         "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
         "fd_before": fd_before,
         "fd_after": fd_after,
+        "results": results,
+    }
+
+
+def _stress_article_api_batch(
+    port: int,
+    queries: list[dict[str, str]],
+    *,
+    mode: str,
+    read_backend: str | None,
+    limit: int,
+    rounds: int,
+    timeout: float,
+    include_export_keywords: bool,
+    workers: int,
+    fd_growth_limit: int,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    fd_before = _open_fd_count()
+    jobs = [
+        (round_index, query)
+        for round_index in range(1, rounds + 1)
+        for query in queries
+    ]
+
+    def fetch(job: tuple[int, dict[str, str]]) -> dict[str, Any]:
+        round_index, query = job
+        result = _fetch_article_api_query(
+            port,
+            query,
+            limit=limit,
+            timeout=timeout,
+            include_export_keywords=include_export_keywords,
+        )
+        result["round"] = round_index
+        return result
+
+    with _temporary_env("AIBRANDMONITOR_ARTICLE_READ_BACKEND", read_backend):
+        if workers <= 1:
+            results = [fetch(job) for job in jobs]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                results = list(executor.map(fetch, jobs))
+    fd_after = _open_fd_count()
+    fd_delta = (
+        int(fd_after) - int(fd_before)
+        if fd_before is not None and fd_after is not None
+        else None
+    )
+    fd_ok = fd_growth_limit < 0 or fd_delta is None or fd_delta <= fd_growth_limit
+    failures = [item for item in results if not bool(item.get("ok"))]
+    return {
+        "mode": mode,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+        "fd_before": fd_before,
+        "fd_after": fd_after,
+        "fd_delta": fd_delta,
+        "fd_ok": fd_ok,
+        "failed_count": len(failures),
+        "request_count": len(results),
         "results": results,
     }
 
@@ -381,6 +582,31 @@ def _compare_article_api_batches(
         sqlite_item = sqlite_by_name.get(name, {})
         comparisons.append(_compare_article_api_query(json_item, sqlite_item))
     return comparisons
+
+
+def _compare_stress_article_api_batches(
+    json_results: list[dict[str, Any]],
+    sqlite_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    sqlite_by_key = {
+        _stress_result_key(item): item
+        for item in sqlite_results
+    }
+    comparisons: list[dict[str, Any]] = []
+    for json_item in json_results:
+        key = _stress_result_key(json_item)
+        sqlite_item = sqlite_by_key.get(key, {})
+        comparison = _compare_article_api_query(json_item, sqlite_item)
+        comparison["round"] = key[0]
+        comparisons.append(comparison)
+    return comparisons
+
+
+def _stress_result_key(item: dict[str, Any]) -> tuple[int, str]:
+    return (
+        int(item.get("round") or 0),
+        str(item.get("name") or ""),
+    )
 
 
 def _compare_article_api_query(
@@ -509,6 +735,63 @@ def _batch_summary(batch: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _stress_batch_summary(batch: dict[str, Any]) -> dict[str, Any]:
+    results = batch.get("results") if isinstance(batch.get("results"), list) else []
+    failures = [item for item in results if not bool(item.get("ok"))]
+    return {
+        "elapsed_ms": batch.get("elapsed_ms"),
+        "request_count": len(results),
+        "failed_count": len(failures),
+        "latency_ms": _latency_summary([
+            float(item.get("elapsed_ms") or 0)
+            for item in results
+            if bool(item.get("ok"))
+        ]),
+        "fd_before": batch.get("fd_before"),
+        "fd_after": batch.get("fd_after"),
+        "fd_delta": batch.get("fd_delta"),
+        "fd_ok": bool(batch.get("fd_ok", True)),
+        "failures": [
+            {
+                "round": item.get("round"),
+                "name": item.get("name", ""),
+                "status": item.get("status"),
+                "error": item.get("error", ""),
+                "message": item.get("message", ""),
+            }
+            for item in failures[:10]
+        ],
+    }
+
+
+def _latency_summary(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "min": None,
+            "p50": None,
+            "p95": None,
+            "max": None,
+            "avg": None,
+        }
+    ordered = sorted(values)
+    return {
+        "count": len(ordered),
+        "min": round(ordered[0], 3),
+        "p50": round(_percentile_nearest_rank(ordered, 50), 3),
+        "p95": round(_percentile_nearest_rank(ordered, 95), 3),
+        "max": round(ordered[-1], 3),
+        "avg": round(sum(ordered) / len(ordered), 3),
+    }
+
+
+def _percentile_nearest_rank(ordered_values: list[float], percentile: int) -> float:
+    if not ordered_values:
+        return 0.0
+    rank = max(1, int((len(ordered_values) * percentile + 99) // 100))
+    return ordered_values[min(len(ordered_values) - 1, rank - 1)]
+
+
 @contextlib.contextmanager
 def _temporary_env(name: str, value: str | None):
     marker = object()
@@ -533,6 +816,15 @@ def _api_compare_worker_count(queries: list[dict[str, str]], *, max_workers: int
         return max(1, min(len(queries), int(max_workers or 1)))
     cpu_count = os.cpu_count() or 2
     return max(1, min(len(queries), cpu_count, 8))
+
+
+def _stress_modes(mode: str) -> list[tuple[str, str | None]]:
+    normalized = str(mode or "both").strip().lower()
+    if normalized == "json":
+        return [("json", None)]
+    if normalized == "sqlite_shadow":
+        return [("sqlite_shadow", "sqlite_shadow")]
+    return [("json", None), ("sqlite_shadow", "sqlite_shadow")]
 
 
 def _open_fd_count() -> int | None:

@@ -137,6 +137,66 @@ class ArticleHistorySQLiteShadowCLITests(unittest.TestCase):
         self.assertTrue(parsed["ok"])
         self.assertEqual(parsed["queries"][0]["name"], "all")
 
+    def test_stress_api_articles_command_prints_report(self) -> None:
+        cli = _load_cli_module()
+        calls = []
+
+        def fake_stress(
+            db_path,
+            *,
+            max_workers,
+            limit,
+            rounds,
+            timeout,
+            include_export_keywords,
+            fd_growth_limit,
+            mode,
+        ):
+            calls.append((
+                db_path,
+                max_workers,
+                limit,
+                rounds,
+                timeout,
+                include_export_keywords,
+                fd_growth_limit,
+                mode,
+            ))
+            return {
+                "ok": True,
+                "failed_count": 0,
+                "modes": {"sqlite_shadow": {"request_count": 6}},
+            }
+
+        cli.stress_article_api_pages = fake_stress
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = cli.main([
+                "stress-api-articles",
+                "--db-path",
+                "shadow.sqlite3",
+                "--workers",
+                "3",
+                "--limit",
+                "30",
+                "--rounds",
+                "7",
+                "--timeout",
+                "4.5",
+                "--fd-growth-limit",
+                "2",
+                "--mode",
+                "sqlite_shadow",
+                "--include-export-keywords",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [("shadow.sqlite3", 3, 30, 7, 4.5, True, 2, "sqlite_shadow")])
+        parsed = json.loads(output.getvalue())
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["modes"]["sqlite_shadow"]["request_count"], 6)
+
 
 if __name__ == "__main__":
     unittest.main()
