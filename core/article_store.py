@@ -14,6 +14,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -51,7 +52,19 @@ ARTICLE_STORE_BACKEND_ENV = "AIBRANDMONITOR_ARTICLE_STORE_BACKEND"
 ARTICLE_SHADOW_WRITE_ENV = "AIBRANDMONITOR_ARTICLE_SQLITE_SHADOW_WRITES"
 SMALL_DOCUMENT_CACHE_TTL_SECONDS = 1.0
 
+ARTICLE_STORE_BACKEND_JSON_VALUES = {"json", "off", "disabled", "file", "files"}
+ARTICLE_STORE_BACKEND_SQLITE_VALUES = {"sqlite", "sqlite3", "db", "database"}
+ARTICLE_STORE_BACKEND_AUTO_VALUES = {"", "auto", "sqlite_auto", "sqlite_primary_auto", "auto_sqlite"}
+ARTICLE_STORE_SQLITE_MIGRATION_MIN_INTERVAL_SECONDS = 30.0
+ARTICLE_STORE_SQLITE_ERROR_LIMIT = 3
+ARTICLE_STORE_SQLITE_COOLDOWN_SECONDS = 60.0
+
 _small_document_cache: dict[str, tuple[float, object]] = {}
+_article_store_backend_health_lock = threading.RLock()
+_article_store_backend_health: dict[str, object] = {}
+_article_store_migration_lock = threading.RLock()
+_article_store_migration_state: dict[str, object] = {}
+_article_store_migration_threads: list[threading.Thread] = []
 
 # 权威媒体域名白名单（内置初始值，可通过手动切换覆盖）
 AUTHORITY_DOMAINS: set = {
@@ -358,15 +371,163 @@ def _sqlite_store() -> SQLiteJsonDocumentStore:
     return SQLiteJsonDocumentStore(_local_store_db_file())
 
 
+def _article_store_backend_request() -> dict[str, str]:
+    raw_value = os.environ.get(ARTICLE_STORE_BACKEND_ENV)
+    normalized = str(raw_value or "").strip().lower()
+    if normalized in ARTICLE_STORE_BACKEND_JSON_VALUES:
+        requested = "json"
+    elif normalized in ARTICLE_STORE_BACKEND_SQLITE_VALUES:
+        requested = "sqlite"
+    elif normalized in ARTICLE_STORE_BACKEND_AUTO_VALUES:
+        requested = "auto"
+    else:
+        requested = "auto"
+    return {
+        "requested_backend": requested,
+        "raw_backend": "" if raw_value is None else str(raw_value),
+        "backend_source": "default_auto" if raw_value is None or not str(raw_value).strip() else "env",
+    }
+
+
 def _article_store_backend_name() -> str:
-    backend = os.environ.get(ARTICLE_STORE_BACKEND_ENV, "").strip().lower()
-    if backend in {"sqlite", "sqlite3", "db", "database"}:
-        return "sqlite"
-    return "json"
+    return _article_store_backend_request()["requested_backend"]
 
 
 def _article_store_sqlite_enabled() -> bool:
-    return _article_store_backend_name() == "sqlite"
+    return _resolve_article_store_backend(schedule_migration=True, record=True)["effective_backend"] == "sqlite"
+
+
+def _article_json_file_signature() -> tuple[str, int, int]:
+    return _json_document_signature(
+        "article_store/articles",
+        _articles_file(),
+        use_sqlite=False,
+    )
+
+
+def _article_json_source_signature() -> str:
+    payload = {
+        "version": 1,
+        "articles": _article_json_file_signature(),
+    }
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _article_json_count_from_file(*, max_bytes: int = 5_000_000) -> int | None:
+    path = _articles_file()
+    try:
+        if not path.exists():
+            return 0
+        if path.stat().st_size > max_bytes:
+            return None
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return len(parsed) if isinstance(parsed, list) else 0
+
+
+def _article_sqlite_error_limit() -> int:
+    try:
+        value = int(os.environ.get("AIBRANDMONITOR_ARTICLE_STORE_SQLITE_ERROR_LIMIT", ARTICLE_STORE_SQLITE_ERROR_LIMIT))
+    except Exception:
+        value = ARTICLE_STORE_SQLITE_ERROR_LIMIT
+    return max(1, value)
+
+
+def _article_sqlite_cooldown_seconds() -> float:
+    try:
+        value = float(os.environ.get("AIBRANDMONITOR_ARTICLE_STORE_SQLITE_COOLDOWN_SECONDS", ARTICLE_STORE_SQLITE_COOLDOWN_SECONDS))
+    except Exception:
+        value = ARTICLE_STORE_SQLITE_COOLDOWN_SECONDS
+    return max(0.0, value)
+
+
+def _article_sqlite_migration_min_interval_seconds() -> float:
+    try:
+        value = float(
+            os.environ.get(
+                "AIBRANDMONITOR_ARTICLE_STORE_SQLITE_MIGRATION_MIN_INTERVAL_SECONDS",
+                ARTICLE_STORE_SQLITE_MIGRATION_MIN_INTERVAL_SECONDS,
+            )
+        )
+    except Exception:
+        value = ARTICLE_STORE_SQLITE_MIGRATION_MIN_INTERVAL_SECONDS
+    return max(0.0, value)
+
+
+def _article_store_sqlite_cooldown_remaining() -> float:
+    now_ts = time.time()
+    with _article_store_backend_health_lock:
+        disabled_until = _safe_float(_article_store_backend_health.get("disabled_until"), 0.0)
+    return max(0.0, disabled_until - now_ts)
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _record_article_store_backend_success(mode: str, *, effective_backend: str, db_path: Path | None = None) -> None:
+    with _article_store_backend_health_lock:
+        _article_store_backend_health.update({
+            "last_mode": str(mode or ""),
+            "last_effective_backend": str(effective_backend or ""),
+            "last_success_at": local_now().isoformat(timespec="seconds"),
+            "consecutive_errors": 0,
+            "disabled_until": 0.0,
+            "disabled_until_iso": "",
+        })
+        if db_path is not None:
+            _article_store_backend_health["last_db_path"] = str(db_path)
+
+
+def _record_article_store_backend_fallback(mode: str, reason: str, *, db_path: Path | None = None) -> None:
+    with _article_store_backend_health_lock:
+        _article_store_backend_health.update({
+            "last_mode": str(mode or ""),
+            "last_effective_backend": "json",
+            "last_fallback_reason": str(reason or ""),
+            "last_fallback_at": local_now().isoformat(timespec="seconds"),
+            "fallback_count": _coerce_non_negative_int(_article_store_backend_health.get("fallback_count", 0)) + 1,
+        })
+        if db_path is not None:
+            _article_store_backend_health["last_db_path"] = str(db_path)
+
+
+def _record_article_store_backend_error(mode: str, reason: str, *, detail: str = "", db_path: Path | None = None) -> None:
+    now_ts = time.time()
+    with _article_store_backend_health_lock:
+        consecutive = _coerce_non_negative_int(_article_store_backend_health.get("consecutive_errors", 0)) + 1
+        disabled_until = (
+            now_ts + _article_sqlite_cooldown_seconds()
+            if consecutive >= _article_sqlite_error_limit()
+            else 0.0
+        )
+        _article_store_backend_health.update({
+            "last_mode": str(mode or ""),
+            "last_effective_backend": "json",
+            "last_fallback_reason": str(reason or ""),
+            "last_fallback_at": local_now().isoformat(timespec="seconds"),
+            "last_error": str(detail or reason or ""),
+            "last_error_at": local_now().isoformat(timespec="seconds"),
+            "consecutive_errors": consecutive,
+            "fallback_count": _coerce_non_negative_int(_article_store_backend_health.get("fallback_count", 0)) + 1,
+            "disabled_until": disabled_until,
+            "disabled_until_iso": (
+                datetime.fromtimestamp(disabled_until).isoformat(timespec="seconds")
+                if disabled_until > 0
+                else ""
+            ),
+        })
+        if disabled_until > 0:
+            _article_store_backend_health["tripped_count"] = (
+                _coerce_non_negative_int(_article_store_backend_health.get("tripped_count", 0)) + 1
+            )
+        if db_path is not None:
+            _article_store_backend_health["last_db_path"] = str(db_path)
 
 
 def _load_articles_json_for_sqlite_import() -> list[dict]:
@@ -380,39 +541,410 @@ def _load_articles_json_for_sqlite_import() -> list[dict]:
     return normalized_articles
 
 
-def _article_sqlite_store():
+def _build_article_sqlite_store():
     from .article_sqlite_store import ArticleSQLiteStore
 
-    db_path = _article_store_db_file()
-    db_missing = not db_path.exists()
-    store = ArticleSQLiteStore(
+    return ArticleSQLiteStore(
         _article_store_db_file(),
         normalize_article_url=normalize_article_url,
         normalize_article_entry=lambda article: _normalize_article_entry(article)[0],
         now_text=_article_now_minute_text,
     )
+
+
+def _write_article_sqlite_import_meta(
+    store,
+    *,
+    imported_articles: list[dict],
+    result: dict,
+    source_signature: str,
+    source_file_signature: tuple[str, int, int],
+    reason: str,
+    source_path: Path | None = None,
+) -> None:
+    imported_at = local_now().isoformat(timespec="seconds")
+    source_path = source_path or _articles_file()
+    store.set_meta("article_store_backend", "sqlite_authoritative")
+    store.set_meta("article_store_import_source", "articles.json")
+    store.set_meta("article_store_import_reason", str(reason or ""))
+    store.set_meta("article_store_import_source_path", str(source_path))
+    store.set_meta(
+        "article_store_import_source_signature",
+        json.dumps(source_file_signature, ensure_ascii=False, default=str, separators=(",", ":")),
+    )
+    store.set_meta("article_store_json_source_signature", source_signature)
+    store.set_meta("article_store_import_source_count", str(len(imported_articles)))
+    try:
+        store.set_meta("article_store_sqlite_article_count", str(store.count_articles()))
+    except Exception:
+        store.set_meta("article_store_sqlite_article_count", "")
+    store.set_meta(
+        "article_store_import_result",
+        json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
+    store.set_meta("article_store_imported_at", imported_at)
+    store.set_meta("article_store_last_ok_at", imported_at)
+    store.set_meta("article_store_last_error", "")
+
+
+def _article_import_payload_digest(articles: list[dict]) -> str:
+    text = json.dumps(articles or [], ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _initialize_article_sqlite_store_from_json_sync(*, reason: str) -> dict:
+    store = _build_article_sqlite_store()
+    imported_articles = _load_articles_json_for_sqlite_import()
+    imported_digest = _article_import_payload_digest(imported_articles)
+    source_file_signature = _article_json_file_signature()
+    source_signature = _article_json_source_signature()
+    result = store.import_from_articles(imported_articles, replace=True)
+    imported_sqlite_count = store.count_articles()
+    if imported_articles and imported_sqlite_count <= 0:
+        store.set_meta("article_store_json_source_signature", "")
+        store.set_meta("article_store_last_error", "count_mismatch")
+        raise RuntimeError("article sqlite import count mismatch")
+    final_source_signature = _article_json_source_signature()
+    if final_source_signature != source_signature:
+        final_articles = _load_articles_json_for_sqlite_import()
+        if _article_import_payload_digest(final_articles) != imported_digest:
+            store.set_meta("article_store_json_source_signature", "")
+            store.set_meta("article_store_last_error", "source_changed_during_import")
+            raise RuntimeError("article json source changed during sqlite import")
+        source_signature = final_source_signature
+        source_file_signature = _article_json_file_signature()
+    _write_article_sqlite_import_meta(
+        store,
+        imported_articles=imported_articles,
+        result=result,
+        source_signature=source_signature,
+        source_file_signature=source_file_signature,
+        reason=reason,
+        source_path=_articles_file(),
+    )
+    return {
+        "result": result,
+        "source_signature": source_signature,
+        "source_count": len(imported_articles),
+        "article_count": imported_sqlite_count,
+    }
+
+
+def _article_sqlite_store():
+    db_path = _article_store_db_file()
+    db_missing = not db_path.exists()
+    store = _build_article_sqlite_store()
     if db_missing:
-        source_signature = _json_document_signature(
-            "article_store/articles",
-            _articles_file(),
-            use_sqlite=False,
-        )
-        imported_articles = _load_articles_json_for_sqlite_import()
-        result = store.import_from_articles(imported_articles, replace=True)
-        imported_at = local_now().isoformat(timespec="seconds")
-        store.set_meta("article_store_backend", "sqlite_authoritative")
-        store.set_meta("article_store_import_source", "articles.json")
-        store.set_meta("article_store_import_source_path", str(_articles_file()))
-        store.set_meta(
-            "article_store_import_source_signature",
-            json.dumps(source_signature, ensure_ascii=False, default=str, separators=(",", ":")),
-        )
-        store.set_meta(
-            "article_store_import_result",
-            json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        )
-        store.set_meta("article_store_imported_at", imported_at)
+        _initialize_article_sqlite_store_from_json_sync(reason="forced_sqlite_first_use")
     return store
+
+
+def _article_sqlite_meta_snapshot(store, keys: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for key in keys:
+        try:
+            result[key] = str(store.get_meta(key) or "").strip()
+        except Exception:
+            result[key] = ""
+    return result
+
+
+def _article_store_sqlite_freshness(store) -> dict[str, object]:
+    current_json_signature = _article_json_source_signature()
+    current_file_signature = _article_json_file_signature()
+    current_file_signature_text = json.dumps(
+        current_file_signature,
+        ensure_ascii=False,
+        default=str,
+        separators=(",", ":"),
+    )
+    meta = _article_sqlite_meta_snapshot(
+        store,
+        [
+            "article_store_json_source_signature",
+            "article_store_import_source_signature",
+            "article_store_import_source_count",
+            "article_store_imported_at",
+            "article_store_last_ok_at",
+            "article_store_last_error",
+        ],
+    )
+    sqlite_count = store.count_articles()
+    imported_count_text = str(meta.get("article_store_import_source_count") or "").strip()
+    try:
+        imported_count = int(imported_count_text) if imported_count_text else None
+    except Exception:
+        imported_count = None
+    json_count = _article_json_count_from_file()
+    stored_json_signature = str(meta.get("article_store_json_source_signature") or "").strip()
+    stored_file_signature = str(meta.get("article_store_import_source_signature") or "").strip()
+    signature_fresh = (
+        stored_json_signature == current_json_signature
+        or stored_file_signature == current_file_signature_text
+    )
+    has_import_meta = bool(stored_json_signature or stored_file_signature)
+    count_fresh = True if has_import_meta else json_count is not None and sqlite_count == json_count
+    fresh = bool(signature_fresh and count_fresh)
+    return {
+        "fresh": fresh,
+        "signature_fresh": bool(signature_fresh),
+        "count_fresh": bool(count_fresh),
+        "json_source_signature": current_json_signature,
+        "json_file_signature": current_file_signature,
+        "stored_json_source_signature": stored_json_signature,
+        "stored_json_file_signature": stored_file_signature,
+        "sqlite_count": sqlite_count,
+        "json_count": json_count,
+        "imported_count": imported_count,
+        "meta": meta,
+    }
+
+
+def _resolve_article_store_backend(*, schedule_migration: bool, record: bool) -> dict[str, object]:
+    request = _article_store_backend_request()
+    requested = request["requested_backend"]
+    db_path = _article_store_db_file()
+    result: dict[str, object] = {
+        **request,
+        "effective_backend": "json",
+        "fallback_reason": "",
+        "db_path": str(db_path),
+        "db_ready": False,
+        "readiness": {},
+        "freshness": {},
+    }
+
+    if requested == "json":
+        result["fallback_reason"] = "forced_json"
+        if record:
+            _record_article_store_backend_fallback(requested, "forced_json", db_path=db_path)
+        return result
+
+    cooldown_remaining = _article_store_sqlite_cooldown_remaining()
+    if requested == "auto" and cooldown_remaining > 0:
+        result["fallback_reason"] = "health_cooldown"
+        result["cooldown_remaining_seconds"] = round(cooldown_remaining, 3)
+        if record:
+            _record_article_store_backend_fallback(requested, "health_cooldown", db_path=db_path)
+        return result
+
+    try:
+        if requested == "sqlite":
+            if not db_path.exists():
+                _initialize_article_sqlite_store_from_json_sync(reason="forced_sqlite_missing_db")
+            readiness = _article_sqlite_store_class().validate_readiness(db_path)
+            result["readiness"] = readiness
+            result["db_ready"] = bool(readiness.get("ready"))
+            if bool(readiness.get("ready")):
+                result["effective_backend"] = "sqlite"
+                if record:
+                    _record_article_store_backend_success(requested, effective_backend="sqlite", db_path=db_path)
+                return result
+            reason = (
+                "article_store_db_missing"
+                if not readiness.get("available")
+                else f"article_store_db_{readiness.get('reason') or 'not_ready'}"
+            )
+            result["fallback_reason"] = reason
+            if record:
+                _record_article_store_backend_error(requested, reason, detail=json.dumps(readiness, ensure_ascii=False), db_path=db_path)
+            return result
+
+        readiness = _article_sqlite_store_class().validate_readiness(db_path)
+        result["readiness"] = readiness
+        result["db_ready"] = bool(readiness.get("ready"))
+        if not bool(readiness.get("ready")):
+            reason = (
+                "article_store_db_missing"
+                if not readiness.get("available")
+                else f"article_store_db_{readiness.get('reason') or 'not_ready'}"
+            )
+            result["fallback_reason"] = reason
+            if schedule_migration:
+                result["migration_scheduled"] = _schedule_article_store_sqlite_migration(reason=reason)
+            if record:
+                _record_article_store_backend_fallback(requested, reason, db_path=db_path)
+            return result
+
+        store = _build_article_sqlite_store()
+        freshness = _article_store_sqlite_freshness(store)
+        result["freshness"] = freshness
+        if bool(freshness.get("fresh")):
+            result["effective_backend"] = "sqlite"
+            if record:
+                _record_article_store_backend_success(requested, effective_backend="sqlite", db_path=db_path)
+            return result
+
+        reason = "article_store_source_stale" if not freshness.get("signature_fresh") else "article_store_count_stale"
+        result["fallback_reason"] = reason
+        if schedule_migration:
+            result["migration_scheduled"] = _schedule_article_store_sqlite_migration(reason=reason)
+        if record:
+            _record_article_store_backend_fallback(requested, reason, db_path=db_path)
+        return result
+    except Exception as exc:
+        reason = "article_store_sqlite_error"
+        detail = f"{exc.__class__.__name__}: {exc}"
+        result["fallback_reason"] = reason
+        result["error"] = detail
+        if record:
+            _record_article_store_backend_error(requested, reason, detail=detail, db_path=db_path)
+        return result
+
+
+def _article_sqlite_store_class():
+    from .article_sqlite_store import ArticleSQLiteStore
+
+    return ArticleSQLiteStore
+
+
+def _schedule_article_store_sqlite_migration(*, reason: str) -> bool:
+    now_ts = time.time()
+    db_path = _article_store_db_file()
+    with _article_store_migration_lock:
+        _article_store_migration_threads[:] = [
+            thread for thread in _article_store_migration_threads if thread.is_alive()
+        ]
+        if bool(_article_store_migration_state.get("running")):
+            return False
+        next_allowed_at = _safe_float(_article_store_migration_state.get("next_allowed_at"), 0.0)
+        if next_allowed_at > now_ts:
+            return False
+        _article_store_migration_state.update({
+            "running": True,
+            "last_reason": str(reason or ""),
+            "last_started_at": now_ts,
+            "last_started_at_iso": local_now().isoformat(timespec="seconds"),
+            "last_finished_at": 0.0,
+            "last_finished_at_iso": "",
+            "last_error": "",
+            "db_path": str(db_path),
+            "next_allowed_at": now_ts + _article_sqlite_migration_min_interval_seconds(),
+        })
+
+    thread = threading.Thread(
+        target=_run_article_store_sqlite_migration,
+        args=(str(reason or ""),),
+        name="article-store-sqlite-primary-migration",
+        daemon=True,
+    )
+    with _article_store_migration_lock:
+        _article_store_migration_threads.append(thread)
+    thread.start()
+    return True
+
+
+def _run_article_store_sqlite_migration(reason: str) -> None:
+    ok = False
+    detail = ""
+    summary: dict[str, object] = {}
+    try:
+        summary = _initialize_article_sqlite_store_from_json_sync(reason=f"auto:{reason}")
+        ok = True
+    except Exception as exc:
+        detail = f"{exc.__class__.__name__}: {exc}"
+        try:
+            store = _build_article_sqlite_store()
+            store.set_meta("article_store_json_source_signature", "")
+            store.set_meta("article_store_last_error", detail)
+            store.set_meta("article_store_last_error_at", local_now().isoformat(timespec="seconds"))
+        except Exception:
+            pass
+        _record_article_store_backend_error("auto", "article_store_migration_failed", detail=detail, db_path=_article_store_db_file())
+    finally:
+        finished_at = time.time()
+        with _article_store_migration_lock:
+            _article_store_migration_state.update({
+                "running": False,
+                "last_ok": ok,
+                "last_error": detail,
+                "last_finished_at": finished_at,
+                "last_finished_at_iso": local_now().isoformat(timespec="seconds"),
+                "last_summary": summary,
+            })
+
+
+def wait_for_article_store_backend_migration(timeout: float = 5.0) -> dict[str, object]:
+    deadline = time.time() + max(0.0, float(timeout or 0.0))
+    while True:
+        with _article_store_migration_lock:
+            threads = [thread for thread in _article_store_migration_threads if thread.is_alive()]
+        if not threads:
+            break
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        for thread in threads:
+            thread.join(timeout=min(0.05, max(0.0, remaining)))
+    with _article_store_migration_lock:
+        _article_store_migration_threads[:] = [
+            thread for thread in _article_store_migration_threads if thread.is_alive()
+        ]
+        return dict(_article_store_migration_state)
+
+
+def reset_article_store_backend_health_for_tests() -> None:
+    wait_for_article_store_backend_migration(timeout=2.0)
+    with _article_store_backend_health_lock:
+        _article_store_backend_health.clear()
+    with _article_store_migration_lock:
+        _article_store_migration_state.clear()
+        _article_store_migration_threads.clear()
+
+
+def get_article_store_backend_health() -> dict[str, object]:
+    request = _article_store_backend_request()
+    db_path = _article_store_db_file()
+    resolution = _resolve_article_store_backend(schedule_migration=False, record=False)
+    readiness = resolution.get("readiness") if isinstance(resolution.get("readiness"), dict) else {}
+    freshness = resolution.get("freshness") if isinstance(resolution.get("freshness"), dict) else {}
+    sqlite_signature = ""
+    sqlite_count = None
+    if bool(readiness.get("ready")):
+        try:
+            store = _build_article_sqlite_store()
+            sqlite_signature = store.source_signature()
+            sqlite_count = store.count_articles()
+        except Exception:
+            sqlite_signature = ""
+            sqlite_count = None
+    with _article_store_backend_health_lock:
+        health = dict(_article_store_backend_health)
+    cooldown_remaining = _article_store_sqlite_cooldown_remaining()
+    health["blocked"] = cooldown_remaining > 0
+    health["cooldown_remaining_seconds"] = round(cooldown_remaining, 3)
+    health["error_limit"] = _article_sqlite_error_limit()
+    health["cooldown_seconds"] = _article_sqlite_cooldown_seconds()
+    with _article_store_migration_lock:
+        migration_state = dict(_article_store_migration_state)
+        migration_state["thread_count"] = len([thread for thread in _article_store_migration_threads if thread.is_alive()])
+    json_signature = _article_json_source_signature()
+    json_file_signature = _article_json_file_signature()
+    json_count = _article_json_count_from_file()
+    return {
+        "ok": True,
+        "requested_backend": request["requested_backend"],
+        "effective_backend": resolution.get("effective_backend", "json"),
+        "effectiveBackend": resolution.get("effective_backend", "json"),
+        "backend_source": request["backend_source"],
+        "raw_backend": request["raw_backend"],
+        "fallback_reason": resolution.get("fallback_reason", ""),
+        "fallbackReason": resolution.get("fallback_reason", ""),
+        "db_path": str(db_path),
+        "db_ready": bool(readiness.get("ready")),
+        "readiness": readiness,
+        "json_signature": json_signature,
+        "json_file_signature": json_file_signature,
+        "sqlite_signature": sqlite_signature,
+        "article_counts": {
+            "json": json_count,
+            "sqlite": sqlite_count if sqlite_count is not None else freshness.get("sqlite_count"),
+            "imported": freshness.get("imported_count"),
+        },
+        "freshness": freshness,
+        "migration_state": migration_state,
+        "health": health,
+    }
 
 
 def _article_shadow_db_file() -> Path:

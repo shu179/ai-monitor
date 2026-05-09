@@ -164,6 +164,38 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
             operations["refresh_article_matches"]["details"],
         )
 
+    def test_small_benchmark_supports_guarded_auto_backend(self) -> None:
+        original_articles_file = article_store.ARTICLES_FILE
+        original_shadow_file = article_store.ARTICLE_SHADOW_DB_FILE
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary = run_benchmark(
+                BenchmarkOptions(
+                    count=80,
+                    task_count=4,
+                    page_limit=10,
+                    bulk_size=6,
+                    duplicate_every=11,
+                    today_every=4,
+                    article_store_backend="auto",
+                    data_dir=Path(tmpdir),
+                    force=True,
+                )
+            )
+
+        self.assertEqual(article_store.ARTICLES_FILE, original_articles_file)
+        self.assertEqual(article_store.ARTICLE_SHADOW_DB_FILE, original_shadow_file)
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["input"]["article_store_backend"], "auto")
+        self.assertEqual(summary["input"]["article_store_effective_backend"], "sqlite")
+        self.assertEqual(summary["article_store_backend_health"]["effective_backend"], "sqlite")
+        operations = {operation["name"]: operation for operation in summary["operations"]}
+        self.assertIn("article_store_auto_primary_probe", operations)
+        self.assertTrue(operations["article_store_auto_primary_probe"]["ok"])
+        probe = operations["article_store_auto_primary_probe"]["details"]
+        self.assertEqual(probe["initial_effective_backend"], "json")
+        self.assertEqual(probe["final_effective_backend"], "sqlite")
+
 
 if __name__ == "__main__":
     unittest.main()

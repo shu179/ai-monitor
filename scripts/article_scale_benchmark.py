@@ -323,6 +323,14 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
             sqlite_article_compare_recorder=None,
         )
 
+        if article_store_backend == "auto":
+            operations.append(
+                _measure_operation(
+                    "article_store_auto_primary_probe",
+                    _article_store_auto_primary_probe,
+                    paths["article_store_db"],
+                )
+            )
         operations.append(
             _measure_operation(
                 "rebuild_sqlite_shadow",
@@ -408,6 +416,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
 
         final_json_count = _json_article_count(paths["articles"])
         final_authoritative_count = len(article_store.get_articles())
+        article_store_backend_health = article_store.get_article_store_backend_health()
         sqlite_status = _sqlite_status(paths["shadow_db"], today)
 
     summary: dict[str, Any] = {
@@ -422,6 +431,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
             "duplicate_every": int(opts.duplicate_every),
             "today_every": int(opts.today_every),
             "article_store_backend": article_store_backend,
+            "article_store_effective_backend": article_store_backend_health.get("effective_backend", ""),
             "skip_refresh": bool(opts.skip_refresh),
         },
         "paths": {
@@ -435,6 +445,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
             "authoritative_final": final_authoritative_count,
             **sqlite_status,
         },
+        "article_store_backend_health": article_store_backend_health,
         "operations": operations,
         "standards": {},
         "recommendations": migration_recommendations(),
@@ -549,8 +560,12 @@ def _prepare_data_dir(data_dir: Path, *, force: bool) -> dict[str, Path]:
 
 
 def _normalize_article_store_backend(value: str) -> str:
-    backend = str(value or "json").strip().lower()
-    return "sqlite" if backend in {"sqlite", "sqlite3", "db", "database"} else "json"
+    backend = str(value or "auto").strip().lower()
+    if backend in {"sqlite", "sqlite3", "db", "database"}:
+        return "sqlite"
+    if backend in {"json", "off", "disabled", "file", "files"}:
+        return "json"
+    return "auto"
 
 
 def _article_authoritative_backend_label() -> str:
@@ -582,13 +597,18 @@ def isolated_article_store_paths(data_dir: Path, *, article_store_backend: str =
         article_store.LOCAL_STORE_DB_FILE = logs_dir / "local_store.sqlite3"
         article_store.ARTICLE_SHADOW_DB_FILE = logs_dir / "article_history_shadow.sqlite3"
         article_store.ARTICLE_STORE_DB_FILE = logs_dir / "article_store.sqlite3"
-        if _normalize_article_store_backend(article_store_backend) == "sqlite":
+        normalized_backend = _normalize_article_store_backend(article_store_backend)
+        if normalized_backend == "sqlite":
             os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "sqlite"
+        elif normalized_backend == "json":
+            os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "json"
         else:
             os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
+        article_store.reset_article_store_backend_health_for_tests()
         article_store._small_document_cache.clear()  # noqa: SLF001
         yield
     finally:
+        article_store.wait_for_article_store_backend_migration(timeout=5.0)
         article_store.ARTICLES_FILE = originals["ARTICLES_FILE"]
         article_store.DOMAIN_OVERRIDES_FILE = originals["DOMAIN_OVERRIDES_FILE"]
         article_store.DOMAIN_MEDIA_NAMES_FILE = originals["DOMAIN_MEDIA_NAMES_FILE"]
@@ -600,6 +620,7 @@ def isolated_article_store_paths(data_dir: Path, *, article_store_backend: str =
             os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
         else:
             os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = originals["ARTICLE_STORE_BACKEND_ENV"]
+        article_store.reset_article_store_backend_health_for_tests()
         article_store._small_document_cache.clear()  # noqa: SLF001
 
 
@@ -609,6 +630,24 @@ def _json_articles_loader(counter: dict[str, int]) -> Callable[[dict | None], li
         return article_store.get_articles()
 
     return load
+
+
+def _article_store_auto_primary_probe() -> dict[str, Any]:
+    initial_articles = article_store.get_articles()
+    initial_health = article_store.get_article_store_backend_health()
+    migration_state = article_store.wait_for_article_store_backend_migration(timeout=30.0)
+    final_articles = article_store.get_articles()
+    final_health = article_store.get_article_store_backend_health()
+    return {
+        "initial_effective_backend": initial_health.get("effective_backend"),
+        "initial_fallback_reason": initial_health.get("fallback_reason"),
+        "final_effective_backend": final_health.get("effective_backend"),
+        "final_fallback_reason": final_health.get("fallback_reason"),
+        "initial_returned": len(initial_articles),
+        "final_returned": len(final_articles),
+        "migration_state": migration_state,
+        "health": final_health,
+    }
 
 
 def _rebuild_sqlite_shadow(
@@ -930,7 +969,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bulk-size", type=int, default=DEFAULT_BULK_SIZE, help="Small bulk upsert batch size.")
     parser.add_argument("--duplicate-every", type=int, default=DEFAULT_DUPLICATE_EVERY, help="Repeat one URL every N rows; 0 disables duplicates.")
     parser.add_argument("--today-every", type=int, default=DEFAULT_TODAY_EVERY, help="Mark every Nth article as published today.")
-    parser.add_argument("--article-store-backend", choices=("json", "sqlite"), default="json", help="Authoritative ArticleStore backend for write-path measurements.")
+    parser.add_argument("--article-store-backend", choices=("json", "sqlite", "auto"), default="json", help="Authoritative ArticleStore backend for write-path measurements.")
     parser.add_argument("--data-dir", type=Path, default=None, help="Explicit isolated benchmark data dir. Defaults to tempfile.")
     parser.add_argument("--force", action="store_true", help="Overwrite an existing explicit data dir articles.json.")
     parser.add_argument("--keep-data", action="store_true", help="Keep a generated tempfile data dir after the run.")

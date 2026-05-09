@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -16,12 +17,14 @@ class ArticleStoreLockTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
         root = Path(self._tmpdir.name)
+        self._original_article_store_backend = os.environ.get(article_store.ARTICLE_STORE_BACKEND_ENV)
         self._original_paths = {
             "ARTICLES_FILE": article_store.ARTICLES_FILE,
             "DOMAIN_OVERRIDES_FILE": article_store.DOMAIN_OVERRIDES_FILE,
             "DOMAIN_MEDIA_NAMES_FILE": article_store.DOMAIN_MEDIA_NAMES_FILE,
             "EXCLUDED_ARTICLE_URLS_FILE": article_store.EXCLUDED_ARTICLE_URLS_FILE,
             "ARTICLE_SHADOW_DB_FILE": article_store.ARTICLE_SHADOW_DB_FILE,
+            "ARTICLE_STORE_DB_FILE": article_store.ARTICLE_STORE_DB_FILE,
             "MAX_REFERENCE_EVENTS_PER_TASK": article_store.MAX_REFERENCE_EVENTS_PER_TASK,
             "MAX_EXCLUDED_ARTICLE_URLS": article_store.MAX_EXCLUDED_ARTICLE_URLS,
         }
@@ -30,17 +33,26 @@ class ArticleStoreLockTests(unittest.TestCase):
         article_store.DOMAIN_MEDIA_NAMES_FILE = root / "logs" / "domain_media_names.json"
         article_store.EXCLUDED_ARTICLE_URLS_FILE = root / "logs" / "excluded_article_urls.json"
         article_store.ARTICLE_SHADOW_DB_FILE = root / "logs" / "article_history_shadow.sqlite3"
+        article_store.ARTICLE_STORE_DB_FILE = root / "logs" / "article_store.sqlite3"
         article_store.ARTICLES_FILE.parent.mkdir(parents=True, exist_ok=True)
         article_store.ARTICLES_FILE.write_text("[]", encoding="utf-8")
+        os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "json"
 
     def tearDown(self) -> None:
+        article_store.wait_for_article_store_backend_migration(timeout=2.0)
+        if self._original_article_store_backend is None:
+            os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
+        else:
+            os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = self._original_article_store_backend
         article_store.ARTICLES_FILE = self._original_paths["ARTICLES_FILE"]
         article_store.DOMAIN_OVERRIDES_FILE = self._original_paths["DOMAIN_OVERRIDES_FILE"]
         article_store.DOMAIN_MEDIA_NAMES_FILE = self._original_paths["DOMAIN_MEDIA_NAMES_FILE"]
         article_store.EXCLUDED_ARTICLE_URLS_FILE = self._original_paths["EXCLUDED_ARTICLE_URLS_FILE"]
         article_store.ARTICLE_SHADOW_DB_FILE = self._original_paths["ARTICLE_SHADOW_DB_FILE"]
+        article_store.ARTICLE_STORE_DB_FILE = self._original_paths["ARTICLE_STORE_DB_FILE"]
         article_store.MAX_REFERENCE_EVENTS_PER_TASK = self._original_paths["MAX_REFERENCE_EVENTS_PER_TASK"]
         article_store.MAX_EXCLUDED_ARTICLE_URLS = self._original_paths["MAX_EXCLUDED_ARTICLE_URLS"]
+        article_store.reset_article_store_backend_health_for_tests()
         self._tmpdir.cleanup()
 
     def test_article_store_lock_follows_active_articles_file(self) -> None:

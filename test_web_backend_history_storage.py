@@ -35,6 +35,7 @@ def test_get_history_storage_status_reports_health_and_shadow_db(tmp_path: Path)
     with (
         patch("web_backend.default_shadow_db_path", return_value=db_path),
         patch("web_backend.get_structured_read_health", return_value={"enabled": False, "effectiveBackend": "json"}),
+        patch("web_backend.get_article_store_backend_health", return_value={"effective_backend": "json"}),
         patch("web_backend._open_sqlite_fd_count", return_value=2),
     ):
         status = runtime.get_history_storage_status()
@@ -42,6 +43,7 @@ def test_get_history_storage_status_reports_health_and_shadow_db(tmp_path: Path)
     assert status["ok"] is True
     assert status["history"] == {"enabled": False, "effectiveBackend": "json"}
     assert status["articles"]["ok"] is True
+    assert status["articleStore"] == {"effective_backend": "json"}
     assert status["shadowDb"]["path"] == str(db_path)
     assert status["shadowDb"]["exists"] is True
     assert status["shadowDb"]["totalBytes"] == len(b"shadow") + len(b"wal")
@@ -67,6 +69,7 @@ def test_rebuild_history_sqlite_shadow_rebuilds_without_changing_config(tmp_path
         patch("web_backend.rebuild_shadow_store", side_effect=fake_rebuild),
         patch("web_backend.reset_structured_read_health") as reset_health,
         patch("web_backend.get_structured_read_health", return_value={"enabled": True, "effectiveBackend": "sqlite_shadow"}),
+        patch("web_backend.get_article_store_backend_health", return_value={"effective_backend": "json"}),
         patch("web_backend._open_sqlite_fd_count", return_value=0),
     ):
         result = runtime.rebuild_history_sqlite_shadow({"workers": 99, "tail_limit": 0})

@@ -24,19 +24,30 @@ class ArticleStorageCharacterizationTests(unittest.TestCase):
             "DOMAIN_OVERRIDES_FILE": article_store.DOMAIN_OVERRIDES_FILE,
             "DOMAIN_MEDIA_NAMES_FILE": article_store.DOMAIN_MEDIA_NAMES_FILE,
             "EXCLUDED_ARTICLE_URLS_FILE": article_store.EXCLUDED_ARTICLE_URLS_FILE,
+            "ARTICLE_STORE_DB_FILE": article_store.ARTICLE_STORE_DB_FILE,
         }
+        self._original_article_store_backend = os.environ.get(article_store.ARTICLE_STORE_BACKEND_ENV)
         article_store.ARTICLES_FILE = root / "logs" / "articles.json"
         article_store.DOMAIN_OVERRIDES_FILE = root / "logs" / "domain_overrides.json"
         article_store.DOMAIN_MEDIA_NAMES_FILE = root / "logs" / "domain_media_names.json"
         article_store.EXCLUDED_ARTICLE_URLS_FILE = root / "logs" / "excluded_article_urls.json"
+        article_store.ARTICLE_STORE_DB_FILE = root / "logs" / "article_store.sqlite3"
         article_store.ARTICLES_FILE.parent.mkdir(parents=True, exist_ok=True)
         article_store.ARTICLES_FILE.write_text("[]", encoding="utf-8")
+        os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "json"
 
     def tearDown(self) -> None:
+        article_store.wait_for_article_store_backend_migration(timeout=2.0)
+        if self._original_article_store_backend is None:
+            os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
+        else:
+            os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = self._original_article_store_backend
         article_store.ARTICLES_FILE = self._original_paths["ARTICLES_FILE"]
         article_store.DOMAIN_OVERRIDES_FILE = self._original_paths["DOMAIN_OVERRIDES_FILE"]
         article_store.DOMAIN_MEDIA_NAMES_FILE = self._original_paths["DOMAIN_MEDIA_NAMES_FILE"]
         article_store.EXCLUDED_ARTICLE_URLS_FILE = self._original_paths["EXCLUDED_ARTICLE_URLS_FILE"]
+        article_store.ARTICLE_STORE_DB_FILE = self._original_paths["ARTICLE_STORE_DB_FILE"]
+        article_store.reset_article_store_backend_health_for_tests()
         self._tmpdir.cleanup()
 
     def test_bulk_upsert_updates_by_normalized_url_and_clears_exclusion(self) -> None:
@@ -173,6 +184,7 @@ class ArticleSQLiteStorageMigrationTests(unittest.TestCase):
         self._tmpdir = tempfile.TemporaryDirectory()
         root = Path(self._tmpdir.name)
         self._original_storage_backend = os.environ.get(article_store.STORAGE_BACKEND_ENV)
+        self._original_article_store_backend = os.environ.get(article_store.ARTICLE_STORE_BACKEND_ENV)
         self._original_paths = {
             "DEFAULT_ARTICLES_FILE": article_store.DEFAULT_ARTICLES_FILE,
             "ARTICLES_FILE": article_store.ARTICLES_FILE,
@@ -183,6 +195,7 @@ class ArticleSQLiteStorageMigrationTests(unittest.TestCase):
             "DEFAULT_EXCLUDED_ARTICLE_URLS_FILE": article_store.DEFAULT_EXCLUDED_ARTICLE_URLS_FILE,
             "EXCLUDED_ARTICLE_URLS_FILE": article_store.EXCLUDED_ARTICLE_URLS_FILE,
             "LOCAL_STORE_DB_FILE": article_store.LOCAL_STORE_DB_FILE,
+            "ARTICLE_STORE_DB_FILE": article_store.ARTICLE_STORE_DB_FILE,
         }
         article_store.DEFAULT_ARTICLES_FILE = root / "logs" / "articles.json"
         article_store.ARTICLES_FILE = article_store.DEFAULT_ARTICLES_FILE
@@ -193,13 +206,20 @@ class ArticleSQLiteStorageMigrationTests(unittest.TestCase):
         article_store.DEFAULT_EXCLUDED_ARTICLE_URLS_FILE = root / "logs" / "excluded_article_urls.json"
         article_store.EXCLUDED_ARTICLE_URLS_FILE = article_store.DEFAULT_EXCLUDED_ARTICLE_URLS_FILE
         article_store.LOCAL_STORE_DB_FILE = root / "logs" / "local_store.sqlite3"
+        article_store.ARTICLE_STORE_DB_FILE = root / "logs" / "article_store.sqlite3"
         article_store.ARTICLES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "json"
 
     def tearDown(self) -> None:
+        article_store.wait_for_article_store_backend_migration(timeout=2.0)
         if self._original_storage_backend is None:
             os.environ.pop(article_store.STORAGE_BACKEND_ENV, None)
         else:
             os.environ[article_store.STORAGE_BACKEND_ENV] = self._original_storage_backend
+        if self._original_article_store_backend is None:
+            os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
+        else:
+            os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = self._original_article_store_backend
         article_store.DEFAULT_ARTICLES_FILE = self._original_paths["DEFAULT_ARTICLES_FILE"]
         article_store.ARTICLES_FILE = self._original_paths["ARTICLES_FILE"]
         article_store.DEFAULT_DOMAIN_OVERRIDES_FILE = self._original_paths["DEFAULT_DOMAIN_OVERRIDES_FILE"]
@@ -209,6 +229,8 @@ class ArticleSQLiteStorageMigrationTests(unittest.TestCase):
         article_store.DEFAULT_EXCLUDED_ARTICLE_URLS_FILE = self._original_paths["DEFAULT_EXCLUDED_ARTICLE_URLS_FILE"]
         article_store.EXCLUDED_ARTICLE_URLS_FILE = self._original_paths["EXCLUDED_ARTICLE_URLS_FILE"]
         article_store.LOCAL_STORE_DB_FILE = self._original_paths["LOCAL_STORE_DB_FILE"]
+        article_store.ARTICLE_STORE_DB_FILE = self._original_paths["ARTICLE_STORE_DB_FILE"]
+        article_store.reset_article_store_backend_health_for_tests()
         self._tmpdir.cleanup()
 
     def test_default_article_store_keeps_json_backend(self) -> None:

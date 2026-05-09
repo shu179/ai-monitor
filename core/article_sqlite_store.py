@@ -383,6 +383,12 @@ class ArticleSQLiteStore:
             ).fetchall()
         return {str(row[0]): int(row[1] or 0) for row in rows if str(row[0] or "")}
 
+    def count_articles(self) -> int:
+        self.initialize()
+        with self._connection() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM articles").fetchone()
+        return int((row or [0])[0] or 0)
+
     def get_match_refresh_stats(self, config_signature: str) -> dict[str, int]:
         self.initialize()
         signature = self._text(config_signature)

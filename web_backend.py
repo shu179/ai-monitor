@@ -145,6 +145,7 @@ from core.account_crawler import (
 )
 from core.article_store import (
     export_article_store_bundle,
+    get_article_store_backend_health,
     get_article_source_signature,
     get_articles,
     get_articles_file_path,
@@ -6418,6 +6419,7 @@ return changedCount
             "ok": True,
             "history": get_structured_read_health(),
             "articles": self.get_article_sqlite_shadow_compare_status(),
+            "articleStore": get_article_store_backend_health(),
             "shadowDb": _sqlite_shadow_db_summary(db_path),
         }
 

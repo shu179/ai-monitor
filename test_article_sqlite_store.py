@@ -193,6 +193,9 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
         self._original_env = {
             article_store.ARTICLE_STORE_BACKEND_ENV: os.environ.get(article_store.ARTICLE_STORE_BACKEND_ENV),
             article_store.ARTICLE_SHADOW_WRITE_ENV: os.environ.get(article_store.ARTICLE_SHADOW_WRITE_ENV),
+            "AIBRANDMONITOR_ARTICLE_STORE_SQLITE_ERROR_LIMIT": os.environ.get("AIBRANDMONITOR_ARTICLE_STORE_SQLITE_ERROR_LIMIT"),
+            "AIBRANDMONITOR_ARTICLE_STORE_SQLITE_COOLDOWN_SECONDS": os.environ.get("AIBRANDMONITOR_ARTICLE_STORE_SQLITE_COOLDOWN_SECONDS"),
+            "AIBRANDMONITOR_ARTICLE_STORE_SQLITE_MIGRATION_MIN_INTERVAL_SECONDS": os.environ.get("AIBRANDMONITOR_ARTICLE_STORE_SQLITE_MIGRATION_MIN_INTERVAL_SECONDS"),
         }
         self._original_paths = {
             "ARTICLES_FILE": article_store.ARTICLES_FILE,
@@ -203,8 +206,10 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
             "ARTICLE_STORE_DB_FILE": article_store.ARTICLE_STORE_DB_FILE,
         }
         os.environ[article_store.ARTICLE_SHADOW_WRITE_ENV] = "0"
+        os.environ["AIBRANDMONITOR_ARTICLE_STORE_SQLITE_MIGRATION_MIN_INTERVAL_SECONDS"] = "0"
 
     def tearDown(self) -> None:
+        article_store.wait_for_article_store_backend_migration(timeout=2.0)
         for key, value in self._original_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -217,6 +222,7 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
         article_store.ARTICLE_SHADOW_DB_FILE = self._original_paths["ARTICLE_SHADOW_DB_FILE"]
         article_store.ARTICLE_STORE_DB_FILE = self._original_paths["ARTICLE_STORE_DB_FILE"]
         article_store._small_document_cache.clear()  # noqa: SLF001
+        article_store.reset_article_store_backend_health_for_tests()
         self._tmpdir.cleanup()
 
     def test_public_crud_parity_between_json_and_sqlite_backend(self) -> None:
@@ -267,7 +273,131 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
             meta = dict(conn.execute("SELECT key, value FROM store_meta").fetchall())
         self.assertEqual(meta["article_store_import_source"], "articles.json")
         self.assertEqual(meta["article_store_import_source_path"], str(article_store.ARTICLES_FILE))
+        self.assertIn("article_store_json_source_signature", meta)
         self.assertIn("created", meta["article_store_import_result"])
+
+    def test_default_empty_backend_auto_falls_back_and_migrates_in_background(self) -> None:
+        self._configure_paths("auto-missing")
+        os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
+        legacy_text = json.dumps(
+            [
+                {
+                    "id": "legacy-a",
+                    "url": "https://example.com/a",
+                    "title": "Legacy A",
+                    "published_at": "2026-05-09",
+                }
+            ],
+            ensure_ascii=False,
+        )
+        article_store.ARTICLES_FILE.write_text(legacy_text, encoding="utf-8")
+
+        initial = article_store.get_articles()
+        initial_health = article_store.get_article_store_backend_health()
+        migration = article_store.wait_for_article_store_backend_migration(timeout=5.0)
+        final_health = article_store.get_article_store_backend_health()
+        final = article_store.get_articles()
+
+        self.assertEqual([item["id"] for item in initial], ["legacy-a"])
+        self.assertEqual(initial_health["requested_backend"], "auto")
+        self.assertEqual(initial_health["effective_backend"], "json")
+        self.assertIn(initial_health["fallback_reason"], {"article_store_db_missing", "article_store_source_stale", ""})
+        self.assertTrue(migration.get("last_ok"))
+        self.assertEqual(final_health["effective_backend"], "sqlite")
+        self.assertEqual([item["id"] for item in final], ["legacy-a"])
+        persisted = json.loads(article_store.ARTICLES_FILE.read_text(encoding="utf-8"))
+        self.assertEqual([item["id"] for item in persisted], ["legacy-a"])
+
+    def test_auto_mode_uses_fresh_sqlite_primary(self) -> None:
+        self._configure_paths("auto-fresh")
+        os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
+        article_store.ARTICLES_FILE.write_text(
+            json.dumps([{"id": "article-a", "url": "https://example.com/a", "title": "A"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        article_store.get_articles()
+        article_store.wait_for_article_store_backend_migration(timeout=5.0)
+
+        added = article_store.add_article({"id": "article-b", "url": "https://example.com/b", "title": "B"})
+        health = article_store.get_article_store_backend_health()
+        articles = article_store.get_articles()
+
+        self.assertEqual(added["id"], "article-b")
+        self.assertEqual(health["effective_backend"], "sqlite")
+        self.assertEqual({item["id"] for item in articles}, {"article-a", "article-b"})
+        persisted_json = json.loads(article_store.ARTICLES_FILE.read_text(encoding="utf-8"))
+        self.assertEqual([item["id"] for item in persisted_json], ["article-a"])
+
+    def test_json_disabled_backend_forces_json_and_does_not_schedule_migration(self) -> None:
+        self._configure_paths("json-disabled")
+        os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "off"
+        article_store.ARTICLES_FILE.write_text(
+            json.dumps([{"id": "article-a", "url": "https://example.com/a", "title": "A"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        articles = article_store.get_articles()
+        migration = article_store.wait_for_article_store_backend_migration(timeout=0.2)
+        health = article_store.get_article_store_backend_health()
+
+        self.assertEqual([item["id"] for item in articles], ["article-a"])
+        self.assertEqual(health["requested_backend"], "json")
+        self.assertEqual(health["effective_backend"], "json")
+        self.assertEqual(health["fallback_reason"], "forced_json")
+        self.assertFalse(article_store.ARTICLE_STORE_DB_FILE.exists())
+        self.assertFalse(migration.get("running", False))
+        self.assertFalse(migration.get("last_ok", False))
+
+    def test_auto_stale_signature_falls_back_to_json_and_repairs(self) -> None:
+        self._configure_paths("auto-stale")
+        os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
+        article_store.ARTICLES_FILE.write_text(
+            json.dumps([{"id": "article-a", "url": "https://example.com/a", "title": "A"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        article_store.get_articles()
+        article_store.wait_for_article_store_backend_migration(timeout=5.0)
+        updated_text = json.dumps(
+            [
+                {"id": "article-a", "url": "https://example.com/a", "title": "A"},
+                {"id": "article-b", "url": "https://example.com/b", "title": "B"},
+            ],
+            ensure_ascii=False,
+        )
+        article_store.ARTICLES_FILE.write_text(updated_text, encoding="utf-8")
+
+        fallback = article_store.get_articles()
+        fallback_health = article_store.get_article_store_backend_health()
+        migration = article_store.wait_for_article_store_backend_migration(timeout=5.0)
+        final_health = article_store.get_article_store_backend_health()
+
+        self.assertEqual({item["id"] for item in fallback}, {"article-a", "article-b"})
+        self.assertEqual(fallback_health["effective_backend"], "json")
+        self.assertEqual(fallback_health["fallback_reason"], "article_store_source_stale")
+        self.assertTrue(migration.get("last_ok"))
+        self.assertEqual(final_health["effective_backend"], "sqlite")
+        self.assertEqual(final_health["article_counts"]["sqlite"], 2)
+        persisted = json.loads(article_store.ARTICLES_FILE.read_text(encoding="utf-8"))
+        self.assertEqual({item["id"] for item in persisted}, {"article-a", "article-b"})
+
+    def test_auto_sqlite_error_enters_cooldown_without_breaking_json(self) -> None:
+        self._configure_paths("auto-error")
+        os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
+        os.environ["AIBRANDMONITOR_ARTICLE_STORE_SQLITE_ERROR_LIMIT"] = "1"
+        os.environ["AIBRANDMONITOR_ARTICLE_STORE_SQLITE_COOLDOWN_SECONDS"] = "30"
+        article_store.ARTICLES_FILE.write_text(
+            json.dumps([{"id": "article-a", "url": "https://example.com/a", "title": "A"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        with patch.object(ArticleSQLiteStore, "validate_readiness", side_effect=RuntimeError("db boom")):
+            articles = article_store.get_articles()
+            health = article_store.get_article_store_backend_health()
+
+        self.assertEqual([item["id"] for item in articles], ["article-a"])
+        self.assertEqual(health["effective_backend"], "json")
+        self.assertEqual(health["fallback_reason"], "health_cooldown")
+        self.assertTrue(health["health"]["blocked"])
 
     def test_sqlite_backend_confirm_undo_and_refresh_paths(self) -> None:
         self._configure_paths("sqlite-surrounding")
@@ -441,6 +571,7 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
         self.assertEqual(mocked.call_count, len(self._refresh_articles()))
 
     def _configure_paths(self, label: str) -> None:
+        article_store.reset_article_store_backend_health_for_tests()
         logs_dir = Path(self._tmpdir.name) / label / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         article_store.ARTICLES_FILE = logs_dir / "articles.json"
@@ -500,7 +631,7 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
         if backend == "sqlite":
             os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "sqlite"
         else:
-            os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
+            os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "json"
         refreshed = []
         article_store.bulk_upsert_articles(self._refresh_articles())
         refreshed = article_store.refresh_article_matches(self._refresh_config())
@@ -519,7 +650,7 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
         if backend == "sqlite":
             os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "sqlite"
         else:
-            os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
+            os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = "json"
 
         with (
             patch.object(article_store, "_article_now_minute_text", return_value="2026-05-09 10:00"),

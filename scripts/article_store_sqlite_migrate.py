@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import tempfile
@@ -59,7 +60,35 @@ def migrate_articles(
         target_db = Path(temp_dir.name) / "article_store.sqlite3"
 
     store = _build_store(target_db)
+    source_file_signature = article_store._json_document_signature(  # noqa: SLF001
+        "article_store/articles",
+        articles_json,
+        use_sqlite=False,
+    )
+    source_signature_payload = {
+        "version": 1,
+        "articles": source_file_signature,
+    }
+    source_signature = hashlib.sha256(
+        json.dumps(
+            source_signature_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode("utf-8", errors="ignore")
+    ).hexdigest()
     result = store.import_from_articles(articles, replace=replace)
+    if apply:
+        article_store._write_article_sqlite_import_meta(  # noqa: SLF001
+            store,
+            imported_articles=articles,
+            result=result,
+            source_signature=source_signature,
+            source_file_signature=source_file_signature,
+            reason="manual_migration",
+            source_path=articles_json,
+        )
     summary = {
         "applied": bool(apply),
         "articles_json": str(articles_json),
@@ -72,6 +101,7 @@ def migrate_articles(
         "import_updated": int(result.get("updated") or 0),
         "import_skipped": int(result.get("skipped") or 0),
         "signature": store.source_signature(),
+        "source_signature": source_signature,
     }
     if temp_dir is not None:
         summary["dry_run_note"] = "temporary sqlite database was removed before command exit"
