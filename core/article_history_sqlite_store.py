@@ -377,6 +377,107 @@ class ArticleHistorySQLiteStore:
             "details": details,
         }
 
+    def append_history_record(
+        self,
+        storage_key: str,
+        record: dict[str, Any],
+        *,
+        max_records: int | None = None,
+    ) -> dict[str, int]:
+        """Append one runtime history record to a storage key."""
+        self.initialize()
+        normalized_storage_key = self._text(storage_key)
+        if not normalized_storage_key:
+            return {"created": 0, "updated": 0, "skipped": 1, "pruned": 0}
+        updated_at_ns = time.time_ns()
+        with self._connection() as conn:
+            sort_index = self._next_history_sort_index(conn, normalized_storage_key)
+            outcome = self._upsert_history_record(
+                conn,
+                normalized_storage_key,
+                record,
+                sort_index=sort_index,
+                updated_at_ns=updated_at_ns,
+            )
+            pruned = 0
+            if outcome != "skipped" and max_records is not None:
+                pruned = self._prune_history_records(conn, normalized_storage_key, max_records)
+        return {
+            "created": 1 if outcome == "created" else 0,
+            "updated": 1 if outcome == "updated" else 0,
+            "skipped": 1 if outcome == "skipped" else 0,
+            "pruned": pruned,
+        }
+
+    def apply_history_review(
+        self,
+        storage_keys: Iterable[str],
+        record_id: str,
+        status: str,
+        note: str = "",
+        *,
+        reviewed_at: str = "",
+    ) -> dict[str, Any]:
+        """Update review metadata for a record across primary/legacy storage keys."""
+        normalized_status = self._text(status)
+        normalized_record_id = self._text(record_id)
+        if normalized_status not in {"approved", "rejected"} or not normalized_record_id:
+            return {"changed": 0, "storage_keys": []}
+        unique_storage_keys = []
+        seen_storage_keys: set[str] = set()
+        for key in storage_keys or []:
+            normalized_key = self._text(key)
+            if normalized_key and normalized_key not in seen_storage_keys:
+                unique_storage_keys.append(normalized_key)
+                seen_storage_keys.add(normalized_key)
+        if not unique_storage_keys:
+            return {"changed": 0, "storage_keys": []}
+
+        changed = 0
+        changed_storage_keys: list[str] = []
+        updated_at_ns = time.time_ns()
+        normalized_note = self._text(note)
+        normalized_reviewed_at = self._text(reviewed_at) or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.initialize()
+        with self._connection() as conn:
+            for storage_key in unique_storage_keys:
+                rows = conn.execute(
+                    """
+                    SELECT id, raw_json
+                    FROM history_records
+                    WHERE storage_key = ?
+                    ORDER BY sort_index ASC, id ASC
+                    """,
+                    (storage_key,),
+                ).fetchall()
+                key_changed = False
+                for stored_id, raw_json in rows:
+                    record = self._json_loads(raw_json)
+                    if self._text(record.get("id") or stored_id) != normalized_record_id:
+                        continue
+                    record["review_status"] = normalized_status
+                    record["review_note"] = normalized_note
+                    record["reviewed_at"] = normalized_reviewed_at
+                    conn.execute(
+                        """
+                        UPDATE history_records
+                        SET review_status = ?, raw_json = ?, updated_at_ns = ?
+                        WHERE storage_key = ? AND id = ?
+                        """,
+                        (
+                            normalized_status,
+                            self._json_dumps(record),
+                            updated_at_ns,
+                            storage_key,
+                            self._text(stored_id),
+                        ),
+                    )
+                    changed += 1
+                    key_changed = True
+                if key_changed:
+                    changed_storage_keys.append(storage_key)
+        return {"changed": changed, "storage_keys": changed_storage_keys}
+
     def get_history_records(
         self,
         storage_key: str,
@@ -643,6 +744,26 @@ class ArticleHistorySQLiteStore:
             (storage_key,),
         ).fetchone()
         return int((row or [0])[0] or 0)
+
+    def _prune_history_records(self, conn: sqlite3.Connection, storage_key: str, max_records: int) -> int:
+        capped_max = max(1, int(max_records or 1))
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM history_records
+            WHERE storage_key = ?
+            ORDER BY sort_index DESC, id DESC
+            LIMIT -1 OFFSET ?
+            """,
+            (storage_key, capped_max),
+        ).fetchall()
+        stale_ids = [self._text(row[0]) for row in rows if self._text(row[0])]
+        for stale_id in stale_ids:
+            conn.execute(
+                "DELETE FROM history_records WHERE storage_key = ? AND id = ?",
+                (storage_key, stale_id),
+            )
+        return len(stale_ids)
 
     @classmethod
     def _normalize_history_record(cls, record: dict[str, Any], *, storage_key: str) -> dict[str, Any]:

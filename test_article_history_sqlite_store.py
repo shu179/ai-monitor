@@ -230,6 +230,67 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             self.assertEqual(store.get_history_record_count("task-a"), 2)
             self.assertEqual(store.get_history_record_count("task-b"), 1)
 
+    def test_append_history_record_preserves_runtime_storage_targets_and_trims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")
+            for index in range(1, 5):
+                entry = {
+                    "id": f"r{index}",
+                    "ts": f"2024-01-0{index} 09:00",
+                    "task_id": "task-a",
+                    "task_name": "品牌A",
+                    "platform": "doubao",
+                    "keyword": "关键词",
+                    "brand": "品牌A",
+                    "rank": 1,
+                    "success": True,
+                    "review_status": "pending",
+                }
+                primary_result = store.append_history_record("task-a", entry, max_records=3)
+                legacy_result = store.append_history_record("品牌A", entry, max_records=3)
+
+            self.assertEqual(primary_result, {"created": 1, "updated": 0, "skipped": 0, "pruned": 1})
+            self.assertEqual(legacy_result, {"created": 1, "updated": 0, "skipped": 0, "pruned": 1})
+            self.assertEqual([item["id"] for item in store.get_history_records("task-a")], ["r2", "r3", "r4"])
+            self.assertEqual([item["id"] for item in store.get_history_records("品牌A")], ["r2", "r3", "r4"])
+
+    def test_apply_history_review_updates_primary_and_legacy_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")
+            entry = {
+                "id": "pending-1",
+                "ts": "2024-01-01 09:00",
+                "task_id": "task-review",
+                "task_name": "复核任务",
+                "platform": "doubao",
+                "keyword": "关键词",
+                "brand": "品牌A",
+                "rank": 1,
+                "success": True,
+                "review_status": "pending",
+                "review_note": "",
+                "reviewed_at": "",
+            }
+            store.append_history_record("task-review", entry)
+            store.append_history_record("复核任务", dict(entry))
+
+            result = store.apply_history_review(
+                ["task-review", "复核任务"],
+                "pending-1",
+                "approved",
+                "ok",
+                reviewed_at="2024-01-02 10:00:00",
+            )
+
+            self.assertEqual(result, {"changed": 2, "storage_keys": ["task-review", "复核任务"]})
+            primary = store.get_history_records("task-review")[0]
+            legacy = store.get_history_records("复核任务")[0]
+            self.assertEqual(primary["review_status"], "approved")
+            self.assertEqual(legacy["review_status"], "approved")
+            self.assertEqual(primary["review_note"], "ok")
+            self.assertEqual(primary["reviewed_at"], "2024-01-02 10:00:00")
+            self.assertEqual(store.get_pending_reviews(limit=10), [])
+
     def test_history_task_names_follow_first_record_per_storage_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ArticleHistorySQLiteStore(Path(tmpdir) / "local_store.sqlite3")

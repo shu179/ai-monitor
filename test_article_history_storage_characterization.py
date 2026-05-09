@@ -9,6 +9,7 @@ from pathlib import Path
 
 import core.article_store as article_store
 import core.history as history
+from core.article_history_sqlite_store import ArticleHistorySQLiteStore
 
 
 class ArticleStorageCharacterizationTests(unittest.TestCase):
@@ -381,14 +382,17 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self._tmpdir = tempfile.TemporaryDirectory()
         root = Path(self._tmpdir.name)
         self._original_storage_backend = os.environ.get(history.STORAGE_BACKEND_ENV)
+        self._original_shadow_write = os.environ.get(history.STRUCTURED_SHADOW_WRITE_ENV)
         self._original_paths = {
             "DEFAULT_HISTORY_DIR": history.DEFAULT_HISTORY_DIR,
             "HISTORY_DIR": history.HISTORY_DIR,
             "LOCAL_STORE_DB_FILE": history.LOCAL_STORE_DB_FILE,
+            "HISTORY_SHADOW_DB_FILE": history.HISTORY_SHADOW_DB_FILE,
         }
         history.DEFAULT_HISTORY_DIR = root / "logs" / "history"
         history.HISTORY_DIR = history.DEFAULT_HISTORY_DIR
         history.LOCAL_STORE_DB_FILE = root / "logs" / "local_store.sqlite3"
+        history.HISTORY_SHADOW_DB_FILE = root / "logs" / "article_history_shadow.sqlite3"
         history.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self) -> None:
@@ -396,9 +400,14 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             os.environ.pop(history.STORAGE_BACKEND_ENV, None)
         else:
             os.environ[history.STORAGE_BACKEND_ENV] = self._original_storage_backend
+        if self._original_shadow_write is None:
+            os.environ.pop(history.STRUCTURED_SHADOW_WRITE_ENV, None)
+        else:
+            os.environ[history.STRUCTURED_SHADOW_WRITE_ENV] = self._original_shadow_write
         history.DEFAULT_HISTORY_DIR = self._original_paths["DEFAULT_HISTORY_DIR"]
         history.HISTORY_DIR = self._original_paths["HISTORY_DIR"]
         history.LOCAL_STORE_DB_FILE = self._original_paths["LOCAL_STORE_DB_FILE"]
+        history.HISTORY_SHADOW_DB_FILE = self._original_paths["HISTORY_SHADOW_DB_FILE"]
         self._tmpdir.cleanup()
 
     def test_default_history_keeps_json_backend(self) -> None:
@@ -420,6 +429,7 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             [written["id"]],
         )
         self.assertFalse(history.LOCAL_STORE_DB_FILE.exists())
+        self.assertFalse(history.HISTORY_SHADOW_DB_FILE.exists())
 
     def test_sqlite_opt_in_history_migrates_legacy_files(self) -> None:
         os.environ[history.STORAGE_BACKEND_ENV] = "sqlite"
@@ -494,6 +504,59 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self.assertEqual(sorted(rows.keys()), ["history/task-review.json", "history/复核任务.json"])
         self.assertEqual(json.loads(rows["history/task-review.json"])[0]["review_status"], "approved")
         self.assertEqual(json.loads(rows["history/复核任务.json"])[0]["review_status"], "approved")
+
+    def test_structured_shadow_writes_follow_record_and_review_writes_when_enabled(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_SHADOW_WRITE_ENV] = "1"
+
+        entry = history.record(
+            "影子任务",
+            "doubao",
+            "关键词",
+            "品牌A",
+            1,
+            True,
+            task_id="task_write_path",
+        )
+        changed = history.apply_review("影子任务", entry["id"], "approved", "ok", task_id="task_write_path")
+
+        self.assertTrue(changed)
+        self.assertTrue(history._task_file("task_write_path").exists())
+        store = ArticleHistorySQLiteStore(history.HISTORY_SHADOW_DB_FILE)
+        self.assertEqual([item["id"] for item in store.get_history_records("task_write_path")], [entry["id"]])
+        self.assertEqual([item["id"] for item in store.get_history_records("影子任务")], [entry["id"]])
+        primary = store.get_history_records("task_write_path")[0]
+        legacy = store.get_history_records("影子任务")[0]
+        self.assertEqual(primary["review_status"], "approved")
+        self.assertEqual(legacy["review_status"], "approved")
+        self.assertEqual(primary["review_note"], "ok")
+        self.assertEqual(store.get_pending_reviews(), [])
+
+    def test_structured_shadow_writes_follow_import_trimmed_records_when_enabled(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_SHADOW_WRITE_ENV] = "1"
+        history.MAX_RECORDS = 2
+
+        imported = history.import_records(
+            "导入影子",
+            [
+                {"id": "r3", "ts": "2024-01-03 09:00", "rank": 1, "success": True},
+                {"id": "r1", "ts": "2024-01-01 09:00", "rank": 1, "success": True},
+                {"id": "r2", "ts": "2024-01-02 09:00", "rank": 1, "success": True},
+            ],
+            task_id="task_import_write_path",
+        )
+
+        self.assertEqual(imported, 3)
+        store = ArticleHistorySQLiteStore(history.HISTORY_SHADOW_DB_FILE)
+        self.assertEqual(
+            [item["id"] for item in store.get_history_records("task_import_write_path")],
+            ["r2", "r3"],
+        )
+        self.assertEqual(
+            [item["id"] for item in store.get_history_records("导入影子")],
+            ["r2", "r3"],
+        )
 
 
 if __name__ == "__main__":

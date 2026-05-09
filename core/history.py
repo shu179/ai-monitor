@@ -22,11 +22,14 @@ from .time_utils import local_now, local_today, parse_local_date
 
 DEFAULT_HISTORY_DIR = resolve_app_path("logs/history")
 DEFAULT_LOCAL_STORE_DB_FILE = resolve_app_path("logs/local_store.sqlite3")
+DEFAULT_HISTORY_SHADOW_DB_FILE = resolve_app_path("logs/article_history_shadow.sqlite3")
 
 HISTORY_DIR = DEFAULT_HISTORY_DIR
 LOCAL_STORE_DB_FILE = DEFAULT_LOCAL_STORE_DB_FILE
+HISTORY_SHADOW_DB_FILE = DEFAULT_HISTORY_SHADOW_DB_FILE
 MAX_RECORDS = 500  # 每个任务最多保留原始记录数
 STORAGE_BACKEND_ENV = "AIBRANDMONITOR_STORAGE_BACKEND"
+STRUCTURED_SHADOW_WRITE_ENV = "AIBRANDMONITOR_HISTORY_STRUCTURED_SHADOW_WRITES"
 
 _PLATFORM_ID_ALIASES: dict[str, str] = {
     "豆包": "doubao",
@@ -87,6 +90,12 @@ def _local_store_db_file() -> Path:
     return account_scoped_path("logs/local_store.sqlite3", fallback=DEFAULT_LOCAL_STORE_DB_FILE)
 
 
+def _history_shadow_db_file() -> Path:
+    if HISTORY_SHADOW_DB_FILE != DEFAULT_HISTORY_SHADOW_DB_FILE:
+        return HISTORY_SHADOW_DB_FILE
+    return account_scoped_path("logs/article_history_shadow.sqlite3", fallback=DEFAULT_HISTORY_SHADOW_DB_FILE)
+
+
 def _sqlite_storage_enabled() -> bool:
     backend = os.environ.get(STORAGE_BACKEND_ENV, "").strip().lower()
     return backend in {"sqlite", "sqlite3", "db", "database"}
@@ -96,8 +105,19 @@ def _history_uses_sqlite() -> bool:
     return HISTORY_DIR == DEFAULT_HISTORY_DIR and _sqlite_storage_enabled()
 
 
+def _history_structured_shadow_writes_enabled() -> bool:
+    value = os.environ.get(STRUCTURED_SHADOW_WRITE_ENV, "").strip().lower()
+    return value in {"1", "true", "yes", "on", "sqlite", "structured"}
+
+
 def _sqlite_store() -> SQLiteJsonDocumentStore:
     return SQLiteJsonDocumentStore(_local_store_db_file())
+
+
+def _structured_shadow_store():
+    from .article_history_sqlite_store import ArticleHistorySQLiteStore
+
+    return ArticleHistorySQLiteStore(_history_shadow_db_file())
 
 
 def _history_doc_key(path: Path) -> str:
@@ -151,6 +171,45 @@ def _save_json_document(path: Path, data) -> None:
         except Exception as e:
             print(f"[History] 写入 SQLite 失败，回退 JSON {path}: {e}")
     _write_json_path(path, data)
+
+
+def _shadow_append_history_record(storage_key: str, entry: dict) -> None:
+    if not _history_structured_shadow_writes_enabled():
+        return
+    try:
+        _structured_shadow_store().append_history_record(storage_key, entry, max_records=MAX_RECORDS)
+    except Exception as e:
+        print(f"[History] 写入结构化 SQLite 影子历史失败 {storage_key}: {e}")
+
+
+def _shadow_replace_history_records(storage_key: str, records: list[dict]) -> None:
+    if not _history_structured_shadow_writes_enabled():
+        return
+    try:
+        _structured_shadow_store().import_history_records(storage_key, records, replace=True)
+    except Exception as e:
+        print(f"[History] 替换结构化 SQLite 影子历史失败 {storage_key}: {e}")
+
+
+def _shadow_apply_history_review(
+    storage_keys: list[str],
+    record_id: str,
+    status: str,
+    note: str,
+    reviewed_at: str,
+) -> None:
+    if not _history_structured_shadow_writes_enabled():
+        return
+    try:
+        _structured_shadow_store().apply_history_review(
+            storage_keys,
+            record_id,
+            status,
+            note,
+            reviewed_at=reviewed_at,
+        )
+    except Exception as e:
+        print(f"[History] 更新结构化 SQLite 影子复核失败 {record_id}: {e}")
 
 
 def _write_json_path(path: Path, data) -> None:
@@ -337,6 +396,9 @@ def record(
             _save(path, records)
             written_storage_keys.append(key)
 
+    for key in written_storage_keys:
+        _shadow_append_history_record(key, entry)
+
     # 保留旧的 task_name 口径统计产物，避免影响现有趋势/报表读取。
     if task_name and task_name in written_storage_keys:
         lock = _get_lock(task_name)
@@ -421,6 +483,7 @@ def import_records(task_name: str, entries: list[dict], *, task_id: str = "") ->
             if len(records) > MAX_RECORDS:
                 records = records[-MAX_RECORDS:]
             _save(path, records)
+            _shadow_replace_history_records(key, records)
             if key == task_name:
                 _compute_rates_locked(task_name, records)
             imported = max(imported, added_for_target)
@@ -1164,6 +1227,8 @@ def apply_review(task_name: str, record_id: str, status: str, note: str = "", *,
         return False
 
     changed = False
+    changed_storage_keys: list[str] = []
+    reviewed_at = local_now().strftime("%Y-%m-%d %H:%M:%S")
     for key in _history_write_targets(task_id=str(task_id or "").strip(), task_name=str(task_name or "").strip()):
         path = _task_file(key)
         lock = _get_lock(key)
@@ -1176,13 +1241,16 @@ def apply_review(task_name: str, record_id: str, status: str, note: str = "", *,
                     continue
                 record["review_status"] = status
                 record["review_note"] = str(note or "").strip()
-                record["reviewed_at"] = local_now().strftime("%Y-%m-%d %H:%M:%S")
+                record["reviewed_at"] = reviewed_at
                 file_changed = True
                 changed = True
             if file_changed:
                 _save(path, records)
+                changed_storage_keys.append(key)
                 if key == str(task_name or "").strip():
                     _compute_rates_locked(task_name, records)
+    if changed_storage_keys:
+        _shadow_apply_history_review(changed_storage_keys, record_id, status, note, reviewed_at)
     return changed
 
 
