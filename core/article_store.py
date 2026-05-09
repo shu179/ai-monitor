@@ -34,6 +34,7 @@ DEFAULT_DOMAIN_MEDIA_NAMES_FILE = resolve_app_path("logs/domain_media_names.json
 DEFAULT_EXCLUDED_ARTICLE_URLS_FILE = resolve_app_path("logs/excluded_article_urls.json")
 DEFAULT_LOCAL_STORE_DB_FILE = resolve_app_path("logs/local_store.sqlite3")
 DEFAULT_ARTICLE_SHADOW_DB_FILE = resolve_app_path("logs/article_history_shadow.sqlite3")
+DEFAULT_ARTICLE_STORE_DB_FILE = resolve_app_path("logs/article_store.sqlite3")
 
 ARTICLES_FILE = DEFAULT_ARTICLES_FILE
 DOMAIN_OVERRIDES_FILE = DEFAULT_DOMAIN_OVERRIDES_FILE
@@ -41,10 +42,12 @@ DOMAIN_MEDIA_NAMES_FILE = DEFAULT_DOMAIN_MEDIA_NAMES_FILE
 EXCLUDED_ARTICLE_URLS_FILE = DEFAULT_EXCLUDED_ARTICLE_URLS_FILE
 LOCAL_STORE_DB_FILE = DEFAULT_LOCAL_STORE_DB_FILE
 ARTICLE_SHADOW_DB_FILE = DEFAULT_ARTICLE_SHADOW_DB_FILE
+ARTICLE_STORE_DB_FILE = DEFAULT_ARTICLE_STORE_DB_FILE
 
 MAX_REFERENCE_EVENTS_PER_TASK = 500
 MAX_EXCLUDED_ARTICLE_URLS = 5000
 STORAGE_BACKEND_ENV = "AIBRANDMONITOR_STORAGE_BACKEND"
+ARTICLE_STORE_BACKEND_ENV = "AIBRANDMONITOR_ARTICLE_STORE_BACKEND"
 ARTICLE_SHADOW_WRITE_ENV = "AIBRANDMONITOR_ARTICLE_SQLITE_SHADOW_WRITES"
 SMALL_DOCUMENT_CACHE_TTL_SECONDS = 1.0
 
@@ -334,6 +337,18 @@ def _local_store_db_file() -> Path:
     return account_scoped_path("logs/local_store.sqlite3", fallback=DEFAULT_LOCAL_STORE_DB_FILE)
 
 
+def _article_store_db_file() -> Path:
+    if ARTICLE_STORE_DB_FILE != DEFAULT_ARTICLE_STORE_DB_FILE:
+        return ARTICLE_STORE_DB_FILE
+    if ARTICLES_FILE != DEFAULT_ARTICLES_FILE:
+        return ARTICLES_FILE.parent / "article_store.sqlite3"
+    return account_scoped_path("logs/article_store.sqlite3", fallback=DEFAULT_ARTICLE_STORE_DB_FILE)
+
+
+def get_article_store_db_path() -> Path:
+    return _article_store_db_file()
+
+
 def _sqlite_storage_enabled() -> bool:
     backend = os.environ.get(STORAGE_BACKEND_ENV, "").strip().lower()
     return backend in {"sqlite", "sqlite3", "db", "database"}
@@ -341,6 +356,28 @@ def _sqlite_storage_enabled() -> bool:
 
 def _sqlite_store() -> SQLiteJsonDocumentStore:
     return SQLiteJsonDocumentStore(_local_store_db_file())
+
+
+def _article_store_backend_name() -> str:
+    backend = os.environ.get(ARTICLE_STORE_BACKEND_ENV, "").strip().lower()
+    if backend in {"sqlite", "sqlite3", "db", "database"}:
+        return "sqlite"
+    return "json"
+
+
+def _article_store_sqlite_enabled() -> bool:
+    return _article_store_backend_name() == "sqlite"
+
+
+def _article_sqlite_store():
+    from .article_sqlite_store import ArticleSQLiteStore
+
+    return ArticleSQLiteStore(
+        _article_store_db_file(),
+        normalize_article_url=normalize_article_url,
+        normalize_article_entry=lambda article: _normalize_article_entry(article)[0],
+        now_text=_article_now_minute_text,
+    )
 
 
 def _article_shadow_db_file() -> Path:
@@ -1905,11 +1942,156 @@ def restore_excluded_article_urls(urls: list[str] | tuple[str, ...] | set[str]) 
     }
 
 
+def _clear_excluded_article_urls_for_normalized_urls(normalized_urls: set[str]) -> None:
+    urls = {
+        normalize_article_url(url)
+        for url in (normalized_urls or set())
+        if normalize_article_url(url)
+    }
+    if not urls:
+        return
+    excluded_urls = _load_excluded_article_urls()
+    changed = False
+    for normalized_url in urls:
+        if normalized_url in excluded_urls:
+            excluded_urls.pop(normalized_url, None)
+            changed = True
+    if changed:
+        _save_excluded_article_urls(excluded_urls)
+
+
+def _add_article_sqlite(entry: dict) -> dict:
+    store = _article_sqlite_store()
+    with _lock:
+        normalized_url = normalize_article_url((entry or {}).get("url", ""))
+        existing = store.get_article_by_url(normalized_url) if normalized_url else None
+        article = store.add_article(dict(entry or {}))
+        if existing is None and normalized_url:
+            _clear_excluded_article_urls_for_normalized_urls({normalized_url})
+        return article
+
+
+def _bulk_upsert_articles_sqlite(entries: list[dict] | tuple[dict, ...]) -> list[dict]:
+    store = _article_sqlite_store()
+    with _lock:
+        results = store.bulk_upsert_articles(entries or [])
+        restored_urls = {
+            normalize_article_url(article.get("url", ""))
+            for article in results
+            if isinstance(article, dict) and normalize_article_url(article.get("url", ""))
+        }
+        _clear_excluded_article_urls_for_normalized_urls(restored_urls)
+        return results
+
+
+def _update_article_sqlite(article_id: str, patch: dict) -> dict | None:
+    with _lock:
+        return _article_sqlite_store().update_article(article_id, patch or {})
+
+
+def _delete_article_sqlite(article_id: str, *, exclude_url: bool = True) -> dict | None:
+    with _lock:
+        removed = _article_sqlite_store().delete_article(article_id)
+        if removed is not None and exclude_url:
+            exclude_article_url(
+                str(removed.get("url") or "").strip(),
+                title=str(removed.get("title") or "").strip(),
+                source="manual_delete",
+            )
+        return removed
+
+
+def _confirm_article_import_batch_sqlite(
+    article_ids: list[str] | tuple[str, ...] | set[str],
+    updated_article_ids: list[str] | tuple[str, ...] | set[str],
+    *,
+    import_id: str,
+    confirmed_at: str,
+) -> int:
+    target_ids = {
+        str(article_id or "").strip()
+        for article_id in list(article_ids or []) + list(updated_article_ids or [])
+        if str(article_id or "").strip()
+    }
+    if not target_ids:
+        return 0
+    store = _article_sqlite_store()
+    updated_count = 0
+    with _lock:
+        for article_id in target_ids:
+            updated = store.update_article(
+                article_id,
+                {
+                    "import_status": "confirmed",
+                    "import_batch_id": str(import_id or "").strip(),
+                    "import_confirmed_at": str(confirmed_at or "").strip(),
+                },
+            )
+            if updated is not None:
+                updated_count += 1
+    return updated_count
+
+
+def _undo_article_import_batch_sqlite(
+    article_ids: list[str] | tuple[str, ...] | set[str],
+    updated_articles: list[dict] | tuple[dict, ...] = (),
+) -> dict[str, int]:
+    remove_ids = {
+        str(article_id or "").strip()
+        for article_id in (article_ids or [])
+        if str(article_id or "").strip()
+    }
+    restore_clear_fields = {
+        "account_name": "",
+        "published_at": "",
+        "ts": "",
+        "excerpt": "",
+        "import_batch_id": "",
+        "import_status": "",
+        "import_file_name": "",
+        "imported_from_sheet": "",
+        "imported_from_row": 0,
+        "last_table_import_at": "",
+        "last_table_import_file": "",
+        "import_confirmed_at": "",
+        "matched_tasks": [],
+        "match_reasons": {},
+        "unmatched_reason": "",
+    }
+    restore_by_id: dict[str, dict] = {}
+    for item in updated_articles or []:
+        if not isinstance(item, dict):
+            continue
+        article_id = str(item.get("id") or "").strip()
+        before = item.get("before") if isinstance(item.get("before"), dict) else None
+        if not article_id or not before:
+            continue
+        restore_patch = dict(restore_clear_fields)
+        restore_patch.update(before)
+        restore_by_id[article_id] = restore_patch
+    if not remove_ids and not restore_by_id:
+        return {"removed_count": 0, "restored_count": 0}
+    removed_count = 0
+    restored_count = 0
+    store = _article_sqlite_store()
+    with _lock:
+        for article_id in remove_ids:
+            if store.delete_article(article_id) is not None:
+                removed_count += 1
+        for article_id, restore_patch in restore_by_id.items():
+            if store.update_article(article_id, restore_patch) is not None:
+                restored_count += 1
+    return {"removed_count": removed_count, "restored_count": restored_count}
+
+
 def add_article(entry: dict) -> dict:
     """
     新增一条文章记录，自动补全 id 和 ts。
     返回补全后的完整 entry。
     """
+    if _article_store_sqlite_enabled():
+        return _add_article_sqlite(entry)
+
     entry = dict(entry)
     entry.setdefault("id", uuid.uuid4().hex)
     now_text = _article_now_minute_text()
@@ -1952,6 +2134,9 @@ def add_article(entry: dict) -> dict:
 
 def bulk_upsert_articles(entries: list[dict] | tuple[dict, ...]) -> list[dict]:
     """Create or update multiple article records with a single articles.json write."""
+    if _article_store_sqlite_enabled():
+        return _bulk_upsert_articles_sqlite(entries)
+
     prepared_entries = [dict(entry) for entry in (entries or []) if isinstance(entry, dict)]
     if not prepared_entries:
         return []
@@ -2053,6 +2238,9 @@ def bulk_upsert_articles(entries: list[dict] | tuple[dict, ...]) -> list[dict]:
 
 def update_article(article_id: str, patch: dict) -> dict | None:
     """按文章 ID 更新记录并返回最新内容。"""
+    if _article_store_sqlite_enabled():
+        return _update_article_sqlite(article_id, patch)
+
     article_id = str(article_id or "").strip()
     if not article_id:
         return None
@@ -2107,6 +2295,14 @@ def confirm_article_import_batch(
     confirmed_at: str,
 ) -> int:
     """批量确认表格导入，避免逐篇重复读写 articles.json。"""
+    if _article_store_sqlite_enabled():
+        return _confirm_article_import_batch_sqlite(
+            article_ids,
+            updated_article_ids,
+            import_id=import_id,
+            confirmed_at=confirmed_at,
+        )
+
     target_ids = {
         str(article_id or "").strip()
         for article_id in list(article_ids or []) + list(updated_article_ids or [])
@@ -2151,6 +2347,9 @@ def undo_article_import_batch(
     updated_articles: list[dict] | tuple[dict, ...] = (),
 ) -> dict[str, int]:
     """批量撤销表格导入，新增文章移除，已更新文章恢复导入前快照。"""
+    if _article_store_sqlite_enabled():
+        return _undo_article_import_batch_sqlite(article_ids, updated_articles)
+
     remove_ids = {
         str(article_id or "").strip()
         for article_id in (article_ids or [])
@@ -2228,6 +2427,9 @@ def undo_article_import_batch(
 
 
 def find_article_by_url(url: str) -> dict | None:
+    if _article_store_sqlite_enabled():
+        return _article_sqlite_store().get_article_by_url(url)
+
     normalized_url = normalize_article_url(url)
     if not normalized_url:
         return None
@@ -2241,6 +2443,9 @@ def find_article_by_url(url: str) -> dict | None:
 
 def get_articles() -> list:
     """返回全部文章，按发布时间降序，录入时间兜底。"""
+    if _article_store_sqlite_enabled():
+        return _article_sqlite_store().list_articles()
+
     with _lock:
         articles = _load_articles()
     return _sort_articles_for_display(articles)
@@ -2248,6 +2453,9 @@ def get_articles() -> list:
 
 def get_articles_file_signature() -> tuple[str, int, int]:
     """Return a cheap source signature for the article store file."""
+    if _article_store_sqlite_enabled():
+        return _article_sqlite_store().file_signature()
+
     return _json_document_signature(
         "article_store/articles",
         _articles_file(),
@@ -2567,6 +2775,9 @@ def import_article_store_bundle(bundle: dict | None, *, mode: str = "merge") -> 
 
 def delete_article(article_id: str, *, exclude_url: bool = True) -> dict | None:
     """按 ID 删除文章，返回被删除的文章。"""
+    if _article_store_sqlite_enabled():
+        return _delete_article_sqlite(article_id, exclude_url=exclude_url)
+
     article_id = str(article_id or "").strip()
     if not article_id:
         return None
