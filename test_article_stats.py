@@ -10,14 +10,15 @@ class _ArticleStatsConfigProvider:
         return {}
 
 
-def _article_service(articles, sqlite_article_page_loader=None):
+def _article_service(articles, sqlite_article_page_loader=None, sqlite_article_compare_recorder=None):
     return ArticleService(
         config_provider=_ArticleStatsConfigProvider(),
         synced_articles_loader=lambda config: list(articles),
-        sqlite_article_page_loader=sqlite_article_page_loader,
         invalidate_article_cache=lambda: None,
         lock=threading.RLock(),
         import_batch_store=ArticleImportBatchStore(),
+        sqlite_article_page_loader=sqlite_article_page_loader,
+        sqlite_article_compare_recorder=sqlite_article_compare_recorder,
     )
 
 
@@ -181,6 +182,47 @@ class ArticleStatsTests(unittest.TestCase):
 
         self.assertEqual(result["total"], 1)
         self.assertEqual([article["id"] for article in result["articles"]], ["json-article"])
+
+    def test_article_list_compare_mode_returns_json_and_records_shadow_page(self):
+        comparisons = []
+        service = _article_service(
+            [
+                {
+                    "id": "json-article",
+                    "url": "https://example.com/json",
+                    "title": "JSON 文章",
+                    "media_type": "selfmedia",
+                    "matched_tasks": ["品牌B"],
+                    "published_at": "2024-03-04",
+                    "ts": "2024-03-04",
+                }
+            ],
+            sqlite_article_page_loader=lambda config, **kwargs: {
+                "compare_only": True,
+                "articles": [
+                    {
+                        "id": "sqlite-article",
+                        "url": "https://example.com/sqlite",
+                        "title": "SQLite 文章",
+                        "media_type": "selfmedia",
+                        "matched_tasks": ["品牌B"],
+                        "published_at": "2024-03-04",
+                        "ts": "2024-03-04",
+                    }
+                ],
+                "total": 1,
+                "today_total": 0,
+            },
+            sqlite_article_compare_recorder=lambda **payload: comparisons.append(payload),
+        )
+
+        result = service.get_articles_filtered(limit=20)
+
+        self.assertEqual([article["id"] for article in result["articles"]], ["json-article"])
+        self.assertEqual(len(comparisons), 1)
+        self.assertEqual(comparisons[0]["query"]["limit"], 20)
+        self.assertEqual(comparisons[0]["json_result"]["articles"][0]["id"], "json-article")
+        self.assertEqual(comparisons[0]["sqlite_page"]["articles"][0]["id"], "sqlite-article")
 
 
 if __name__ == "__main__":

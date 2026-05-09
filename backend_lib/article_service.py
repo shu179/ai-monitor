@@ -491,14 +491,16 @@ class ArticleService:
         *,
         config_provider: RuntimeConfigProvider,
         synced_articles_loader: Callable[[dict | None], list[dict[str, Any]]],
-        sqlite_article_page_loader: Callable[..., dict[str, Any] | None] | None = None,
         invalidate_article_cache: Callable[[], None],
         lock: Any,
         import_batch_store: ArticleImportBatchStore,
+        sqlite_article_page_loader: Callable[..., dict[str, Any] | None] | None = None,
+        sqlite_article_compare_recorder: Callable[..., None] | None = None,
     ) -> None:
         self._config_provider = config_provider
         self._get_synced_articles = synced_articles_loader
         self._get_sqlite_article_page = sqlite_article_page_loader
+        self._record_sqlite_article_compare = sqlite_article_compare_recorder
         self._invalidate_article_cache_callback = invalidate_article_cache
         self._lock = lock
         self._import_batch_store = import_batch_store
@@ -578,7 +580,7 @@ class ArticleService:
             limit=limit,
             task_name=task_name,
         )
-        if sqlite_page is not None:
+        if sqlite_page is not None and not bool(sqlite_page.get("compare_only")):
             return {
                 "articles": [
                     _article_to_api(
@@ -593,6 +595,32 @@ class ArticleService:
                 "today_total": int(sqlite_page.get("today_total") or 0),
             }
 
+        json_result = self._load_json_article_page(
+            config,
+            media_type=media_type,
+            limit=limit,
+            task_name=task_name,
+            include_export_keywords=include_export_keywords,
+        )
+        if sqlite_page is not None and bool(sqlite_page.get("compare_only")):
+            self._compare_sqlite_article_page(
+                sqlite_page,
+                json_result,
+                media_type=media_type,
+                limit=limit,
+                task_name=task_name,
+            )
+        return json_result
+
+    def _load_json_article_page(
+        self,
+        config: dict[str, Any],
+        *,
+        media_type: str,
+        limit: int,
+        task_name: str,
+        include_export_keywords: bool,
+    ) -> dict:
         articles = self._get_synced_articles(config)
         if task_name:
             articles = [article for article in articles if task_name in (article.get("matched_tasks") or [])]
@@ -618,6 +646,31 @@ class ArticleService:
             "total": total,
             "today_total": today_total,
         }
+
+    def _compare_sqlite_article_page(
+        self,
+        sqlite_page: dict[str, Any],
+        json_result: dict[str, Any],
+        *,
+        media_type: str,
+        limit: int,
+        task_name: str,
+    ) -> None:
+        recorder = self._record_sqlite_article_compare
+        if not callable(recorder):
+            return
+        try:
+            recorder(
+                query={
+                    "media_type": str(media_type or ""),
+                    "limit": int(limit or 0),
+                    "task_name": str(task_name or ""),
+                },
+                sqlite_page=sqlite_page,
+                json_result=json_result,
+            )
+        except Exception as exc:
+            print(f"[ArticleService] SQLite 文章页影子比对记录失败: {exc}")
 
     def _load_sqlite_article_page(
         self,
@@ -649,6 +702,7 @@ class ArticleService:
             "articles": articles,
             "total": int(page.get("total") or len(articles)),
             "today_total": int(page.get("today_total") or 0),
+            "compare_only": bool(page.get("compare_only")),
         }
 
     def import_article(self, payload: dict) -> dict:

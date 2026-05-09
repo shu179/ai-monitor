@@ -1808,10 +1808,11 @@ class AppRuntime:
         self.article_service = ArticleService(
             config_provider=self.config_provider,
             synced_articles_loader=self._get_synced_articles,
-            sqlite_article_page_loader=self._get_sqlite_shadow_article_page,
             invalidate_article_cache=self._invalidate_article_cache,
             lock=self._lock,
             import_batch_store=self.article_import_batch_store,
+            sqlite_article_page_loader=self._get_sqlite_shadow_article_page,
+            sqlite_article_compare_recorder=self._record_sqlite_shadow_article_compare,
         )
         self.article_reference_service = ArticleReferenceService(
             config_provider=self.config_provider,
@@ -1840,6 +1841,8 @@ class AppRuntime:
         self._article_cache_lock = threading.RLock()
         self._article_sqlite_shadow_lock = threading.RLock()
         self._article_sqlite_shadow_cache_key: tuple[Any, ...] | None = None
+        self._article_sqlite_shadow_compare_lock = threading.RLock()
+        self._article_sqlite_shadow_compare_recent: list[dict[str, Any]] = []
         self._synced_articles_cache: dict[str, Any] | None = None
         self._article_cloud_enqueue_lock = threading.RLock()
         self._last_article_cloud_enqueue_key: tuple[Any, ...] | None = None
@@ -5356,7 +5359,8 @@ return changedCount
         limit: int = 50,
         task_name: str = "",
     ) -> dict[str, Any] | None:
-        if str(os.environ.get("AIBRANDMONITOR_ARTICLE_READ_BACKEND", "") or "").strip().lower() != "sqlite_shadow":
+        read_backend = str(os.environ.get("AIBRANDMONITOR_ARTICLE_READ_BACKEND", "") or "").strip().lower()
+        if read_backend not in {"sqlite_shadow", "sqlite_shadow_compare"}:
             return None
         resolved_limit = max(1, int(limit or 50))
         if resolved_limit > 500:
@@ -5389,6 +5393,72 @@ return changedCount
                 task_name=str(task_name or "").strip(),
                 media_type=normalized_media_type,
             ),
+            "compare_only": read_backend == "sqlite_shadow_compare",
+        }
+
+    def _record_sqlite_shadow_article_compare(
+        self,
+        *,
+        query: dict[str, Any],
+        sqlite_page: dict[str, Any],
+        json_result: dict[str, Any],
+    ) -> None:
+        json_articles = [
+            item for item in (json_result.get("articles") or [])
+            if isinstance(item, dict)
+        ]
+        sqlite_articles = [
+            item for item in (sqlite_page.get("articles") or [])
+            if isinstance(item, dict)
+        ]
+        json_ids = [str(item.get("id") or "").strip() for item in json_articles]
+        sqlite_ids = [str(item.get("id") or "").strip() for item in sqlite_articles]
+        json_total = int(json_result.get("total") or 0)
+        sqlite_total = int(sqlite_page.get("total") or 0)
+        json_today_total = int(json_result.get("today_total") or 0)
+        sqlite_today_total = int(sqlite_page.get("today_total") or 0)
+
+        mismatches: list[str] = []
+        if json_total != sqlite_total:
+            mismatches.append("total")
+        if json_today_total != sqlite_today_total:
+            mismatches.append("today_total")
+        if json_ids != sqlite_ids:
+            mismatches.append("article_ids")
+
+        entry = {
+            "ok": not mismatches,
+            "checked_at": local_now().isoformat(timespec="seconds"),
+            "query": dict(query or {}),
+            "mismatches": mismatches,
+            "json": {
+                "total": json_total,
+                "today_total": json_today_total,
+                "ids": json_ids,
+            },
+            "sqlite": {
+                "total": sqlite_total,
+                "today_total": sqlite_today_total,
+                "ids": sqlite_ids,
+            },
+        }
+        with self._article_sqlite_shadow_compare_lock:
+            self._article_sqlite_shadow_compare_recent.append(entry)
+            self._article_sqlite_shadow_compare_recent = self._article_sqlite_shadow_compare_recent[-50:]
+        if mismatches:
+            print("[WebBackend] SQLite 文章页影子比对不一致", entry)
+
+    def get_article_sqlite_shadow_compare_status(self) -> dict[str, Any]:
+        with self._article_sqlite_shadow_compare_lock:
+            recent = list(self._article_sqlite_shadow_compare_recent)
+        mismatch_count = sum(1 for item in recent if not bool(item.get("ok")))
+        return {
+            "ok": True,
+            "mode": str(os.environ.get("AIBRANDMONITOR_ARTICLE_READ_BACKEND", "") or "").strip().lower(),
+            "checked": len(recent),
+            "mismatches": mismatch_count,
+            "last": recent[-1] if recent else None,
+            "recent": recent,
         }
 
     def _ensure_sqlite_shadow_article_index(self, config: dict[str, Any], *, db_path: Path) -> bool:
@@ -10164,6 +10234,9 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                     include_export_keywords=include_export_keywords,
                 ),
             )
+            return True
+        if path == "/api/articles/sqlite-shadow-compare":
+            _json_response(self, self.runtime.get_article_sqlite_shadow_compare_status())
             return True
         if path == "/api/articles/import-batches":
             _json_response(self, self.runtime.get_pending_article_imports())
