@@ -135,6 +135,7 @@ from backend_lib.snapshot_fragments import (
 from backend_lib.task_overview_service import TaskOverviewService
 from backend_lib.todo_service import TodoService, _todo_to_api
 from core import SmartScheduler
+from core.app_runtime import BrowserAuthSessionStore, TestRunStateStore
 from core.article_history_sqlite_mirror import default_shadow_db_path, rebuild_shadow_store
 from core.article_history_sqlite_store import ArticleHistorySQLiteStore
 from core.app_paths import get_app_root, get_data_root, resolve_app_path
@@ -2006,8 +2007,11 @@ class AppRuntime:
         self._recognition_test_session: dict[str, Any] | None = None
         self._recognition_warmup_thread: threading.Thread | None = None
         self._recognition_warmup_lock = threading.RLock()
-        self._test_run_lock = threading.RLock()
-        self._test_runs: dict[str, dict[str, Any]] = {}
+        self._test_run_state = TestRunStateStore(
+            terminal_ttl_seconds=TEST_RUN_TERMINAL_TTL_SECONDS,
+            iso_now_func=_local_iso_seconds,
+        )
+        self._test_run_lock = self._test_run_state.lock
         self.article_import_batch_store = ArticleImportBatchStore()
         self.todos_service = TodoService(
             config_provider=self.config_provider,
@@ -2044,7 +2048,6 @@ class AppRuntime:
             ),
             runtime_safety_checker=self._selector_heal_runtime_safety,
         )
-        self._test_run_cancel_events: dict[str, threading.Event] = {}
         self._test_failure_notices: dict[str, dict[str, Any]] = {}
         self._context_snapshot_lock = threading.RLock()
         self._article_cache_lock = threading.RLock()
@@ -2096,8 +2099,11 @@ class AppRuntime:
         self._recognition_browser_profile = resolve_app_path("user_data/recognition_browser_profile")
         self._recognition_browser_tabs: dict[str, str] = {}
         self._recognition_browser_launch_pids: set[int] = set()
-        self._browser_auth_lock = threading.RLock()
-        self._browser_auth_sessions: dict[str, dict[str, Any]] = {}
+        self._browser_auth_state = BrowserAuthSessionStore(
+            ttl_seconds=BROWSER_AUTH_SESSION_TTL_SECONDS,
+            normalize_platform=normalize_browser_platform_name,
+        )
+        self._browser_auth_lock = self._browser_auth_state.lock
         self._search_uploads: dict[str, dict[str, Any]] = {}
         self._search_outputs: dict[str, dict[str, Any]] = {}
         self._monitoring_status_message = "定时任务已关闭"
@@ -2145,7 +2151,7 @@ class AppRuntime:
         self.config_provider.set_path(next_config_path)
         self.article_import_batch_store.reset()
         self._last_run = None
-        self._test_runs.clear()
+        self._test_run_state.clear()
         self._test_failure_notices.clear()
         self._query_serial_state = None
         self._invalidate_tasks_full_cache()
@@ -2634,19 +2640,8 @@ class AppRuntime:
             print(f"[WebBackend] 检查浏览器登录会话状态失败: {exc}")
             return False
 
-    @staticmethod
-    def _browser_auth_session_age_seconds(session: dict[str, Any] | None) -> float | None:
-        if not isinstance(session, dict):
-            return None
-        return _runtime_timestamp_age_seconds(session.get("opened_at"))
-
     def _prune_browser_auth_sessions(self) -> None:
-        expired_platforms: list[str] = []
-        with self._browser_auth_lock:
-            for platform_name, session in list(self._browser_auth_sessions.items()):
-                age = self._browser_auth_session_age_seconds(session)
-                if age is not None and age > BROWSER_AUTH_SESSION_TTL_SECONDS:
-                    expired_platforms.append(platform_name)
+        expired_platforms = self._browser_auth_state.expired_platforms()
         for platform_name in expired_platforms:
             self._close_browser_auth_session(
                 platform_name,
@@ -2686,9 +2681,8 @@ class AppRuntime:
         normalized = normalize_browser_platform_name(platform_name)
         if not normalized:
             return
-        with self._browser_auth_lock:
-            session = self._browser_auth_sessions.pop(normalized, None)
-        if not isinstance(session, dict):
+        session = self._browser_auth_state.pop(normalized)
+        if not isinstance(session, dict) or not session:
             return
         if session.get("external_in_use"):
             profile_path = str(session.get("profile_path") or "").strip()
@@ -2714,9 +2708,8 @@ class AppRuntime:
         normalized = normalize_browser_platform_name(platform_name)
         if not normalized:
             return
-        with self._browser_auth_lock:
-            session = self._browser_auth_sessions.pop(normalized, None)
-        if not isinstance(session, dict):
+        session = self._browser_auth_state.pop(normalized)
+        if not isinstance(session, dict) or not session:
             return
         if reason:
             print(f"[WebBackend] 停止跟踪登录窗口: {normalized} ({reason})")
@@ -2740,10 +2733,9 @@ class AppRuntime:
             wait_seconds = max(0.0, float(delay_seconds or 0.0))
             if wait_seconds > 0:
                 threading.Event().wait(wait_seconds)
-            with self._browser_auth_lock:
-                session = self._browser_auth_sessions.get(normalized)
-                current_opened_at = str((session or {}).get("opened_at") or "").strip()
-            if not isinstance(session, dict):
+            session = self._browser_auth_state.get(normalized)
+            current_opened_at = str((session or {}).get("opened_at") or "").strip()
+            if not isinstance(session, dict) or not session:
                 return
             if opened_at and current_opened_at and current_opened_at != opened_at:
                 return
@@ -3753,15 +3745,14 @@ return changedCount
         normalized = normalize_browser_platform_name(platform_name)
         if not normalized:
             return
-        with self._browser_auth_lock:
-            self._browser_auth_sessions[normalized] = {
-                "platform": None,
-                "opened_at": local_now().isoformat(timespec="seconds"),
-                "profile_id": str(profile_id or "").strip(),
-                "profile_path": str(profile_path or "").strip(),
-                "pid": int(pid) if isinstance(pid, int) and pid > 0 else None,
-                "external_in_use": True,
-            }
+        self._browser_auth_state.set(normalized, {
+            "platform": None,
+            "opened_at": local_now().isoformat(timespec="seconds"),
+            "profile_id": str(profile_id or "").strip(),
+            "profile_path": str(profile_path or "").strip(),
+            "pid": int(pid) if isinstance(pid, int) and pid > 0 else None,
+            "external_in_use": True,
+        })
 
     @staticmethod
     def _looks_like_existing_browser_session_error(exc: Exception) -> bool:
@@ -3771,30 +3762,28 @@ return changedCount
     def get_browser_auth(self) -> dict[str, Any]:
         self._prune_browser_auth_sessions()
         snapshots = get_browser_auth_snapshot(BROWSER_PLATFORM_IDS)
-        with self._browser_auth_lock:
-            for platform_name in list(self._browser_auth_sessions.keys()):
-                session = self._browser_auth_sessions.get(platform_name)
-                if self._is_browser_auth_session_alive(session):
-                    continue
-                self._browser_auth_sessions.pop(platform_name, None)
-                try:
-                    if isinstance(session, dict) and session.get("platform") is not None:
-                        session["platform"].close()
-                except Exception:
-                    pass
-            for platform_name, snapshot in snapshots.items():
-                session = self._browser_auth_sessions.get(platform_name)
-                tracked_open = self._is_browser_auth_session_alive(session)
-                profile_busy = self._is_browser_profile_in_use(self._browser_auth_profile_path(snapshot))
-                snapshot["profile_busy"] = bool(profile_busy)
-                snapshot["debug"] = self._build_browser_auth_debug_snapshot(
-                    snapshot,
-                    session,
-                    tracked_open=tracked_open,
-                    profile_busy=profile_busy,
-                )
-                snapshot["login_window_open"] = tracked_open
-                snapshot["login_opened_at"] = str((session or {}).get("opened_at") or "")
+        stale_sessions = self._browser_auth_state.pop_where(
+            lambda _platform_name, session: not self._is_browser_auth_session_alive(session)
+        )
+        for _platform_name, session in stale_sessions:
+            try:
+                if isinstance(session, dict) and session.get("platform") is not None:
+                    session["platform"].close()
+            except Exception:
+                pass
+        for platform_name, snapshot in snapshots.items():
+            session = self._browser_auth_state.get(platform_name)
+            tracked_open = self._is_browser_auth_session_alive(session)
+            profile_busy = self._is_browser_profile_in_use(self._browser_auth_profile_path(snapshot))
+            snapshot["profile_busy"] = bool(profile_busy)
+            snapshot["debug"] = self._build_browser_auth_debug_snapshot(
+                snapshot,
+                session,
+                tracked_open=tracked_open,
+                profile_busy=profile_busy,
+            )
+            snapshot["login_window_open"] = tracked_open
+            snapshot["login_opened_at"] = str((session or {}).get("opened_at") or "")
         return {
             "platforms": snapshots,
             "diagnostics": build_browser_runtime_diagnostics(snapshots),
@@ -3885,11 +3874,10 @@ return changedCount
                 result["message"] = "该平台的本地浏览器环境已重建，请在打开的浏览器里重新登录新账号。"
             return result
         if action == "confirm":
-            with self._browser_auth_lock:
-                session = dict(self._browser_auth_sessions.get(normalized) or {})
-                opened_at = str((session or {}).get("opened_at") or "").strip()
-                profile_path = str((session or {}).get("profile_path") or "").strip()
-                external_in_use = bool((session or {}).get("external_in_use"))
+            session = self._browser_auth_state.get(normalized)
+            opened_at = str((session or {}).get("opened_at") or "").strip()
+            profile_path = str((session or {}).get("profile_path") or "").strip()
+            external_in_use = bool((session or {}).get("external_in_use"))
             if external_in_use and profile_path:
                 self._detach_browser_auth_session(normalized, reason="用户确认已登录")
                 self._schedule_browser_auth_profile_close(
@@ -3932,8 +3920,7 @@ return changedCount
             active_profile = current_snapshot.get("active_profile") or {}
             profile_path = str(active_profile.get("absolute_path") or "").strip()
             closed_any = False
-            with self._browser_auth_lock:
-                session = dict(self._browser_auth_sessions.get(normalized) or {})
+            session = self._browser_auth_state.get(normalized)
             if session:
                 self._close_browser_auth_session(
                     normalized,
@@ -5559,7 +5546,7 @@ return changedCount
             self.stop_monitoring(persist_preference=False)
         self._close_manual_platform_session_manager(reason="Web 后端正在关闭")
         self._close_recognition_shared_browser()
-        for platform_name in list(self._browser_auth_sessions.keys()):
+        for platform_name in self._browser_auth_state.list_platforms():
             self._close_browser_auth_session(platform_name, reason="Web 后端正在关闭")
         mgr = self._recognition_manager
         if mgr and mgr.get_runtime_status().get("running", False):
@@ -7715,32 +7702,10 @@ return changedCount
                 session_manager.close_all(reason="手动测试结束")
 
     def _set_test_run_state(self, run_id: str, patch: dict[str, Any]) -> None:
-        with self._test_run_lock:
-            state = self._test_runs.get(run_id)
-            if not state:
-                return
-            state.update(patch)
-            state["updatedAt"] = _local_iso_seconds()
+        self._test_run_state.update(run_id, patch)
 
     def _prune_test_runs_locked(self) -> None:
-        now = local_now()
-        terminal_statuses = {"success", "failed", "cancelled"}
-        expired: list[str] = []
-        for run_id, state in list(self._test_runs.items()):
-            status = str((state or {}).get("status") or "").strip()
-            if status not in terminal_statuses:
-                continue
-            timestamp = (
-                (state or {}).get("finishedAt")
-                or (state or {}).get("updatedAt")
-                or (state or {}).get("startedAt")
-            )
-            age = _runtime_timestamp_age_seconds(timestamp, now=now)
-            if age is not None and age > TEST_RUN_TERMINAL_TTL_SECONDS:
-                expired.append(run_id)
-        for run_id in expired:
-            self._test_runs.pop(run_id, None)
-            self._test_run_cancel_events.pop(run_id, None)
+        self._test_run_state.prune_terminal()
 
     def _prune_search_file_caches_locked(self) -> None:
         now = local_now()
@@ -7762,8 +7727,7 @@ return changedCount
         run_id: str,
         report: dict[str, Any] | None = None,
     ) -> tuple[str, str, str]:
-        with self._test_run_lock:
-            state = dict(self._test_runs.get(run_id) or {})
+        state = self._test_run_state.get(run_id)
         failed_details = list((report or {}).get("failed_query_details") or [])
         failure_entry = dict(failed_details[0] or {}) if failed_details else {}
         keyword = str(
@@ -7837,7 +7801,7 @@ return changedCount
 
     def cancel_test_run(self, run_id: str) -> dict:
         with self._test_run_lock:
-            state = self._test_runs.get(run_id)
+            state = self._test_run_state.get(run_id)
             if not state:
                 return {"ok": False, "message": "未找到测试任务"}
             status = str(state.get("status") or "").strip()
@@ -7849,13 +7813,14 @@ return changedCount
                     "message": str(state.get("message") or "测试任务已结束").strip() or "测试任务已结束",
                     "errorMessage": str(state.get("errorMessage") or "").strip(),
                 }
-            cancel_event = self._test_run_cancel_events.get(run_id)
+            cancel_event = self._test_run_state.get_cancel_event(run_id)
             if cancel_event is None:
                 return {"ok": False, "message": "当前测试任务不支持中断"}
             cancel_event.set()
-            state["cancelRequested"] = True
-            state["message"] = "正在中断测试任务..."
-            state["updatedAt"] = _local_iso_seconds()
+            self._test_run_state.update(run_id, {
+                "cancelRequested": True,
+                "message": "正在中断测试任务...",
+            })
             return {
                 "ok": True,
                 "runId": run_id,
@@ -7865,12 +7830,10 @@ return changedCount
 
     def _get_active_test_run_block_reason_locked(self) -> str:
         self._prune_test_runs_locked()
-        for state in self._test_runs.values():
-            status = str((state or {}).get("status") or "").strip()
-            if status in {"queued", "running"}:
-                return "当前已有进行中的测试任务，请等待结束后再启动新的测试任务。"
-            if bool((state or {}).get("cancelRequested")) and status not in {"success", "failed", "cancelled"}:
-                return "当前测试任务正在中断中，请稍后再试。"
+        if self._test_run_state.active_run_ids():
+            return "当前已有进行中的测试任务，请等待结束后再启动新的测试任务。"
+        if self._test_run_state.has_cancelling_run():
+            return "当前测试任务正在中断中，请稍后再试。"
         return ""
 
     def _get_test_run_block_reason(self) -> str:
@@ -7969,8 +7932,7 @@ return changedCount
             blocked_reason = self._get_active_test_run_block_reason_locked()
             if blocked_reason:
                 return {"ok": False, "message": blocked_reason}
-            self._test_runs[run_id] = initial_state
-            self._test_run_cancel_events[run_id] = cancel_event
+            self._test_run_state.create(run_id, initial_state, cancel_event=cancel_event)
 
         def _on_progress(payload: dict[str, Any]) -> None:
             stage = str(payload.get("stage") or "").strip()
@@ -8042,14 +8004,7 @@ return changedCount
                     "durationSeconds": float(metrics.get("duration_seconds") or 0.0),
                     "recordedAt": _local_iso_seconds(),
                 }
-                with self._test_run_lock:
-                    state = self._test_runs.get(run_id)
-                    if not state:
-                        return
-                    diagnostics = list(state.get("pollDiagnostics") or [])
-                    diagnostics.append(item)
-                    state["pollDiagnostics"] = diagnostics[-50:]
-                    state["updatedAt"] = _local_iso_seconds()
+                self._test_run_state.append_poll_diagnostic(run_id, item, limit=50)
                 return
             if stage == "query_done":
                 completed_queries = int(payload.get("completed_queries") or 0)
@@ -8187,8 +8142,7 @@ return changedCount
                     "finishedAt": _local_iso_seconds(),
                 })
             finally:
-                with self._test_run_lock:
-                    self._test_run_cancel_events.pop(run_id, None)
+                self._test_run_state.pop_cancel_event(run_id)
                 if session_manager is not None:
                     session_manager.close_all(reason="异步手动测试结束")
 
@@ -8198,7 +8152,7 @@ return changedCount
     def get_test_run_status(self, run_id: str) -> dict:
         with self._test_run_lock:
             self._prune_test_runs_locked()
-            state = self._test_runs.get(run_id)
+            state = self._test_run_state.get(run_id)
             if not state:
                 return {"ok": False, "message": "未找到测试任务"}
             snapshot = dict(state)
@@ -9132,12 +9086,7 @@ return changedCount
         if worker_running:
             blockers.append("手动执行任务正在运行，请等待结束后再应用 selector。")
 
-        with self._test_run_lock:
-            active_test_runs = [
-                run_id
-                for run_id, state in self._test_runs.items()
-                if str((state or {}).get("status") or "").strip() in {"queued", "running"}
-            ]
+        active_test_runs = self._test_run_state.active_run_ids()
         checks["active_test_runs"] = active_test_runs
         if active_test_runs:
             blockers.append("当前有测试任务正在运行，请等待结束后再应用 selector。")
@@ -9708,23 +9657,22 @@ return changedCount
                 pass
         success_message = f"已发送 {actual_screenshot_count} 张成功截图，并将任务改判为成功"
         self._clear_test_failure_notice(resolved_id)
-        with self._test_run_lock:
-            for state in self._test_runs.values():
-                if str(state.get("taskId") or "").strip() != resolved_id:
-                    continue
-                if str(state.get("status") or "").strip() != "failed":
-                    continue
-                state.update({
-                    "status": "success",
-                    "message": success_message,
-                    "result": "success",
-                    "errorMessage": "",
-                    "failureDetails": [],
-                    "sendableSuccessCount": actual_screenshot_count,
-                    "actualScreenshotCount": actual_screenshot_count,
-                    "canForceSendSuccess": False,
-                    "updatedAt": _local_iso_seconds(),
-                })
+        self._test_run_state.update_where(
+            lambda state: (
+                str(state.get("taskId") or "").strip() == resolved_id
+                and str(state.get("status") or "").strip() == "failed"
+            ),
+            {
+                "status": "success",
+                "message": success_message,
+                "result": "success",
+                "errorMessage": "",
+                "failureDetails": [],
+                "sendableSuccessCount": actual_screenshot_count,
+                "actualScreenshotCount": actual_screenshot_count,
+                "canForceSendSuccess": False,
+            },
+        )
         return {
             "ok": True,
             "message": success_message,

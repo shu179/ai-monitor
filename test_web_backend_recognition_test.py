@@ -121,26 +121,24 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
         runtime = AppRuntime()
         old_time = (local_now() - timedelta(hours=7)).isoformat(timespec="seconds")
         fresh_time = local_now().isoformat(timespec="seconds")
-        runtime._browser_auth_sessions = {
-            "doubao": {
-                "platform": None,
-                "opened_at": old_time,
-                "profile_path": "/tmp/doubao-auth",
-                "external_in_use": True,
-            },
-            "kimi": {
-                "platform": None,
-                "opened_at": fresh_time,
-                "profile_path": "/tmp/kimi-auth",
-                "external_in_use": True,
-            },
-        }
+        runtime._browser_auth_state.set("doubao", {
+            "platform": None,
+            "opened_at": old_time,
+            "profile_path": "/tmp/doubao-auth",
+            "external_in_use": True,
+        })
+        runtime._browser_auth_state.set("kimi", {
+            "platform": None,
+            "opened_at": fresh_time,
+            "profile_path": "/tmp/kimi-auth",
+            "external_in_use": True,
+        })
 
         with patch.object(runtime, "_terminate_browser_profile_processes", return_value=True) as terminate:
             runtime._prune_browser_auth_sessions()
 
-        self.assertNotIn("doubao", runtime._browser_auth_sessions)
-        self.assertIn("kimi", runtime._browser_auth_sessions)
+        self.assertNotIn("doubao", runtime._browser_auth_state.list_platforms())
+        self.assertIn("kimi", runtime._browser_auth_state.list_platforms())
         terminate.assert_called_once_with("/tmp/doubao-auth", graceful_timeout=8.0, force=True)
 
     def test_recent_external_browser_auth_session_can_be_alive_without_pid(self):
@@ -169,25 +167,24 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
         old_time = (local_now() - timedelta(hours=7)).isoformat(timespec="seconds")
         fresh_time = local_now().isoformat(timespec="seconds")
         with runtime._test_run_lock:
-            runtime._test_runs["old-run"] = {
+            runtime._test_run_state.create("old-run", {
                 "runId": "old-run",
                 "status": "success",
                 "finishedAt": old_time,
                 "updatedAt": old_time,
-            }
-            runtime._test_runs["active-run"] = {
+            }, cancel_event=Mock())
+            runtime._test_run_state.create("active-run", {
                 "runId": "active-run",
                 "status": "running",
                 "updatedAt": fresh_time,
-            }
-            runtime._test_run_cancel_events["old-run"] = Mock()
+            })
 
         result = runtime.get_test_run_status("old-run")
 
         self.assertFalse(result["ok"])
-        self.assertNotIn("old-run", runtime._test_runs)
-        self.assertNotIn("old-run", runtime._test_run_cancel_events)
-        self.assertIn("active-run", runtime._test_runs)
+        self.assertEqual(runtime._test_run_state.get("old-run"), {})
+        self.assertIsNone(runtime._test_run_state.get_cancel_event("old-run"))
+        self.assertIn("active-run", runtime._test_run_state.active_run_ids())
 
     def test_search_file_caches_prune_missing_and_stale_entries(self):
         runtime = AppRuntime()
@@ -296,10 +293,10 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
                 }
             ],
         })
-        runtime._test_runs["active"] = {
+        runtime._test_run_state.create("active", {
             "status": "queued",
             "cancelRequested": False,
-        }
+        })
 
         with patch.object(runtime, "_get_test_run_block_reason", return_value=""):
             result = runtime.start_test_run_task("task-1")
@@ -318,12 +315,12 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
                 }
             ],
         })
-        runtime._test_runs["run-1"] = {
+        runtime._test_run_state.create("run-1", {
             "runId": "run-1",
             "taskId": "task-1",
             "status": "failed",
             "message": "测试失败",
-        }
+        })
 
         with patch("web_backend._collect_today_successful_task_payload", return_value={
             "screenshotPaths": ["/tmp/ok.png"],
@@ -356,7 +353,7 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
         runtime.load_config = Mock(return_value={"tasks": [task]})
         runtime._set_test_failure_notice("task-1", "测试失败", run_id="run-1")
         self.assertEqual(runtime._get_test_failure_notice("task-1")["runId"], "run-1")
-        runtime._test_runs["run-1"] = {
+        runtime._test_run_state.create("run-1", {
             "runId": "run-1",
             "taskId": "task-1",
             "status": "failed",
@@ -364,7 +361,7 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
             "result": "failed",
             "errorMessage": "未补齐",
             "failureDetails": [{"keyword": "词1"}],
-        }
+        })
         notifier = Mock()
         notifier.last_error = ""
         notifier.send_detected_images.return_value = True
