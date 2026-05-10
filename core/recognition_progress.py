@@ -21,7 +21,16 @@ def format_batch_image_progress(batch: dict) -> str:
     return f"累计 {total_count} 张（本次 {current_count} 张，历史 {historical_count} 张）"
 
 
+def format_threshold_progress_text(current_count: int, batch_size: int, historical_count: int) -> str:
+    current_count = max(0, int(current_count or 0))
+    batch_size = max(1, int(batch_size or 1))
+    historical_count = max(0, int(historical_count or 0))
+    total_count = current_count + historical_count
+    return f"累计 {total_count}/{batch_size} 张（本次 {current_count} 张，历史 {historical_count} 张）"
+
+
 __all__ = [
     "batch_image_count",
     "format_batch_image_progress",
+    "format_threshold_progress_text",
 ]

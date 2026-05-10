@@ -70,6 +70,7 @@ from core.recognition_matching import (
 from core.recognition_progress import (
     batch_image_count as _progress_batch_image_count,
     format_batch_image_progress as _progress_format_batch_image_progress,
+    format_threshold_progress_text as _progress_format_threshold_progress_text,
 )
 from core.time_utils import local_now, local_today
 
@@ -959,11 +960,7 @@ class ClipboardRecognitionManager:
         )
 
     def _format_threshold_progress_text(self, current_count: int, batch_size: int, historical_count: int) -> str:
-        current_count = max(0, int(current_count or 0))
-        batch_size = max(1, int(batch_size or 1))
-        historical_count = max(0, int(historical_count or 0))
-        total_count = current_count + historical_count
-        return f"累计 {total_count}/{batch_size} 张（本次 {current_count} 张，历史 {historical_count} 张）"
+        return _progress_format_threshold_progress_text(current_count, batch_size, historical_count)
 
     def _batch_image_count(self, batch: dict | None) -> int:
         return _progress_batch_image_count(batch)

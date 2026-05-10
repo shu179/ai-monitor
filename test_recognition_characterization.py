@@ -131,6 +131,25 @@ def test_format_batch_image_progress_characterizes_counts(manager, batch, expect
     assert manager._format_batch_image_progress(batch) == expected
 
 
+@pytest.mark.parametrize(
+    ("current_count", "batch_size", "historical_count", "expected"),
+    [
+        (0, 1, 0, "累计 0/1 张（本次 0 张，历史 0 张）"),
+        (2, 3, 1, "累计 3/3 张（本次 2 张，历史 1 张）"),
+        (-2, 0, -1, "累计 0/1 张（本次 0 张，历史 0 张）"),
+        ("2", "5", "1", "累计 3/5 张（本次 2 张，历史 1 张）"),
+    ],
+)
+def test_format_threshold_progress_text_characterizes_clamping(
+    manager,
+    current_count,
+    batch_size,
+    historical_count,
+    expected,
+):
+    assert manager._format_threshold_progress_text(current_count, batch_size, historical_count) == expected
+
+
 def test_matched_pairs_dedupe_expand_and_leave_remaining_platforms_stable(manager):
     serialized = manager._serialize_matched_pairs(
         [
