@@ -299,6 +299,7 @@ TASKS_FULL_CACHE_TTL_SECONDS = 3.0
 TEST_RUN_TERMINAL_TTL_SECONDS = 6 * 60 * 60
 SEARCH_FILE_CACHE_TTL_SECONDS = 24 * 60 * 60
 BROWSER_AUTH_SESSION_TTL_SECONDS = 6 * 60 * 60
+CLOUD_ARTICLE_DEFERRED_REFRESH_RETRY_SECONDS = 2.0
 
 _HISTORY_READ_AUTO_VALUES = {"auto", "sqlite_auto", "sqlite_shadow_auto", "auto_sqlite_shadow"}
 _HISTORY_READ_SQLITE_VALUES = {"sqlite_shadow", "sqlite_structured", "structured", "sqlite"}
@@ -2058,6 +2059,7 @@ class AppRuntime:
         self._last_article_cloud_enqueue_key: tuple[Any, ...] | None = None
         self._article_cloud_enqueue_requested = False
         self._article_cloud_enqueue_thread: threading.Thread | None = None
+        self._article_cloud_enqueue_retry_thread: threading.Thread | None = None
         self._pending_delete_processing_lock = threading.RLock()
         self._cloud_status_validation_lock = threading.RLock()
         self._cloud_status_validated_identity = ""
@@ -2342,7 +2344,13 @@ class AppRuntime:
                 return
 
             resolved_config = config or self.config_provider.load()
-            articles = self._get_cloud_article_upload_snapshot(resolved_config, session=session)
+            articles, deferred_refresh = self._get_cloud_article_upload_snapshot_with_refresh_state(
+                resolved_config,
+                session=session,
+            )
+            if deferred_refresh:
+                self._schedule_cloud_articles_snapshot_retry()
+                return
             snapshot_key = (
                 cloud_session_identity_key(session),
                 self._article_store_version_key(),
@@ -2361,17 +2369,59 @@ class AppRuntime:
         except Exception as exc:
             print(f"[WebBackend] 文章云端同步入队失败，将等待下次本地变更重试: {exc}")
 
+    def _schedule_cloud_articles_snapshot_retry(self, *, delay_seconds: float | None = None) -> None:
+        delay = CLOUD_ARTICLE_DEFERRED_REFRESH_RETRY_SECONDS if delay_seconds is None else delay_seconds
+        try:
+            delay = max(0.0, float(delay))
+        except Exception:
+            delay = CLOUD_ARTICLE_DEFERRED_REFRESH_RETRY_SECONDS
+        with self._article_cloud_enqueue_lock:
+            retry_thread = self._article_cloud_enqueue_retry_thread
+            if retry_thread and retry_thread.is_alive():
+                return
+            retry_thread = threading.Thread(
+                target=self._run_cloud_articles_snapshot_retry,
+                args=(delay,),
+                name="cloud-article-snapshot-retry",
+                daemon=True,
+            )
+            self._article_cloud_enqueue_retry_thread = retry_thread
+            retry_thread.start()
+
+    def _run_cloud_articles_snapshot_retry(self, delay_seconds: float) -> None:
+        try:
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+        finally:
+            with self._article_cloud_enqueue_lock:
+                if self._article_cloud_enqueue_retry_thread is threading.current_thread():
+                    self._article_cloud_enqueue_retry_thread = None
+        self._schedule_cloud_articles_snapshot()
+
     def _get_cloud_article_upload_snapshot(
         self,
         config: dict[str, Any] | None = None,
         *,
         session: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        articles, _deferred_refresh = self._get_cloud_article_upload_snapshot_with_refresh_state(
+            config,
+            session=session,
+        )
+        return articles
+
+    def _get_cloud_article_upload_snapshot_with_refresh_state(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        session: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
         """Return local article candidates for cloud upload without UI visibility filtering."""
         resolved_config = config or self.config_provider.load()
         session_payload = session if isinstance(session, dict) else CloudSessionStore().load()
         schedule_result = schedule_article_match_refresh(resolved_config, reason="cloud_upload_snapshot")
-        if _article_match_refresh_is_deferred(schedule_result):
+        deferred_refresh = _article_match_refresh_is_deferred(schedule_result)
+        if deferred_refresh:
             articles = _apply_articles_account_context(
                 get_articles(),
                 resolved_config,
@@ -2410,8 +2460,8 @@ class AppRuntime:
                         if task_id > 0 and task_id in visible_cloud_task_id_set
                     ]
                 scoped_articles.append(item)
-            return scoped_articles
-        return articles
+            return scoped_articles, deferred_refresh
+        return articles, deferred_refresh
 
     @staticmethod
     def _article_cloud_task_map_key(config: dict[str, Any] | None) -> str:
