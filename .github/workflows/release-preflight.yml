@@ -103,7 +103,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install pytest
+          pip install pytest SQLAlchemy
 
       - name: Run preflight script
         run: |
@@ -147,7 +147,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install pyinstaller pytest
+          pip install pyinstaller pytest SQLAlchemy
 
       - name: Check web-ui/dist exists
         id: check-web-ui
