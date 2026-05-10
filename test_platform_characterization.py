@@ -199,6 +199,14 @@ def test_mixed_six_platform_replay_keeps_order_and_reports_failures(isolated_tas
         "smart",
         "browser",
     ]
+    assert [(item["keyword"], item["platform"], item["mode"]) for item in results] == [
+        ("品牌A 浏览器问答", "doubao", "browser"),
+        ("品牌A 浏览器问答", "deepseek", "browser"),
+        ("品牌B API问答", "kimi", "api"),
+        ("品牌B API问答", "tongyi", "api"),
+        ("品牌C 智能问答", "yuanbao", "smart"),
+        ("品牌D 浏览器问答", "wenxin", "browser"),
+    ]
     assert {item["platform"]: item["rank"] for item in results} == {
         "doubao": 1,
         "deepseek": 99,
@@ -263,3 +271,187 @@ def test_missing_screenshot_keeps_notification_fallback_explainable(tmp_path):
     assert result["success"] is False
     assert result["found_results"] == 2
     assert "任务组未补齐" in result["error_message"]
+
+
+def test_same_keyword_partial_platform_failure_keeps_success_result(isolated_task_state):
+    screenshot_dir = isolated_task_state / "screenshots"
+    calls: list[str] = []
+    issues: list[dict] = []
+
+    task = {
+        "name": "同关键词部分失败 characterization",
+        "task_id": "same_keyword_partial_failure",
+        "keywords": [
+            {
+                "keyword": "品牌A 对比",
+                "brand": "品牌A",
+                "platforms": ["doubao", "deepseek"],
+                "mode": "browser",
+            }
+        ],
+    }
+
+    def create_platform(platform_name: str, *, config=None, inspect=False, stop_checker=None):
+        del config, inspect, stop_checker
+        return _ReplayBrowserPlatform(platform_name, screenshot_dir, calls)
+
+    with (
+        patch("core.task_executor_browser.create_browser_platform", side_effect=create_platform),
+        patch("core.task_executor_impl._load_today_success_only_query_results", return_value={}),
+        patch("core.task_executor_impl._record_result_history", return_value=None),
+        patch("core.task_executor_impl._record_diagnostic", return_value="diag"),
+        patch(
+            "core.task_executor_impl._send_task_notifications",
+            return_value={"attempted": True, "success": True, "found_results": 1, "error_message": ""},
+        ),
+    ):
+        results, report = task_executor_impl.run_task_group(
+            task,
+            {},
+            {},
+            return_report=True,
+            issue_callback=issues.append,
+        )
+
+    assert calls == [
+        "browser:doubao:品牌A 对比",
+        "browser:deepseek:品牌A 对比",
+    ]
+    assert [(item["platform"], item["rank"], bool(item["screenshot"])) for item in results] == [
+        ("doubao", 1, True),
+        ("deepseek", 99, False),
+    ]
+    assert report["attempted_queries"] == 2
+    assert report["success_queries"] == 1
+    assert report["failed_queries"] == 1
+    assert report["round_status"] == "partial"
+    assert report["query_round_status"] == "partial"
+    assert report["task_status"] == "partial"
+    assert report["failure_kind"] == "temporary"
+    assert report["task_failure_kind"] == "temporary"
+    assert report["failed_query_details"] == [
+        {
+            "keyword": "品牌A 对比",
+            "platform": "deepseek",
+            "brand": "品牌A",
+            "mode": "browser",
+            "error_message": "浏览器页面崩溃",
+            "failure_type": "temporary_error",
+        }
+    ]
+    assert [item["platform"] for item in issues] == ["deepseek"]
+
+
+def test_structural_and_temporary_failure_report_fields_are_stable(isolated_task_state):
+    task = {
+        "name": "失败字段 characterization",
+        "task_id": "failure_fields",
+        "keywords": [
+            {
+                "keyword": "品牌A API",
+                "brand": "品牌A",
+                "platforms": ["kimi", "tongyi"],
+                "mode": "api",
+            }
+        ],
+    }
+    issues: list[dict] = []
+
+    def run_api_task(platform_name: str, keyword: str, brand: str, config: dict, **kwargs):
+        del keyword, brand, config, kwargs
+        if platform_name == "tongyi":
+            return {"rank": 99, "error_message": "未配置 api_key", "mode": "api"}
+        return {"rank": 99, "error_message": "请求超时", "mode": "api"}
+
+    with (
+        patch("core.task_executor_impl._run_api_task", side_effect=run_api_task),
+        patch("core.task_executor_impl._load_today_success_only_query_results", return_value={}),
+        patch("core.task_executor_impl._record_result_history", return_value=None),
+        patch("core.task_executor_impl._record_diagnostic", return_value="diag"),
+        patch(
+            "core.task_executor_impl._send_task_notifications",
+            return_value={"attempted": False, "success": False, "found_results": 0, "error_message": ""},
+        ),
+    ):
+        results, report = task_executor_impl.run_task_group(
+            task,
+            {},
+            {},
+            return_report=True,
+            issue_callback=issues.append,
+        )
+
+    assert [(item["platform"], item["rank"], item["error_message"]) for item in results] == [
+        ("kimi", 99, "请求超时"),
+        ("tongyi", 99, "未配置 api_key"),
+    ]
+    assert report["round_status"] == "failed"
+    assert report["query_round_status"] == "failed"
+    assert report["task_status"] == "failed"
+    assert report["failure_kind"] == "structural"
+    assert report["task_failure_kind"] == "structural"
+    assert [item["failure_type"] for item in report["failed_query_details"]] == [
+        "temporary_error",
+        "structural_error",
+    ]
+    assert [item["platform"] for item in issues] == ["kimi", "tongyi"]
+
+
+def test_missing_rank_found_mentioned_and_screenshot_fields_default_to_no_hit(isolated_task_state):
+    task = {
+        "name": "缺字段 characterization",
+        "task_id": "missing_result_fields",
+        "keywords": [
+            {
+                "keyword": "品牌Z API",
+                "brand": "品牌Z",
+                "platforms": ["kimi"],
+                "mode": "api",
+            }
+        ],
+    }
+
+    def run_api_task(platform_name: str, keyword: str, brand: str, config: dict, **kwargs):
+        del platform_name, keyword, brand, config, kwargs
+        return {"answer_text": "没有结构化 rank/found/mentioned/screenshot 字段"}
+
+    with (
+        patch("core.task_executor_impl._run_api_task", side_effect=run_api_task),
+        patch("core.task_executor_impl._load_today_success_only_query_results", return_value={}),
+        patch("core.task_executor_impl._record_result_history", return_value=None),
+        patch(
+            "core.task_executor_impl._send_task_notifications",
+            return_value={"attempted": False, "success": False, "found_results": 0, "error_message": ""},
+        ),
+    ):
+        results, report = task_executor_impl.run_task_group(task, {}, {}, return_report=True)
+
+    assert results == [
+        {
+            "keyword": "品牌Z API",
+            "platform": "kimi",
+            "brand": "品牌Z",
+            "rank": 99,
+            "screenshot": None,
+            "answer_text": "没有结构化 rank/found/mentioned/screenshot 字段",
+            "evidence": "",
+            "error_message": "",
+            "highlight_count": 0,
+            "mode": "api",
+            "diagnostic_id": "",
+            "recovered_manually": False,
+            "references": [],
+            "body_references": [],
+        }
+    ]
+    assert report["no_hit_queries"] == 1
+    assert report["failed_query_details"] == [
+        {
+            "keyword": "品牌Z API",
+            "platform": "kimi",
+            "brand": "品牌Z",
+            "mode": "api",
+            "error_message": "未识别到品牌名 品牌Z",
+            "failure_type": "no_hit",
+        }
+    ]
