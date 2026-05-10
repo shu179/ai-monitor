@@ -1,6 +1,6 @@
 """scope idempotency_key to workspace on sync_events, run_records, article_reference_events
 
-Revision ID: 0010_sync_events_workspace_scoped_idempotency
+Revision ID: 0010_workspace_idempotency
 Revises: 0009_viewer_all_tasks
 Create Date: 2026-05-10 00:00:00
 
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy import inspect
 
-revision: str = "0010_sync_events_workspace_scoped_idempotency"
+revision: str = "0010_workspace_idempotency"
 down_revision: Union[str, None] = "0009_viewer_all_tasks"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
