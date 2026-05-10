@@ -51,7 +51,7 @@ jobs:
         run: |
           cd cloud-server
           pip install -r requirements.txt
-          pip install pytest-asyncio
+          pip install pytest pytest-asyncio
 
       - name: Wait for PostgreSQL to be ready
         run: |
@@ -71,7 +71,7 @@ jobs:
       - name: Run Alembic migration upgrade
         run: |
           cd cloud-server
-          alembic upgrade head
+          python -m alembic upgrade head
 
       - name: Verify constraints exist
         run: |
@@ -103,6 +103,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+          pip install pytest
 
       - name: Run preflight script
         run: |
@@ -111,6 +112,7 @@ jobs:
       - name: Run key pytests
         run: |
           python -m pytest \
+            test_verify_constraints.py \
             test_diagnostic_events.py \
             test_browser_processes.py \
             test_cloud_outbox.py \
@@ -145,7 +147,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller pytest
 
       - name: Check web-ui/dist exists
         id: check-web-ui
@@ -189,6 +191,7 @@ jobs:
       - name: Run key pytests on Windows
         run: |
           python -m pytest `
+            test_verify_constraints.py `
             test_diagnostic_events.py `
             test_browser_processes.py `
             test_cloud_outbox.py `
