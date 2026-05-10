@@ -156,6 +156,11 @@ PLATFORM_STRONG_HINTS = {
     ),
 }
 
+INPUT_BUBBLE_HINTS = (
+    "发送", "输入", "问", "追问", "深度思考", "联网搜索", "上传", "附件",
+    "chatgpt", "claude", "gemini", "deepseek", "豆包", "通义", "文心", "元宝", "kimi",
+)
+
 
 def normalize_keyword_brand_pair(keyword: str, brand: str) -> tuple[str, str]:
     return (str(keyword or "").strip().lower(), str(brand or "").strip().lower())
@@ -247,6 +252,13 @@ def infer_platform_from_body_text(text: str, candidate_platforms: list[str]) -> 
     if second_score and (best_score - second_score) < 10:
         return ""
     return best_platform
+
+
+def should_trim_input_bubble(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    return any(token.lower() in normalized for token in INPUT_BUBBLE_HINTS)
 
 
 def normalized_platform_list(platforms: list[Any] | tuple[Any, ...] | set[Any] | None) -> list[str]:
@@ -459,6 +471,7 @@ def build_keyword_updates_from_batch(
 
 
 __all__ = [
+    "INPUT_BUBBLE_HINTS",
     "PLATFORM_DISPLAY",
     "PLATFORM_ID_ALIASES",
     "PLATFORM_INFERENCE_TOKENS",
@@ -476,4 +489,5 @@ __all__ = [
     "platforms_for_matched_item",
     "remaining_current_platforms_after_match",
     "serialize_matched_pairs",
+    "should_trim_input_bubble",
 ]

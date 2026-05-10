@@ -49,6 +49,7 @@ from core.notification_idempotency import (
     record_notification_sent,
 )
 from core.recognition_matching import (
+    INPUT_BUBBLE_HINTS,
     PLATFORM_DISPLAY,
     PLATFORM_ID_ALIASES,
     PLATFORM_INFERENCE_TOKENS,
@@ -64,14 +65,10 @@ from core.recognition_matching import (
     normalize_platform_id as _matching_normalize_platform_id,
     remaining_current_platforms_after_match as _matching_remaining_current_platforms_after_match,
     serialize_matched_pairs as _matching_serialize_matched_pairs,
+    should_trim_input_bubble as _matching_should_trim_input_bubble,
 )
 from core.time_utils import local_now, local_today
 
-
-INPUT_BUBBLE_HINTS = (
-    "发送", "输入", "问", "追问", "深度思考", "联网搜索", "上传", "附件",
-    "chatgpt", "claude", "gemini", "deepseek", "豆包", "通义", "文心", "元宝", "kimi",
-)
 
 class ClipboardRecognitionManager:
     """识别模式后台管理器。"""
@@ -2514,10 +2511,7 @@ class ClipboardRecognitionManager:
         return platform_name
 
     def _should_trim_input_bubble(self, text: str) -> bool:
-        normalized = str(text or "").strip().lower()
-        if not normalized:
-            return False
-        return any(token.lower() in normalized for token in INPUT_BUBBLE_HINTS)
+        return _matching_should_trim_input_bubble(text)
 
     def _build_decorated_send_image(
         self,

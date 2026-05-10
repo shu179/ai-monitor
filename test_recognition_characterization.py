@@ -69,6 +69,23 @@ def test_infer_platform_from_body_text_uses_stricter_threshold_than_bottom_text(
     assert manager._infer_platform_from_body_text("kimi deepseek", ["deepseek", "kimi"]) == "kimi"
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("", False),
+        (None, False),
+        ("发送消息或输入 / 选择技能", True),
+        ("深度思考 联网搜索", True),
+        ("ChatGPT 对话窗口", True),
+        ("附件 上传", True),
+        ("这是一段问题回答", True),
+        ("品牌A正常回答内容", False),
+    ],
+)
+def test_should_trim_input_bubble_characterizes_text_tokens(manager, text, expected):
+    assert manager._should_trim_input_bubble(text) is expected
+
+
 def test_matched_pairs_dedupe_expand_and_leave_remaining_platforms_stable(manager):
     serialized = manager._serialize_matched_pairs(
         [
