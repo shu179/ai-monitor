@@ -409,6 +409,7 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
         self._original_storage_backend = os.environ.get(history.STORAGE_BACKEND_ENV)
         self._original_shadow_write = os.environ.get(history.STRUCTURED_SHADOW_WRITE_ENV)
         self._original_read_backend = os.environ.get(history.STRUCTURED_READ_BACKEND_ENV)
+        self._original_write_backend = os.environ.get(history.STRUCTURED_WRITE_BACKEND_ENV)
         self._original_rebuild_interval = os.environ.get("AIBRANDMONITOR_HISTORY_SQLITE_REBUILD_MIN_INTERVAL_SECONDS")
         self._original_bad_db_cooldown = os.environ.get("AIBRANDMONITOR_HISTORY_SQLITE_BAD_DB_COOLDOWN_SECONDS")
         self._original_paths = {
@@ -438,6 +439,10 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             os.environ.pop(history.STRUCTURED_READ_BACKEND_ENV, None)
         else:
             os.environ[history.STRUCTURED_READ_BACKEND_ENV] = self._original_read_backend
+        if self._original_write_backend is None:
+            os.environ.pop(history.STRUCTURED_WRITE_BACKEND_ENV, None)
+        else:
+            os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = self._original_write_backend
         if self._original_rebuild_interval is None:
             os.environ.pop("AIBRANDMONITOR_HISTORY_SQLITE_REBUILD_MIN_INTERVAL_SECONDS", None)
         else:
@@ -803,6 +808,119 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             [item["id"] for item in json_pending],
         )
         self.assertEqual(history.get_structured_read_health()["effectiveBackend"], "sqlite_shadow")
+
+    def test_structured_authoritative_writes_record_import_and_review_without_history_json_rewrite(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ.pop(history.STRUCTURED_READ_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = "sqlite_structured"
+
+        recorded = history.record(
+            "Authoritative Task",
+            "doubao",
+            "keyword",
+            "Brand",
+            1,
+            True,
+            task_id="task_auth",
+        )
+        imported = history.import_records(
+            "Authoritative Task",
+            [
+                {
+                    "id": "auth-imported",
+                    "ts": "2024-01-02 09:00",
+                    "task_id": "task_auth",
+                    "task_name": "Authoritative Task",
+                    "platform": "kimi",
+                    "keyword": "imported",
+                    "brand": "Brand",
+                    "rank": 2,
+                    "success": True,
+                    "review_status": "pending",
+                }
+            ],
+            task_id="task_auth",
+        )
+        changed = history.apply_review("Authoritative Task", recorded["id"], "approved", "ok", task_id="task_auth")
+        records = history.get_records("Authoritative Task", task_id="task_auth")
+
+        self.assertEqual(imported, 1)
+        self.assertTrue(changed)
+        self.assertFalse(history._task_file("task_auth").exists())
+        self.assertFalse(history._task_file("Authoritative Task").exists())
+        self.assertEqual(
+            [(item["id"], item["review_status"]) for item in records],
+            [("auth-imported", "pending"), (recorded["id"], "approved")],
+        )
+        self.assertEqual([item["id"] for item in history.get_pending_reviews(limit=10)], ["auth-imported"])
+        health = history.get_structured_read_health()
+        self.assertEqual(health["effectiveBackend"], "sqlite_structured")
+        self.assertEqual(health["writePath"]["effectiveBackend"], "sqlite_structured")
+        self.assertFalse(health["writePath"]["knownFullDocumentRewrite"])
+        self.assertTrue(health["authoritativeReadiness"]["readyForAuthoritativeSwitch"])
+
+    def test_structured_authoritative_writes_bootstrap_existing_json_before_append(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = "sqlite_structured"
+        history._task_file("task_bootstrap").write_text(
+            json.dumps([
+                {
+                    "id": "legacy-json",
+                    "ts": "2024-01-01 09:00",
+                    "task_id": "task_bootstrap",
+                    "task_name": "Bootstrap Task",
+                    "rank": 1,
+                    "success": True,
+                },
+            ], ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        appended = history.record(
+            "Bootstrap Task",
+            "doubao",
+            "keyword",
+            "Brand",
+            1,
+            True,
+            task_id="task_bootstrap",
+        )
+
+        self.assertEqual(
+            [item["id"] for item in history.get_records("Bootstrap Task", task_id="task_bootstrap")],
+            ["legacy-json", appended["id"]],
+        )
+        self.assertTrue(history._task_file("task_bootstrap").exists())
+        self.assertEqual(
+            [item["id"] for item in json.loads(history._task_file("task_bootstrap").read_text(encoding="utf-8"))],
+            ["legacy-json"],
+        )
+
+    def test_structured_authoritative_write_failure_falls_back_to_json_history(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = "sqlite_structured"
+
+        with patch.object(
+            ArticleHistorySQLiteStore,
+            "append_history_record",
+            side_effect=RuntimeError("structured write failed"),
+        ):
+            recorded = history.record(
+                "Fallback Task",
+                "doubao",
+                "keyword",
+                "Brand",
+                1,
+                True,
+                task_id="task_fallback",
+            )
+
+        self.assertTrue(history._task_file("task_fallback").exists())
+        self.assertEqual(
+            [item["id"] for item in history.get_records("Fallback Task", task_id="task_fallback")],
+            [recorded["id"]],
+        )
+        self.assertEqual(history.get_structured_read_health()["effectiveBackend"], "json")
 
     def test_structured_read_backend_reads_records_and_derived_views_when_enabled(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)

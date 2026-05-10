@@ -44,6 +44,7 @@ class BenchmarkOptions:
     task_count: int = DEFAULT_TASK_COUNT
     page_limit: int = DEFAULT_PAGE_LIMIT
     history_read_backend: str = "auto"
+    history_write_backend: str = "json"
     history_storage_backend: str = "json"
     shadow_writes: bool = True
     data_dir: Path | None = None
@@ -121,6 +122,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
     with isolated_history_paths(
         data_dir,
         history_read_backend=opts.history_read_backend,
+        history_write_backend=opts.history_write_backend,
         history_storage_backend=opts.history_storage_backend,
         shadow_writes=opts.shadow_writes,
     ):
@@ -166,6 +168,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
             "task_count": int(opts.task_count),
             "page_limit": int(opts.page_limit),
             "history_read_backend": _normalize_history_read_backend(opts.history_read_backend),
+            "history_write_backend": _normalize_history_write_backend(opts.history_write_backend),
             "history_storage_backend": _normalize_history_storage_backend(opts.history_storage_backend),
             "shadow_writes": bool(opts.shadow_writes),
         },
@@ -229,6 +232,7 @@ def isolated_history_paths(
     data_dir: Path,
     *,
     history_read_backend: str = "auto",
+    history_write_backend: str = "json",
     history_storage_backend: str = "json",
     shadow_writes: bool = True,
 ):
@@ -243,6 +247,7 @@ def isolated_history_paths(
         history.STORAGE_BACKEND_ENV: os.environ.get(history.STORAGE_BACKEND_ENV),
         history.STRUCTURED_READ_BACKEND_ENV: os.environ.get(history.STRUCTURED_READ_BACKEND_ENV),
         history.STRUCTURED_SHADOW_WRITE_ENV: os.environ.get(history.STRUCTURED_SHADOW_WRITE_ENV),
+        history.STRUCTURED_WRITE_BACKEND_ENV: os.environ.get(history.STRUCTURED_WRITE_BACKEND_ENV),
     }
     try:
         history.DEFAULT_HISTORY_DIR = logs_dir / "history"
@@ -261,6 +266,11 @@ def isolated_history_paths(
             os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "sqlite_shadow"
         else:
             os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "auto"
+        write_backend = _normalize_history_write_backend(history_write_backend)
+        if write_backend == "sqlite_structured":
+            os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = "sqlite_structured"
+        else:
+            os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = "json"
         os.environ[history.STRUCTURED_SHADOW_WRITE_ENV] = "1" if shadow_writes else "0"
         history.configure_structured_history_storage({})
         history.reset_structured_read_health()
@@ -428,6 +438,7 @@ def evaluate_standards(operations: list[dict[str, Any]], health: dict[str, Any])
     read_page = operation_map.get("read_page_sqlite_shadow", {})
     read_page_details = read_page.get("details") if isinstance(read_page.get("details"), dict) else {}
     write_path = health.get("writePath") if isinstance(health.get("writePath"), dict) else {}
+    known_rewrite = bool(write_path.get("knownFullDocumentRewrite", True))
     return {
         "sqlite_shadow_page_read": {
             "status": "pass" if read_page_details.get("effective_backend") == "sqlite_shadow" else "warn",
@@ -440,12 +451,16 @@ def evaluate_standards(operations: list[dict[str, Any]], health: dict[str, Any])
             "limit": SQLITE_FD_GROWTH_LIMIT,
         },
         "write_path_bottlenecks": {
-            "status": "known_bottleneck" if write_path.get("knownFullDocumentRewrite", True) else "pass",
+            "status": "known_bottleneck" if known_rewrite else "pass",
             "effective_backend": write_path.get("effectiveBackend", "json_file"),
             "operations": write_path.get("operations", {}),
             "note": (
-                "Runtime append/import/review still keep JSON documents as authoritative and rewrite the task document. "
-                "Structured SQLite is currently a guarded read/shadow-write path."
+                (
+                    "Runtime append/import/review still keep JSON documents as authoritative and rewrite the task document. "
+                    "Structured SQLite is currently a guarded read/shadow-write path."
+                )
+                if known_rewrite
+                else "Runtime append/import/review used the explicit structured SQLite authoritative write path."
             ),
         },
         "authoritative_readiness": health.get("authoritativeReadiness", {}),
@@ -497,6 +512,13 @@ def _normalize_history_storage_backend(value: str) -> str:
     backend = str(value or "json").strip().lower().replace("-", "_")
     if backend in {"sqlite", "sqlite_document", "sqlite_json_document", "db", "database"}:
         return "sqlite_document"
+    return "json"
+
+
+def _normalize_history_write_backend(value: str) -> str:
+    backend = str(value or "json").strip().lower().replace("-", "_")
+    if backend in {"sqlite", "sqlite_structured", "structured_sqlite", "structured"}:
+        return "sqlite_structured"
     return "json"
 
 
@@ -557,6 +579,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="json",
         help="Authoritative JSON-document storage path to exercise.",
     )
+    parser.add_argument(
+        "--history-write-backend",
+        choices=("json", "sqlite_structured"),
+        default="json",
+        help="Runtime history write backend for record/import/review measurements.",
+    )
     parser.add_argument("--disable-shadow-writes", action="store_true", help="Disable structured shadow write-through.")
     parser.add_argument("--data-dir", type=Path, default=None, help="Explicit isolated benchmark data dir. Defaults to tempfile.")
     parser.add_argument("--force", action="store_true", help="Overwrite an existing explicit benchmark data dir.")
@@ -573,6 +601,7 @@ def main(argv: list[str] | None = None) -> int:
             task_count=args.task_count,
             page_limit=args.page_limit,
             history_read_backend=args.history_read_backend,
+            history_write_backend=args.history_write_backend,
             history_storage_backend=args.history_storage_backend,
             shadow_writes=not args.disable_shadow_writes,
             data_dir=args.data_dir,

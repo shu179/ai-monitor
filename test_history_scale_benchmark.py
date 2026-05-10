@@ -112,6 +112,32 @@ class HistoryScaleBenchmarkTests(unittest.TestCase):
         self.assertTrue(append_details["structured_shadow_writes"])
         self.assertTrue(append_details["known_full_document_rewrite"])
 
+    def test_small_benchmark_supports_structured_authoritative_write_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary = run_benchmark(
+                BenchmarkOptions(
+                    record_count=90,
+                    task_count=3,
+                    page_limit=7,
+                    history_write_backend="sqlite_structured",
+                    data_dir=Path(tmpdir),
+                    force=True,
+                )
+            )
+
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["input"]["history_write_backend"], "sqlite_structured")
+        self.assertEqual(summary["backend"]["effective_backend"], "sqlite_structured")
+        self.assertEqual(summary["backend"]["storage_backend"], "sqlite_structured")
+        self.assertEqual(summary["standards"]["write_path_bottlenecks"]["status"], "pass")
+        self.assertTrue(summary["health"]["authoritativeReadiness"]["readyForAuthoritativeSwitch"])
+
+        operations = {operation["name"]: operation for operation in summary["operations"]}
+        for name in ("append_record", "import_records_merge", "apply_review"):
+            details = operations[name]["details"]
+            self.assertEqual(details["effective_backend"], "sqlite_structured")
+            self.assertFalse(details["known_full_document_rewrite"])
+
     def test_cli_small_smoke_writes_json_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "summary.json"

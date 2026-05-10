@@ -33,8 +33,10 @@ MAX_RECORDS = 500  # 每个任务最多保留原始记录数
 STORAGE_BACKEND_ENV = "AIBRANDMONITOR_STORAGE_BACKEND"
 STRUCTURED_SHADOW_WRITE_ENV = "AIBRANDMONITOR_HISTORY_STRUCTURED_SHADOW_WRITES"
 STRUCTURED_READ_BACKEND_ENV = "AIBRANDMONITOR_HISTORY_READ_BACKEND"
+STRUCTURED_WRITE_BACKEND_ENV = "AIBRANDMONITOR_HISTORY_WRITE_BACKEND"
 STRUCTURED_READ_BACKEND_SQLITE_VALUES = {"sqlite_shadow", "sqlite_structured", "structured", "sqlite"}
 STRUCTURED_READ_BACKEND_AUTO_VALUES = {"auto", "sqlite_auto", "sqlite_shadow_auto", "auto_sqlite_shadow"}
+STRUCTURED_WRITE_BACKEND_SQLITE_VALUES = {"sqlite_structured", "structured_sqlite", "structured", "sqlite"}
 
 _PLATFORM_ID_ALIASES: dict[str, str] = {
     "豆包": "doubao",
@@ -94,6 +96,8 @@ _structured_read_store_status_cache: dict[str, object] = {}
 _structured_read_config_lock = threading.RLock()
 _structured_read_config_backend = ""
 _structured_shadow_write_config_enabled = False
+_structured_authoritative_write_health_lock = threading.RLock()
+_structured_authoritative_write_health: dict[str, object] = {}
 _structured_shadow_rebuild_lock = threading.RLock()
 _structured_shadow_rebuild_state: dict[str, object] = {}
 _MAX_LOCKS = 500  # 锁字典的最大容量，超出时清理最旧的 25%
@@ -127,6 +131,79 @@ def _history_structured_shadow_writes_enabled() -> bool:
             return bool(_structured_shadow_write_config_enabled)
     value = str(env_value or "").strip().lower()
     return value in {"1", "true", "yes", "on", "sqlite", "structured"}
+
+
+def _normalize_structured_write_backend(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in STRUCTURED_WRITE_BACKEND_SQLITE_VALUES:
+        return "sqlite_structured"
+    return ""
+
+
+def _history_structured_write_backend_with_source() -> tuple[str, str]:
+    env_value = os.environ.get(STRUCTURED_WRITE_BACKEND_ENV)
+    if env_value is not None:
+        return _normalize_structured_write_backend(env_value), "env"
+    return "", "default"
+
+
+def _history_structured_write_backend() -> str:
+    return _history_structured_write_backend_with_source()[0]
+
+
+def _history_structured_authoritative_writes_enabled() -> bool:
+    return (
+        _history_structured_write_backend() == "sqlite_structured"
+        and not _structured_authoritative_write_cooldown_active()
+    )
+
+
+def _structured_authoritative_write_cooldown_seconds() -> int:
+    try:
+        return max(1, int(os.environ.get("AIBRANDMONITOR_HISTORY_SQLITE_WRITE_COOLDOWN_SECONDS", "60")))
+    except Exception:
+        return 60
+
+
+def _structured_authoritative_write_cooldown_active() -> bool:
+    now_ts = time.monotonic()
+    with _structured_authoritative_write_health_lock:
+        disabled_until = float(
+            _structured_authoritative_write_health.get("disabled_until_monotonic")
+            or _structured_authoritative_write_health.get("disabled_until")
+            or 0.0
+        )
+    return disabled_until > now_ts
+
+
+def _structured_authoritative_write_health_snapshot() -> dict[str, object]:
+    now_ts = time.monotonic()
+    with _structured_authoritative_write_health_lock:
+        health = dict(_structured_authoritative_write_health)
+    disabled_until = float(
+        health.get("disabled_until_monotonic")
+        or health.get("disabled_until")
+        or 0.0
+    )
+    health["cooldown_remaining_seconds"] = max(0.0, round(disabled_until - now_ts, 3))
+    health["disabled"] = disabled_until > now_ts
+    return health
+
+
+def _disable_structured_authoritative_writes_temporarily(reason: str, detail: str = "") -> None:
+    now_ts = time.monotonic()
+    disabled_until = now_ts + _structured_authoritative_write_cooldown_seconds()
+    with _structured_authoritative_write_health_lock:
+        _structured_authoritative_write_health.update({
+            "last_status": "fallback",
+            "last_fallback_reason": str(reason or ""),
+            "last_error": str(detail or ""),
+            "last_error_at": local_now().isoformat(timespec="seconds"),
+            "disabled_until": disabled_until,
+            "disabled_until_monotonic": disabled_until,
+            "fallback_count": int(_structured_authoritative_write_health.get("fallback_count") or 0) + 1,
+        })
+    _clear_structured_read_store_status_cache()
 
 
 def _normalize_structured_read_backend(value: object) -> str:
@@ -198,10 +275,16 @@ def _history_structured_read_auto_configured() -> bool:
 
 
 def _history_structured_read_configured() -> bool:
-    return _history_structured_read_explicit_enabled() or _history_structured_read_auto_configured()
+    return (
+        _history_structured_read_explicit_enabled()
+        or _history_structured_read_auto_configured()
+        or _history_structured_authoritative_writes_enabled()
+    )
 
 
 def _history_structured_read_enabled() -> bool:
+    if _history_structured_authoritative_writes_enabled():
+        return _structured_read_store_ready()
     if _history_structured_read_explicit_enabled():
         return True
     if _history_structured_read_auto_configured():
@@ -216,16 +299,27 @@ def get_structured_read_health() -> dict:
     store_status = _structured_read_store_status()
     fresh = _structured_read_store_fresh(store_status)
     requested_backend, backend_source = _history_structured_read_backend_with_source()
+    write_backend, write_backend_source = _history_structured_write_backend_with_source()
+    write_health = _structured_authoritative_write_health_snapshot()
+    structured_writes_authoritative = _history_structured_authoritative_writes_enabled()
     explicit_enabled = requested_backend in STRUCTURED_READ_BACKEND_SQLITE_VALUES
     auto_configured = requested_backend in STRUCTURED_READ_BACKEND_AUTO_VALUES
-    enabled = explicit_enabled or (auto_configured and fresh)
     ready = bool(store_status.get("ready"))
-    effective_backend = "sqlite_shadow" if enabled and ready and (explicit_enabled or fresh) else "json"
+    enabled = explicit_enabled or (auto_configured and fresh) or (structured_writes_authoritative and ready)
+    if structured_writes_authoritative and ready:
+        effective_backend = "sqlite_structured"
+    elif enabled and ready and (explicit_enabled or fresh):
+        effective_backend = "sqlite_shadow"
+    else:
+        effective_backend = "json"
     health.update({
         "enabled": enabled,
         "backend": requested_backend,
         "backendSource": backend_source,
         "requestedBackend": requested_backend or "json",
+        "writeBackend": write_backend or "json",
+        "writeBackendSource": write_backend_source,
+        "writeBackendHealth": write_health,
         "effectiveBackend": effective_backend,
         "available": bool(store_status.get("available")),
         "ready": ready,
@@ -252,9 +346,48 @@ def _history_document_backend_label() -> str:
 
 
 def _history_write_path_diagnostics() -> dict[str, object]:
+    write_backend, write_backend_source = _history_structured_write_backend_with_source()
+    write_health = _structured_authoritative_write_health_snapshot()
+    if write_backend == "sqlite_structured" and bool(write_health.get("disabled")):
+        document_backend = _history_document_backend_label()
+        return {
+            "requestedBackend": "sqlite_structured",
+            "backendSource": write_backend_source,
+            "effectiveBackend": document_backend,
+            "authoritativeBackend": document_backend,
+            "structuredShadowWrites": _history_structured_shadow_writes_enabled(),
+            "knownFullDocumentRewrite": True,
+            "operations": {
+                "record": "fallback_full_document_load_append_rewrite",
+                "import_records": "fallback_full_document_load_merge_rewrite",
+                "apply_review": "fallback_full_document_load_update_rewrite",
+            },
+            "sqliteStructuredRole": "temporarily_disabled",
+            "fallback": "structured_sqlite_write_error",
+            "fallbackReason": str(write_health.get("last_fallback_reason") or ""),
+            "cooldownRemainingSeconds": write_health.get("cooldown_remaining_seconds", 0),
+        }
+    if write_backend == "sqlite_structured":
+        return {
+            "requestedBackend": "sqlite_structured",
+            "backendSource": write_backend_source,
+            "effectiveBackend": "sqlite_structured",
+            "authoritativeBackend": "sqlite_structured",
+            "structuredShadowWrites": True,
+            "knownFullDocumentRewrite": False,
+            "operations": {
+                "record": "sqlite_append_prune",
+                "import_records": "sqlite_merge_replace",
+                "apply_review": "sqlite_review_update",
+            },
+            "sqliteStructuredRole": "authoritative",
+            "fallback": "json_document_on_error",
+        }
     document_backend = _history_document_backend_label()
     shadow_writes = _history_structured_shadow_writes_enabled()
     return {
+        "requestedBackend": "json",
+        "backendSource": write_backend_source,
         "effectiveBackend": document_backend,
         "authoritativeBackend": document_backend,
         "structuredShadowWrites": shadow_writes,
@@ -275,10 +408,15 @@ def _history_structured_authoritative_readiness(
     effective_backend: str,
     fresh: bool,
 ) -> dict[str, object]:
+    authoritative_writes = _history_structured_authoritative_writes_enabled()
     ready = bool(store_status.get("ready"))
     shadow_writes = _history_structured_shadow_writes_enabled()
-    can_serve_reads = effective_backend == "sqlite_shadow"
-    if not ready:
+    can_serve_reads = effective_backend in {"sqlite_shadow", "sqlite_structured"}
+    if authoritative_writes and ready:
+        reason = ""
+    elif authoritative_writes:
+        reason = str(store_status.get("reason") or "will_initialize_from_json_on_first_write")
+    elif not ready:
         reason = str(store_status.get("reason") or "shadow_db_not_ready")
     elif not fresh and _history_structured_read_auto_configured():
         reason = "shadow_db_stale"
@@ -287,15 +425,20 @@ def _history_structured_authoritative_readiness(
     else:
         reason = "structured_history_is_shadow_only"
     return {
-        "readyForAuthoritativeSwitch": False,
+        "readyForAuthoritativeSwitch": bool(authoritative_writes and ready),
+        "authoritativeWriteEnabled": authoritative_writes,
         "canServeReads": can_serve_reads,
-        "canReceiveShadowWrites": shadow_writes,
+        "canReceiveShadowWrites": shadow_writes or authoritative_writes,
         "shadowReady": ready,
         "shadowFresh": bool(fresh),
         "reason": reason,
         "note": (
-            "Structured SQLite history can be validated and used for guarded reads, "
-            "but runtime record/import/review writes still keep JSON as the authoritative document path."
+            "Structured SQLite history writes are explicitly enabled for record/import/review."
+            if authoritative_writes
+            else (
+                "Structured SQLite history can be validated and used for guarded reads, "
+                "but runtime record/import/review writes still keep JSON as the authoritative document path."
+            )
         ),
     }
 
@@ -303,6 +446,8 @@ def _history_structured_authoritative_readiness(
 def reset_structured_read_health() -> None:
     with _structured_read_health_lock:
         _structured_read_health.clear()
+    with _structured_authoritative_write_health_lock:
+        _structured_authoritative_write_health.clear()
     with _structured_shadow_rebuild_lock:
         _structured_shadow_rebuild_state.clear()
     _clear_structured_read_store_status_cache()
@@ -359,6 +504,14 @@ def _record_structured_read_fallback(operation: str, reason: str, detail: str = 
 
 
 def _structured_read_ready(operation: str) -> bool:
+    if _history_structured_authoritative_writes_enabled():
+        if not _ensure_structured_authoritative_store_ready():
+            _record_structured_read_fallback(operation, "structured_write_backend_not_ready")
+            return False
+        if _structured_read_store_ready():
+            return True
+        _record_structured_read_fallback(operation, "structured_write_backend_not_ready")
+        return False
     if not _history_structured_read_configured():
         return False
     if _history_structured_read_auto_configured():
@@ -671,6 +824,142 @@ def _shadow_apply_history_review(
         return False
 
 
+def _record_structured_authoritative(task_name: str, task_id: str, entry: dict) -> bool:
+    try:
+        if not _ensure_structured_authoritative_store_ready():
+            return False
+        store = _structured_shadow_store()
+        written_storage_keys: list[str] = []
+        with _structured_shadow_write_lock:
+            for key in _history_write_targets(task_id=task_id, task_name=task_name):
+                storage_key = _structured_canonical_storage_key(key)
+                if not storage_key:
+                    continue
+                lock = _get_lock(f"{storage_key}__structured")
+                with lock:
+                    store.append_history_record(storage_key, entry, max_records=MAX_RECORDS)
+                written_storage_keys.append(storage_key)
+            store.set_meta("history_write_backend", "sqlite_structured")
+            store.set_meta("history_last_authoritative_write_at", local_now().isoformat(timespec="seconds"))
+        if task_name and _structured_canonical_storage_key(task_name) in written_storage_keys:
+            _compute_rates_from_structured_store(task_name, store)
+        _clear_structured_read_store_status_cache()
+        return bool(written_storage_keys)
+    except Exception as e:
+        print(f"[History] 写入结构化 SQLite authoritative 历史失败，回退 JSON: {e}")
+        _disable_structured_authoritative_writes_temporarily("record_write_failed", str(e))
+        _clear_structured_read_store_status_cache()
+        return False
+
+
+def _import_records_structured_authoritative(
+    task_name: str,
+    normalized_entries: list[dict],
+    *,
+    task_id: str = "",
+) -> int | None:
+    try:
+        if not _ensure_structured_authoritative_store_ready():
+            return None
+        store = _structured_shadow_store()
+        imported = 0
+        legacy_storage_key = _structured_canonical_storage_key(task_name)
+        recompute_legacy_rates = False
+        with _structured_shadow_write_lock:
+            for key in _history_write_targets(task_id=task_id, task_name=task_name):
+                storage_key = _structured_canonical_storage_key(key)
+                if not storage_key:
+                    continue
+                lock = _get_lock(f"{storage_key}__structured")
+                with lock:
+                    records = store.get_history_records(storage_key)
+                    seen_keys = {
+                        _history_record_dedupe_key(record)
+                        for record in records
+                        if isinstance(record, dict)
+                    }
+                    added_for_target = 0
+                    for entry in normalized_entries:
+                        dedupe_key = _history_record_dedupe_key(entry)
+                        if dedupe_key in seen_keys:
+                            continue
+                        records.append(dict(entry))
+                        seen_keys.add(dedupe_key)
+                        added_for_target += 1
+                    if not added_for_target:
+                        continue
+                    records.sort(key=lambda item: str(item.get("ts") or ""))
+                    if len(records) > MAX_RECORDS:
+                        records = records[-MAX_RECORDS:]
+                    store.import_history_records(storage_key, records, replace=True)
+                    if storage_key == legacy_storage_key:
+                        recompute_legacy_rates = True
+                    imported = max(imported, added_for_target)
+            store.set_meta("history_write_backend", "sqlite_structured")
+            store.set_meta("history_last_authoritative_write_at", local_now().isoformat(timespec="seconds"))
+        if recompute_legacy_rates:
+            _compute_rates_from_structured_store(task_name, store)
+        _clear_structured_read_store_status_cache()
+        return imported
+    except Exception as e:
+        print(f"[History] 导入结构化 SQLite authoritative 历史失败，回退 JSON: {e}")
+        _disable_structured_authoritative_writes_temporarily("import_records_write_failed", str(e))
+        _clear_structured_read_store_status_cache()
+        return None
+
+
+def _apply_review_structured_authoritative(
+    task_name: str,
+    record_id: str,
+    status: str,
+    note: str = "",
+    *,
+    task_id: str = "",
+) -> bool | None:
+    try:
+        if not _ensure_structured_authoritative_store_ready():
+            return None
+        expanded_storage_keys: list[str] = []
+        for key in _history_write_targets(task_id=str(task_id or "").strip(), task_name=str(task_name or "").strip()):
+            for alias in _structured_storage_key_aliases(key):
+                _append_unique_text(expanded_storage_keys, alias)
+        reviewed_at = local_now().strftime("%Y-%m-%d %H:%M:%S")
+        store = _structured_shadow_store()
+        with _structured_shadow_write_lock:
+            result = store.apply_history_review(
+                expanded_storage_keys,
+                record_id,
+                status,
+                note,
+                reviewed_at=reviewed_at,
+            )
+            store.set_meta("history_write_backend", "sqlite_structured")
+            store.set_meta("history_last_authoritative_write_at", local_now().isoformat(timespec="seconds"))
+        changed = int(result.get("changed") or 0) > 0
+        if changed and str(task_name or "").strip():
+            _compute_rates_from_structured_store(task_name, store)
+        _clear_structured_read_store_status_cache()
+        return changed
+    except Exception as e:
+        print(f"[History] 更新结构化 SQLite authoritative 复核失败，回退 JSON: {e}")
+        _disable_structured_authoritative_writes_temporarily("apply_review_write_failed", str(e))
+        _clear_structured_read_store_status_cache()
+        return None
+
+
+def _compute_rates_from_structured_store(task_name: str, store) -> None:
+    normalized_task_name = str(task_name or "").strip()
+    if not normalized_task_name:
+        return
+    storage_key = _structured_canonical_storage_key(normalized_task_name)
+    if not storage_key:
+        return
+    lock = _get_lock(normalized_task_name)
+    with lock:
+        records = store.get_history_records(storage_key)
+        _compute_rates_locked(normalized_task_name, records)
+
+
 def _structured_read_store_available() -> bool:
     return _history_shadow_db_file().exists()
 
@@ -772,8 +1061,49 @@ def _structured_read_store_fresh(store_status: dict[str, object] | None = None) 
     status = store_status if isinstance(store_status, dict) else _structured_read_store_status()
     if not status.get("ready"):
         return False
+    if _history_structured_authoritative_writes_enabled():
+        return True
     stored_signature = str(status.get("stored_signature") or "").strip()
     return bool(stored_signature) and stored_signature == get_history_source_signature()
+
+
+def _ensure_structured_authoritative_store_ready() -> bool:
+    if not _history_structured_authoritative_writes_enabled():
+        return False
+    try:
+        with _structured_shadow_write_lock:
+            store = _structured_shadow_store()
+            initialized = str(store.get_meta("history_write_backend") or "").strip() == "sqlite_structured"
+            if not initialized:
+                sources = _load_history_sources_for_structured_bootstrap()
+                if sources:
+                    store.import_history_sources(sources, replace=True)
+                else:
+                    store.initialize()
+                store.set_meta("history_write_backend", "sqlite_structured")
+                store.set_meta("history_authoritative_initialized_at", local_now().isoformat(timespec="seconds"))
+                store.set_meta("history_source_signature", get_history_source_signature())
+        _clear_structured_read_store_status_cache()
+        return bool(_structured_read_store_status().get("ready"))
+    except Exception as e:
+        print(f"[History] 初始化结构化 SQLite authoritative 历史失败，回退 JSON: {e}")
+        _disable_structured_authoritative_writes_temporarily("bootstrap_failed", str(e))
+        _clear_structured_read_store_status_cache()
+        return False
+
+
+def _load_history_sources_for_structured_bootstrap() -> dict[str, list[dict]]:
+    sources: dict[str, list[dict]] = {}
+    history_dir = _history_dir()
+    for filename in _iter_history_json_filenames():
+        stem = Path(filename).stem
+        if stem.endswith("_rates") or stem.endswith("_periods") or "_trend_" in stem:
+            continue
+        records = _load(history_dir / filename)
+        normalized_records = [record for record in records if isinstance(record, dict)]
+        if normalized_records:
+            sources[stem] = normalized_records
+    return sources
 
 
 def get_history_source_signature() -> str:
@@ -1102,6 +1432,10 @@ def record(
     if isinstance(extra, dict) and extra:
         entry["extra"] = extra
 
+    if _history_structured_authoritative_writes_enabled():
+        if _record_structured_authoritative(task_name, task_id, entry):
+            return entry
+
     shadow_context = _begin_structured_shadow_runtime_write()
     written_storage_keys: list[str] = []
     for key in _history_write_targets(task_id=task_id, task_name=task_name):
@@ -1266,6 +1600,15 @@ def import_records(task_name: str, entries: list[dict], *, task_id: str = "") ->
         normalized_entries.append(entry)
     if not normalized_entries:
         return 0
+
+    if _history_structured_authoritative_writes_enabled():
+        structured_imported = _import_records_structured_authoritative(
+            task_name,
+            normalized_entries,
+            task_id=task_id,
+        )
+        if structured_imported is not None:
+            return structured_imported
 
     shadow_context = _begin_structured_shadow_runtime_write()
     imported = 0
@@ -2105,6 +2448,17 @@ def apply_review(task_name: str, record_id: str, status: str, note: str = "", *,
     status = str(status or "").strip()
     if status not in {"approved", "rejected"}:
         return False
+
+    if _history_structured_authoritative_writes_enabled():
+        structured_changed = _apply_review_structured_authoritative(
+            task_name,
+            record_id,
+            status,
+            note,
+            task_id=task_id,
+        )
+        if structured_changed is not None:
+            return structured_changed
 
     changed = False
     changed_storage_keys: list[str] = []
