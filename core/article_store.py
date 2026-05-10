@@ -5502,14 +5502,14 @@ def get_article_match_refresh_status() -> dict[str, object]:
         status = "interrupted"
     elif running:
         status = "running"
+    elif last_error:
+        status = "error"
     elif finished_at:
         status = "finished"
     elif not running and total > 0:
         status = "finished"
     else:
         status = "idle"
-    if last_error and not running and status != "finished":
-        status = "error"
     return {
         "backend": "sqlite",
         "status": status,

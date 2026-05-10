@@ -307,6 +307,16 @@ _ARTICLE_READ_AUTO_VALUES = {"", "auto", "sqlite_auto", "sqlite_shadow_auto", "a
 _ARTICLE_READ_SQLITE_VALUES = {"sqlite_shadow"}
 _ARTICLE_READ_COMPARE_VALUES = {"sqlite_shadow_compare"}
 _ARTICLE_READ_DISABLED_VALUES = {"0", "false", "no", "off", "disabled", "json", "file", "files"}
+_ARTICLE_MATCH_REFRESH_DEFERRED_REASONS = {"already_running"}
+
+
+def _article_match_refresh_is_deferred(schedule_result: Any) -> bool:
+    if not isinstance(schedule_result, dict):
+        return False
+    if bool(schedule_result.get("scheduled")):
+        return True
+    reason = str(schedule_result.get("reason") or "").strip()
+    return reason in _ARTICLE_MATCH_REFRESH_DEFERRED_REASONS
 
 
 # 前端和后端平台 ID 可能不一致，做双向映射
@@ -2361,7 +2371,7 @@ class AppRuntime:
         resolved_config = config or self.config_provider.load()
         session_payload = session if isinstance(session, dict) else CloudSessionStore().load()
         schedule_result = schedule_article_match_refresh(resolved_config, reason="cloud_upload_snapshot")
-        if schedule_result.get("scheduled"):
+        if _article_match_refresh_is_deferred(schedule_result):
             articles = _apply_articles_account_context(
                 get_articles(),
                 resolved_config,
@@ -5548,7 +5558,8 @@ return changedCount
                 return list(cache.get("articles") or [])
 
             schedule_result = schedule_article_match_refresh(resolved_config, reason="cloud_sync_read")
-            if schedule_result.get("scheduled"):
+            deferred_refresh = _article_match_refresh_is_deferred(schedule_result)
+            if deferred_refresh:
                 articles = _apply_articles_account_context(
                     get_articles(),
                     resolved_config,
@@ -5563,6 +5574,8 @@ return changedCount
                 resolved_config,
                 session=session,
             )
+            if deferred_refresh:
+                return list(articles)
             final_key = (
                 self._article_store_version_key(),
                 cache_key[1],

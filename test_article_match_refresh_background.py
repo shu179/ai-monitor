@@ -60,6 +60,7 @@ class ArticleMatchRefreshBackgroundTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         article_store.wait_for_article_store_backend_migration(timeout=2.0)
+        self._wait_for_background_refresh(timeout=5.0)
         article_store._reset_article_match_refresh_state_for_tests()  # noqa: SLF001
         if self._original_backend is None:
             os.environ.pop(article_store.ARTICLE_STORE_BACKEND_ENV, None)
@@ -182,6 +183,7 @@ class ArticleMatchRefreshBackgroundTests(unittest.TestCase):
             self.assertTrue(result.get("scheduled"), f"Expected scheduled: {result}")
             final_status = self._wait_for_background_refresh(timeout=30.0)
         self.assertIn("injected test error", str(final_status.get("last_error", "")))
+        self.assertEqual(final_status.get("status"), "error")
         # get_articles should still work
         articles = article_store.get_articles()
         self.assertEqual(len(articles), 100)

@@ -380,7 +380,13 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
             },
         ]
 
-        with patch("web_backend.refresh_article_matches", return_value=copy.deepcopy(articles)):
+        with (
+            patch(
+                "web_backend.schedule_article_match_refresh",
+                return_value={"scheduled": False, "reason": "nothing_to_refresh"},
+            ),
+            patch("web_backend.refresh_article_matches", return_value=copy.deepcopy(articles)),
+        ):
             result = runtime._get_cloud_article_upload_snapshot(
                 config,
                 session={
