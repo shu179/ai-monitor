@@ -51,11 +51,15 @@ from core.notification_idempotency import (
 from core.recognition_matching import (
     PLATFORM_DISPLAY,
     PLATFORM_ID_ALIASES,
+    PLATFORM_INFERENCE_TOKENS,
+    PLATFORM_STRONG_HINTS,
     build_keyword_updates_from_batch as _matching_build_keyword_updates_from_batch,
     build_matched_pairs as _matching_build_matched_pairs,
     build_task_matched_pairs as _matching_build_task_matched_pairs,
     display_platform_name as _matching_display_platform_name,
     expand_matched_pair_slots as _matching_expand_matched_pair_slots,
+    infer_platform_from_body_text as _matching_infer_platform_from_body_text,
+    infer_platform_from_text as _matching_infer_platform_from_text,
     normalize_keyword_brand_pair as _matching_normalize_keyword_brand_pair,
     normalize_platform_id as _matching_normalize_platform_id,
     remaining_current_platforms_after_match as _matching_remaining_current_platforms_after_match,
@@ -63,106 +67,6 @@ from core.recognition_matching import (
 )
 from core.time_utils import local_now, local_today
 
-
-PLATFORM_INFERENCE_TOKENS = {
-    "doubao": (
-        ("豆包", 8),
-        ("doubao", 8),
-        ("发送消息或输入/选择技能", 28),
-        ('发送消息或输入"/"选择技能', 28),
-        ("发送消息或输入 / 选择技能", 28),
-        ("选择技能", 12),
-        ("帮我写作", 12),
-        ("图像生成", 12),
-        ("视频生成", 12),
-        ("编程", 6),
-        ("翻译", 6),
-        ("发送消息或输入", 10),
-    ),
-    "deepseek": (
-        ("给deepseek发送消息", 24),
-        ("给 deepseek 发送消息", 24),
-        ("deepseek", 4),
-        ("智能搜索", 4),
-        ("深度思考", 3),
-    ),
-    "ark_deepseek": (
-        ("方舟", 16),
-        ("火山方舟", 20),
-        ("ark", 10),
-        ("volces", 10),
-    ),
-    "kimi": (
-        ("kimi", 24),
-        ("moonshot", 16),
-        ("问点难的，让我多想一步", 10),
-        ("k2.5思考", 3),
-        ("k2.5 思考", 3),
-    ),
-    "tongyi": (
-        ("千问", 22),
-        ("向千问提问", 26),
-        ("任务助理", 22),
-        ("深度研究", 4),
-        ("通义", 16),
-        ("qwen", 12),
-    ),
-    "wenxin": (
-        ("文心", 18),
-        ("一言", 12),
-        ("自动适配需求", 4),
-        ("复杂问题自动深析", 4),
-        ("思考·自动", 2),
-        ("思考-自动", 2),
-    ),
-    "yuanbao": (
-        ("元宝", 18),
-        ("腾讯元宝", 24),
-        ("hunyuan", 12),
-        ("有问题，尽管问", 26),
-        ("shift+enter换行", 28),
-        ("shift+enter 换行", 28),
-        ("工具", 12),
-        ("联网搜索", 2),
-    ),
-    "chatgpt": (("chatgpt", 24), ("openai", 20), ("gpt", 12)),
-    "claude": (("claude", 24), ("anthropic", 20)),
-    "gemini": (("gemini", 24), ("google ai", 20), ("谷歌", 14)),
-    "perplexity": (("perplexity", 24),),
-}
-
-PLATFORM_STRONG_HINTS = {
-    "doubao": (
-        "发送消息或输入/选择技能",
-        '发送消息或输入"/"选择技能',
-        "发送消息或输入 / 选择技能",
-        "选择技能",
-        "帮我写作",
-        "图像生成",
-        "视频生成",
-    ),
-    "deepseek": (
-        "给deepseek发送消息",
-        "给 deepseek 发送消息",
-    ),
-    "yuanbao": (
-        "有问题，尽管问",
-        "shift+enter换行",
-        "shift+enter 换行",
-    ),
-    "tongyi": (
-        "向千问提问",
-        "任务助理",
-    ),
-    "wenxin": (
-        "文心",
-        "自动适配需求",
-    ),
-    "kimi": (
-        "kimi",
-        "moonshot",
-    ),
-}
 
 INPUT_BUBBLE_HINTS = (
     "发送", "输入", "问", "追问", "深度思考", "联网搜索", "上传", "附件",
@@ -2522,75 +2426,10 @@ class ClipboardRecognitionManager:
         return aliases
 
     def _infer_platform_from_text(self, text: str, candidate_platforms: list[str]) -> str:
-        normalized_text = str(text or "").strip().lower()
-        if not normalized_text:
-            return ""
-        compact_text = re.sub(r"\s+", "", normalized_text)
-        for platform in candidate_platforms:
-            for token in PLATFORM_STRONG_HINTS.get(platform, ()):
-                normalized_token = str(token or "").strip().lower()
-                compact_token = re.sub(r"\s+", "", normalized_token)
-                if normalized_token and (
-                    normalized_token in normalized_text or
-                    (compact_token and compact_token in compact_text)
-                ):
-                    return platform
-        best_platform = ""
-        best_score = 0
-        second_score = 0
-        for platform in candidate_platforms:
-            score = 0
-            for token, weight in PLATFORM_INFERENCE_TOKENS.get(platform, ()):
-                normalized_token = str(token or "").strip().lower()
-                compact_token = re.sub(r"\s+", "", normalized_token)
-                if normalized_token and (
-                    normalized_token in normalized_text or
-                    (compact_token and compact_token in compact_text)
-                ):
-                    score += int(weight)
-            if score > best_score:
-                second_score = best_score
-                best_platform = platform
-                best_score = score
-            elif score > second_score:
-                second_score = score
-        if best_score < 16:
-            return ""
-        if second_score and (best_score - second_score) < 6:
-            return ""
-        return best_platform
+        return _matching_infer_platform_from_text(text, candidate_platforms)
 
     def _infer_platform_from_body_text(self, text: str, candidate_platforms: list[str]) -> str:
-        normalized_text = str(text or "").strip().lower()
-        if not normalized_text:
-            return ""
-        compact_text = re.sub(r"\s+", "", normalized_text)
-        best_platform = ""
-        best_score = 0
-        second_score = 0
-        for platform in candidate_platforms:
-            score = 0
-            for token, weight in PLATFORM_INFERENCE_TOKENS.get(platform, ()):
-                normalized_token = str(token or "").strip().lower()
-                compact_token = re.sub(r"\s+", "", normalized_token)
-                if not normalized_token:
-                    continue
-                if normalized_token in normalized_text or (compact_token and compact_token in compact_text):
-                    score += int(weight)
-            if score > best_score:
-                second_score = best_score
-                best_platform = platform
-                best_score = score
-            elif score > second_score:
-                second_score = score
-
-        # 正文里经常会提到别的平台名，必须提高阈值并要求明显领先，避免把豆包正文里的
-        # “DeepSeek”内容误判成 DeepSeek 界面。
-        if best_score < 22:
-            return ""
-        if second_score and (best_score - second_score) < 10:
-            return ""
-        return best_platform
+        return _matching_infer_platform_from_body_text(text, candidate_platforms)
 
     def _extract_bottom_hint_text(self, image_path: str, config: dict) -> str:
         temp_path = None

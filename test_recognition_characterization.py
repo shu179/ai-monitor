@@ -31,6 +31,44 @@ def test_platform_aliases_normalize_existing_ids(manager, raw, expected):
     assert manager._normalize_platform_id(raw) == expected
 
 
+@pytest.mark.parametrize(
+    ("text", "candidates", "expected"),
+    [
+        ("", ["doubao"], ""),
+        (None, ["doubao"], ""),
+        ("豆包 发送消息或输入/选择技能", ["doubao", "deepseek"], "doubao"),
+        ("腾讯元宝 有问题，尽管问", ["yuanbao", "doubao"], "yuanbao"),
+        ("通义千问 向千问提问", ["tongyi", "wenxin"], "tongyi"),
+        ("文心一言 自动适配需求", ["wenxin", "tongyi"], "wenxin"),
+        ("deepseek 智能搜索", ["deepseek"], ""),
+        ("kimi", ["kimi"], "kimi"),
+        ("ChatGPT", ["chatgpt"], "chatgpt"),
+        ("Claude by Anthropic", ["claude"], "claude"),
+        ("Gemini Google AI", ["gemini"], "gemini"),
+        ("Perplexity", ["perplexity"], "perplexity"),
+    ],
+)
+def test_infer_platform_from_text_characterizes_tokens(manager, text, candidates, expected):
+    assert manager._infer_platform_from_text(text, candidates) == expected
+
+
+def test_infer_platform_from_text_characterizes_multi_platform_conflicts(manager):
+    assert manager._infer_platform_from_text("kimi deepseek", ["deepseek", "kimi"]) == "kimi"
+    assert manager._infer_platform_from_text("ChatGPT Claude", ["chatgpt", "claude"]) == "chatgpt"
+    assert manager._infer_platform_from_text("Claude Gemini", ["claude", "gemini"]) == ""
+    assert manager._infer_platform_from_text("给 deepseek 发送消息 Kimi", ["kimi", "deepseek"]) == "kimi"
+    assert manager._infer_platform_from_text("给 deepseek 发送消息 Kimi", ["deepseek", "kimi"]) == "deepseek"
+
+
+def test_infer_platform_from_body_text_uses_stricter_threshold_than_bottom_text(manager):
+    assert manager._infer_platform_from_text("豆包 选择技能", ["doubao"]) == "doubao"
+    assert manager._infer_platform_from_body_text("豆包 选择技能", ["doubao"]) == ""
+    assert manager._infer_platform_from_body_text("ChatGPT", ["chatgpt"]) == "chatgpt"
+    assert manager._infer_platform_from_body_text("ChatGPT Claude", ["chatgpt", "claude"]) == "chatgpt"
+    assert manager._infer_platform_from_body_text("Claude Gemini", ["claude", "gemini"]) == ""
+    assert manager._infer_platform_from_body_text("kimi deepseek", ["deepseek", "kimi"]) == "kimi"
+
+
 def test_matched_pairs_dedupe_expand_and_leave_remaining_platforms_stable(manager):
     serialized = manager._serialize_matched_pairs(
         [
