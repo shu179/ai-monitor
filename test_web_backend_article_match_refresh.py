@@ -56,6 +56,15 @@ def _cloud_session() -> dict:
     }
 
 
+class _FakeCloudOutbox:
+    def __init__(self) -> None:
+        self.bound_session: dict | None = None
+
+    def bind_to_session(self, session: dict) -> "_FakeCloudOutbox":
+        self.bound_session = copy.deepcopy(session)
+        return self
+
+
 class WebBackendArticleMatchRefreshTests(unittest.TestCase):
     def test_get_synced_articles_does_not_cache_deferred_snapshot(self) -> None:
         runtime = _runtime()
@@ -217,6 +226,45 @@ class WebBackendArticleMatchRefreshTests(unittest.TestCase):
         uploaded_articles = enqueue_mock.call_args.args[0]
         self.assertEqual([item["title"] for item in uploaded_articles], ["fresh cloud snapshot"])
         self.assertIsNotNone(runtime._last_article_cloud_enqueue_key)
+
+    def test_recover_cloud_run_history_uploads_skips_deferred_article_snapshot(self) -> None:
+        runtime = _runtime()
+        runtime._lock = threading.RLock()
+        runtime.load_config = lambda: copy.deepcopy(_config())
+        fake_outbox = _FakeCloudOutbox()
+        stale_articles = [_article("stale recovery snapshot")]
+
+        with (
+            patch("web_backend.CloudSessionStore", return_value=_FakeCloudSessionStore(_cloud_session())),
+            patch("web_backend.CloudOutbox", return_value=fake_outbox),
+            patch(
+                "web_backend.enqueue_recent_cloud_run_records_from_history",
+                return_value={"run_queued": 2},
+            ) as run_enqueue_mock,
+            patch(
+                "web_backend.schedule_article_match_refresh",
+                return_value={"scheduled": True, "reason": "cloud_upload_snapshot"},
+            ),
+            patch("web_backend.get_articles", return_value=copy.deepcopy(stale_articles)) as get_articles_mock,
+            patch(
+                "web_backend.refresh_article_matches",
+                side_effect=AssertionError("deferred recovery must not sync refresh"),
+            ) as refresh_mock,
+            patch("web_backend.enqueue_cloud_articles") as article_enqueue_mock,
+            patch.object(runtime, "_schedule_cloud_articles_snapshot_retry") as retry_mock,
+        ):
+            result = runtime._recover_cloud_run_history_uploads()
+
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("run_records"), {"run_queued": 2})
+        self.assertEqual(result.get("articles_sync", {}).get("deferred"), True)
+        self.assertEqual(result.get("articles_sync", {}).get("queued"), 0)
+        run_enqueue_mock.assert_called_once()
+        get_articles_mock.assert_called_once()
+        refresh_mock.assert_not_called()
+        article_enqueue_mock.assert_not_called()
+        retry_mock.assert_called_once()
+        self.assertEqual(fake_outbox.bound_session, _cloud_session())
 
 
 if __name__ == "__main__":

@@ -4803,13 +4803,27 @@ return changedCount
         try:
             with self._lock:
                 config = self.load_config()
-            session_outbox = CloudOutbox().bind_to_session(CloudSessionStore().load())
+            session = CloudSessionStore().load()
+            session_outbox = CloudOutbox().bind_to_session(session)
             run_metrics = enqueue_recent_cloud_run_records_from_history(config, outbox=session_outbox, days=7)
-            article_metrics = enqueue_cloud_articles(
-                self._get_cloud_article_upload_snapshot(config),
+            articles, deferred_refresh = self._get_cloud_article_upload_snapshot_with_refresh_state(
                 config,
-                outbox=session_outbox,
+                session=session,
             )
+            if deferred_refresh:
+                self._schedule_cloud_articles_snapshot_retry()
+                article_metrics = {
+                    "deferred": True,
+                    "reason": "match_refresh_deferred",
+                    "articles": len(articles),
+                    "queued": 0,
+                }
+            else:
+                article_metrics = enqueue_cloud_articles(
+                    articles,
+                    config,
+                    outbox=session_outbox,
+                )
             return {
                 "ok": True,
                 **run_metrics,
