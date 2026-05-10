@@ -44,9 +44,11 @@ from core.notification_retry import (
     start_notification_retry_worker,
 )
 from core.notification_idempotency import (
-    build_payload_hash,
     notification_already_sent,
     record_notification_sent,
+)
+from core.recognition_notifications import (
+    build_recognition_notification_idempotency as _notifications_build_recognition_notification_idempotency,
 )
 from core.recognition_matching import (
     INPUT_BUBBLE_HINTS,
@@ -71,6 +73,7 @@ from core.recognition_progress import (
     batch_image_count as _progress_batch_image_count,
     format_batch_image_progress as _progress_format_batch_image_progress,
     format_threshold_progress_text as _progress_format_threshold_progress_text,
+    keyword_state_complete_for_platforms as _progress_keyword_state_complete_for_platforms,
 )
 from core.time_utils import local_now, local_today
 
@@ -936,28 +939,7 @@ class ClipboardRecognitionManager:
         return _matching_display_platform_name(platform_name)
 
     def _keyword_state_complete_for_platforms(self, state: dict, platforms: list[str]) -> bool:
-        payload = dict(state or {})
-        normalized_platforms = [
-            self._normalize_platform_id(platform)
-            for platform in (platforms or [])
-            if self._normalize_platform_id(platform)
-        ]
-        if not normalized_platforms:
-            return bool(payload.get("run_success")) and bool(payload.get("screenshot_saved"))
-        platform_states = dict(payload.get("platform_states") or {})
-        if platform_states:
-            return all(
-                bool((platform_states.get(platform) or {}).get("run_success"))
-                and bool((platform_states.get(platform) or {}).get("screenshot_saved"))
-                for platform in normalized_platforms
-            )
-        state_platform = self._normalize_platform_id(payload.get("platform", ""))
-        return (
-            len(normalized_platforms) == 1
-            and state_platform == normalized_platforms[0]
-            and bool(payload.get("run_success"))
-            and bool(payload.get("screenshot_saved"))
-        )
+        return _progress_keyword_state_complete_for_platforms(state, platforms)
 
     def _format_threshold_progress_text(self, current_count: int, batch_size: int, historical_count: int) -> str:
         return _progress_format_threshold_progress_text(current_count, batch_size, historical_count)
@@ -3364,26 +3346,15 @@ class ClipboardRecognitionManager:
         detected_platforms: list[str],
         image_count: int,
     ) -> dict:
-        task_id = str((task or {}).get("task_id") or derive_task_id(task or {}) or "").strip()
-        task_name = str((batch or {}).get("task_name") or (task or {}).get("name") or task_id).strip()
-        channel = "recognition_detected_images"
-        run_date = local_today().isoformat()
-        payload_hash = build_payload_hash({
-            "brands": list((batch or {}).get("brands") or []),
-            "completed_keywords": list(completed_keywords or []),
-            "supplemented_keywords": list(supplemented_keywords or []),
-            "detected_platforms": list(detected_platforms or []),
-            "image_count": max(0, int(image_count or 0)),
-        })
-        return {
-            "webhook_url": str(getattr(notifier, "webhook_url", "") or "").strip(),
-            "task_id": task_id,
-            "task_name": task_name,
-            "channel": channel,
-            "run_date": run_date,
-            "round_id": f"{channel}:{task_id or task_name}:{run_date}",
-            "payload_hash": payload_hash,
-        }
+        return _notifications_build_recognition_notification_idempotency(
+            webhook_url=str(getattr(notifier, "webhook_url", "") or "").strip(),
+            task=task,
+            batch=batch,
+            completed_keywords=completed_keywords,
+            supplemented_keywords=supplemented_keywords,
+            detected_platforms=detected_platforms,
+            image_count=image_count,
+        )
 
     def _send_loop(self):
         while True:

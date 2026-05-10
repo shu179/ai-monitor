@@ -2,7 +2,9 @@ from unittest.mock import patch
 
 import pytest
 
+from core.notification_idempotency import build_payload_hash
 from core.recognition import ClipboardRecognitionManager
+from core.time_utils import local_today
 
 
 @pytest.fixture()
@@ -148,6 +150,71 @@ def test_format_threshold_progress_text_characterizes_clamping(
     expected,
 ):
     assert manager._format_threshold_progress_text(current_count, batch_size, historical_count) == expected
+
+
+def test_keyword_state_complete_for_platforms_characterizes_platform_state_shapes(manager):
+    assert manager._keyword_state_complete_for_platforms(
+        {"run_success": True, "screenshot_saved": True},
+        [],
+    ) is True
+    assert manager._keyword_state_complete_for_platforms(
+        {
+            "platform_states": {
+                "doubao": {"run_success": True, "screenshot_saved": True},
+                "deepseek": {"run_success": True, "screenshot_saved": False},
+            }
+        },
+        ["豆包", "DeepSeek"],
+    ) is False
+    assert manager._keyword_state_complete_for_platforms(
+        {
+            "platform_states": {
+                "doubao": {"run_success": True, "screenshot_saved": True},
+                "deepseek": {"run_success": True, "screenshot_saved": True},
+            }
+        },
+        ["豆包", "DeepSeek"],
+    ) is True
+    assert manager._keyword_state_complete_for_platforms(
+        {"platform": "通义千问", "run_success": True, "screenshot_saved": True},
+        ["tongyi"],
+    ) is True
+    assert manager._keyword_state_complete_for_platforms(
+        {"platform": "通义千问", "run_success": True, "screenshot_saved": True},
+        ["tongyi", "doubao"],
+    ) is False
+
+
+def test_recognition_notification_idempotency_characterizes_stable_payload(manager):
+    class _Notifier:
+        webhook_url = " https://qy.example/webhook "
+
+    identity = manager._build_notification_idempotency(
+        _Notifier(),
+        task={"task_id": "task-1", "name": "品牌A任务"},
+        batch={"task_name": "批次任务名", "brands": ["品牌A"]},
+        completed_keywords=["关键词1"],
+        supplemented_keywords=["关键词2"],
+        detected_platforms=["doubao", "deepseek"],
+        image_count=-2,
+    )
+
+    run_date = local_today().isoformat()
+    assert identity == {
+        "webhook_url": "https://qy.example/webhook",
+        "task_id": "task-1",
+        "task_name": "批次任务名",
+        "channel": "recognition_detected_images",
+        "run_date": run_date,
+        "round_id": f"recognition_detected_images:task-1:{run_date}",
+        "payload_hash": build_payload_hash({
+            "brands": ["品牌A"],
+            "completed_keywords": ["关键词1"],
+            "supplemented_keywords": ["关键词2"],
+            "detected_platforms": ["doubao", "deepseek"],
+            "image_count": 0,
+        }),
+    }
 
 
 def test_matched_pairs_dedupe_expand_and_leave_remaining_platforms_stable(manager):
