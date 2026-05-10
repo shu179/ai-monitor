@@ -2,12 +2,6 @@ name: Release Preflight
 
 on:
   workflow_dispatch:
-    inputs:
-      skip_tests:
-        description: 'Skip pytest runs (for quick preflight check)'
-        required: false
-        default: 'false'
-        type: boolean
 
   pull_request:
     types: [opened, synchronize, reopened]
@@ -67,9 +61,12 @@ jobs:
           done
           exit 1
 
-      - name: Set DATABASE_URL for migration
+      - name: Set cloud-server environment
         run: |
-          echo "DATABASE_URL=postgresql://testuser:testpass@localhost:5432/testdb" >> $GITHUB_ENV
+          echo "SURFACED_CLOUD_SECRET_KEY=ci-secret-key-at-least-16-chars" >> $GITHUB_ENV
+          echo "SURFACED_CLOUD_DATABASE_URL=postgresql+psycopg://testuser:testpass@localhost:5432/testdb" >> $GITHUB_ENV
+          echo "SURFACED_CLOUD_EMAIL_VERIFICATION_REQUIRED=false" >> $GITHUB_ENV
+          echo "SURFACED_CLOUD_EMAIL_PROVIDER=smtp" >> $GITHUB_ENV
 
       - name: Run Alembic migration upgrade
         run: |
@@ -79,19 +76,7 @@ jobs:
       - name: Verify constraints exist
         run: |
           cd cloud-server
-          python -c "
-          from sqlalchemy import create_engine, inspect
-          engine = create_engine('${{ env.DATABASE_URL }}')
-          inspector = inspect(engine)
-
-          tables = ['sync_events', 'run_records', 'article_reference_events']
-          for table in tables:
-              constraints = inspector.get_unique_constraints(table)
-              print(f'Table {table} unique constraints: {[c[\"name\"] for c in constraints]}')
-              if not constraints:
-                  raise Exception(f'No unique constraints found for {table}')
-          print('All unique constraints verified!')
-          "
+          python ../.github/workflows/verify_constraints.py
 
       - name: Run cloud-server tests
         run: |
@@ -167,10 +152,10 @@ jobs:
         run: |
           if (Test-Path "web-ui/dist/index.html") {
             Write-Host "web-ui/dist exists, skipping build"
-            Write-Host "::set-output name=needs-build::false"
+            "needs-build=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8
           } else {
             Write-Host "web-ui/dist missing, will build"
-            Write-Host "::set-output name=needs-build::true"
+            "needs-build=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8
           }
 
       - name: Set up Node.js
@@ -236,13 +221,13 @@ jobs:
           compression-level: 9
 
   # ============================================================
-  # Optional: Windows 2025 packaging (matrix extension)
+  # Optional: Windows latest packaging (disabled by default)
+  # Enable by removing 'if: false' or setting to a condition
   # ============================================================
   windows-packaging-edge:
+    if: false
     name: Windows Packaging (Edge)
     runs-on: windows-latest
-    # Uncomment to enable windows-latest matrix testing:
-    # if: false  # Disabled by default, enable manually or via matrix
 
     env:
       PYTHON_VERSION: '3.12'
