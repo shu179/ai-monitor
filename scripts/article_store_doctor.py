@@ -280,8 +280,15 @@ def _match_refresh_job_snapshot(db_path: Path, *, readiness: dict[str, Any]) -> 
         "match_refresh_reason",
     ]
     try:
-        store = _build_store(db_path)
-        meta_snapshot = {key: store.get_meta(key) for key in meta_keys}
+        with _connect_readonly(db_path) as conn:
+            meta_snapshot = {
+                str(row[0] or ""): str(row[1] or "")
+                for row in conn.execute(
+                    "SELECT key, value FROM store_meta WHERE key IN (%s)"
+                    % ",".join("?" for _ in meta_keys),
+                    meta_keys,
+                ).fetchall()
+            }
     except Exception as exc:
         return {"backend": "sqlite", "error": f"{exc.__class__.__name__}: {exc}"}
 

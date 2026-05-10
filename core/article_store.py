@@ -5753,10 +5753,19 @@ def schedule_article_match_refresh(config: dict, *, reason: str = "", force: boo
     }
 
 
-def _reset_article_match_refresh_state_for_tests() -> None:
-    _match_refresh_worker_lock.acquire()
-    try:
-        global _match_refresh_worker_thread
-        _match_refresh_worker_thread = None
-    finally:
-        _match_refresh_worker_lock.release()
+def _reset_article_match_refresh_state_for_tests(timeout: float = 5.0) -> None:
+    global _match_refresh_worker_thread
+    deadline = time.time() + max(0.0, float(timeout or 0.0))
+    while True:
+        with _match_refresh_worker_lock:
+            thread = _match_refresh_worker_thread
+        if thread is None or not thread.is_alive() or thread is threading.current_thread():
+            break
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        thread.join(timeout=min(0.05, max(0.0, remaining)))
+
+    with _match_refresh_worker_lock:
+        if _match_refresh_worker_thread is not None and not _match_refresh_worker_thread.is_alive():
+            _match_refresh_worker_thread = None

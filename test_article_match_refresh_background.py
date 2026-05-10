@@ -291,6 +291,20 @@ class ArticleMatchRefreshBackgroundTests(unittest.TestCase):
         self.assertGreater(int(result.get("processed_count") or 0), 0)
         self.assertEqual(result.get("status"), "finished")
 
+    def test_reset_waits_for_running_background_refresh(self) -> None:
+        self._add_articles(100)
+        config = _minimal_config()
+        os.environ[article_store.ARTICLE_MATCH_REFRESH_SLEEP_SECONDS_ENV] = "0.02"
+        result = article_store.schedule_article_match_refresh(config, reason="test-reset")
+        self.assertTrue(result.get("scheduled"), f"Expected scheduled: {result}")
+
+        article_store._reset_article_match_refresh_state_for_tests(timeout=10.0)  # noqa: SLF001
+
+        status = article_store.get_article_match_refresh_status()
+        self.assertFalse(status.get("worker_alive"), status)
+        self.assertFalse(status.get("running"), status)
+        self.assertEqual(status.get("status"), "finished")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -67,7 +68,8 @@ def test_doctor_reports_fresh_sqlite_as_healthy(tmp_path: Path) -> None:
             verify_json_sqlite=True,
         )
     )
-    summary = run_doctor(DoctorOptions(data_dir=tmp_path, requested_backend="auto"))
+    with patch("scripts.article_store_doctor._build_store", side_effect=AssertionError("check-only must stay readonly")):
+        summary = run_doctor(DoctorOptions(data_dir=tmp_path, requested_backend="auto"))
 
     assert rebuild["operations"][0]["name"] == "rebuild_sqlite"
     assert rebuild["operations"][0]["ok"] is True
