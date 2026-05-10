@@ -751,6 +751,59 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             ["r2", "r3"],
         )
 
+    def test_structured_shadow_read_write_parity_after_record_import_and_review(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_SHADOW_WRITE_ENV] = "1"
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "json"
+
+        recorded = history.record(
+            "Parity Task",
+            "doubao",
+            "keyword",
+            "Brand",
+            1,
+            True,
+            task_id="task_parity",
+        )
+        imported = history.import_records(
+            "Parity Task",
+            [
+                {
+                    "id": "imported-parity",
+                    "ts": "2024-01-02 09:00",
+                    "task_id": "task_parity",
+                    "task_name": "Parity Task",
+                    "platform": "kimi",
+                    "keyword": "keyword imported",
+                    "brand": "Brand",
+                    "rank": 2,
+                    "success": True,
+                    "review_status": "pending",
+                }
+            ],
+            task_id="task_parity",
+        )
+        changed = history.apply_review("Parity Task", recorded["id"], "approved", "ok", task_id="task_parity")
+        json_records = history.get_records("Parity Task", task_id="task_parity")
+        json_pending = history.get_pending_reviews(limit=10)
+
+        os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "sqlite_shadow"
+        history.reset_structured_read_health()
+        sqlite_records = history.get_records("Parity Task", task_id="task_parity")
+        sqlite_pending = history.get_pending_reviews(limit=10)
+
+        self.assertEqual(imported, 1)
+        self.assertTrue(changed)
+        self.assertEqual(
+            [(item["id"], item["review_status"]) for item in sqlite_records],
+            [(item["id"], item["review_status"]) for item in json_records],
+        )
+        self.assertEqual(
+            [item["id"] for item in sqlite_pending],
+            [item["id"] for item in json_pending],
+        )
+        self.assertEqual(history.get_structured_read_health()["effectiveBackend"], "sqlite_shadow")
+
     def test_structured_read_backend_reads_records_and_derived_views_when_enabled(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
         os.environ[history.STRUCTURED_READ_BACKEND_ENV] = "sqlite_shadow"

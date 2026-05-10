@@ -238,7 +238,66 @@ def get_structured_read_health() -> dict:
         "shadowWritesEnabled": _history_structured_shadow_writes_enabled(),
         "db_path": str(_history_shadow_db_file()),
     })
+    health["authoritativeReadiness"] = _history_structured_authoritative_readiness(
+        store_status,
+        effective_backend=effective_backend,
+        fresh=fresh,
+    )
+    health["writePath"] = _history_write_path_diagnostics()
     return health
+
+
+def _history_document_backend_label() -> str:
+    return "sqlite_json_document" if _history_uses_sqlite() else "json_file"
+
+
+def _history_write_path_diagnostics() -> dict[str, object]:
+    document_backend = _history_document_backend_label()
+    shadow_writes = _history_structured_shadow_writes_enabled()
+    return {
+        "effectiveBackend": document_backend,
+        "authoritativeBackend": document_backend,
+        "structuredShadowWrites": shadow_writes,
+        "knownFullDocumentRewrite": True,
+        "operations": {
+            "record": "full_document_load_append_rewrite",
+            "import_records": "full_document_load_merge_rewrite",
+            "apply_review": "full_document_load_update_rewrite",
+        },
+        "sqliteStructuredRole": "shadow_write_through" if shadow_writes else "disabled",
+        "fallback": "json_file" if document_backend == "sqlite_json_document" else "",
+    }
+
+
+def _history_structured_authoritative_readiness(
+    store_status: dict[str, object],
+    *,
+    effective_backend: str,
+    fresh: bool,
+) -> dict[str, object]:
+    ready = bool(store_status.get("ready"))
+    shadow_writes = _history_structured_shadow_writes_enabled()
+    can_serve_reads = effective_backend == "sqlite_shadow"
+    if not ready:
+        reason = str(store_status.get("reason") or "shadow_db_not_ready")
+    elif not fresh and _history_structured_read_auto_configured():
+        reason = "shadow_db_stale"
+    elif not shadow_writes:
+        reason = "shadow_writes_disabled"
+    else:
+        reason = "structured_history_is_shadow_only"
+    return {
+        "readyForAuthoritativeSwitch": False,
+        "canServeReads": can_serve_reads,
+        "canReceiveShadowWrites": shadow_writes,
+        "shadowReady": ready,
+        "shadowFresh": bool(fresh),
+        "reason": reason,
+        "note": (
+            "Structured SQLite history can be validated and used for guarded reads, "
+            "but runtime record/import/review writes still keep JSON as the authoritative document path."
+        ),
+    }
 
 
 def reset_structured_read_health() -> None:
