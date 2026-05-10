@@ -5,20 +5,24 @@ from __future__ import annotations
 import threading
 import unittest
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 from core.notifier import WeComNotifier
 
 
 class CooldownRaceTests(unittest.TestCase):
     def setUp(self) -> None:
-        WeComNotifier._shared_last_sent = {}
-        WeComNotifier._shared_pending = {}
-        WeComNotifier._shared_last_post = {}
-        WeComNotifier._shared_post_locks = {}
+        with WeComNotifier._shared_lock:
+            WeComNotifier._shared_last_sent.clear()
+            WeComNotifier._shared_pending.clear()
+        with WeComNotifier._shared_post_lock:
+            WeComNotifier._shared_last_post.clear()
+            WeComNotifier._shared_post_locks.clear()
+        self.webhook_url = f"https://example.invalid/wecom-test/{uuid4().hex}"
 
     def _make_notifier(self, cooldown_minutes: int = 30) -> WeComNotifier:
         return WeComNotifier(
-            webhook_url="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=PLACEHOLDER",
+            webhook_url=self.webhook_url,
             cooldown_minutes=cooldown_minutes,
             send_interval=0,
         )
