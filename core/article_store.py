@@ -2793,12 +2793,9 @@ def _prune_cloud_articles_by_visible_task_ids_sqlite(
 
 
 def _refresh_article_matches_sqlite(config: dict) -> list:
-    valid_task_names = {
-        str(task.get("name", "") or "").strip()
-        for task in (config.get("tasks", []) or [])
-        if str(task.get("name", "") or "").strip()
-    }
-    config_signature = _article_match_config_signature(config)
+    compiled_matcher = compile_article_matcher(config)
+    valid_task_names = compiled_matcher.valid_task_names
+    config_signature = compiled_matcher.config_signature
     store = _article_sqlite_store()
     stats = store.get_match_refresh_stats(config_signature)
     if int(stats.get("needs_refresh_count") or 0) <= 0:
@@ -2826,7 +2823,8 @@ def _refresh_article_matches_sqlite(config: dict) -> list:
                 and str(name or "").strip() not in excluded_task_names
             ]
             existing_reasons = article.get("match_reasons") if isinstance(article.get("match_reasons"), dict) else {}
-            current_signature = _article_match_signature(article, config_signature)
+            fields = _build_match_fields(str(article.get("title", "") or ""), article)
+            current_signature = _article_match_signature(article, config_signature, fields=fields)
             metadata_changed = (
                 str(article.get("_match_signature") or "") != current_signature
                 or str(article.get("_match_config_signature") or "") != config_signature
@@ -2853,7 +2851,13 @@ def _refresh_article_matches_sqlite(config: dict) -> list:
                     })
                 continue
 
-            analyzed = analyze_article_matches(article.get("title", ""), config, article=article)
+            analyzed = analyze_article_matches(
+                article.get("title", ""),
+                config,
+                article=article,
+                compiled_matcher=compiled_matcher,
+                fields=fields,
+            )
             inferred = [
                 str(name or "").strip()
                 for name in (analyzed.get("matched_tasks") or [])
@@ -4287,9 +4291,7 @@ def _has_strong_boundary_overlap(left: str, right: str) -> bool:
     return max(prefix, suffix) >= 2
 
 
-def _near_substring_match(haystack: str, candidate: str) -> bool:
-    normalized_haystack = _normalize_match_text(haystack)
-    normalized_candidate = _normalize_match_text(candidate)
+def _near_substring_match_normalized(normalized_haystack: str, normalized_candidate: str) -> bool:
     if len(normalized_candidate) < 4 or len(normalized_haystack) < 3:
         return False
 
@@ -4307,6 +4309,13 @@ def _near_substring_match(haystack: str, candidate: str) -> bool:
     return False
 
 
+def _near_substring_match(haystack: str, candidate: str) -> bool:
+    return _near_substring_match_normalized(
+        _normalize_match_text(haystack),
+        _normalize_match_text(candidate),
+    )
+
+
 def _candidate_matches_article(haystack: str, candidate: str) -> bool:
     normalized_candidate = _normalize_match_text(candidate)
     if not normalized_candidate:
@@ -4316,7 +4325,7 @@ def _candidate_matches_article(haystack: str, candidate: str) -> bool:
     segments = [seg for seg in _build_match_segments(candidate) if len(seg) >= 2 or re.search(r"[a-z]", seg)]
     if len(segments) >= 2 and _ordered_segments_match(haystack, segments):
         return True
-    return _near_substring_match(haystack, normalized_candidate)
+    return _near_substring_match_normalized(haystack, normalized_candidate)
 
 
 def _build_char_ngrams(text: str, size: int) -> list[str]:
@@ -4587,6 +4596,374 @@ def _collect_title_tag_hits(fields: dict[str, str], task: dict) -> dict[str, lis
     }
 
 
+class _CompiledMatchTerm:
+    __slots__ = (
+        "raw",
+        "normalized",
+        "segments",
+        "stripped_insertion",
+        "stripped_insertion_segments",
+        "provider_subject",
+        "provider_subject_segments",
+        "ngrams",
+    )
+
+    def __init__(self, raw: str) -> None:
+        self.raw = str(raw or "").strip()
+        self.normalized = _normalize_match_text(self.raw)
+        self.segments = [
+            segment
+            for segment in _build_match_segments(self.normalized)
+            if len(segment) >= 2 or re.search(r"[a-z]", segment)
+        ]
+        self.stripped_insertion = _strip_title_insertion_noise(self.normalized)
+        self.stripped_insertion_segments = [
+            segment
+            for segment in _build_match_segments(self.stripped_insertion)
+            if len(segment) >= 2 or re.search(r"[a-z]", segment)
+        ]
+        provider_subjects = _extract_provider_subject_terms(self.normalized)
+        self.provider_subject = provider_subjects[0] if provider_subjects else ""
+        self.provider_subject_segments = [
+            segment
+            for segment in _build_match_segments(self.provider_subject)
+            if len(segment) >= 2 or re.search(r"[a-z]", segment)
+        ]
+        if len(self.normalized) >= 6:
+            ngram_size = 4 if len(self.normalized) >= 10 else 3
+            self.ngrams = _build_char_ngrams(self.normalized, ngram_size)
+        else:
+            self.ngrams = []
+
+
+class _CompiledArticleTask:
+    __slots__ = (
+        "task_name",
+        "brand_terms",
+        "normalized_brand_terms",
+        "brand_match_terms",
+        "keyword_terms",
+        "keyword_match_terms",
+        "keyword_core_texts",
+        "core_match_terms",
+        "core_candidate_match_terms",
+        "provider_subject_terms",
+        "provider_subject_match_terms",
+        "brand_removed_context_terms",
+        "brand_removed_context_match_terms",
+        "industry_tags",
+        "region_tags",
+        "industry_match_terms",
+        "region_match_terms",
+    )
+
+    def __init__(self, task: dict) -> None:
+        self.task_name = str(task.get("name", "") or "").strip()
+        task_brand = str(task.get("brand", "") or "").strip()
+        keywords = task.get("keywords", [])
+        if not keywords and task.get("keyword"):
+            keywords = [{"keyword": task["keyword"]}]
+
+        self.keyword_terms = _dedupe_texts([
+            str((entry or {}).get("keyword", "") or "").strip()
+            for entry in keywords
+            if isinstance(entry, dict)
+        ])
+        self.brand_terms = _dedupe_texts(
+            [task_brand]
+            + [
+                str((entry or {}).get("brand", "") or "").strip()
+                for entry in keywords
+                if isinstance(entry, dict)
+            ]
+        )
+        self.normalized_brand_terms = [
+            _normalize_match_text(term)
+            for term in self.brand_terms
+            if _normalize_match_text(term)
+        ]
+        self.brand_match_terms = [_CompiledMatchTerm(term) for term in self.brand_terms]
+        self.keyword_match_terms = [_CompiledMatchTerm(term) for term in self.keyword_terms]
+
+        self.keyword_core_texts: dict[str, list[str]] = {}
+        core_terms: list[str] = []
+        provider_subject_terms: list[str] = []
+        context_terms: list[str] = []
+        core_candidate_terms: list[str] = []
+        for keyword in self.keyword_terms:
+            keyword_core_terms = [
+                core_text
+                for core_text in _extract_core_keyword_texts(keyword, task=task)
+                if core_text and core_text != keyword
+            ]
+            self.keyword_core_texts[keyword] = keyword_core_terms
+            core_terms.extend(keyword_core_terms)
+            core_candidate_terms.extend(keyword_core_terms)
+            current_provider_subject_terms = _extract_provider_subject_terms(keyword)
+            provider_subject_terms.extend(current_provider_subject_terms)
+            core_candidate_terms.extend(current_provider_subject_terms)
+            current_context_terms = _remove_brand_terms_from_keyword(keyword, self.brand_terms)
+            context_terms.extend(current_context_terms)
+            core_candidate_terms.extend(current_context_terms)
+
+        self.core_match_terms = [_CompiledMatchTerm(term) for term in core_terms]
+        self.core_candidate_match_terms = [
+            _CompiledMatchTerm(term)
+            for term in core_candidate_terms
+        ]
+        self.provider_subject_terms = _dedupe_texts(provider_subject_terms)
+        self.provider_subject_match_terms = [
+            _CompiledMatchTerm(term)
+            for term in self.provider_subject_terms
+        ]
+        self.brand_removed_context_terms = _dedupe_texts(context_terms)
+        self.brand_removed_context_match_terms = [
+            _CompiledMatchTerm(term)
+            for term in self.brand_removed_context_terms
+        ]
+        self.industry_tags = _dedupe_texts([
+            str(term or "").strip()
+            for term in (task.get("industry_tags") or [])
+            if str(term or "").strip()
+        ])
+        self.region_tags = _dedupe_texts([
+            str(term or "").strip()
+            for term in (task.get("region_tags") or [])
+            if str(term or "").strip()
+        ])
+        self.industry_match_terms = [_CompiledMatchTerm(term) for term in self.industry_tags]
+        self.region_match_terms = [_CompiledMatchTerm(term) for term in self.region_tags]
+
+
+class CompiledArticleMatcher:
+    """Preprocessed article matcher for refresh batches sharing one config."""
+
+    __slots__ = ("config_signature", "tasks", "valid_task_names")
+
+    def __init__(self, config: dict | None) -> None:
+        self.config_signature = _article_match_config_signature(config)
+        self.tasks = [
+            compiled_task
+            for compiled_task in (
+                _CompiledArticleTask(task)
+                for task in ((config or {}).get("tasks", []) or [])
+                if isinstance(task, dict)
+            )
+            if compiled_task.task_name
+        ]
+        self.valid_task_names = {task.task_name for task in self.tasks}
+
+    def analyze(
+        self,
+        title: str,
+        article: dict | None = None,
+        *,
+        fields: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        match_fields = fields if fields is not None else _build_match_fields(title, article)
+        return _analyze_article_matches_compiled(match_fields, self)
+
+
+def compile_article_matcher(config: dict | None) -> CompiledArticleMatcher:
+    return CompiledArticleMatcher(config)
+
+
+def _compiled_candidate_matches(
+    normalized_haystack: str,
+    normalized_candidate: str,
+    segments: list[str],
+) -> bool:
+    if not normalized_candidate:
+        return False
+    if normalized_candidate in normalized_haystack:
+        return True
+    if len(segments) >= 2 and _ordered_segments_match(normalized_haystack, segments):
+        return True
+    return _near_substring_match_normalized(normalized_haystack, normalized_candidate)
+
+
+def _compiled_candidate_term_matches(normalized_haystack: str, term: _CompiledMatchTerm) -> bool:
+    return _compiled_candidate_matches(normalized_haystack, term.normalized, term.segments)
+
+
+def _build_compiled_title_context(fields: dict[str, str]) -> dict[str, str]:
+    title = fields["title"]
+    provider_subject = ""
+    if any(term in title for term in _PROVIDER_EQUIVALENT_NORMALIZED):
+        provider_subject = _strip_equivalent_provider_terms(title)
+    return {
+        "title": title,
+        "provider_subject": provider_subject,
+        "stripped_insertion": _strip_title_insertion_noise(title),
+    }
+
+
+def _compiled_keyword_theme_matches_title(
+    title_context: dict[str, str],
+    term: _CompiledMatchTerm,
+) -> bool:
+    normalized_title = title_context["title"]
+    normalized_keyword = term.normalized
+    if not normalized_title or not normalized_keyword:
+        return False
+    if _compiled_candidate_term_matches(normalized_title, term):
+        return True
+    title_provider_subject = title_context.get("provider_subject", "")
+    if (
+        title_provider_subject
+        and term.provider_subject
+        and len(title_provider_subject) >= 3
+        and len(term.provider_subject) >= 3
+        and _compiled_candidate_matches(
+            title_provider_subject,
+            term.provider_subject,
+            term.provider_subject_segments,
+        )
+    ):
+        return True
+
+    stripped_title = title_context.get("stripped_insertion", "")
+    stripped_keyword = term.stripped_insertion
+    if (
+        stripped_title
+        and stripped_keyword
+        and (stripped_title != normalized_title or stripped_keyword != normalized_keyword)
+        and _compiled_candidate_matches(
+            stripped_title,
+            stripped_keyword,
+            term.stripped_insertion_segments,
+        )
+    ):
+        return True
+
+    if len(normalized_keyword) >= 4:
+        for split_idx in range(2, len(normalized_keyword) - 1):
+            left = normalized_keyword[:split_idx]
+            right = normalized_keyword[split_idx:]
+            if len(left) < 2 or len(right) < 2:
+                continue
+            left_idx = normalized_title.find(left)
+            if left_idx < 0:
+                continue
+            search_start = left_idx + len(left)
+            right_idx = normalized_title.find(right, search_start)
+            if right_idx < 0:
+                continue
+            gap = normalized_title[search_start:right_idx]
+            if not gap or len(gap) > 4:
+                continue
+            if gap in _TITLE_INSERTION_NOISE_NORMALIZED:
+                return True
+
+    if len(normalized_title) < 8 or len(normalized_keyword) < 6:
+        return False
+
+    matcher = SequenceMatcher(None, normalized_keyword, normalized_title)
+    matching_blocks = matcher.get_matching_blocks()
+    max_block = max((block.size for block in matching_blocks), default=0)
+    ratio = matcher.ratio()
+    keyword_len = len(normalized_keyword)
+
+    if ratio >= 0.72 and max_block >= max(6, min(12, keyword_len - 1)):
+        return True
+
+    if len(term.ngrams) < 2:
+        return False
+    hit_count = sum(1 for gram in term.ngrams if gram in normalized_title)
+    hit_ratio = hit_count / len(term.ngrams)
+    if max_block >= max(6, int(keyword_len * 0.45)) and hit_ratio >= 0.45:
+        return True
+    return False
+
+
+def _collect_compiled_title_tag_hits(
+    title_context: dict[str, str],
+    task: _CompiledArticleTask,
+) -> dict[str, list[str]]:
+    industry_hits = [
+        term.raw
+        for term in task.industry_match_terms
+        if _compiled_candidate_term_matches(title_context["title"], term)
+        or _compiled_keyword_theme_matches_title(title_context, term)
+    ]
+    region_hits = [
+        term.raw
+        for term in task.region_match_terms
+        if _compiled_candidate_term_matches(title_context["title"], term)
+        or _compiled_keyword_theme_matches_title(title_context, term)
+    ]
+    if not industry_hits or not region_hits:
+        return {"industry": [], "region": []}
+    return {
+        "industry": industry_hits,
+        "region": region_hits,
+    }
+
+
+def _collect_compiled_task_candidates(
+    task: _CompiledArticleTask,
+    fields: dict[str, str],
+    title_context: dict[str, str],
+) -> dict[str, object]:
+    title_brand_hits = [
+        term.raw
+        for term in task.brand_match_terms
+        if _compiled_candidate_term_matches(fields["title"], term)
+    ]
+    title_keyword_hits = [
+        term.raw
+        for term in task.keyword_match_terms
+        if _compiled_keyword_theme_matches_title(title_context, term)
+    ]
+
+    core_hits: list[str] = []
+    for term in task.core_candidate_match_terms:
+        if _compiled_keyword_theme_matches_title(title_context, term):
+            core_hits.append(term.raw)
+
+    excerpt_brand_hits = [
+        term.raw
+        for term in task.brand_match_terms
+        if _compiled_candidate_term_matches(fields["excerpt"], term)
+    ]
+    meta_brand_hits = [
+        term.raw
+        for term in task.brand_match_terms
+        if any(_compiled_candidate_term_matches(fields[key], term) for key in ("source", "platform", "url"))
+    ]
+
+    title_reasons: list[str] = []
+    if title_brand_hits:
+        title_reasons.append(f"标题命中品牌名“{_format_term_list(title_brand_hits, 1)}”")
+    if title_keyword_hits:
+        title_reasons.append(f"标题命中关键词“{_format_term_list(title_keyword_hits, 1)}”")
+    if core_hits and not title_keyword_hits:
+        title_reasons.append(f"标题命中核心词“{_format_term_list(core_hits, 1)}”")
+
+    title_tag_hits = _collect_compiled_title_tag_hits(title_context, task)
+    if title_tag_hits.get("industry") and title_tag_hits.get("region"):
+        title_reasons.append(
+            "标题命中行业/地区标签"
+            f"“{_format_term_list(title_tag_hits['industry'], 1)} / {_format_term_list(title_tag_hits['region'], 1)}”"
+        )
+
+    return {
+        "candidate": bool(
+            title_brand_hits
+            or title_keyword_hits
+            or core_hits
+            or (title_tag_hits.get("industry") and title_tag_hits.get("region"))
+        ),
+        "title_brand_hits": title_brand_hits,
+        "title_keyword_hits": title_keyword_hits,
+        "core_hits": core_hits,
+        "title_tag_hits": title_tag_hits,
+        "excerpt_brand_hits": excerpt_brand_hits,
+        "meta_brand_hits": meta_brand_hits,
+        "title_reasons": title_reasons[:2],
+    }
+
+
 def _collect_task_candidates(task: dict, fields: dict[str, str]) -> dict[str, object]:
     task_brand = str(task.get("brand", "") or "").strip()
     keywords = task.get("keywords", [])
@@ -4657,9 +5034,10 @@ def _collect_task_candidates(task: dict, fields: dict[str, str]) -> dict[str, ob
     }
 
 
-def analyze_article_matches(title: str, config: dict, article: dict | None = None) -> dict[str, object]:
-    """返回文章命中的任务、命中原因及未命中提示。"""
-    fields = _build_match_fields(title, article)
+def _finalize_article_match_candidates(
+    fields: dict[str, str],
+    candidates: list[dict[str, object]],
+) -> dict[str, object]:
     if not fields["full"]:
         return {
             "matched_tasks": [],
@@ -4669,19 +5047,6 @@ def analyze_article_matches(title: str, config: dict, article: dict | None = Non
 
     matched: list[str] = []
     match_reasons: dict[str, list[str]] = {}
-    candidates: list[dict[str, object]] = []
-    for task in config.get("tasks", []):
-        task_name = task.get("name", "").strip()
-        if not task_name:
-            continue
-        candidate_info = _collect_task_candidates(task, fields)
-        if not bool(candidate_info.get("candidate")):
-            continue
-        candidates.append({
-            "task_name": task_name,
-            **candidate_info,
-        })
-
     unmatched_reason = ""
     if not candidates:
         unmatched_reason = "标题未命中任何关键词核心词，暂未归类"
@@ -4758,6 +5123,58 @@ def analyze_article_matches(title: str, config: dict, article: dict | None = Non
         "match_reasons": match_reasons,
         "unmatched_reason": unmatched_reason,
     }
+
+
+def _analyze_article_matches_compiled(
+    fields: dict[str, str],
+    compiled_matcher: CompiledArticleMatcher,
+) -> dict[str, object]:
+    if not fields["full"]:
+        return _finalize_article_match_candidates(fields, [])
+
+    title_context = _build_compiled_title_context(fields)
+    candidates: list[dict[str, object]] = []
+    for task in compiled_matcher.tasks:
+        candidate_info = _collect_compiled_task_candidates(task, fields, title_context)
+        if not bool(candidate_info.get("candidate")):
+            continue
+        candidates.append({
+            "task_name": task.task_name,
+            **candidate_info,
+        })
+    return _finalize_article_match_candidates(fields, candidates)
+
+
+def analyze_article_matches(
+    title: str,
+    config: dict,
+    article: dict | None = None,
+    *,
+    compiled_matcher: CompiledArticleMatcher | None = None,
+    fields: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """返回文章命中的任务、命中原因及未命中提示。"""
+    match_fields = fields if fields is not None else _build_match_fields(title, article)
+    if compiled_matcher is not None:
+        return compiled_matcher.analyze(title, article=article, fields=match_fields)
+
+    if not match_fields["full"]:
+        return _finalize_article_match_candidates(match_fields, [])
+
+    candidates: list[dict[str, object]] = []
+    for task in config.get("tasks", []):
+        task_name = task.get("name", "").strip()
+        if not task_name:
+            continue
+        candidate_info = _collect_task_candidates(task, match_fields)
+        if not bool(candidate_info.get("candidate")):
+            continue
+        candidates.append({
+            "task_name": task_name,
+            **candidate_info,
+        })
+
+    return _finalize_article_match_candidates(match_fields, candidates)
 
 
 def match_tasks(title: str, config: dict, article: dict | None = None) -> list:
@@ -4872,12 +5289,21 @@ def _article_match_config_signature(config: dict | None) -> str:
     return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def _article_match_signature(article: dict, config_signature: str) -> str:
-    fields = _build_match_fields(str((article or {}).get("title", "") or ""), article)
+def _article_match_signature(
+    article: dict,
+    config_signature: str,
+    *,
+    fields: dict[str, str] | None = None,
+) -> str:
+    match_fields = (
+        fields
+        if fields is not None
+        else _build_match_fields(str((article or {}).get("title", "") or ""), article)
+    )
     payload = {
         "version": 2,
         "config": config_signature,
-        "fields": fields,
+        "fields": match_fields,
         "excluded_tasks": sorted(
             str(name or "").strip()
             for name in ((article or {}).get("excluded_tasks") or [])
@@ -4896,12 +5322,9 @@ def refresh_article_matches(config: dict) -> list:
     if _article_store_sqlite_enabled():
         return _refresh_article_matches_sqlite(config)
 
-    valid_task_names = {
-        str(task.get("name", "") or "").strip()
-        for task in (config.get("tasks", []) or [])
-        if str(task.get("name", "") or "").strip()
-    }
-    config_signature = _article_match_config_signature(config)
+    compiled_matcher = compile_article_matcher(config)
+    valid_task_names = compiled_matcher.valid_task_names
+    config_signature = compiled_matcher.config_signature
 
     updated_articles: list[dict] = []
     shadow_context: dict[str, object] | None = None
@@ -4926,7 +5349,8 @@ def refresh_article_matches(config: dict) -> list:
                 and str(name or "").strip() not in excluded_task_names
             ]
             existing_reasons = article.get("match_reasons") if isinstance(article.get("match_reasons"), dict) else {}
-            current_signature = _article_match_signature(article, config_signature)
+            fields = _build_match_fields(str(article.get("title", "") or ""), article)
+            current_signature = _article_match_signature(article, config_signature, fields=fields)
             if str(article.get("_match_signature") or "") == current_signature:
                 match_reasons = {
                     task_name: existing_reasons.get(task_name) or ["保留历史归类"]
@@ -4945,7 +5369,13 @@ def refresh_article_matches(config: dict) -> list:
                     changed = True
                 continue
 
-            analyzed = analyze_article_matches(article.get("title", ""), config, article=article)
+            analyzed = analyze_article_matches(
+                article.get("title", ""),
+                config,
+                article=article,
+                compiled_matcher=compiled_matcher,
+                fields=fields,
+            )
             inferred = [
                 str(name or "").strip()
                 for name in (analyzed.get("matched_tasks") or [])

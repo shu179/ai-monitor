@@ -102,6 +102,14 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
         self.assertIn("refresh_cold_full_seconds", refresh_details)
         self.assertIn("refresh_warm_noop_seconds", refresh_details)
         self.assertIn("refresh_small_dirty_seconds", refresh_details)
+        self.assertIn("matcher_compile_seconds", refresh_details)
+        self.assertIn("refresh_cold_full_analyze_calls", refresh_details)
+        self.assertEqual(refresh_details["refresh_warm_noop_analyze_calls"], 0)
+        self.assertEqual(
+            refresh_details["refresh_small_dirty_analyze_calls"],
+            len(refresh_details["dirty_article_ids"]),
+        )
+        self.assertGreater(refresh_details["refresh_cold_full_analyze_calls"], 0)
         self.assertEqual(refresh_details["effective_backend"], "json_authoritative_with_sqlite_shadow_write_through_full_scan")
 
     def test_small_benchmark_supports_sqlite_authoritative_backend(self) -> None:
@@ -164,6 +172,14 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
             "refresh_small_dirty_seconds",
             operations["refresh_article_matches"]["details"],
         )
+        refresh_details = operations["refresh_article_matches"]["details"]
+        self.assertIn("matcher_compile_seconds", refresh_details)
+        self.assertEqual(refresh_details["refresh_warm_noop_analyze_calls"], 0)
+        self.assertEqual(
+            refresh_details["refresh_small_dirty_analyze_calls"],
+            len(refresh_details["dirty_article_ids"]),
+        )
+        self.assertGreater(refresh_details["refresh_cold_full_analyze_calls"], 0)
 
     def test_small_benchmark_supports_guarded_auto_backend(self) -> None:
         original_articles_file = article_store.ARTICLES_FILE

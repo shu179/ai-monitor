@@ -931,6 +931,7 @@ def _delete_single_article(count: int) -> dict[str, Any]:
 
 def _refresh_article_matches(config: dict[str, Any], counter: dict[str, int]) -> dict[str, Any]:
     backend_label = _article_authoritative_backend_label()
+    matcher_compile = _time_compile_article_matcher(config)
     cold = _timed_refresh_article_matches(config, counter)
     warm = _timed_refresh_article_matches(config, counter)
     dirty_article_ids = _mark_small_dirty_articles(config)
@@ -946,6 +947,11 @@ def _refresh_article_matches(config: dict[str, Any], counter: dict[str, int]) ->
         "refresh_cold_full_seconds": cold["elapsed_seconds"],
         "refresh_warm_noop_seconds": warm["elapsed_seconds"],
         "refresh_small_dirty_seconds": small_dirty["elapsed_seconds"],
+        "matcher_compile_seconds": matcher_compile["elapsed_seconds"],
+        "matcher_compile_task_count": matcher_compile["task_count"],
+        "refresh_cold_full_analyze_calls": cold["analyze_calls"],
+        "refresh_warm_noop_analyze_calls": warm["analyze_calls"],
+        "refresh_small_dirty_analyze_calls": small_dirty["analyze_calls"],
         "refresh_cold_full_returned": cold["articles_returned"],
         "refresh_warm_noop_returned": warm["articles_returned"],
         "refresh_small_dirty_returned": small_dirty["articles_returned"],
@@ -953,13 +959,35 @@ def _refresh_article_matches(config: dict[str, Any], counter: dict[str, int]) ->
     }
 
 
+def _time_compile_article_matcher(config: dict[str, Any]) -> dict[str, Any]:
+    started = time.perf_counter()
+    compiled = article_store.compile_article_matcher(config)
+    return {
+        "elapsed_seconds": round(time.perf_counter() - started, 6),
+        "task_count": len(compiled.tasks),
+    }
+
+
 def _timed_refresh_article_matches(config: dict[str, Any], counter: dict[str, int]) -> dict[str, Any]:
     counter["count"] = int(counter.get("count") or 0) + 1
     started = time.perf_counter()
-    articles = article_store.refresh_article_matches(config)
+    analyze_calls = 0
+    original_analyze = article_store.analyze_article_matches
+
+    def counting_analyze_article_matches(*args: Any, **kwargs: Any) -> dict[str, object]:
+        nonlocal analyze_calls
+        analyze_calls += 1
+        return original_analyze(*args, **kwargs)
+
+    article_store.analyze_article_matches = counting_analyze_article_matches
+    try:
+        articles = article_store.refresh_article_matches(config)
+    finally:
+        article_store.analyze_article_matches = original_analyze
     return {
         "elapsed_seconds": round(time.perf_counter() - started, 6),
         "articles_returned": len(articles),
+        "analyze_calls": analyze_calls,
     }
 
 
