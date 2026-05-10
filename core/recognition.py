@@ -67,6 +67,10 @@ from core.recognition_matching import (
     serialize_matched_pairs as _matching_serialize_matched_pairs,
     should_trim_input_bubble as _matching_should_trim_input_bubble,
 )
+from core.recognition_progress import (
+    batch_image_count as _progress_batch_image_count,
+    format_batch_image_progress as _progress_format_batch_image_progress,
+)
 from core.time_utils import local_now, local_today
 
 
@@ -962,14 +966,7 @@ class ClipboardRecognitionManager:
         return f"累计 {total_count}/{batch_size} 张（本次 {current_count} 张，历史 {historical_count} 张）"
 
     def _batch_image_count(self, batch: dict | None) -> int:
-        payload = batch if isinstance(batch, dict) else {}
-        image_items = payload.get("image_items")
-        if isinstance(image_items, list):
-            return len(image_items)
-        image_paths = payload.get("image_paths")
-        if isinstance(image_paths, list):
-            return len(image_paths)
-        return 0
+        return _progress_batch_image_count(batch)
 
     def _get_pending_batches_for_task_locked(self, task_name: str) -> list[tuple[str, dict]]:
         task_text = str(task_name or "").strip()
@@ -2741,10 +2738,7 @@ class ClipboardRecognitionManager:
         return batch
 
     def _format_batch_image_progress(self, batch: dict) -> str:
-        current_count = int(batch.get("current_image_count") or len(batch.get("image_paths") or []))
-        historical_count = int(batch.get("historical_screenshot_count") or 0)
-        total_count = int(batch.get("total_image_count") or len(batch.get("image_paths") or []))
-        return f"累计 {total_count} 张（本次 {current_count} 张，历史 {historical_count} 张）"
+        return _progress_format_batch_image_progress(batch)
 
     def _build_keyword_updates_from_batch(
         self,

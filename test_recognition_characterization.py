@@ -86,6 +86,51 @@ def test_should_trim_input_bubble_characterizes_text_tokens(manager, text, expec
     assert manager._should_trim_input_bubble(text) is expected
 
 
+@pytest.mark.parametrize(
+    ("batch", "expected"),
+    [
+        (None, 0),
+        ({}, 0),
+        ({"image_paths": []}, 0),
+        ({"image_paths": ["/tmp/a.jpg", "/tmp/b.jpg"]}, 2),
+        ({"image_items": [{"path": ""}, {"path": "/tmp/b.jpg"}]}, 2),
+        ({"image_items": [], "image_paths": ["/tmp/fallback.jpg"]}, 0),
+    ],
+)
+def test_batch_image_count_characterizes_payload_shapes(manager, batch, expected):
+    assert manager._batch_image_count(batch) == expected
+
+
+@pytest.mark.parametrize(
+    ("batch", "expected"),
+    [
+        ({}, "累计 0 张（本次 0 张，历史 0 张）"),
+        ({"image_paths": []}, "累计 0 张（本次 0 张，历史 0 张）"),
+        ({"image_paths": ["/tmp/current.jpg"]}, "累计 1 张（本次 1 张，历史 0 张）"),
+        (
+            {
+                "image_paths": ["/tmp/historical.jpg", "/tmp/current.jpg"],
+                "current_image_count": 1,
+                "historical_screenshot_count": 1,
+                "total_image_count": 2,
+            },
+            "累计 2 张（本次 1 张，历史 1 张）",
+        ),
+        (
+            {
+                "image_paths": ["/tmp/a.jpg", "/tmp/b.jpg", "/tmp/c.jpg"],
+                "current_image_count": 2,
+                "historical_screenshot_count": 1,
+                "total_image_count": 3,
+            },
+            "累计 3 张（本次 2 张，历史 1 张）",
+        ),
+    ],
+)
+def test_format_batch_image_progress_characterizes_counts(manager, batch, expected):
+    assert manager._format_batch_image_progress(batch) == expected
+
+
 def test_matched_pairs_dedupe_expand_and_leave_remaining_platforms_stable(manager):
     serialized = manager._serialize_matched_pairs(
         [
