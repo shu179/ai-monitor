@@ -126,9 +126,9 @@ class WeComNotifier:
         key = self._cooldown_key(platform, brand, keyword)
         current_time = time.monotonic()
         with self._shared_lock:
-            last_time = self._shared_last_sent.get(key, 0)
+            last_time = self._shared_last_sent.get(key)
 
-        if current_time - last_time < self.cooldown:
+        if last_time is not None and current_time - last_time < self.cooldown:
             minutes_ago = (current_time - last_time) / 60
             self.last_skip_reason = "cooldown"
             print(f"[{platform}] 关键词已在冷却期内（{minutes_ago:.1f}分钟前发送过），跳过")
@@ -159,8 +159,8 @@ class WeComNotifier:
         key = self._cooldown_key(platform, brand, keyword)
         current_time = time.monotonic()
         with self._shared_lock:
-            last_time = self._shared_last_sent.get(key, 0)
-            if current_time - last_time < self.cooldown:
+            last_time = self._shared_last_sent.get(key)
+            if last_time is not None and current_time - last_time < self.cooldown:
                 minutes_ago = (current_time - last_time) / 60
                 self.last_skip_reason = "cooldown"
                 print(f"[{platform}] 关键词已在冷却期内（{minutes_ago:.1f}分钟前发送过），跳过")

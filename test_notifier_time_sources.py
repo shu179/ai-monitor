@@ -25,6 +25,17 @@ class NotifierTimeSourceTests(unittest.TestCase):
             self.assertFalse(notifier.should_notify("doubao", "品牌A", "关键词A"))
             self.assertTrue(notifier.should_notify("doubao", "品牌A", "关键词A"))
 
+    def test_missing_cooldown_key_is_not_throttled_on_fresh_boot(self) -> None:
+        notifier = WeComNotifier(
+            webhook_url="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=PLACEHOLDER",
+            cooldown_minutes=30,
+            send_interval=0,
+        )
+
+        with patch("core.notifier.time.monotonic", return_value=30.0):
+            self.assertTrue(notifier.should_notify("doubao", "品牌A", "关键词A"))
+            self.assertTrue(notifier._reserve_cooldown("doubao", "品牌A", "关键词A"))
+
     def test_post_interval_uses_monotonic_time(self) -> None:
         notifier = WeComNotifier(
             webhook_url="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=PLACEHOLDER",

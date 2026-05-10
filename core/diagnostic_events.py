@@ -44,8 +44,8 @@ def record_event_safe(
         if event_key and throttle_seconds > 0:
             now = time.monotonic()
             with _throttle_lock:
-                last = _last_fired.get(event_key, 0.0)
-                if now - last < throttle_seconds:
+                last = _last_fired.get(event_key)
+                if last is not None and now - last < throttle_seconds:
                     return False
                 if event_key in _inflight:
                     return False

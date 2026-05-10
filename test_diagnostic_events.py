@@ -35,6 +35,19 @@ class RecordEventSafeTests(unittest.TestCase):
         self.assertTrue(result)
         mock_record.assert_called_once()
 
+    def test_missing_throttle_key_is_not_throttled_on_fresh_boot(self):
+        with patch.object(diag, "time") as mock_time:
+            mock_time.monotonic.return_value = 30.0
+            with _patched_record_event() as mock_record:
+                result = diag.record_event_safe(
+                    "cloud_sync",
+                    "msg",
+                    event_key="fresh_boot_key",
+                    throttle_seconds=600,
+                )
+        self.assertTrue(result)
+        mock_record.assert_called_once()
+
     def test_returns_false_when_throttled(self):
         with _patched_record_event():
             first = diag.record_event_safe("cloud_sync", "msg", event_key="k1", throttle_seconds=600)
