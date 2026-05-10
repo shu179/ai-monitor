@@ -1,0 +1,288 @@
+name: Release Preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip pytest runs (for quick preflight check)'
+        required: false
+        default: 'false'
+        type: boolean
+
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+  push:
+    branches:
+      - codex/p0-stability-hardening
+
+env:
+  PYTHON_VERSION: '3.12'
+  NODE_VERSION: '20'
+
+jobs:
+  # ============================================================
+  # Job 1: PostgreSQL Migration Validation (Linux)
+  # ============================================================
+  migration-validation:
+    name: Migration Validation
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install cloud-server dependencies
+        run: |
+          cd cloud-server
+          pip install -r requirements.txt
+          pip install pytest-asyncio
+
+      - name: Wait for PostgreSQL to be ready
+        run: |
+          for i in {1..30}; do
+            pg_isready -h localhost -p 5432 -U testuser && exit 0 || true
+            sleep 1
+          done
+          exit 1
+
+      - name: Set DATABASE_URL for migration
+        run: |
+          echo "DATABASE_URL=postgresql://testuser:testpass@localhost:5432/testdb" >> $GITHUB_ENV
+
+      - name: Run Alembic migration upgrade
+        run: |
+          cd cloud-server
+          alembic upgrade head
+
+      - name: Verify constraints exist
+        run: |
+          cd cloud-server
+          python -c "
+          from sqlalchemy import create_engine, inspect
+          engine = create_engine('${{ env.DATABASE_URL }}')
+          inspector = inspect(engine)
+
+          tables = ['sync_events', 'run_records', 'article_reference_events']
+          for table in tables:
+              constraints = inspector.get_unique_constraints(table)
+              print(f'Table {table} unique constraints: {[c[\"name\"] for c in constraints]}')
+              if not constraints:
+                  raise Exception(f'No unique constraints found for {table}')
+          print('All unique constraints verified!')
+          "
+
+      - name: Run cloud-server tests
+        run: |
+          cd cloud-server
+          python -m pytest tests/ -v --tb=short
+
+  # ============================================================
+  # Job 2: Preflight and Tests (Linux)
+  # ============================================================
+  preflight-tests:
+    name: Preflight and Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run preflight script
+        run: |
+          python scripts/preflight_release.py
+
+      - name: Run key pytests
+        run: |
+          python -m pytest \
+            test_diagnostic_events.py \
+            test_browser_processes.py \
+            test_cloud_outbox.py \
+            test_cloud_outbox_reliability.py \
+            test_screenshot_cleanup.py \
+            test_notifier_cooldown_race.py \
+            test_notifier_time_sources.py \
+            test_windows_bootstrap.py \
+            test_preflight_release.py \
+            -v --tb=short
+
+  # ============================================================
+  # Job 3: Windows Packaging (windows-2022)
+  # ============================================================
+  windows-packaging:
+    name: Windows Packaging
+    runs-on: windows-2022
+
+    env:
+      PYTHON_VERSION: '3.12'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Check web-ui/dist exists
+        id: check-web-ui
+        run: |
+          if (Test-Path "web-ui/dist/index.html") {
+            Write-Host "web-ui/dist exists, skipping build"
+            Write-Host "::set-output name=needs-build::false"
+          } else {
+            Write-Host "web-ui/dist missing, will build"
+            Write-Host "::set-output name=needs-build::true"
+          }
+
+      - name: Set up Node.js
+        if: steps.check-web-ui.outputs.needs-build == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: 'web-ui/package-lock.json'
+
+      - name: Build web-ui if needed
+        if: steps.check-web-ui.outputs.needs-build == 'true'
+        run: |
+          cd web-ui
+          npm ci
+          npm run build
+
+      - name: Verify web-ui/dist after build
+        if: steps.check-web-ui.outputs.needs-build == 'true'
+        run: |
+          if (-not (Test-Path "web-ui/dist/index.html")) {
+            Write-Host "ERROR: web-ui/dist/index.html still missing after build"
+            exit 1
+          }
+          Write-Host "web-ui/dist ready"
+
+      - name: Run preflight script
+        run: |
+          python scripts/preflight_release.py
+
+      - name: Run key pytests on Windows
+        run: |
+          python -m pytest `
+            test_diagnostic_events.py `
+            test_browser_processes.py `
+            test_cloud_outbox.py `
+            test_cloud_outbox_reliability.py `
+            test_screenshot_cleanup.py `
+            test_notifier_cooldown_race.py `
+            test_windows_bootstrap.py `
+            test_preflight_release.py `
+            -v --tb=short
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller build.spec --clean --noconfirm
+
+      - name: Verify dist output
+        run: |
+          if (-not (Test-Path "dist/Surfaced")) {
+            Write-Host "ERROR: dist/Surfaced not found"
+            exit 1
+          }
+          Write-Host "dist/Surfaced ready"
+          Get-ChildItem -Path "dist" -Recurse | Select-Object FullName, Length
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: surfaced-dist-windows
+          path: dist/
+          retention-days: 7
+          compression-level: 9
+
+  # ============================================================
+  # Optional: Windows 2025 packaging (matrix extension)
+  # ============================================================
+  windows-packaging-edge:
+    name: Windows Packaging (Edge)
+    runs-on: windows-latest
+    # Uncomment to enable windows-latest matrix testing:
+    # if: false  # Disabled by default, enable manually or via matrix
+
+    env:
+      PYTHON_VERSION: '3.12'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Check web-ui/dist
+        run: |
+          if (Test-Path "web-ui/dist/index.html") {
+            Write-Host "web-ui/dist exists"
+          } else {
+            Write-Host "web-ui/dist missing"
+            exit 1
+          }
+
+      - name: Run preflight
+        run: |
+          python scripts/preflight_release.py
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller build.spec --clean --noconfirm
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: surfaced-dist-windows-latest
+          path: dist/
+          retention-days: 7
+          compression-level: 9
