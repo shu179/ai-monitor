@@ -183,6 +183,71 @@ class TestCheckBuildSpec:
 
         assert "FAIL" in statuses
 
+    def test_unsupported_specdir_global_returns_fail(self, tmp_project):
+        """PyInstaller no longer provides SPECDIR in the spec namespace."""
+        (tmp_project / "build.spec").write_text(
+            "from pathlib import Path\n"
+            "root = Path(SPECDIR).absolute()\n"
+            "manifest='build/app.manifest'\n"
+            "hiddenimports=['core.windows_bootstrap']\n"
+        )
+
+        results = check_build_spec(tmp_project)
+
+        assert any(
+            r.status == "FAIL" and "SPECDIR" in r.message
+            for r in results
+        )
+
+    def test_onedir_collect_without_exclude_binaries_returns_fail(self, tmp_project):
+        """Directory builds should keep binaries for COLLECT, not pack them into EXE."""
+        (tmp_project / "build.spec").write_text(
+            "manifest='build/app.manifest'\n"
+            "hiddenimports=['core.windows_bootstrap']\n"
+            "exe = EXE(pyz, a.scripts, a.binaries, a.zipfiles, a.datas, [])\n"
+            "coll = COLLECT(exe, a.binaries, a.zipfiles, a.datas)\n"
+        )
+
+        results = check_build_spec(tmp_project)
+
+        assert any(
+            r.status == "FAIL" and "exclude_binaries=True" in r.message
+            for r in results
+        )
+
+    def test_onedir_collect_with_exclude_binaries_passes(self, tmp_project):
+        """The release build should use PyInstaller's standard onedir shape."""
+        (tmp_project / "build.spec").write_text(
+            "manifest='build/app.manifest'\n"
+            "hiddenimports=['core.windows_bootstrap']\n"
+            "exe = EXE(pyz, a.scripts, [], exclude_binaries=True)\n"
+            "coll = COLLECT(exe, a.binaries, a.zipfiles, a.datas)\n"
+        )
+
+        results = check_build_spec(tmp_project)
+
+        assert not any(
+            r.status == "FAIL" and "exclude_binaries=True" in r.message
+            for r in results
+        )
+
+    def test_tree_entries_in_analysis_datas_return_fail(self, tmp_project):
+        """Tree() produces a TOC and should not be placed inside Analysis datas."""
+        (tmp_project / "build.spec").write_text(
+            "manifest='build/app.manifest'\n"
+            "hiddenimports=['core.windows_bootstrap']\n"
+            "datas = [Tree('assets', prefix='assets')]\n"
+            "exe = EXE(pyz, a.scripts, [], exclude_binaries=True)\n"
+            "coll = COLLECT(exe, a.binaries, a.zipfiles, a.datas)\n"
+        )
+
+        results = check_build_spec(tmp_project)
+
+        assert any(
+            r.status == "FAIL" and "Tree entries" in r.message
+            for r in results
+        )
+
 
 class TestCheckBootstrapOrder:
     """Tests for check_bootstrap_order function."""

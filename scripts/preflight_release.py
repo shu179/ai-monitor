@@ -39,6 +39,39 @@ def check_build_spec(root: Path) -> list[CheckResult]:
         ))
         return results
 
+    # PyInstaller exposes SPEC/SPECPATH globals, not SPECDIR. Using SPECDIR
+    # fails before Analysis() starts on current PyInstaller releases.
+    if re.search(r"\bSPECDIR\b", content):
+        results.append(CheckResult(
+            "FAIL", "build.spec", "build.spec uses unsupported SPECDIR global"
+        ))
+    else:
+        results.append(CheckResult(
+            "PASS", "build.spec", "build.spec does not use unsupported SPECDIR global"
+        ))
+
+    if "COLLECT(" in content:
+        if "exclude_binaries=True" in content:
+            results.append(CheckResult(
+                "PASS", "build.spec", "onedir COLLECT build uses exclude_binaries=True"
+            ))
+        else:
+            results.append(CheckResult(
+                "FAIL", "build.spec",
+                "onedir COLLECT build should set exclude_binaries=True on EXE"
+            ))
+
+    datas_match = re.search(r"\bdatas\s*=\s*\[(?P<body>.*?)\]", content, re.DOTALL)
+    if datas_match and re.search(r"\bTree\s*\(", datas_match.group("body")):
+        results.append(CheckResult(
+            "FAIL", "build.spec",
+            "Tree entries should be passed to COLLECT, not Analysis datas"
+        ))
+    else:
+        results.append(CheckResult(
+            "PASS", "build.spec", "Analysis datas does not contain Tree entries"
+        ))
+
     # Check manifest reference exists
     if "manifest='build/app.manifest'" in content or 'manifest="build/app.manifest"' in content:
         manifest_file = root / "build" / "app.manifest"
