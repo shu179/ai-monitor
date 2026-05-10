@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from .time_utils import local_today, parse_local_date
+from .time_utils import local_now, local_today, parse_local_date
 
 
 SCHEMA_VERSION = 1
@@ -776,7 +776,7 @@ class ArticleHistorySQLiteStore:
         changed_storage_keys: list[str] = []
         updated_at_ns = time.time_ns()
         normalized_note = self._text(note)
-        normalized_reviewed_at = self._text(reviewed_at) or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        normalized_reviewed_at = self._text(reviewed_at) or local_now().strftime("%Y-%m-%d %H:%M:%S")
         self.initialize()
         with self._connection() as conn:
             for storage_key in unique_storage_keys:

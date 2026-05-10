@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .time_utils import local_today, parse_local_date
+from .time_utils import local_now, local_today, parse_local_date
 
 
 SCHEMA_VERSION = 1
@@ -60,7 +60,7 @@ class ArticleSQLiteStore:
         self.db_path = Path(db_path)
         self._normalize_article_url = normalize_article_url
         self._normalize_article_entry = normalize_article_entry
-        self._now_text = now_text or (lambda: datetime.now().strftime("%Y-%m-%d %H:%M"))
+        self._now_text = now_text or (lambda: local_now().strftime("%Y-%m-%d %H:%M"))
 
     def initialize(self) -> None:
         with self._connection() as conn:

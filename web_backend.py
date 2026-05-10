@@ -5919,9 +5919,12 @@ return changedCount
         }
 
     def _sqlite_shadow_cooldown_reason(self) -> str:
-        now_ts = time.time()
+        now_ts = time.monotonic()
         with self._article_sqlite_shadow_health_lock:
-            disabled_until = _safe_float(self._article_sqlite_shadow_health.get("disabled_until"), 0.0)
+            disabled_until = _safe_float(
+                self._article_sqlite_shadow_health.get("disabled_until_monotonic"),
+                _safe_float(self._article_sqlite_shadow_health.get("disabled_until"), 0.0),
+            )
             if disabled_until > now_ts:
                 return str(self._article_sqlite_shadow_health.get("last_fallback_reason") or "health_cooldown")
         return ""
@@ -5938,13 +5941,14 @@ return changedCount
         with self._article_sqlite_shadow_health_lock:
             self._article_sqlite_shadow_health.update({
                 "consecutive_errors": 0,
-                "disabled_until": 0.0,
-                "disabled_until_iso": "",
                 "last_mode": str(mode or ""),
                 "last_effective_backend": "json" if str(mode or "") == "sqlite_shadow_compare" else "sqlite_shadow",
                 "last_probe_backend": "sqlite_shadow",
                 "last_success_at": local_now().isoformat(timespec="seconds"),
                 "last_elapsed_ms": round(float(elapsed_ms), 3),
+                "disabled_until": 0.0,
+                "disabled_until_monotonic": 0.0,
+                "disabled_until_iso": "",
                 "last_fd_before": fd_before,
                 "last_fd_after": fd_after,
                 "last_fd_delta": _fd_delta(fd_before, fd_after),
@@ -5973,7 +5977,8 @@ return changedCount
         fd_after: int | None = None,
         db_path: Path | None = None,
     ) -> None:
-        now_ts = time.time()
+        now_ts = time.monotonic()
+        now_wall = local_now()
         error_limit = self._sqlite_shadow_error_limit()
         cooldown_seconds = self._sqlite_shadow_cooldown_seconds()
         with self._article_sqlite_shadow_health_lock:
@@ -5991,8 +5996,9 @@ return changedCount
                 "last_error_at": local_now().isoformat(timespec="seconds"),
                 "fallback_count": _safe_int(self._article_sqlite_shadow_health.get("fallback_count"), 0) + 1,
                 "disabled_until": disabled_until,
+                "disabled_until_monotonic": disabled_until,
                 "disabled_until_iso": (
-                    datetime.fromtimestamp(disabled_until).isoformat(timespec="seconds")
+                    (now_wall + timedelta(seconds=cooldown_seconds)).isoformat(timespec="seconds")
                     if disabled_until > 0
                     else ""
                 ),
@@ -6012,10 +6018,13 @@ return changedCount
                 self._article_sqlite_shadow_health["last_db_path"] = str(db_path)
 
     def _article_sqlite_shadow_health_snapshot(self) -> dict[str, Any]:
-        now_ts = time.time()
+        now_ts = time.monotonic()
         with self._article_sqlite_shadow_health_lock:
             health = dict(self._article_sqlite_shadow_health)
-        disabled_until = _safe_float(health.get("disabled_until"), 0.0)
+        disabled_until = _safe_float(
+            health.get("disabled_until_monotonic"),
+            _safe_float(health.get("disabled_until"), 0.0),
+        )
         health["blocked"] = disabled_until > now_ts
         health["cooldown_remaining_seconds"] = max(0, round(disabled_until - now_ts, 3)) if disabled_until > now_ts else 0
         health["error_limit"] = self._sqlite_shadow_error_limit()
@@ -6086,19 +6095,25 @@ return changedCount
         db_path: Path,
         reason: str,
     ) -> bool:
-        now_ts = time.time()
+        now_ts = time.monotonic()
         with self._article_sqlite_shadow_rebuild_lock:
             if bool(self._article_sqlite_shadow_rebuild_state.get("running")):
                 return False
-            next_allowed_at = _safe_float(self._article_sqlite_shadow_rebuild_state.get("next_allowed_at"), 0.0)
+            next_allowed_at = _safe_float(
+                self._article_sqlite_shadow_rebuild_state.get("next_allowed_at_monotonic"),
+                _safe_float(self._article_sqlite_shadow_rebuild_state.get("next_allowed_at"), 0.0),
+            )
             if next_allowed_at > now_ts:
                 return False
+            next_allowed = now_ts + self._sqlite_shadow_article_rebuild_min_interval_seconds()
             self._article_sqlite_shadow_rebuild_state.update({
                 "running": True,
                 "last_reason": str(reason or ""),
                 "last_started_at": now_ts,
+                "last_started_at_monotonic": now_ts,
                 "last_started_at_iso": local_now().isoformat(timespec="seconds"),
-                "next_allowed_at": now_ts + self._sqlite_shadow_article_rebuild_min_interval_seconds(),
+                "next_allowed_at": next_allowed,
+                "next_allowed_at_monotonic": next_allowed,
                 "db_path": str(db_path),
             })
 
@@ -6150,10 +6165,12 @@ return changedCount
             print(f"[WebBackend] SQLite 文章影子索引后台重建失败: {exc}")
         finally:
             with self._article_sqlite_shadow_rebuild_lock:
+                finished_at = time.monotonic()
                 self._article_sqlite_shadow_rebuild_state.update({
                     "running": False,
                     "last_ok": ok,
-                    "last_finished_at": time.time(),
+                    "last_finished_at": finished_at,
+                    "last_finished_at_monotonic": finished_at,
                     "last_finished_at_iso": local_now().isoformat(timespec="seconds"),
                     "last_reason": str(reason or self._article_sqlite_shadow_rebuild_state.get("last_reason") or ""),
                     "last_error": "" if ok else detail,

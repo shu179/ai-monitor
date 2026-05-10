@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
@@ -464,9 +464,12 @@ def _article_sqlite_migration_min_interval_seconds() -> float:
 
 
 def _article_store_sqlite_cooldown_remaining() -> float:
-    now_ts = time.time()
+    now_ts = time.monotonic()
     with _article_store_backend_health_lock:
-        disabled_until = _safe_float(_article_store_backend_health.get("disabled_until"), 0.0)
+        disabled_until = _safe_float(
+            _article_store_backend_health.get("disabled_until_monotonic"),
+            _safe_float(_article_store_backend_health.get("disabled_until"), 0.0),
+        )
     return max(0.0, disabled_until - now_ts)
 
 
@@ -485,6 +488,7 @@ def _record_article_store_backend_success(mode: str, *, effective_backend: str, 
             "last_success_at": local_now().isoformat(timespec="seconds"),
             "consecutive_errors": 0,
             "disabled_until": 0.0,
+            "disabled_until_monotonic": 0.0,
             "disabled_until_iso": "",
         })
         if db_path is not None:
@@ -505,11 +509,13 @@ def _record_article_store_backend_fallback(mode: str, reason: str, *, db_path: P
 
 
 def _record_article_store_backend_error(mode: str, reason: str, *, detail: str = "", db_path: Path | None = None) -> None:
-    now_ts = time.time()
+    now_ts = time.monotonic()
+    now_wall = local_now()
     with _article_store_backend_health_lock:
         consecutive = _coerce_non_negative_int(_article_store_backend_health.get("consecutive_errors", 0)) + 1
+        cooldown_seconds = _article_sqlite_cooldown_seconds()
         disabled_until = (
-            now_ts + _article_sqlite_cooldown_seconds()
+            now_ts + cooldown_seconds
             if consecutive >= _article_sqlite_error_limit()
             else 0.0
         )
@@ -523,8 +529,9 @@ def _record_article_store_backend_error(mode: str, reason: str, *, detail: str =
             "consecutive_errors": consecutive,
             "fallback_count": _coerce_non_negative_int(_article_store_backend_health.get("fallback_count", 0)) + 1,
             "disabled_until": disabled_until,
+            "disabled_until_monotonic": disabled_until,
             "disabled_until_iso": (
-                datetime.fromtimestamp(disabled_until).isoformat(timespec="seconds")
+                (now_wall + timedelta(seconds=cooldown_seconds)).isoformat(timespec="seconds")
                 if disabled_until > 0
                 else ""
             ),
@@ -806,7 +813,7 @@ def _article_sqlite_store_class():
 
 
 def _schedule_article_store_sqlite_migration(*, reason: str) -> bool:
-    now_ts = time.time()
+    now_ts = time.monotonic()
     db_path = _article_store_db_file()
     with _article_store_migration_lock:
         _article_store_migration_threads[:] = [
@@ -814,19 +821,26 @@ def _schedule_article_store_sqlite_migration(*, reason: str) -> bool:
         ]
         if bool(_article_store_migration_state.get("running")):
             return False
-        next_allowed_at = _safe_float(_article_store_migration_state.get("next_allowed_at"), 0.0)
+        next_allowed_at = _safe_float(
+            _article_store_migration_state.get("next_allowed_at_monotonic"),
+            _safe_float(_article_store_migration_state.get("next_allowed_at"), 0.0),
+        )
         if next_allowed_at > now_ts:
             return False
+        next_allowed = now_ts + _article_sqlite_migration_min_interval_seconds()
         _article_store_migration_state.update({
             "running": True,
             "last_reason": str(reason or ""),
             "last_started_at": now_ts,
+            "last_started_at_monotonic": now_ts,
             "last_started_at_iso": local_now().isoformat(timespec="seconds"),
             "last_finished_at": 0.0,
+            "last_finished_at_monotonic": 0.0,
             "last_finished_at_iso": "",
             "last_error": "",
             "db_path": str(db_path),
-            "next_allowed_at": now_ts + _article_sqlite_migration_min_interval_seconds(),
+            "next_allowed_at": next_allowed,
+            "next_allowed_at_monotonic": next_allowed,
         })
 
     thread = threading.Thread(
@@ -859,26 +873,27 @@ def _run_article_store_sqlite_migration(reason: str) -> None:
             pass
         _record_article_store_backend_error("auto", "article_store_migration_failed", detail=detail, db_path=_article_store_db_file())
     finally:
-        finished_at = time.time()
+        finished_at = time.monotonic()
         with _article_store_migration_lock:
             _article_store_migration_state.update({
                 "running": False,
                 "last_ok": ok,
                 "last_error": detail,
                 "last_finished_at": finished_at,
+                "last_finished_at_monotonic": finished_at,
                 "last_finished_at_iso": local_now().isoformat(timespec="seconds"),
                 "last_summary": summary,
             })
 
 
 def wait_for_article_store_backend_migration(timeout: float = 5.0) -> dict[str, object]:
-    deadline = time.time() + max(0.0, float(timeout or 0.0))
+    deadline = time.monotonic() + max(0.0, float(timeout or 0.0))
     while True:
         with _article_store_migration_lock:
             threads = [thread for thread in _article_store_migration_threads if thread.is_alive()]
         if not threads:
             break
-        remaining = deadline - time.time()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         for thread in threads:
@@ -5755,13 +5770,13 @@ def schedule_article_match_refresh(config: dict, *, reason: str = "", force: boo
 
 def _reset_article_match_refresh_state_for_tests(timeout: float = 5.0) -> None:
     global _match_refresh_worker_thread
-    deadline = time.time() + max(0.0, float(timeout or 0.0))
+    deadline = time.monotonic() + max(0.0, float(timeout or 0.0))
     while True:
         with _match_refresh_worker_lock:
             thread = _match_refresh_worker_thread
         if thread is None or not thread.is_alive() or thread is threading.current_thread():
             break
-        remaining = deadline - time.time()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         thread.join(timeout=min(0.05, max(0.0, remaining)))

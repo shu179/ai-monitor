@@ -396,10 +396,14 @@ def _finish_structured_shadow_runtime_write(context: dict[str, object] | None, *
 
 
 def _structured_shadow_rebuild_state_snapshot() -> dict[str, object]:
-    now_ts = time.time()
+    now_ts = time.monotonic()
     with _structured_shadow_rebuild_lock:
         state = dict(_structured_shadow_rebuild_state)
-    next_allowed_at = float(state.get("next_allowed_at") or 0.0)
+    next_allowed_at = float(
+        state.get("next_allowed_at_monotonic")
+        or state.get("next_allowed_at")
+        or 0.0
+    )
     state["cooldown_remaining_seconds"] = max(0.0, round(next_allowed_at - now_ts, 3))
     return state
 
@@ -407,19 +411,26 @@ def _structured_shadow_rebuild_state_snapshot() -> dict[str, object]:
 def _schedule_structured_shadow_rebuild(reason: str) -> bool:
     if not _history_structured_read_auto_configured():
         return False
-    now_ts = time.time()
+    now_ts = time.monotonic()
     with _structured_shadow_rebuild_lock:
         if bool(_structured_shadow_rebuild_state.get("running")):
             return False
-        next_allowed_at = float(_structured_shadow_rebuild_state.get("next_allowed_at") or 0.0)
+        next_allowed_at = float(
+            _structured_shadow_rebuild_state.get("next_allowed_at_monotonic")
+            or _structured_shadow_rebuild_state.get("next_allowed_at")
+            or 0.0
+        )
         if next_allowed_at > now_ts:
             return False
+        next_allowed = now_ts + _structured_shadow_rebuild_min_interval_seconds()
         _structured_shadow_rebuild_state.update({
             "running": True,
             "last_reason": str(reason or ""),
             "last_started_at": now_ts,
+            "last_started_at_monotonic": now_ts,
             "last_started_at_iso": local_now().isoformat(timespec="seconds"),
-            "next_allowed_at": now_ts + _structured_shadow_rebuild_min_interval_seconds(),
+            "next_allowed_at": next_allowed,
+            "next_allowed_at_monotonic": next_allowed,
         })
 
     thread = threading.Thread(
@@ -448,10 +459,12 @@ def _run_structured_shadow_rebuild(reason: str = "") -> None:
     finally:
         _clear_structured_read_store_status_cache()
         with _structured_shadow_rebuild_lock:
+            finished_at = time.monotonic()
             _structured_shadow_rebuild_state.update({
                 "running": False,
                 "last_ok": ok,
-                "last_finished_at": time.time(),
+                "last_finished_at": finished_at,
+                "last_finished_at_monotonic": finished_at,
                 "last_finished_at_iso": local_now().isoformat(timespec="seconds"),
                 "last_reason": str(reason or _structured_shadow_rebuild_state.get("last_reason") or ""),
                 "last_error": "" if ok else detail,
@@ -636,12 +649,16 @@ def _structured_read_store_status() -> dict[str, object]:
 
     db_signature = _structured_read_db_signature(db_path)
     cache_key = str(db_path)
-    now_ts = time.time()
+    now_ts = time.monotonic()
     with _structured_read_store_status_lock:
         if _structured_read_store_status_cache.get("key") == cache_key:
             cached_status = _structured_read_store_status_cache.get("status")
             if isinstance(cached_status, dict) and not bool(cached_status.get("ready")):
-                cooldown_until = float(cached_status.get("cooldown_until") or 0.0)
+                cooldown_until = float(
+                    cached_status.get("cooldown_until_monotonic")
+                    or cached_status.get("cooldown_until")
+                    or 0.0
+                )
                 if cooldown_until > now_ts:
                     result = dict(cached_status)
                     result["cooldown_remaining_seconds"] = max(0.0, round(cooldown_until - now_ts, 3))
@@ -652,7 +669,11 @@ def _structured_read_store_status() -> dict[str, object]:
         ):
             cached_status = _structured_read_store_status_cache.get("status")
             if isinstance(cached_status, dict):
-                cooldown_until = float(cached_status.get("cooldown_until") or 0.0)
+                cooldown_until = float(
+                    cached_status.get("cooldown_until_monotonic")
+                    or cached_status.get("cooldown_until")
+                    or 0.0
+                )
                 if bool(cached_status.get("ready")) or cooldown_until > now_ts:
                     result = dict(cached_status)
                     result["cooldown_remaining_seconds"] = (
@@ -666,10 +687,13 @@ def _structured_read_store_status() -> dict[str, object]:
 
     status = ArticleHistorySQLiteStore.validate_readiness(db_path)
     if status.get("available") and not status.get("ready"):
-        status["cooldown_until"] = now_ts + _structured_read_bad_db_cooldown_seconds()
+        cooldown_until = now_ts + _structured_read_bad_db_cooldown_seconds()
+        status["cooldown_until"] = cooldown_until
+        status["cooldown_until_monotonic"] = cooldown_until
         status["cooldown_remaining_seconds"] = _structured_read_bad_db_cooldown_seconds()
     else:
         status["cooldown_until"] = 0.0
+        status["cooldown_until_monotonic"] = 0.0
         status["cooldown_remaining_seconds"] = 0
 
     with _structured_read_store_status_lock:
