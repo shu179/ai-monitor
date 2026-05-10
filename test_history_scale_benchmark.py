@@ -138,6 +138,29 @@ class HistoryScaleBenchmarkTests(unittest.TestCase):
             self.assertEqual(details["effective_backend"], "sqlite_structured")
             self.assertFalse(details["known_full_document_rewrite"])
 
+    def test_small_benchmark_supports_auto_write_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary = run_benchmark(
+                BenchmarkOptions(
+                    record_count=90,
+                    task_count=3,
+                    page_limit=7,
+                    history_write_backend="auto",
+                    data_dir=Path(tmpdir),
+                    force=True,
+                )
+            )
+
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["input"]["history_write_backend"], "auto")
+        self.assertEqual(summary["backend"]["storage_backend"], "sqlite_structured")
+        self.assertEqual(summary["health"]["writePath"]["requestedBackend"], "auto")
+        self.assertEqual(summary["standards"]["write_path_bottlenecks"]["status"], "pass")
+        self.assertIn("initial_health", summary)
+        self.assertIn("bootstrap", summary)
+        self.assertIn("fd", summary)
+        self.assertIn("write_timing", summary)
+
     def test_cli_small_smoke_writes_json_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "summary.json"
@@ -164,6 +187,33 @@ class HistoryScaleBenchmarkTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["input"]["record_count"], 30)
         self.assertEqual(payload["backend"]["effective_backend"], "sqlite_shadow")
+
+    def test_cli_accepts_auto_history_write_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "summary.json"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main([
+                    "--record-count",
+                    "30",
+                    "--task-count",
+                    "2",
+                    "--page-limit",
+                    "5",
+                    "--history-write-backend",
+                    "auto",
+                    "--data-dir",
+                    tmpdir,
+                    "--force",
+                    "--output",
+                    str(output_path),
+                ])
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["input"]["history_write_backend"], "auto")
+        self.assertEqual(payload["backend"]["storage_backend"], "sqlite_structured")
 
 
 if __name__ == "__main__":

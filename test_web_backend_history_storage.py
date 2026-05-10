@@ -100,6 +100,7 @@ def test_loaded_config_defaults_history_storage_to_guarded_auto() -> None:
 
     assert config["storage"] == {
         "history_read_backend": "auto",
+        "history_write_backend": "auto",
         "history_shadow_writes_enabled": True,
     }
     configure_mock.assert_called_once_with(config)
@@ -109,7 +110,13 @@ def test_loaded_config_defaults_history_storage_to_guarded_auto() -> None:
 
 def test_loaded_config_disables_history_storage_for_ordinary_cloud_session() -> None:
     runtime = object.__new__(AppRuntime)
-    config = {"storage": {"history_read_backend": "auto", "history_shadow_writes_enabled": True}}
+    config = {
+        "storage": {
+            "history_read_backend": "auto",
+            "history_write_backend": "auto",
+            "history_shadow_writes_enabled": True,
+        }
+    }
     session = {"access_token": "token", "user": {"role": "viewer"}}
 
     with (
@@ -124,6 +131,7 @@ def test_loaded_config_disables_history_storage_for_ordinary_cloud_session() -> 
 
     assert config["storage"] == {
         "history_read_backend": "",
+        "history_write_backend": "",
         "history_shadow_writes_enabled": False,
     }
     configure_mock.assert_called_once_with(config)

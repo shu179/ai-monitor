@@ -46,6 +46,7 @@ def test_save_settings_persists_selector_agent_section():
     }
     assert saved_configs[0]["storage"] == {
         "history_read_backend": "auto",
+        "history_write_backend": "auto",
         "history_shadow_writes_enabled": True,
     }
 
@@ -85,6 +86,7 @@ def test_save_settings_persists_normalized_storage_section():
     assert result["ok"] is True
     assert saved_configs[0]["storage"] == {
         "history_read_backend": "auto",
+        "history_write_backend": "auto",
         "history_shadow_writes_enabled": True,
     }
     configure_storage_mock.assert_called_once_with(saved_configs[0])
@@ -119,6 +121,7 @@ def test_save_settings_preserves_guarded_storage_defaults_without_storage_payloa
     assert result["ok"] is True
     assert saved_configs[0]["storage"] == {
         "history_read_backend": "auto",
+        "history_write_backend": "auto",
         "history_shadow_writes_enabled": True,
     }
     configure_storage_mock.assert_called_once_with(saved_configs[0])
@@ -133,7 +136,11 @@ def test_save_settings_does_not_enable_storage_for_ordinary_cloud_session():
         "cloud_sync": {},
         "query_execution": {},
         "browser_automation": {},
-        "storage": {"history_read_backend": "auto", "history_shadow_writes_enabled": True},
+        "storage": {
+            "history_read_backend": "auto",
+            "history_write_backend": "auto",
+            "history_shadow_writes_enabled": True,
+        },
     }
     saved_configs = []
 
@@ -160,6 +167,7 @@ def test_save_settings_does_not_enable_storage_for_ordinary_cloud_session():
     assert result["ok"] is True
     assert saved_configs[0]["storage"] == {
         "history_read_backend": "",
+        "history_write_backend": "",
         "history_shadow_writes_enabled": False,
     }
     configure_storage_mock.assert_called_once_with(saved_configs[0])

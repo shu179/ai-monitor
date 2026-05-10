@@ -1966,12 +1966,16 @@ def _apply_guarded_history_storage_defaults(
 
     if not _session_allows_guarded_history_sqlite(session):
         storage_cfg["history_read_backend"] = ""
+        storage_cfg["history_write_backend"] = ""
         storage_cfg["history_shadow_writes_enabled"] = False
     else:
         storage_cfg["history_read_backend"] = _normalize_history_read_backend_setting(
             storage_cfg.get("history_read_backend"),
             default="auto",
         )
+        storage_cfg["history_write_backend"] = str(
+            storage_cfg.get("history_write_backend") or "auto"
+        ).strip().lower()
         storage_cfg["history_shadow_writes_enabled"] = True
 
     config["storage"] = storage_cfg
@@ -2126,7 +2130,10 @@ class AppRuntime:
         get_local_model_manager().sync_config(config)
         configure_structured_history_storage(config)
         storage_cfg = config.get("storage") if isinstance(config.get("storage"), dict) else {}
-        if storage_cfg.get("history_read_backend") == "auto":
+        if (
+            storage_cfg.get("history_read_backend") == "auto"
+            or storage_cfg.get("history_write_backend") == "auto"
+        ):
             maybe_schedule_structured_history_auto_rebuild("config_load")
 
     def _activate_current_account_space(self, *, copy_legacy: bool = True) -> None:
@@ -9267,6 +9274,9 @@ return changedCount
                     storage_payload.get("history_read_backend"),
                     default="auto",
                 )
+                storage_payload["history_write_backend"] = str(
+                    storage_payload.get("history_write_backend") or "auto"
+                ).strip().lower()
                 storage_payload["history_shadow_writes_enabled"] = True
 
             allowed_sections = [
@@ -9343,7 +9353,10 @@ return changedCount
             get_local_model_manager().sync_config(config)
             configure_structured_history_storage(config)
             storage_cfg = config.get("storage") if isinstance(config.get("storage"), dict) else {}
-            if storage_cfg.get("history_read_backend") == "auto":
+            if (
+                storage_cfg.get("history_read_backend") == "auto"
+                or storage_cfg.get("history_write_backend") == "auto"
+            ):
                 maybe_schedule_structured_history_auto_rebuild("settings_save")
             self._sync_recognition_mode(config)
         self._refresh_monitoring_runtime(restart_scheduler=False)

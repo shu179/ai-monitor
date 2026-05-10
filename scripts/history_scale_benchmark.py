@@ -128,6 +128,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
     ):
         _seed_history_sources(sources)
         readiness = ArticleHistorySQLiteStore.validate_readiness(paths["shadow_db"])
+        initial_health = history.get_structured_read_health()
         operations = [
             _measure_operation(
                 "read_list_get_records_many",
@@ -186,11 +187,20 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
         },
         "readiness": final_readiness,
         "initial_readiness": readiness,
+        "initial_health": initial_health,
         "fallback": {
             "last_fallback_reason": health.get("last_fallback_reason", ""),
             "readiness_reason": health.get("readinessReason", ""),
             "authoritative_reason": health.get("authoritativeReadiness", {}).get("reason", ""),
+            "write_fallback_reason": health.get("writePath", {}).get("fallbackReason", ""),
         },
+        "bootstrap": {
+            "initial": initial_health.get("bootstrapState", initial_health.get("selfHeal", {})),
+            "final": health.get("bootstrapState", health.get("selfHeal", {})),
+            "completed": bool((health.get("bootstrapState") or health.get("selfHeal") or {}).get("last_finished_at")),
+        },
+        "fd": _summarize_fd_growth(operations),
+        "write_timing": _summarize_write_timing(operations),
         "health": health,
         "operations": operations,
         "standards": evaluate_standards(operations, health),
@@ -269,6 +279,8 @@ def isolated_history_paths(
         write_backend = _normalize_history_write_backend(history_write_backend)
         if write_backend == "sqlite_structured":
             os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = "sqlite_structured"
+        elif write_backend == "auto":
+            os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = "auto"
         else:
             os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = "json"
         os.environ[history.STRUCTURED_SHADOW_WRITE_ENV] = "1" if shadow_writes else "0"
@@ -460,7 +472,7 @@ def evaluate_standards(operations: list[dict[str, Any]], health: dict[str, Any])
                     "Structured SQLite is currently a guarded read/shadow-write path."
                 )
                 if known_rewrite
-                else "Runtime append/import/review used the explicit structured SQLite authoritative write path."
+                else "Runtime append/import/review used the structured SQLite authoritative write path."
             ),
         },
         "authoritative_readiness": health.get("authoritativeReadiness", {}),
@@ -517,9 +529,52 @@ def _normalize_history_storage_backend(value: str) -> str:
 
 def _normalize_history_write_backend(value: str) -> str:
     backend = str(value or "json").strip().lower().replace("-", "_")
+    if backend in {
+        "auto",
+        "sqlite_structured_auto",
+        "structured_sqlite_auto",
+        "structured_auto",
+        "auto_sqlite_structured",
+    }:
+        return "auto"
     if backend in {"sqlite", "sqlite_structured", "structured_sqlite", "structured"}:
         return "sqlite_structured"
     return "json"
+
+
+def _summarize_fd_growth(operations: list[dict[str, Any]]) -> dict[str, Any]:
+    fd_deltas = [
+        int(operation.get("fd_delta"))
+        for operation in operations
+        if isinstance(operation.get("fd_delta"), int)
+    ]
+    sqlite_fd_deltas = [
+        int(operation.get("sqlite_fd_delta"))
+        for operation in operations
+        if isinstance(operation.get("sqlite_fd_delta"), int)
+    ]
+    return {
+        "max_fd_delta": max(fd_deltas) if fd_deltas else None,
+        "max_sqlite_fd_delta": max(sqlite_fd_deltas) if sqlite_fd_deltas else None,
+    }
+
+
+def _summarize_write_timing(operations: list[dict[str, Any]]) -> dict[str, Any]:
+    write_names = {"append_record", "import_records_merge", "apply_review"}
+    timings = {
+        str(operation.get("name")): operation.get("elapsed_ms")
+        for operation in operations
+        if str(operation.get("name")) in write_names
+    }
+    elapsed_values = [
+        float(value)
+        for value in timings.values()
+        if isinstance(value, (int, float))
+    ]
+    return {
+        "operations_ms": timings,
+        "total_ms": round(sum(elapsed_values), 3),
+    }
 
 
 def _open_fd_count() -> int | None:
@@ -581,7 +636,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--history-write-backend",
-        choices=("json", "sqlite_structured"),
+        choices=("json", "auto", "sqlite_structured"),
         default="json",
         help="Runtime history write backend for record/import/review measurements.",
     )

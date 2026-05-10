@@ -469,6 +469,26 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             time.sleep(0.02)
         return last_health
 
+    def _seed_history_json(
+        self,
+        storage_key: str,
+        records: list[dict],
+    ) -> None:
+        history._task_file(storage_key).write_text(
+            json.dumps(records, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _seed_fresh_structured_history(
+        self,
+        sources: dict[str, list[dict]],
+    ) -> None:
+        for storage_key, records in sources.items():
+            self._seed_history_json(storage_key, records)
+        store = ArticleHistorySQLiteStore(history.HISTORY_SHADOW_DB_FILE)
+        store.import_history_sources(sources, replace=True)
+        store.set_meta("history_source_signature", history.get_history_source_signature())
+
     def test_default_history_keeps_json_backend(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
 
@@ -921,6 +941,166 @@ class HistorySQLiteStorageMigrationTests(unittest.TestCase):
             [recorded["id"]],
         )
         self.assertEqual(history.get_structured_read_health()["effectiveBackend"], "json")
+
+    def test_default_history_write_backend_keeps_document_path(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ.pop(history.STRUCTURED_READ_BACKEND_ENV, None)
+        os.environ.pop(history.STRUCTURED_WRITE_BACKEND_ENV, None)
+
+        recorded = history.record(
+            "Default Write Task",
+            "doubao",
+            "keyword",
+            "Brand",
+            1,
+            True,
+            task_id="task_default_write",
+        )
+        health = history.get_structured_read_health()
+
+        self.assertTrue(history._task_file("task_default_write").exists())
+        self.assertEqual(
+            [item["id"] for item in history.get_records("Default Write Task", task_id="task_default_write")],
+            [recorded["id"]],
+        )
+        self.assertEqual(health["writePath"]["requestedBackend"], "json")
+        self.assertEqual(health["writePath"]["effectiveBackend"], "json_file")
+        self.assertTrue(health["writePath"]["knownFullDocumentRewrite"])
+
+    def test_forced_json_or_off_write_backend_keeps_document_path(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ.pop(history.STRUCTURED_READ_BACKEND_ENV, None)
+
+        for backend in ("json", "off"):
+            history.reset_structured_read_health()
+            os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = backend
+            recorded = history.record(
+                f"Forced {backend}",
+                "doubao",
+                "keyword",
+                "Brand",
+                1,
+                True,
+                task_id=f"task_forced_{backend}",
+            )
+            health = history.get_structured_read_health()
+
+            self.assertTrue(history._task_file(f"task_forced_{backend}").exists())
+            self.assertEqual(
+                [item["id"] for item in history.get_records(f"Forced {backend}", task_id=f"task_forced_{backend}")],
+                [recorded["id"]],
+            )
+            self.assertEqual(health["writePath"]["requestedBackend"], "json")
+            self.assertEqual(health["writePath"]["effectiveBackend"], "json_file")
+
+    def test_auto_write_backend_missing_db_falls_back_to_document_path(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ.pop(history.STRUCTURED_READ_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = "auto"
+
+        with patch.object(history, "_schedule_structured_shadow_rebuild", return_value=True) as schedule_mock:
+            recorded = history.record(
+                "Auto Missing Task",
+                "doubao",
+                "keyword",
+                "Brand",
+                1,
+                True,
+                task_id="task_auto_missing",
+            )
+            health = history.get_structured_read_health()
+
+        self.assertTrue(schedule_mock.called)
+        self.assertTrue(history._task_file("task_auto_missing").exists())
+        self.assertEqual(
+            [item["id"] for item in history.get_records("Auto Missing Task", task_id="task_auto_missing")],
+            [recorded["id"]],
+        )
+        self.assertEqual(health["writePath"]["requestedBackend"], "auto")
+        self.assertEqual(health["writePath"]["effectiveBackend"], "json_file")
+        self.assertEqual(health["writePath"]["fallbackReason"], "shadow_db_missing")
+
+    def test_auto_write_backend_uses_structured_after_fresh_bootstrap(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ.pop(history.STRUCTURED_READ_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = "sqlite_structured_auto"
+        seed = {
+            "id": "auto-seed",
+            "ts": "2024-01-01 09:00",
+            "task_id": "task_auto_ready",
+            "task_name": "Auto Ready Task",
+            "platform": "doubao",
+            "keyword": "seed",
+            "brand": "Brand",
+            "rank": 1,
+            "success": True,
+        }
+        self._seed_fresh_structured_history({"task_auto_ready": [seed]})
+
+        appended = history.record(
+            "Auto Ready Task",
+            "doubao",
+            "keyword",
+            "Brand",
+            1,
+            True,
+            task_id="task_auto_ready",
+        )
+        health = history.get_structured_read_health()
+
+        self.assertEqual(health["writePath"]["requestedBackend"], "auto")
+        self.assertEqual(health["writePath"]["effectiveBackend"], "sqlite_structured")
+        self.assertFalse(health["writePath"]["knownFullDocumentRewrite"])
+        self.assertTrue(health["authoritativeReadiness"]["readyForAuthoritativeSwitch"])
+        self.assertEqual(
+            [item["id"] for item in history.get_records("Auto Ready Task", task_id="task_auto_ready")],
+            ["auto-seed", appended["id"]],
+        )
+        self.assertEqual(
+            [item["id"] for item in json.loads(history._task_file("task_auto_ready").read_text(encoding="utf-8"))],
+            ["auto-seed"],
+        )
+
+    def test_auto_structured_write_failure_enters_cooldown_and_falls_back(self) -> None:
+        os.environ.pop(history.STORAGE_BACKEND_ENV, None)
+        os.environ.pop(history.STRUCTURED_READ_BACKEND_ENV, None)
+        os.environ[history.STRUCTURED_WRITE_BACKEND_ENV] = "auto"
+        seed = {
+            "id": "auto-fail-seed",
+            "ts": "2024-01-01 09:00",
+            "task_id": "task_auto_fail",
+            "task_name": "Auto Fail Task",
+            "platform": "doubao",
+            "keyword": "seed",
+            "brand": "Brand",
+            "rank": 1,
+            "success": True,
+        }
+        self._seed_fresh_structured_history({"task_auto_fail": [seed]})
+
+        with patch.object(
+            ArticleHistorySQLiteStore,
+            "append_history_record",
+            side_effect=RuntimeError("auto structured write failed"),
+        ):
+            recorded = history.record(
+                "Auto Fail Task",
+                "doubao",
+                "keyword",
+                "Brand",
+                1,
+                True,
+                task_id="task_auto_fail",
+            )
+
+        health = history.get_structured_read_health()
+        self.assertEqual(
+            [item["id"] for item in json.loads(history._task_file("task_auto_fail").read_text(encoding="utf-8"))],
+            ["auto-fail-seed", recorded["id"]],
+        )
+        self.assertEqual(health["writePath"]["effectiveBackend"], "json_file")
+        self.assertEqual(health["writePath"]["fallbackReason"], "record_write_failed")
+        self.assertGreater(health["writePath"]["cooldownRemainingSeconds"], 0)
 
     def test_structured_read_backend_reads_records_and_derived_views_when_enabled(self) -> None:
         os.environ.pop(history.STORAGE_BACKEND_ENV, None)
