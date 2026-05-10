@@ -20,7 +20,7 @@ class CooldownRaceTests(unittest.TestCase):
             WeComNotifier._shared_post_locks.clear()
         self.webhook_url = f"https://example.invalid/wecom-test/{uuid4().hex}"
 
-    def _make_notifier(self, cooldown_minutes: int = 30) -> WeComNotifier:
+    def _make_notifier(self, cooldown_minutes: int = 0) -> WeComNotifier:
         return WeComNotifier(
             webhook_url=self.webhook_url,
             cooldown_minutes=cooldown_minutes,

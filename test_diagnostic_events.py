@@ -4,9 +4,25 @@ from __future__ import annotations
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
 
 from core import diagnostic_events as diag
+
+
+@contextmanager
+def _patched_record_event(fake=None):
+    """Patch the exact global that record_event_safe resolves at runtime."""
+    replacement = fake if fake is not None else MagicMock()
+    globals_dict = diag.record_event_safe.__globals__
+    original = globals_dict["record_event"]
+    globals_dict["record_event"] = replacement
+    diag.record_event = replacement
+    try:
+        yield replacement
+    finally:
+        globals_dict["record_event"] = original
+        diag.record_event = original
 
 
 class RecordEventSafeTests(unittest.TestCase):
@@ -14,25 +30,25 @@ class RecordEventSafeTests(unittest.TestCase):
         diag.reset_throttle_state()
 
     def test_returns_true_when_event_written(self):
-        with patch.object(diag, "record_event") as mock_record:
+        with _patched_record_event() as mock_record:
             result = diag.record_event_safe("cloud_sync", "test message", event_key="k1")
         self.assertTrue(result)
         mock_record.assert_called_once()
 
     def test_returns_false_when_throttled(self):
-        with patch.object(diag, "record_event"):
+        with _patched_record_event():
             first = diag.record_event_safe("cloud_sync", "msg", event_key="k1", throttle_seconds=600)
             second = diag.record_event_safe("cloud_sync", "msg", event_key="k1", throttle_seconds=600)
         self.assertTrue(first)
         self.assertFalse(second)
 
     def test_never_raises_on_exception(self):
-        with patch.object(diag, "record_event", side_effect=RuntimeError("boom")):
+        with _patched_record_event(MagicMock(side_effect=RuntimeError("boom"))):
             result = diag.record_event_safe("cloud_sync", "msg", event_key="k1")
         self.assertFalse(result)
 
     def test_no_event_key_skips_throttle(self):
-        with patch.object(diag, "record_event") as mock_record:
+        with _patched_record_event() as mock_record:
             r1 = diag.record_event_safe("cloud_sync", "msg")
             r2 = diag.record_event_safe("cloud_sync", "msg")
         self.assertTrue(r1)
@@ -40,18 +56,18 @@ class RecordEventSafeTests(unittest.TestCase):
         self.assertEqual(mock_record.call_count, 2)
 
     def test_throttle_is_per_event_key(self):
-        with patch.object(diag, "record_event"):
+        with _patched_record_event():
             r1 = diag.record_event_safe("cloud_sync", "msg", event_key="key_a", throttle_seconds=600)
             r2 = diag.record_event_safe("cloud_sync", "msg", event_key="key_b", throttle_seconds=600)
         self.assertTrue(r1)
         self.assertTrue(r2)
 
     def test_throttle_expires_after_seconds(self):
-        with patch.object(diag, "record_event"):
+        with _patched_record_event():
             diag.record_event_safe("cloud_sync", "msg", event_key="k_expire", throttle_seconds=1)
         with patch.object(diag, "time") as mock_time:
             mock_time.monotonic.return_value = time.monotonic() + 2
-            with patch.object(diag, "record_event") as mock_record:
+            with _patched_record_event() as mock_record:
                 result = diag.record_event_safe("cloud_sync", "msg", event_key="k_expire", throttle_seconds=1)
         self.assertTrue(result)
         mock_record.assert_called_once()
@@ -65,7 +81,7 @@ class RecordEventSafeTests(unittest.TestCase):
             if call_count == 1:
                 raise RuntimeError("transient failure")
 
-        with patch.object(diag, "record_event", side_effect=failing_then_succeeding):
+        with _patched_record_event(MagicMock(side_effect=failing_then_succeeding)):
             first = diag.record_event_safe("c", "msg", event_key="retry_key", throttle_seconds=600)
             second = diag.record_event_safe("c", "msg", event_key="retry_key", throttle_seconds=600)
         self.assertFalse(first)
@@ -84,7 +100,7 @@ class RecordEventSafeTests(unittest.TestCase):
         def worker():
             results.append(diag.record_event_safe("c", "msg", event_key="concurrent_key", throttle_seconds=600))
 
-        with patch.object(diag, "record_event", side_effect=blocking_record):
+        with _patched_record_event(MagicMock(side_effect=blocking_record)):
             t1 = threading.Thread(target=worker)
             t1.start()
             # Wait until the first thread is inside record_event (inflight acquired)
@@ -106,7 +122,7 @@ class RecordEventSafeTests(unittest.TestCase):
         self.assertEqual(false_count, 1)
 
     def test_passes_all_fields_to_record_event(self):
-        with patch.object(diag, "record_event") as mock_record:
+        with _patched_record_event() as mock_record:
             diag.record_event_safe(
                 "browser_runtime",
                 "test",
@@ -144,7 +160,7 @@ class ConsecutiveFailureTests(unittest.TestCase):
         self.assertEqual(diag.get_consecutive_failure_count("op1"), 2)
 
     def test_emits_diagnostics_at_threshold(self):
-        with patch.object(diag, "record_event") as mock_record:
+        with _patched_record_event() as mock_record:
             diag.record_consecutive_failure("op1", threshold=3, operation="test", error="e1")
             diag.record_consecutive_failure("op1", threshold=3, operation="test", error="e2")
             # Not yet at threshold
@@ -154,7 +170,7 @@ class ConsecutiveFailureTests(unittest.TestCase):
             mock_record.assert_called_once()
 
     def test_does_not_emit_below_threshold(self):
-        with patch.object(diag, "record_event") as mock_record:
+        with _patched_record_event() as mock_record:
             diag.record_consecutive_failure("op1", threshold=5, operation="test", error="e1")
             diag.record_consecutive_failure("op1", threshold=5, operation="test", error="e2")
             diag.record_consecutive_failure("op1", threshold=5, operation="test", error="e3")
@@ -170,14 +186,14 @@ class ConsecutiveFailureTests(unittest.TestCase):
 
     def test_emits_once_at_threshold_then_throttled(self):
         """Emits at threshold, then subsequent calls within throttle window are suppressed."""
-        with patch.object(diag, "record_event") as mock_record:
+        with _patched_record_event() as mock_record:
             for i in range(5):
                 diag.record_consecutive_failure("op1", threshold=3, operation="test", error=f"e{i}")
         # Only the first call at threshold emits; the rest are throttled
         self.assertEqual(mock_record.call_count, 1)
 
     def test_failure_diagnostics_includes_count_and_operation(self):
-        with patch.object(diag, "record_event") as mock_record:
+        with _patched_record_event() as mock_record:
             for i in range(3):
                 diag.record_consecutive_failure(
                     "flush_cloud_outbox",
@@ -195,11 +211,11 @@ class ConsecutiveFailureTests(unittest.TestCase):
 
 class ResetTests(unittest.TestCase):
     def test_reset_throttle_state_clears_all(self):
-        with patch.object(diag, "record_event"):
+        with _patched_record_event():
             diag.record_event_safe("c", "m", event_key="k1")
             diag.record_event_safe("c", "m", event_key="k2")
         diag.reset_throttle_state()
-        with patch.object(diag, "record_event") as mock_record:
+        with _patched_record_event() as mock_record:
             r1 = diag.record_event_safe("c", "m", event_key="k1")
             r2 = diag.record_event_safe("c", "m", event_key="k2")
         self.assertTrue(r1)
