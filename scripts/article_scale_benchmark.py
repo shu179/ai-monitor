@@ -636,15 +636,9 @@ def build_rollout_guard(summary: dict[str, Any]) -> dict[str, Any]:
 
 def _prepare_data_dir(data_dir: Path, *, force: bool) -> dict[str, Path]:
     logs_dir = data_dir / "logs"
-    articles_path = logs_dir / "articles.json"
-    if articles_path.exists() and not force:
-        raise FileExistsError(
-            f"{articles_path} already exists; pass --force to overwrite an explicit benchmark data dir"
-        )
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    return {
+    paths = {
         "logs": logs_dir,
-        "articles": articles_path,
+        "articles": logs_dir / "articles.json",
         "domain_overrides": logs_dir / "domain_overrides.json",
         "domain_media_names": logs_dir / "domain_media_names.json",
         "excluded_article_urls": logs_dir / "excluded_article_urls.json",
@@ -652,6 +646,24 @@ def _prepare_data_dir(data_dir: Path, *, force: bool) -> dict[str, Path]:
         "article_store_db": logs_dir / "article_store.sqlite3",
         "shadow_db": logs_dir / "article_history_shadow.sqlite3",
     }
+    if paths["articles"].exists() and not force:
+        raise FileExistsError(
+            f"{paths['articles']} already exists; pass --force to overwrite an explicit benchmark data dir"
+        )
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    if force:
+        for key, path in paths.items():
+            if key == "logs":
+                continue
+            candidates = [path]
+            if path.suffix == ".sqlite3":
+                candidates.extend([Path(f"{path}-wal"), Path(f"{path}-shm")])
+            for candidate in candidates:
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    pass
+    return paths
 
 
 def _normalize_article_store_backend(value: str) -> str:
@@ -1025,7 +1037,40 @@ def _mark_small_dirty_articles(config: dict[str, Any]) -> list[str]:
     return dirty_ids
 
 
+def _background_refresh_dirty_limit() -> int:
+    try:
+        batch_size = int(os.environ.get(article_store.ARTICLE_MATCH_REFRESH_BATCH_SIZE_ENV, 500))
+    except Exception:
+        batch_size = 500
+    return max(3, min(200, max(1, batch_size) * 2))
+
+
+def _mark_background_refresh_dirty_articles(config: dict[str, Any]) -> list[str]:
+    tasks = [
+        str(task.get("name", "") or "").strip()
+        for task in (config.get("tasks", []) or [])
+        if isinstance(task, dict) and str(task.get("name", "") or "").strip()
+    ]
+    task_name = tasks[0] if tasks else "Brand 0"
+    dirty_ids: list[str] = []
+    for index, article in enumerate(article_store.get_articles()[:_background_refresh_dirty_limit()]):
+        article_id = str((article or {}).get("id") or "").strip()
+        if not article_id:
+            continue
+        updated = article_store.update_article(
+            article_id,
+            {
+                "title": f"{task_name} background refresh dirty {index}",
+                "excerpt": f"{task_name} background refresh benchmark sample {index}",
+            },
+        )
+        if updated is not None:
+            dirty_ids.append(article_id)
+    return dirty_ids
+
+
 def _schedule_background_match_refresh(config: dict[str, Any], *, wait: bool = False) -> dict[str, Any]:
+    dirty_article_ids = _mark_background_refresh_dirty_articles(config) if wait else []
     schedule_result = article_store.schedule_article_match_refresh(config, reason="benchmark")
     status = article_store.get_article_match_refresh_status()
     if wait and schedule_result.get("scheduled"):
@@ -1045,6 +1090,9 @@ def _schedule_background_match_refresh(config: dict[str, Any], *, wait: bool = F
         "needs_refresh_count": status.get("needs_refresh_count", 0),
         "total": status.get("total", 0),
         "batch_size": status.get("batch_size", 0),
+        "sleep_seconds": schedule_result.get("sleep_seconds", 0),
+        "dirty_article_count": len(dirty_article_ids),
+        "dirty_article_ids": dirty_article_ids[:20],
         "processed_count": status.get("processed_count", 0),
         "updated_count": status.get("updated_count", 0),
         "analyzed_count": status.get("analyzed_count", 0),

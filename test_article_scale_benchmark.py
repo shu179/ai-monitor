@@ -9,6 +9,7 @@ from pathlib import Path
 from core import article_store
 from scripts.article_scale_benchmark import (
     BenchmarkOptions,
+    _prepare_data_dir,
     build_rollout_guard,
     build_synthetic_articles,
     build_synthetic_config,
@@ -17,6 +18,21 @@ from scripts.article_scale_benchmark import (
 
 
 class ArticleScaleBenchmarkTests(unittest.TestCase):
+    def test_force_prepare_data_dir_removes_stale_benchmark_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = _prepare_data_dir(Path(tmpdir), force=True)
+            paths["articles"].write_text("[]", encoding="utf-8")
+            paths["article_store_db"].write_text("stale", encoding="utf-8")
+            Path(f"{paths['article_store_db']}-wal").write_text("stale-wal", encoding="utf-8")
+            Path(f"{paths['article_store_db']}-shm").write_text("stale-shm", encoding="utf-8")
+
+            refreshed = _prepare_data_dir(Path(tmpdir), force=True)
+
+            self.assertFalse(refreshed["articles"].exists())
+            self.assertFalse(refreshed["article_store_db"].exists())
+            self.assertFalse(Path(f"{refreshed['article_store_db']}-wal").exists())
+            self.assertFalse(Path(f"{refreshed['article_store_db']}-shm").exists())
+
     def test_synthetic_articles_include_scale_dimensions(self) -> None:
         articles = build_synthetic_articles(
             30,
@@ -126,6 +142,7 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
                     duplicate_every=11,
                     today_every=4,
                     article_store_backend="sqlite",
+                    wait_background_refresh=True,
                     data_dir=Path(tmpdir),
                     force=True,
                 )
@@ -180,6 +197,15 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
             len(refresh_details["dirty_article_ids"]),
         )
         self.assertGreater(refresh_details["refresh_cold_full_analyze_calls"], 0)
+        background_details = operations["schedule_background_match_refresh"]["details"]
+        self.assertTrue(background_details["scheduled"])
+        self.assertEqual(background_details["status"], "finished")
+        self.assertGreater(background_details["dirty_article_count"], 0)
+        self.assertEqual(
+            background_details["processed_count"],
+            background_details["dirty_article_count"],
+        )
+        self.assertGreater(background_details["analyzed_count"], 0)
 
     def test_small_benchmark_supports_guarded_auto_backend(self) -> None:
         original_articles_file = article_store.ARTICLES_FILE

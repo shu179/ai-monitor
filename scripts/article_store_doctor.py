@@ -247,7 +247,7 @@ def build_doctor_summary(
             "imported": sqlite_info.get("meta", {}).get("article_store_import_source_count"),
         },
         "migration_state": migration_state,
-        "match_refresh_job": article_store.get_article_match_refresh_status(),
+        "match_refresh_job": _match_refresh_job_snapshot(target.db_path, readiness=readiness),
         "health": runtime_health,
         "recommendations": recommendations,
         "exit_code_policy": {
@@ -258,6 +258,73 @@ def build_doctor_summary(
             "severe_error": EXIT_SEVERE,
         },
         "loaded_article_count_for_diagnostics": len(articles),
+}
+
+
+def _match_refresh_job_snapshot(db_path: Path, *, readiness: dict[str, Any]) -> dict[str, Any]:
+    if not bool(readiness.get("ready")):
+        return {"backend": "sqlite", "error": "store_unavailable"}
+    meta_keys = [
+        "match_refresh_running",
+        "match_refresh_config_signature",
+        "match_refresh_total",
+        "match_refresh_needs_refresh_count",
+        "match_refresh_processed_count",
+        "match_refresh_updated_count",
+        "match_refresh_analyzed_count",
+        "match_refresh_batch_size",
+        "match_refresh_started_at",
+        "match_refresh_updated_at",
+        "match_refresh_finished_at",
+        "match_refresh_last_error",
+        "match_refresh_reason",
+    ]
+    try:
+        store = _build_store(db_path)
+        meta_snapshot = {key: store.get_meta(key) for key in meta_keys}
+    except Exception as exc:
+        return {"backend": "sqlite", "error": f"{exc.__class__.__name__}: {exc}"}
+
+    running = meta_snapshot.get("match_refresh_running") == "1"
+    worker_alive = False
+    try:
+        if _same_path(article_store.get_article_store_db_path(), db_path):
+            worker_alive = bool(article_store.get_article_match_refresh_status().get("worker_alive"))
+    except Exception:
+        worker_alive = False
+    total = _safe_int(meta_snapshot.get("match_refresh_total")) or 0
+    processed = _safe_int(meta_snapshot.get("match_refresh_processed_count")) or 0
+    finished_at = meta_snapshot.get("match_refresh_finished_at", "")
+    last_error = meta_snapshot.get("match_refresh_last_error", "")
+    if running and not worker_alive:
+        status = "interrupted"
+    elif running:
+        status = "running"
+    elif last_error:
+        status = "error"
+    elif finished_at:
+        status = "finished"
+    elif not running and total > 0:
+        status = "finished"
+    else:
+        status = "idle"
+    return {
+        "backend": "sqlite",
+        "status": status,
+        "running": running,
+        "worker_alive": worker_alive,
+        "config_signature": meta_snapshot.get("match_refresh_config_signature", ""),
+        "total": total,
+        "needs_refresh_count": _safe_int(meta_snapshot.get("match_refresh_needs_refresh_count")) or 0,
+        "processed_count": processed,
+        "updated_count": _safe_int(meta_snapshot.get("match_refresh_updated_count")) or 0,
+        "analyzed_count": _safe_int(meta_snapshot.get("match_refresh_analyzed_count")) or 0,
+        "batch_size": _safe_int(meta_snapshot.get("match_refresh_batch_size")) or 0,
+        "started_at": meta_snapshot.get("match_refresh_started_at", ""),
+        "updated_at": meta_snapshot.get("match_refresh_updated_at", ""),
+        "finished_at": finished_at,
+        "last_error": last_error,
+        "reason": meta_snapshot.get("match_refresh_reason", ""),
     }
 
 

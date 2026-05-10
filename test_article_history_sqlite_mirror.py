@@ -26,6 +26,7 @@ from core.article_store import normalize_article_url
 
 class ArticleHistorySQLiteMirrorTests(unittest.TestCase):
     def setUp(self) -> None:
+        article_store.reset_article_store_backend_health_for_tests()
         self._tmpdir = tempfile.TemporaryDirectory()
         root = Path(self._tmpdir.name)
         self._original_article_paths = {
@@ -44,12 +45,15 @@ class ArticleHistorySQLiteMirrorTests(unittest.TestCase):
         history.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self) -> None:
-        article_store.ARTICLES_FILE = self._original_article_paths["ARTICLES_FILE"]
-        article_store.DOMAIN_OVERRIDES_FILE = self._original_article_paths["DOMAIN_OVERRIDES_FILE"]
-        article_store.DOMAIN_MEDIA_NAMES_FILE = self._original_article_paths["DOMAIN_MEDIA_NAMES_FILE"]
-        article_store.EXCLUDED_ARTICLE_URLS_FILE = self._original_article_paths["EXCLUDED_ARTICLE_URLS_FILE"]
-        history.HISTORY_DIR = self._original_history_dir
-        self._tmpdir.cleanup()
+        try:
+            article_store.reset_article_store_backend_health_for_tests()
+        finally:
+            article_store.ARTICLES_FILE = self._original_article_paths["ARTICLES_FILE"]
+            article_store.DOMAIN_OVERRIDES_FILE = self._original_article_paths["DOMAIN_OVERRIDES_FILE"]
+            article_store.DOMAIN_MEDIA_NAMES_FILE = self._original_article_paths["DOMAIN_MEDIA_NAMES_FILE"]
+            article_store.EXCLUDED_ARTICLE_URLS_FILE = self._original_article_paths["EXCLUDED_ARTICLE_URLS_FILE"]
+            history.HISTORY_DIR = self._original_history_dir
+            self._tmpdir.cleanup()
 
     def test_rebuild_shadow_store_imports_json_sources_and_verifies(self) -> None:
         self._write_articles([

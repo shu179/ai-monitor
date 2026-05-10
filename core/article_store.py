@@ -5531,12 +5531,13 @@ def get_article_match_refresh_status() -> dict[str, object]:
 
 
 def _run_article_match_refresh_worker(config: dict, reason: str) -> None:
-    compiled = compile_article_matcher(config)
-    config_signature = compiled.config_signature
-    store = _article_sqlite_store()
-    batch_size = _match_refresh_batch_size()
-    sleep_seconds = _match_refresh_sleep_seconds()
+    store = None
     try:
+        compiled = compile_article_matcher(config)
+        config_signature = compiled.config_signature
+        store = _article_sqlite_store()
+        batch_size = _match_refresh_batch_size()
+        sleep_seconds = _match_refresh_sleep_seconds()
         stats = store.get_match_refresh_stats(config_signature)
         needs_refresh = int(stats.get("needs_refresh_count") or 0)
         total_articles = int(stats.get("total") or 0)
@@ -5669,6 +5670,8 @@ def _run_article_match_refresh_worker(config: dict, reason: str) -> None:
         )
     except Exception as exc:
         try:
+            if store is None:
+                store = _article_sqlite_store()
             _write_match_refresh_meta(
                 store,
                 running="0",
@@ -5713,6 +5716,23 @@ def schedule_article_match_refresh(config: dict, *, reason: str = "", force: boo
                 "total": int(stats.get("total") or 0),
                 "status": get_article_match_refresh_status(),
             }
+        batch_size = _match_refresh_batch_size()
+        _write_match_refresh_meta(
+            store,
+            running="1",
+            config_signature=config_signature,
+            total=str(int(stats.get("total") or 0)),
+            needs_refresh_count=str(needs_refresh),
+            processed_count="0",
+            updated_count="0",
+            analyzed_count="0",
+            batch_size=str(batch_size),
+            started_at=local_now().isoformat(timespec="seconds"),
+            updated_at="",
+            finished_at="",
+            last_error="",
+            reason=str(reason or ""),
+        )
         thread = threading.Thread(
             target=_run_article_match_refresh_worker,
             args=(config, str(reason or "")),
@@ -5728,7 +5748,7 @@ def schedule_article_match_refresh(config: dict, *, reason: str = "", force: boo
         "reason": str(reason or ""),
         "needs_refresh_count": needs_refresh,
         "total": int(stats.get("total") or 0),
-        "batch_size": _match_refresh_batch_size(),
+        "batch_size": batch_size,
         "sleep_seconds": _match_refresh_sleep_seconds(),
     }
 

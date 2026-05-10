@@ -78,6 +78,41 @@ def test_doctor_reports_fresh_sqlite_as_healthy(tmp_path: Path) -> None:
     assert summary["exit_code"] == 0
 
 
+def test_doctor_reports_match_refresh_job_from_target_db(tmp_path: Path) -> None:
+    _articles_path, db_path = _seed_articles(tmp_path, [{"id": "article-a", "url": "https://example.com/a", "title": "A"}])
+    rebuild = run_doctor(
+        DoctorOptions(
+            data_dir=tmp_path,
+            requested_backend="auto",
+            rebuild_sqlite=True,
+        )
+    )
+    assert _operation(rebuild, "rebuild_sqlite")["ok"] is True
+    store = ArticleSQLiteStore(db_path, normalize_article_url=article_store.normalize_article_url)
+    store.set_meta("match_refresh_running", "0")
+    store.set_meta("match_refresh_config_signature", "target-config")
+    store.set_meta("match_refresh_total", "10")
+    store.set_meta("match_refresh_needs_refresh_count", "4")
+    store.set_meta("match_refresh_processed_count", "4")
+    store.set_meta("match_refresh_updated_count", "3")
+    store.set_meta("match_refresh_analyzed_count", "4")
+    store.set_meta("match_refresh_batch_size", "50")
+    store.set_meta("match_refresh_started_at", "2026-05-10T10:00:00")
+    store.set_meta("match_refresh_updated_at", "2026-05-10T10:00:01")
+    store.set_meta("match_refresh_finished_at", "2026-05-10T10:00:01")
+    store.set_meta("match_refresh_last_error", "")
+    store.set_meta("match_refresh_reason", "target-test")
+
+    summary = run_doctor(DoctorOptions(data_dir=tmp_path, requested_backend="auto"))
+
+    job = summary["match_refresh_job"]
+    assert job["status"] == "finished"
+    assert job["reason"] == "target-test"
+    assert job["config_signature"] == "target-config"
+    assert job["processed_count"] == 4
+    assert job["batch_size"] == 50
+
+
 def test_rebuild_sqlite_uses_temp_db_and_does_not_modify_articles_json(tmp_path: Path) -> None:
     articles = [
         {"id": "article-a", "url": "https://example.com/a", "title": "A"},

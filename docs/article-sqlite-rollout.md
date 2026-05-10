@@ -64,6 +64,7 @@ python3 scripts/article_store_doctor.py --data-dir /path/to/data-dir --check-onl
 - `backend.fallback_reason`: 空字符串表示没有回退原因。
 - `db.readiness.ready`: 期望为 `true`。
 - `freshness.fresh`: 期望为 `true`。
+- `match_refresh_job.status`: 后台文章匹配刷新状态，常见值为 `idle`、`running`、`finished`、`error`、`interrupted`。
 - `exit_code`: `0` 健康；`2` 可修复回退；`1` 严重错误。
 
 ## 修复和校验
@@ -95,6 +96,21 @@ python3 scripts/article_store_doctor.py \
 ```
 
 如果输出文件已存在，确认要覆盖时再加 `--force`。
+
+## 后台 match refresh
+
+SQLite 主存储下，文章匹配刷新会优先通过后台 job 增量处理 dirty 文章，避免普通请求同步跑全量匹配。运行状态写在 SQLite meta 中，可通过 doctor 的 `match_refresh_job` 或 `/api/history-storage/status` 里的 `articleStore.match_refresh_job` 查看。
+
+低性能或 smoke 环境可以用这两个环境变量放慢后台 job，验证 batch、sleep 和进度统计：
+
+```bash
+AIBRANDMONITOR_ARTICLE_MATCH_REFRESH_BATCH_SIZE=50
+AIBRANDMONITOR_ARTICLE_MATCH_REFRESH_SLEEP_SECONDS=0.05
+```
+
+`article_scale_benchmark.py --wait-background-refresh` 会等待后台 job 完成，并在 `operations[].name == "schedule_background_match_refresh"` 中输出 `scheduled`、`status`、`processed_count`、`analyzed_count`、`updated_count`、`batch_size`、`sleep_seconds` 和 fd delta。
+
+云同步上传文章快照时，如果匹配刷新刚被调度或已有 job 在跑，会先 deferred 并稍后重试；不会把旧的 `matched_tasks` 当作 fresh 结果上传。
 
 ## 10 万 benchmark
 
