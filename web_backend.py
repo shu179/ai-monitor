@@ -153,6 +153,7 @@ from core.article_store import (
     normalize_article_url,
     refresh_article_matches,
     restore_excluded_article_urls,
+    schedule_article_match_refresh,
 )
 from core.browser_auth import (
     activate_browser_auth_profile,
@@ -2359,10 +2360,17 @@ class AppRuntime:
         """Return local article candidates for cloud upload without UI visibility filtering."""
         resolved_config = config or self.config_provider.load()
         session_payload = session if isinstance(session, dict) else CloudSessionStore().load()
-        articles = _apply_articles_account_context(
-            refresh_article_matches(resolved_config),
-            resolved_config,
-        )
+        schedule_result = schedule_article_match_refresh(resolved_config, reason="cloud_upload_snapshot")
+        if schedule_result.get("scheduled"):
+            articles = _apply_articles_account_context(
+                get_articles(),
+                resolved_config,
+            )
+        else:
+            articles = _apply_articles_account_context(
+                refresh_article_matches(resolved_config),
+                resolved_config,
+            )
         if self._is_ordinary_cloud_session(session_payload):
             visible_names, visible_cloud_task_names = self._visible_article_task_scope(resolved_config)
             visible_task_name_set = set(visible_names)
@@ -5539,10 +5547,17 @@ return changedCount
             if cache and cache.get("key") == cache_key:
                 return list(cache.get("articles") or [])
 
-            articles = _apply_articles_account_context(
-                refresh_article_matches(resolved_config),
-                resolved_config,
-            )
+            schedule_result = schedule_article_match_refresh(resolved_config, reason="cloud_sync_read")
+            if schedule_result.get("scheduled"):
+                articles = _apply_articles_account_context(
+                    get_articles(),
+                    resolved_config,
+                )
+            else:
+                articles = _apply_articles_account_context(
+                    refresh_article_matches(resolved_config),
+                    resolved_config,
+                )
             articles = self._filter_articles_for_current_cloud_visibility(
                 articles,
                 resolved_config,

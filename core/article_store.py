@@ -59,12 +59,19 @@ ARTICLE_STORE_SQLITE_MIGRATION_MIN_INTERVAL_SECONDS = 30.0
 ARTICLE_STORE_SQLITE_ERROR_LIMIT = 3
 ARTICLE_STORE_SQLITE_COOLDOWN_SECONDS = 60.0
 
+ARTICLE_MATCH_REFRESH_BATCH_SIZE_ENV = "AIBRANDMONITOR_ARTICLE_MATCH_REFRESH_BATCH_SIZE"
+ARTICLE_MATCH_REFRESH_SLEEP_SECONDS_ENV = "AIBRANDMONITOR_ARTICLE_MATCH_REFRESH_SLEEP_SECONDS"
+DEFAULT_MATCH_REFRESH_BATCH_SIZE = 200
+DEFAULT_MATCH_REFRESH_SLEEP_SECONDS = 0.02
+
 _small_document_cache: dict[str, tuple[float, object]] = {}
 _article_store_backend_health_lock = threading.RLock()
 _article_store_backend_health: dict[str, object] = {}
 _article_store_migration_lock = threading.RLock()
 _article_store_migration_state: dict[str, object] = {}
 _article_store_migration_threads: list[threading.Thread] = []
+_match_refresh_worker_lock = threading.RLock()
+_match_refresh_worker_thread: threading.Thread | None = None
 
 # 权威媒体域名白名单（内置初始值，可通过手动切换覆盖）
 AUTHORITY_DOMAINS: set = {
@@ -890,6 +897,14 @@ def reset_article_store_backend_health_for_tests() -> None:
     with _article_store_migration_lock:
         _article_store_migration_state.clear()
         _article_store_migration_threads.clear()
+    _reset_article_match_refresh_state_for_tests()
+
+
+def _match_refresh_job_health() -> dict[str, object]:
+    try:
+        return get_article_match_refresh_status()
+    except Exception as exc:
+        return {"error": f"{exc.__class__.__name__}: {exc}"}
 
 
 def get_article_store_backend_health() -> dict[str, object]:
@@ -944,6 +959,7 @@ def get_article_store_backend_health() -> dict[str, object]:
         "freshness": freshness,
         "migration_state": migration_state,
         "health": health,
+        "match_refresh_job": _match_refresh_job_health(),
     }
 
 
@@ -5424,3 +5440,303 @@ def refresh_article_matches(config: dict) -> list:
         )
 
     return _sort_articles_for_display(articles)
+
+
+def _match_refresh_batch_size() -> int:
+    try:
+        value = int(os.environ.get(ARTICLE_MATCH_REFRESH_BATCH_SIZE_ENV, DEFAULT_MATCH_REFRESH_BATCH_SIZE))
+    except Exception:
+        value = DEFAULT_MATCH_REFRESH_BATCH_SIZE
+    return max(10, min(2000, value))
+
+
+def _match_refresh_sleep_seconds() -> float:
+    try:
+        value = float(os.environ.get(ARTICLE_MATCH_REFRESH_SLEEP_SECONDS_ENV, DEFAULT_MATCH_REFRESH_SLEEP_SECONDS))
+    except Exception:
+        value = DEFAULT_MATCH_REFRESH_SLEEP_SECONDS
+    return max(0.0, min(0.5, value))
+
+
+def _write_match_refresh_meta(store, **kwargs) -> None:
+    for key, value in kwargs.items():
+        store.set_meta(f"match_refresh_{key}", str(value or ""))
+
+
+def get_article_match_refresh_status() -> dict[str, object]:
+    if not _article_store_sqlite_enabled():
+        return {"backend": "json", "message": "match_refresh_job_only_available_for_sqlite_backend"}
+    try:
+        store = _article_sqlite_store()
+    except Exception:
+        return {"backend": "sqlite", "error": "store_unavailable"}
+    meta_keys = [
+        "match_refresh_running",
+        "match_refresh_config_signature",
+        "match_refresh_total",
+        "match_refresh_needs_refresh_count",
+        "match_refresh_processed_count",
+        "match_refresh_updated_count",
+        "match_refresh_analyzed_count",
+        "match_refresh_batch_size",
+        "match_refresh_started_at",
+        "match_refresh_updated_at",
+        "match_refresh_finished_at",
+        "match_refresh_last_error",
+        "match_refresh_reason",
+    ]
+    meta_snapshot: dict[str, str] = {}
+    for key in meta_keys:
+        try:
+            meta_snapshot[key] = store.get_meta(key)
+        except Exception:
+            meta_snapshot[key] = ""
+    running = meta_snapshot.get("match_refresh_running") == "1"
+    with _match_refresh_worker_lock:
+        worker_alive = _match_refresh_worker_thread is not None and _match_refresh_worker_thread.is_alive()
+    total = int(meta_snapshot.get("match_refresh_total") or 0)
+    processed = int(meta_snapshot.get("match_refresh_processed_count") or 0)
+    finished_at = meta_snapshot.get("match_refresh_finished_at", "")
+    last_error = meta_snapshot.get("match_refresh_last_error", "")
+    if running and not worker_alive:
+        status = "interrupted"
+    elif running:
+        status = "running"
+    elif finished_at:
+        status = "finished"
+    elif not running and total > 0:
+        status = "finished"
+    else:
+        status = "idle"
+    if last_error and not running and status != "finished":
+        status = "error"
+    return {
+        "backend": "sqlite",
+        "status": status,
+        "running": running,
+        "worker_alive": worker_alive,
+        "config_signature": meta_snapshot.get("match_refresh_config_signature", ""),
+        "total": total,
+        "needs_refresh_count": int(meta_snapshot.get("match_refresh_needs_refresh_count") or 0),
+        "processed_count": processed,
+        "updated_count": int(meta_snapshot.get("match_refresh_updated_count") or 0),
+        "analyzed_count": int(meta_snapshot.get("match_refresh_analyzed_count") or 0),
+        "batch_size": int(meta_snapshot.get("match_refresh_batch_size") or 0),
+        "started_at": meta_snapshot.get("match_refresh_started_at", ""),
+        "updated_at": meta_snapshot.get("match_refresh_updated_at", ""),
+        "finished_at": finished_at,
+        "last_error": last_error,
+        "reason": meta_snapshot.get("match_refresh_reason", ""),
+    }
+
+
+def _run_article_match_refresh_worker(config: dict, reason: str) -> None:
+    compiled = compile_article_matcher(config)
+    config_signature = compiled.config_signature
+    store = _article_sqlite_store()
+    batch_size = _match_refresh_batch_size()
+    sleep_seconds = _match_refresh_sleep_seconds()
+    try:
+        stats = store.get_match_refresh_stats(config_signature)
+        needs_refresh = int(stats.get("needs_refresh_count") or 0)
+        total_articles = int(stats.get("total") or 0)
+        _write_match_refresh_meta(
+            store,
+            running="1",
+            config_signature=config_signature,
+            total=str(total_articles),
+            needs_refresh_count=str(needs_refresh),
+            processed_count="0",
+            updated_count="0",
+            analyzed_count="0",
+            batch_size=str(batch_size),
+            started_at=local_now().isoformat(timespec="seconds"),
+            updated_at="",
+            finished_at="",
+            last_error="",
+            reason=str(reason or ""),
+        )
+        processed = 0
+        updated = 0
+        analyzed = 0
+        for batch in store.iter_articles_needing_match(config_signature, batch_size=batch_size):
+            updates: list[dict] = []
+            for article in batch:
+                excluded_task_names = {
+                    str(name or "").strip()
+                    for name in (article.get("excluded_tasks") or [])
+                    if str(name or "").strip()
+                }
+                raw_matched = [
+                    str(name or "").strip()
+                    for name in (article.get("matched_tasks") or [])
+                    if str(name or "").strip()
+                ]
+                stored = [
+                    str(name or "").strip()
+                    for name in (article.get("matched_tasks") or [])
+                    if str(name or "").strip() in compiled.valid_task_names
+                    and str(name or "").strip() not in excluded_task_names
+                ]
+                existing_reasons = article.get("match_reasons") if isinstance(article.get("match_reasons"), dict) else {}
+                fields = _build_match_fields(str(article.get("title", "") or ""), article)
+                current_signature = _article_match_signature(article, config_signature, fields=fields)
+                metadata_changed = (
+                    str(article.get("_match_signature") or "") != current_signature
+                    or str(article.get("_match_config_signature") or "") != config_signature
+                )
+                if str(article.get("_match_signature") or "") == current_signature:
+                    match_reasons = {
+                        task_name: existing_reasons.get(task_name) or ["保留历史归类"]
+                        for task_name in stored
+                    }
+                    unmatched_reason = "" if stored else str(article.get("unmatched_reason", "") or "").strip()
+                    if (
+                        stored != raw_matched
+                        or match_reasons != existing_reasons
+                        or unmatched_reason != str(article.get("unmatched_reason", "") or "").strip()
+                        or metadata_changed
+                    ):
+                        updates.append({
+                            "id": article.get("id"),
+                            "matched_tasks": stored,
+                            "match_reasons": match_reasons,
+                            "unmatched_reason": unmatched_reason,
+                            "_match_signature": current_signature,
+                            "_match_config_signature": config_signature,
+                        })
+                    processed += 1
+                    continue
+                analyzed_result = analyze_article_matches(
+                    article.get("title", ""),
+                    config,
+                    article=article,
+                    compiled_matcher=compiled,
+                    fields=fields,
+                )
+                analyzed += 1
+                inferred = [
+                    str(name or "").strip()
+                    for name in (analyzed_result.get("matched_tasks") or [])
+                    if str(name or "").strip()
+                    and str(name or "").strip() not in excluded_task_names
+                ]
+                inferred_reasons = {
+                    str(name or "").strip(): [
+                        str(r or "").strip()
+                        for r in reasons
+                        if str(r or "").strip()
+                    ]
+                    for name, reasons in (analyzed_result.get("match_reasons") or {}).items()
+                    if str(name or "").strip()
+                    and str(name or "").strip() not in excluded_task_names
+                }
+                merged = []
+                for task_name in stored + inferred:
+                    if task_name and task_name not in merged:
+                        merged.append(task_name)
+                match_reasons_map = {
+                    task_name: inferred_reasons.get(task_name) or ["保留历史归类"]
+                    for task_name in merged
+                }
+                unmatched_reason = "" if merged else str(analyzed_result.get("unmatched_reason", "") or "").strip()
+                updates.append({
+                    "id": article.get("id"),
+                    "matched_tasks": merged,
+                    "match_reasons": match_reasons_map,
+                    "unmatched_reason": unmatched_reason,
+                    "_match_signature": current_signature,
+                    "_match_config_signature": config_signature,
+                })
+                processed += 1
+            if updates:
+                results = store.bulk_update_match_fields(updates)
+                updated += len(results)
+            _write_match_refresh_meta(
+                store,
+                processed_count=str(processed),
+                updated_count=str(updated),
+                analyzed_count=str(analyzed),
+                updated_at=local_now().isoformat(timespec="seconds"),
+            )
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+        _write_match_refresh_meta(
+            store,
+            running="0",
+            finished_at=local_now().isoformat(timespec="seconds"),
+            updated_at=local_now().isoformat(timespec="seconds"),
+        )
+    except Exception as exc:
+        try:
+            _write_match_refresh_meta(
+                store,
+                running="0",
+                last_error=f"{exc.__class__.__name__}: {exc}",
+                finished_at=local_now().isoformat(timespec="seconds"),
+                updated_at=local_now().isoformat(timespec="seconds"),
+            )
+        except Exception:
+            pass
+    finally:
+        _match_refresh_worker_lock.acquire()
+        try:
+            global _match_refresh_worker_thread
+            _match_refresh_worker_thread = None
+        finally:
+            _match_refresh_worker_lock.release()
+
+
+def schedule_article_match_refresh(config: dict, *, reason: str = "", force: bool = False) -> dict[str, object]:
+    if not _article_store_sqlite_enabled():
+        return {"scheduled": False, "reason": "not_sqlite_backend"}
+    compiled = compile_article_matcher(config)
+    config_signature = compiled.config_signature
+    store = _article_sqlite_store()
+    stats = store.get_match_refresh_stats(config_signature)
+    needs_refresh = int(stats.get("needs_refresh_count") or 0)
+    if needs_refresh <= 0 and not force:
+        return {
+            "scheduled": False,
+            "reason": "nothing_to_refresh",
+            "needs_refresh_count": 0,
+            "total": int(stats.get("total") or 0),
+        }
+    _match_refresh_worker_lock.acquire()
+    try:
+        global _match_refresh_worker_thread
+        if _match_refresh_worker_thread is not None and _match_refresh_worker_thread.is_alive():
+            return {
+                "scheduled": False,
+                "reason": "already_running",
+                "needs_refresh_count": needs_refresh,
+                "total": int(stats.get("total") or 0),
+                "status": get_article_match_refresh_status(),
+            }
+        thread = threading.Thread(
+            target=_run_article_match_refresh_worker,
+            args=(config, str(reason or "")),
+            name="article-match-refresh-worker",
+            daemon=True,
+        )
+        _match_refresh_worker_thread = thread
+        thread.start()
+    finally:
+        _match_refresh_worker_lock.release()
+    return {
+        "scheduled": True,
+        "reason": str(reason or ""),
+        "needs_refresh_count": needs_refresh,
+        "total": int(stats.get("total") or 0),
+        "batch_size": _match_refresh_batch_size(),
+        "sleep_seconds": _match_refresh_sleep_seconds(),
+    }
+
+
+def _reset_article_match_refresh_state_for_tests() -> None:
+    _match_refresh_worker_lock.acquire()
+    try:
+        global _match_refresh_worker_thread
+        _match_refresh_worker_thread = None
+    finally:
+        _match_refresh_worker_lock.release()

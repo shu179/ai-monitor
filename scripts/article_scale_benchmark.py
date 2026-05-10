@@ -54,6 +54,7 @@ class BenchmarkOptions:
     force: bool = False
     keep_data: bool = False
     skip_refresh: bool = False
+    wait_background_refresh: bool = False
 
 
 class StaticConfigProvider:
@@ -414,6 +415,14 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
                 )
             )
 
+        operations.append(
+            _measure_operation(
+                "schedule_background_match_refresh",
+                lambda: _schedule_background_match_refresh(config, wait=opts.wait_background_refresh),
+                paths["shadow_db"],
+            )
+        )
+
         final_json_count = _json_article_count(paths["articles"])
         final_authoritative_count = len(article_store.get_articles())
         article_store_backend_health = article_store.get_article_store_backend_health()
@@ -434,6 +443,7 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
             "article_store_backend": article_store_backend,
             "article_store_effective_backend": article_store_backend_health.get("effective_backend", ""),
             "skip_refresh": bool(opts.skip_refresh),
+            "wait_background_refresh": bool(opts.wait_background_refresh),
         },
         "paths": {
             "articles_json": str(paths["articles"]),
@@ -1015,6 +1025,36 @@ def _mark_small_dirty_articles(config: dict[str, Any]) -> list[str]:
     return dirty_ids
 
 
+def _schedule_background_match_refresh(config: dict[str, Any], *, wait: bool = False) -> dict[str, Any]:
+    schedule_result = article_store.schedule_article_match_refresh(config, reason="benchmark")
+    status = article_store.get_article_match_refresh_status()
+    if wait and schedule_result.get("scheduled"):
+        timeout = 60.0
+        waited = 0.0
+        poll_interval = 0.1
+        while waited < timeout:
+            current_status = article_store.get_article_match_refresh_status()
+            if not current_status.get("running") and not current_status.get("worker_alive"):
+                break
+            time.sleep(poll_interval)
+            waited += poll_interval
+        status = article_store.get_article_match_refresh_status()
+    return {
+        "scheduled": schedule_result.get("scheduled"),
+        "scheduled_reason": schedule_result.get("reason", ""),
+        "needs_refresh_count": status.get("needs_refresh_count", 0),
+        "total": status.get("total", 0),
+        "batch_size": status.get("batch_size", 0),
+        "processed_count": status.get("processed_count", 0),
+        "updated_count": status.get("updated_count", 0),
+        "analyzed_count": status.get("analyzed_count", 0),
+        "status": status.get("status", ""),
+        "has_finished_at": bool(status.get("finished_at")),
+        "has_error": bool(status.get("last_error")),
+        "error": str(status.get("last_error") or ""),
+    }
+
+
 def _sqlite_status(db_path: Path, today: date) -> dict[str, Any]:
     readiness = ArticleHistorySQLiteStore.validate_readiness(db_path)
     status = {
@@ -1099,6 +1139,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="Overwrite an existing explicit data dir articles.json.")
     parser.add_argument("--keep-data", action="store_true", help="Keep a generated tempfile data dir after the run.")
     parser.add_argument("--skip-refresh", action="store_true", help="Skip refresh_article_matches timing.")
+    parser.add_argument("--wait-background-refresh", action="store_true", help="Wait for background match refresh job to complete.")
     parser.add_argument("--output", type=Path, default=None, help="Optional JSON summary output path.")
     return parser.parse_args(argv)
 
@@ -1118,6 +1159,7 @@ def main(argv: list[str] | None = None) -> int:
             force=args.force,
             keep_data=args.keep_data,
             skip_refresh=args.skip_refresh,
+            wait_background_refresh=args.wait_background_refresh,
         )
     )
     payload = json.dumps(summary, ensure_ascii=False, indent=2)

@@ -247,6 +247,7 @@ def build_doctor_summary(
             "imported": sqlite_info.get("meta", {}).get("article_store_import_source_count"),
         },
         "migration_state": migration_state,
+        "match_refresh_job": article_store.get_article_match_refresh_status(),
         "health": runtime_health,
         "recommendations": recommendations,
         "exit_code_policy": {
