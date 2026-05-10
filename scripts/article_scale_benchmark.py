@@ -460,16 +460,25 @@ def _run_benchmark_in_dir(opts: BenchmarkOptions, data_dir: Path) -> dict[str, A
         "article_store_doctor": article_store_doctor,
         "operations": operations,
         "standards": {},
-        "recommendations": migration_recommendations(),
+        "recommendations": migration_recommendations(
+            str(article_store_backend_health.get("effective_backend") or article_store_backend)
+        ),
     }
     summary["standards"] = evaluate_standards(summary)
     summary["rollout_guard"] = build_rollout_guard(summary)
     return summary
 
 
-def migration_recommendations() -> list[str]:
+def migration_recommendations(effective_backend: str = "json") -> list[str]:
+    backend = str(effective_backend or "json").strip().lower()
+    if backend == "sqlite":
+        return [
+            "ArticleStore is using the SQLite authoritative path for this run.",
+            "Keep JSON as backup/export/migration fallback rather than the hot write path.",
+            "Continue monitoring guarded fallback, cooldown, fd growth, and background match refresh status during rollout.",
+        ]
     return [
-        "Make ArticleStore a structured SQLite authoritative store before moving 100k-scale writes off JSON.",
+        "Make ArticleStore a structured SQLite authoritative store before moving large-scale writes off JSON.",
         "Move upsert/update/delete and import undo flows to DB-side mutations with bounded transactions.",
         "Maintain match signatures and article_task_links in SQLite so refreshes update only dirty rows where possible.",
         "Keep JSON as backup/export/migration fallback instead of the hot write path.",

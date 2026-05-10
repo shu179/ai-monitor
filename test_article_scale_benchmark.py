@@ -178,6 +178,14 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
             "sqlite_authoritative_incremental",
         )
         self.assertIn(
+            "ArticleStore is using the SQLite authoritative path for this run.",
+            summary["recommendations"],
+        )
+        self.assertFalse(any(
+            item.startswith("Make ArticleStore")
+            for item in summary["recommendations"]
+        ))
+        self.assertIn(
             "refresh_cold_full_seconds",
             operations["refresh_article_matches"]["details"],
         )
@@ -234,6 +242,14 @@ class ArticleScaleBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["article_store_backend_health"]["effective_backend"], "sqlite")
         self.assertEqual(summary["article_store_doctor"]["status"], "healthy")
         self.assertEqual(summary["article_store_doctor"]["backend"]["effective_backend"], "sqlite")
+        self.assertIn(
+            "ArticleStore is using the SQLite authoritative path for this run.",
+            summary["recommendations"],
+        )
+        self.assertFalse(any(
+            item.startswith("Make ArticleStore")
+            for item in summary["recommendations"]
+        ))
         self.assertIn("rollout_guard", summary)
         self.assertEqual(summary["rollout_guard"]["final_effective_backend"], "sqlite")
         self.assertEqual(summary["rollout_guard"]["doctor"]["status"], "healthy")
