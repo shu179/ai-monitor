@@ -48,6 +48,19 @@ from core.notification_idempotency import (
     notification_already_sent,
     record_notification_sent,
 )
+from core.recognition_matching import (
+    PLATFORM_DISPLAY,
+    PLATFORM_ID_ALIASES,
+    build_keyword_updates_from_batch as _matching_build_keyword_updates_from_batch,
+    build_matched_pairs as _matching_build_matched_pairs,
+    build_task_matched_pairs as _matching_build_task_matched_pairs,
+    display_platform_name as _matching_display_platform_name,
+    expand_matched_pair_slots as _matching_expand_matched_pair_slots,
+    normalize_keyword_brand_pair as _matching_normalize_keyword_brand_pair,
+    normalize_platform_id as _matching_normalize_platform_id,
+    remaining_current_platforms_after_match as _matching_remaining_current_platforms_after_match,
+    serialize_matched_pairs as _matching_serialize_matched_pairs,
+)
 from core.time_utils import local_now, local_today
 
 
@@ -155,52 +168,6 @@ INPUT_BUBBLE_HINTS = (
     "发送", "输入", "问", "追问", "深度思考", "联网搜索", "上传", "附件",
     "chatgpt", "claude", "gemini", "deepseek", "豆包", "通义", "文心", "元宝", "kimi",
 )
-
-PLATFORM_ID_ALIASES = {
-    "豆包": "doubao",
-    "doubao": "doubao",
-    "deepseek": "deepseek",
-    "DeepSeek": "deepseek",
-    "方舟 DeepSeek": "ark_deepseek",
-    "ark_deepseek": "ark_deepseek",
-    "ark deepseek": "ark_deepseek",
-    "Kimi": "kimi",
-    "kimi": "kimi",
-    "元宝": "yuanbao",
-    "yuanbao": "yuanbao",
-    "通义千问": "tongyi",
-    "通义": "tongyi",
-    "tongyi": "tongyi",
-    "qwen": "tongyi",
-    "文心一言": "wenxin",
-    "文心": "wenxin",
-    "wenxin": "wenxin",
-    "ernie": "wenxin",
-    "ChatGPT": "chatgpt",
-    "chatgpt": "chatgpt",
-    "Claude": "claude",
-    "claude": "claude",
-    "Gemini": "gemini",
-    "gemini": "gemini",
-    "Perplexity": "perplexity",
-    "perplexity": "perplexity",
-}
-
-PLATFORM_DISPLAY = {
-    "local_model": "本地模型",
-    "doubao": "豆包",
-    "deepseek": "DeepSeek",
-    "ark_deepseek": "方舟 DeepSeek",
-    "kimi": "Kimi",
-    "yuanbao": "元宝",
-    "tongyi": "通义千问",
-    "wenxin": "文心一言",
-    "chatgpt": "ChatGPT",
-    "claude": "Claude",
-    "gemini": "Gemini",
-    "perplexity": "Perplexity",
-}
-
 
 class ClipboardRecognitionManager:
     """识别模式后台管理器。"""
@@ -1057,14 +1024,10 @@ class ClipboardRecognitionManager:
         self._notify_manual_state_change()
 
     def _normalize_keyword_brand_pair(self, keyword: str, brand: str) -> tuple[str, str]:
-        return (str(keyword or "").strip().lower(), str(brand or "").strip().lower())
+        return _matching_normalize_keyword_brand_pair(keyword, brand)
 
     def _display_platform_name(self, platform_name: str) -> str:
-        normalized = self._normalize_platform_id(platform_name)
-        if normalized:
-            return PLATFORM_DISPLAY.get(normalized, normalized)
-        text = str(platform_name or "").strip()
-        return PLATFORM_DISPLAY.get(text, text)
+        return _matching_display_platform_name(platform_name)
 
     def _keyword_state_complete_for_platforms(self, state: dict, platforms: list[str]) -> bool:
         payload = dict(state or {})
@@ -1462,44 +1425,7 @@ class ClipboardRecognitionManager:
         return True
 
     def _remaining_current_platforms_after_match(self, current_item: dict | None, matched_pairs: list[dict]) -> list[str]:
-        item = dict(current_item or {})
-        current_platforms = [
-            self._normalize_platform_id(platform)
-            for platform in (item.get("platforms") or [])
-            if self._normalize_platform_id(platform)
-        ]
-        current_platforms = list(dict.fromkeys(current_platforms))
-        if not current_platforms:
-            return []
-
-        current_keyword = str(item.get("keyword") or "").strip()
-        current_keyword_key, _ = self._normalize_keyword_brand_pair(current_keyword, "")
-        if not current_keyword_key:
-            return current_platforms
-        current_brand_keys = {
-            self._normalize_keyword_brand_pair("", brand)[1]
-            for brand in (item.get("brands") or [])
-            if str(brand or "").strip()
-        }
-
-        matched_platforms: set[str] = set()
-        for pair in self._expand_matched_pair_slots(matched_pairs or []):
-            pair_keyword_key, pair_brand_key = self._normalize_keyword_brand_pair(
-                str((pair or {}).get("keyword") or "").strip(),
-                str((pair or {}).get("brand") or "").strip(),
-            )
-            if pair_keyword_key != current_keyword_key:
-                continue
-            if current_brand_keys and pair_brand_key and pair_brand_key not in current_brand_keys:
-                continue
-            for platform in (pair or {}).get("platforms") or []:
-                normalized_platform = self._normalize_platform_id(platform)
-                if normalized_platform:
-                    matched_platforms.add(normalized_platform)
-
-        if not matched_platforms:
-            return current_platforms
-        return [platform for platform in current_platforms if platform not in matched_platforms]
+        return _matching_remaining_current_platforms_after_match(current_item, matched_pairs)
 
     def _guide_item_key(self, item: dict | None) -> tuple[str, str, tuple[str, ...]]:
         payload = dict(item or {})
@@ -2994,56 +2920,11 @@ class ClipboardRecognitionManager:
         image_paths: list[str],
         detected_platforms: list[str],
     ) -> list[dict]:
-        matched_pairs = self._expand_matched_pair_slots(batch.get("matched_pairs") or [])
-        normalized_paths = []
-        seen_paths = set()
-        for path in (image_paths or []):
-            path_text = str(path).strip()
-            if not path_text or path_text in seen_paths:
-                continue
-            seen_paths.add(path_text)
-            normalized_paths.append(path_text)
-        normalized_platforms = [
-            self._normalize_platform_id(platform)
-            for platform in (detected_platforms or [])
-            if self._normalize_platform_id(platform)
-        ]
-        updates = []
-        path_index = 0
-        for index, pair in enumerate(matched_pairs):
-            keyword = str(pair.get("keyword") or "").strip()
-            brand = str(pair.get("brand") or "").strip()
-            pair_platforms = [
-                self._normalize_platform_id(platform)
-                for platform in (pair.get("platforms") or [])
-                if self._normalize_platform_id(platform)
-            ]
-            platform_name = (
-                (pair_platforms[0] if pair_platforms else "")
-                or (normalized_platforms[0] if normalized_platforms else "")
-            )
-            image_path = ""
-            if path_index < len(normalized_paths):
-                image_path = normalized_paths[path_index]
-                path_index += 1
-            if not keyword:
-                continue
-            updates.append({
-                "keyword": keyword,
-                "brand": brand,
-                "run_success": True,
-                "screenshot_saved": bool(image_path),
-                "failure_reason": "" if image_path else "screenshot_save_failed",
-                "platform": platform_name,
-                "image_path": image_path,
-            })
-        if len(matched_pairs) > len(normalized_paths):
-            print(
-                f"[Recognition] 关键词与截图严格一对一绑定，"
-                f"当前仅有 {len(normalized_paths)} 张唯一截图，"
-                f"剩余 {len(matched_pairs) - len(normalized_paths)} 个关键词保留缺口"
-            )
-        return updates
+        return _matching_build_keyword_updates_from_batch(
+            batch,
+            image_paths=image_paths,
+            detected_platforms=detected_platforms,
+        )
 
     def _extract_current_send_state_from_pool_updates(
         self,
@@ -3082,30 +2963,7 @@ class ClipboardRecognitionManager:
         return image_paths, platforms
 
     def _expand_matched_pair_slots(self, matched_pairs: list[dict]) -> list[dict]:
-        slots: list[dict] = []
-        for pair in self._serialize_matched_pairs(matched_pairs or []):
-            keyword = str(pair.get("keyword") or "").strip()
-            brand = str(pair.get("brand") or "").strip()
-            platforms = [
-                self._normalize_platform_id(platform)
-                for platform in (pair.get("platforms") or [])
-                if self._normalize_platform_id(platform)
-            ]
-            platforms = list(dict.fromkeys(platforms))
-            if not platforms:
-                slots.append({
-                    "keyword": keyword,
-                    "brand": brand,
-                    "platforms": [],
-                })
-                continue
-            for platform in platforms:
-                slots.append({
-                    "keyword": keyword,
-                    "brand": brand,
-                    "platforms": [platform],
-                })
-        return slots
+        return _matching_expand_matched_pair_slots(matched_pairs)
 
     def _register_brand_alias(self, alias_map: dict, canonical_brand: str, alias: str):
         key = self._normalize_brand(alias)
@@ -3116,10 +2974,7 @@ class ClipboardRecognitionManager:
         return str(value or "").strip().lower().replace(" ", "")
 
     def _normalize_platform_id(self, value: str) -> str:
-        raw = str(value or "").strip()
-        if not raw:
-            return ""
-        return PLATFORM_ID_ALIASES.get(raw, PLATFORM_ID_ALIASES.get(raw.lower(), raw.lower()))
+        return _matching_normalize_platform_id(value)
 
     def _extract_name_keys(self, value: str) -> list[str]:
         text = str(value or "").strip()
@@ -3142,56 +2997,10 @@ class ClipboardRecognitionManager:
         return keys
 
     def _build_matched_pairs(self, keyword: str, brands: list[str], platforms: list[str] | None = None) -> list[dict]:
-        keyword_text = str(keyword or "").strip()
-        pairs = []
-        seen = set()
-        normalized_platforms = [
-            self._normalize_platform_id(platform)
-            for platform in (platforms or [])
-            if self._normalize_platform_id(platform)
-        ]
-        for brand in brands or []:
-            brand_text = str(brand or "").strip()
-            pair_key = (
-                self._normalize_keyword_brand_pair(keyword_text, brand_text),
-                tuple(dict.fromkeys(normalized_platforms)),
-            )
-            if not keyword_text or pair_key in seen:
-                continue
-            seen.add(pair_key)
-            pairs.append({
-                "keyword": keyword_text,
-                "brand": brand_text,
-                "platforms": list(dict.fromkeys(normalized_platforms)),
-            })
-        return pairs
+        return _matching_build_matched_pairs(keyword, brands, platforms)
 
     def _serialize_matched_pairs(self, matched_pairs: list[dict]) -> list[dict]:
-        serialized = []
-        seen = set()
-        for item in matched_pairs or []:
-            if not isinstance(item, dict):
-                continue
-            keyword = str(item.get("keyword") or "").strip()
-            brand = str(item.get("brand") or "").strip()
-            platforms = [
-                self._normalize_platform_id(platform)
-                for platform in (item.get("platforms") or [])
-                if self._normalize_platform_id(platform)
-            ]
-            pair_key = (
-                self._normalize_keyword_brand_pair(keyword, brand),
-                tuple(dict.fromkeys(platforms)),
-            )
-            if not keyword or pair_key in seen:
-                continue
-            seen.add(pair_key)
-            serialized.append({
-                "keyword": keyword,
-                "brand": brand,
-                "platforms": list(dict.fromkeys(platforms)),
-            })
-        return serialized
+        return _matching_serialize_matched_pairs(matched_pairs)
 
     def _task_name_overlap_score(self, task: dict, brand: str, canonical_brand: str) -> int:
         task_keys = task.get("task_name_keys", [])
@@ -3416,39 +3225,13 @@ class ClipboardRecognitionManager:
         guide_items: list[dict],
         platform_hint: str = "",
     ) -> list[dict]:
-        normalized_hint = self._normalize_platform_id(platform_hint)
-
-        def platforms_for_item(item: dict) -> list[str]:
-            item_platforms = [
-                self._normalize_platform_id(platform)
-                for platform in ((item or {}).get("platforms") or [])
-                if self._normalize_platform_id(platform)
-            ]
-            item_platforms = list(dict.fromkeys(item_platforms))
-            if normalized_hint and (not item_platforms or normalized_hint in item_platforms):
-                return [normalized_hint]
-            if len(item_platforms) == 1:
-                return item_platforms
-            if len(item_platforms) > 1:
-                return []
-            return item_platforms
-
-        if current_item and str(current_item.get("task_name") or "").strip() == str(task_name or "").strip():
-            return self._build_matched_pairs(
-                current_item.get("keyword", ""),
-                list(current_item.get("brands", matched_brands)),
-                platforms_for_item(current_item),
-            )
-
-        for item in guide_items or []:
-            if str(item.get("task_name") or "").strip() != str(task_name or "").strip():
-                continue
-            return self._build_matched_pairs(
-                item.get("keyword", ""),
-                list(item.get("brands", matched_brands)),
-                platforms_for_item(item),
-            )
-        return []
+        return _matching_build_task_matched_pairs(
+            task_name=task_name,
+            matched_brands=matched_brands,
+            current_item=current_item,
+            guide_items=guide_items,
+            platform_hint=platform_hint,
+        )
 
     def _is_duplicate(self, image_hash: str) -> bool:
         with self._lock:
