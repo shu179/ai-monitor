@@ -58,7 +58,7 @@ class CloudOutboxCompactionTests(unittest.TestCase):
             outbox.enqueue(event_type="run", idempotency_key="pending-2", payload={"n": 4})
             outbox.enqueue(event_type="run", idempotency_key="pending-3", payload={"n": 5})
 
-            self.assertEqual(outbox.stats(), {"total": 3, "pending": 3, "failed": 0, "sent": 0})
+            self.assertEqual(outbox.stats(), {"total": 3, "pending": 3, "failed": 0, "sent": 0, "dead_letter": 0})
             pending_keys = [item["idempotency_key"] for item in outbox.pending(limit=10)]
             self.assertEqual(pending_keys, ["pending-1", "pending-2", "pending-3"])
 
@@ -70,7 +70,7 @@ class CloudOutboxCompactionTests(unittest.TestCase):
 
             CloudOutbox(Path(tmpdir) / "outbox.json").mark_failed(["event-1"], "late failure")
 
-            self.assertEqual(outbox.stats(), {"total": 1, "pending": 0, "failed": 0, "sent": 1})
+            self.assertEqual(outbox.stats(), {"total": 1, "pending": 0, "failed": 0, "sent": 1, "dead_letter": 0})
 
     def test_sent_retention_drops_oldest_sent_items_below_total_limit(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -80,29 +80,31 @@ class CloudOutboxCompactionTests(unittest.TestCase):
             outbox.enqueue(event_type="run", idempotency_key="sent-3", payload={"n": 3})
             outbox.mark_sent(["sent-1", "sent-2", "sent-3"])
 
-            self.assertEqual(outbox.stats(), {"total": 2, "pending": 0, "failed": 0, "sent": 2})
+            self.assertEqual(outbox.stats(), {"total": 2, "pending": 0, "failed": 0, "sent": 2, "dead_letter": 0})
             self.assertFalse(outbox.enqueue(event_type="run", idempotency_key="sent-2", payload={"n": 2})[1])
             self.assertFalse(outbox.enqueue(event_type="run", idempotency_key="sent-3", payload={"n": 3})[1])
 
-    def test_max_items_drops_oldest_when_no_sent_items_exist(self):
+    def test_max_items_retains_active_when_no_sent_items_exist(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             outbox = CloudOutbox(Path(tmpdir) / "outbox.json", max_items=2)
             outbox.enqueue(event_type="run", idempotency_key="event-1", payload={"n": 1})
             outbox.enqueue(event_type="run", idempotency_key="event-2", payload={"n": 2})
-            outbox.enqueue(event_type="run", idempotency_key="event-3", payload={"n": 3})
+            result, _ = outbox.enqueue(event_type="run", idempotency_key="event-3", payload={"n": 3})
 
+            # Active items are never dropped — all 3 are retained despite max_items=2
             pending_keys = [item["idempotency_key"] for item in outbox.pending(limit=10)]
-            self.assertEqual(pending_keys, ["event-2", "event-3"])
+            self.assertEqual(pending_keys, ["event-1", "event-2", "event-3"])
 
-    def test_max_bytes_drops_only_as_many_old_pending_items_as_needed(self):
+    def test_max_bytes_retains_active_items_when_no_sent_exist(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             outbox = CloudOutbox(Path(tmpdir) / "outbox.json", max_bytes=1500)
             outbox.enqueue(event_type="run", idempotency_key="event-1", payload={"blob": "x" * 400})
             outbox.enqueue(event_type="run", idempotency_key="event-2", payload={"blob": "x" * 400})
             outbox.enqueue(event_type="run", idempotency_key="event-3", payload={"blob": "x" * 400})
 
+            # Active items are never dropped — all 3 retained even when over max_bytes
             pending_keys = [item["idempotency_key"] for item in outbox.pending(limit=10)]
-            self.assertEqual(pending_keys, ["event-2", "event-3"])
+            self.assertEqual(pending_keys, ["event-1", "event-2", "event-3"])
 
     def test_enqueue_many_dedupes_and_writes_once(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -128,7 +130,7 @@ class CloudOutboxCompactionTests(unittest.TestCase):
                 outbox.mark_sent(["event-1", "event-2"])
 
             self.assertEqual(stdout.getvalue(), "")
-            self.assertEqual(outbox.stats(), {"total": 1, "pending": 0, "failed": 0, "sent": 1})
+            self.assertEqual(outbox.stats(), {"total": 1, "pending": 0, "failed": 0, "sent": 1, "dead_letter": 0})
 
 
 if __name__ == "__main__":

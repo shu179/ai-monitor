@@ -60,6 +60,7 @@ a = Analysis(
         'core.scheduler',
         'core.config_watcher',
         'core.local_model_manager',
+        'core.windows_bootstrap',  # Windows bootstrap: event loop, DPI, ctrl handler
         # UI模块
         'ui.tray',
         'web_backend',
@@ -106,7 +107,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon='app.ico',  # 如果有图标文件可以取消注释
+    manifest='build/app.manifest',  # DPI awareness + compatibility manifest
+    # icon='app.ico',  # 未发现 app.ico（仅有平台 logo），暂不接入
 )
 
 # 目录模式（推荐，启动更快）

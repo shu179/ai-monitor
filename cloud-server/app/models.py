@@ -206,13 +206,14 @@ class RunRecord(Base):
     brand: Mapped[str] = mapped_column(String(128), nullable=False)
     mode: Mapped[str] = mapped_column(String(32), nullable=False)
     result_json: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}", nullable=False)
-    idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False, unique=True)
+    idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False)
     executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
         Index("idx_rr_ws_task_time", "workspace_id", "task_id", "executed_at"),
         Index("idx_rr_ws_task_id", "workspace_id", "task_id", "id"),
+        UniqueConstraint("workspace_id", "idempotency_key", name="uq_run_records_workspace_idempotency"),
     )
 
 
@@ -269,11 +270,14 @@ class ArticleReferenceEvent(Base):
     platform: Mapped[str] = mapped_column(String(32), nullable=False)
     record_day: Mapped[str] = mapped_column(String(10), nullable=False)
     source_record_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False, unique=True)
+    idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False)
     event_json: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    __table_args__ = (Index("idx_article_ref_events_rank", "workspace_id", "task_id", "url_hash", "record_day"),)
+    __table_args__ = (
+        Index("idx_article_ref_events_rank", "workspace_id", "task_id", "url_hash", "record_day"),
+        UniqueConstraint("workspace_id", "idempotency_key", name="uq_article_ref_events_workspace_idempotency"),
+    )
 
 
 class ClassificationJob(Base):
@@ -334,8 +338,11 @@ class SyncEvent(Base):
     workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False, unique=True)
+    idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False)
     payload_json: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    __table_args__ = (Index("idx_sync_events_workspace_id", "workspace_id", "id"),)
+    __table_args__ = (
+        Index("idx_sync_events_workspace_id", "workspace_id", "id"),
+        UniqueConstraint("workspace_id", "idempotency_key", name="uq_sync_events_workspace_idempotency"),
+    )

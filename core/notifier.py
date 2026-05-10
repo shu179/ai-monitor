@@ -57,6 +57,7 @@ class WeComNotifier:
 
     _shared_lock = threading.Lock()
     _shared_last_sent = {}  # (webhook_url, platform, brand, keyword) -> timestamp
+    _shared_pending = {}    # (webhook_url, platform, brand, keyword) -> True (in-flight send)
     _shared_post_lock = threading.Lock()
     _shared_post_locks = {}
     _shared_last_post = {}
@@ -135,12 +136,14 @@ class WeComNotifier:
 
         return True
 
-    def _mark_sent(self, platform: str, brand: str, keyword: str = "") -> None:
+    def _mark_sent(self, platform: str, brand: str, keyword: str = "", *, clear_pending: bool = True) -> None:
         """发送成功后调用，更新冷却时间戳，并清理已过期的历史记录。"""
         sent_at = time.monotonic()
         key = self._cooldown_key(platform, brand, keyword)
         with self._shared_lock:
             self._shared_last_sent[key] = sent_at
+            if clear_pending:
+                self._shared_pending.pop(key, None)
             # 顺手清理已超出冷却期的条目，避免字典无限增长
             expired = [
                 k for k, ts in self._shared_last_sent.items()
@@ -149,6 +152,31 @@ class WeComNotifier:
             for k in expired:
                 del self._shared_last_sent[k]
         self.last_sent[(platform, brand, keyword)] = sent_at
+
+    def _reserve_cooldown(self, platform: str, brand: str, keyword: str = "") -> bool:
+        """原子地检查冷却并标记为 in-flight。返回 True 表示获得了发送资格。"""
+        self.last_skip_reason = ""
+        key = self._cooldown_key(platform, brand, keyword)
+        current_time = time.monotonic()
+        with self._shared_lock:
+            last_time = self._shared_last_sent.get(key, 0)
+            if current_time - last_time < self.cooldown:
+                minutes_ago = (current_time - last_time) / 60
+                self.last_skip_reason = "cooldown"
+                print(f"[{platform}] 关键词已在冷却期内（{minutes_ago:.1f}分钟前发送过），跳过")
+                return False
+            if self._shared_pending.get(key):
+                self.last_skip_reason = "pending"
+                print(f"[{platform}] 关键词正在发送中，跳过")
+                return False
+            self._shared_pending[key] = True
+            return True
+
+    def _release_cooldown(self, platform: str, brand: str, keyword: str = "") -> None:
+        """发送失败时释放 in-flight 占位，避免失败后长时间误冷却。"""
+        key = self._cooldown_key(platform, brand, keyword)
+        with self._shared_lock:
+            self._shared_pending.pop(key, None)
 
     def _build_detected_brand_message(
         self,
@@ -284,29 +312,41 @@ class WeComNotifier:
     ) -> bool:
         self.last_error = ""
         self.last_skip_reason = ""
-        if not bypass_cooldown and not self.should_notify(platform, brand, keyword):
+        reserved = False
+        if bypass_cooldown:
+            pass  # skip reserve entirely — don't touch pending state
+        elif self._reserve_cooldown(platform, brand, keyword):
+            reserved = True
+        else:
             return False
 
-        message = self._build_detected_brand_message(
-            brands=[brand],
-            keywords=[keyword] if keyword else [],
-            references=references,
-            body_references=body_references,
-            greeting=greeting,
-        )
+        try:
+            message = self._build_detected_brand_message(
+                brands=[brand],
+                keywords=[keyword] if keyword else [],
+                references=references,
+                body_references=body_references,
+                greeting=greeting,
+            )
 
-        text_success = self._send_text(message)
+            text_success = self._send_text(message)
 
-        image_success = True
-        if screenshot_path and os.path.exists(screenshot_path):
-            image_success = self._send_image(screenshot_path)
-        elif screenshot_path:
-            print(f"[{platform}] 截图文件不存在，未发送图片: {screenshot_path}")
+            image_success = True
+            if screenshot_path and os.path.exists(screenshot_path):
+                image_success = self._send_image(screenshot_path)
+            elif screenshot_path:
+                print(f"[{platform}] 截图文件不存在，未发送图片: {screenshot_path}")
 
-        # 仅在文字消息发送成功后才记录冷却，避免发送失败导致冷却期误触发
-        if text_success:
-            self._mark_sent(platform, brand, keyword)
-        return text_success and image_success
+            # 仅在文字消息发送成功后才记录冷却，避免发送失败导致冷却期误触发
+            if text_success:
+                self._mark_sent(platform, brand, keyword, clear_pending=reserved)
+            elif reserved:
+                self._release_cooldown(platform, brand, keyword)
+            return text_success and image_success
+        except Exception:
+            if reserved:
+                self._release_cooldown(platform, brand, keyword)
+            raise
 
     def send_text_message(self, content: str) -> bool:
         """发送通用文本消息。"""

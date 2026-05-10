@@ -9,6 +9,7 @@ from core.notifier import WeComNotifier
 class NotifierTimeSourceTests(unittest.TestCase):
     def setUp(self) -> None:
         WeComNotifier._shared_last_sent = {}
+        WeComNotifier._shared_pending = {}
         WeComNotifier._shared_last_post = {}
         WeComNotifier._shared_post_locks = {}
 

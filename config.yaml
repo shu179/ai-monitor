@@ -196,6 +196,10 @@ browser_automation:
     deep_think_menu_selector: '[class*="inputToolbarLeft"] [class*="item__"]'
     deep_think_enable_item_selector: '[class*="dtModeItem__"]'
 screenshot:
+  auto_cleanup: true
+  retention_days: 14
+  max_size_mb: 1024
+  include_recognition: true
   decoration:
     enabled: true
     title: '{platform}'

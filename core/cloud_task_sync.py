@@ -6,6 +6,7 @@ from datetime import date, datetime
 from typing import Any
 
 from .cloud_client import CloudClientError, SurfacedCloudClient
+from .diagnostic_events import record_event_safe
 from .cloud_event_types import (
     EVENT_REFERENCE_CHANGED,
     EVENT_RUN_RECORD_CHANGED,
@@ -1166,6 +1167,15 @@ def _cloud_request_with_refresh(
                 workspace_id=identity["workspace_id"],
                 user_id=identity["user_id"],
             )
+            record_event_safe(
+                "cloud_sync",
+                "云端会话已过期（任务同步刷新 401）",
+                level="warning",
+                event_key=f"cloud_session_expired:{base_url}:{identity['workspace_id']}:{identity['user_id']}",
+                throttle_seconds=600,
+                details={"base_url": base_url, "workspace_id": identity["workspace_id"]},
+                suggestion="请重新登录云端",
+            )
         raise refresh_exc
     refreshed_access_token = str(refreshed_session.get("access_token") or "").strip()
     if not refreshed_access_token:
@@ -1181,6 +1191,15 @@ def _cloud_request_with_refresh(
                 refresh_token=str(refreshed_session.get("refresh_token") or "").strip(),
                 workspace_id=refreshed_identity["workspace_id"],
                 user_id=refreshed_identity["user_id"],
+            )
+            record_event_safe(
+                "cloud_sync",
+                "云端会话已过期（任务同步重试仍 401）",
+                level="warning",
+                event_key=f"cloud_session_expired:{base_url}:{refreshed_identity['workspace_id']}:{refreshed_identity['user_id']}",
+                throttle_seconds=600,
+                details={"base_url": base_url, "workspace_id": refreshed_identity["workspace_id"]},
+                suggestion="请重新登录云端",
             )
         raise retry_exc
 

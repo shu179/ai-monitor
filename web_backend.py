@@ -11271,6 +11271,9 @@ def create_server() -> WebAppServer:
 
 
 if __name__ == "__main__":
+    from core.windows_bootstrap import install_windows_bootstrap
+    install_windows_bootstrap()
+
     import time as _time
     server = create_server()
     _server_stop_lock = threading.Lock()

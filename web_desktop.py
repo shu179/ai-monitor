@@ -9,6 +9,9 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from core.windows_bootstrap import install_windows_bootstrap
+install_windows_bootstrap()
+
 from PySide6.QtCore import QEvent, QObject, QPoint, QSettings, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import (
@@ -545,6 +548,12 @@ class RecognitionOverlayWindow(QWidget):
 
 
 def run_desktop_app() -> None:
+    try:
+        from core.screenshot_cleanup import cleanup_screenshots_from_default_config
+        cleanup_screenshots_from_default_config()
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("Screenshot cleanup failed", exc_info=True)
     server = create_server()
     server_stop_lock = threading.Lock()
     server_stopped = False

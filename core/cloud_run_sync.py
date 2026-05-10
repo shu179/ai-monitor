@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from .cloud_client import CloudClientError, SurfacedCloudClient
+from .diagnostic_events import clear_consecutive_failure, record_consecutive_failure, record_event_safe
 from .cloud_event_types import (
     EVENT_ARTICLE_REFERENCE,
     EVENT_ARTICLE_TASK_LINKS,
@@ -602,6 +603,7 @@ def flush_cloud_outbox(
         queue.mark_sent(obsolete_profile_keys)
 
     identity = cloud_session_identity(session)
+    failure_key = f"flush_cloud_outbox:{base_url}:{identity['workspace_id']}"
     target_client = client or SurfacedCloudClient(base_url)
     event_keys = [str(item.get("idempotency_key") or "") for item in pending]
     events = [
@@ -630,8 +632,15 @@ def flush_cloud_outbox(
                 )
                 refreshed_access_token = str(refreshed_session.get("access_token") or "").strip()
                 if not refreshed_access_token:
+                    record_consecutive_failure(
+                        failure_key,
+                        operation="flush_cloud_outbox",
+                        error="刷新后无 access_token",
+                    )
                     queue.mark_failed(event_keys, "未登录云端")
-                    return {"ok": False, "message": "未登录云端", "outbox": queue.stats(), "metrics": _flush_metrics(started_at, len(events), 0)}
+                    outbox_stats = queue.stats()
+                    _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
+                    return {"ok": False, "message": "未登录云端", "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)}
             except CloudSessionChangedError as changed_exc:
                 return {"ok": False, "message": str(changed_exc), "outbox": queue.stats(), "metrics": _flush_metrics(started_at, len(events), 0)}
             except CloudClientError as refresh_exc:
@@ -642,9 +651,25 @@ def flush_cloud_outbox(
                         refresh_token=refresh_token,
                         workspace_id=identity["workspace_id"],
                         user_id=identity["user_id"],
+                    )
+                    record_event_safe(
+                        "cloud_sync",
+                        "云端会话已过期（刷新令牌 401）",
+                        level="warning",
+                        event_key=f"cloud_session_expired:{base_url}:{identity['workspace_id']}:{identity['user_id']}",
+                        throttle_seconds=600,
+                        details={"base_url": base_url, "workspace_id": identity["workspace_id"]},
+                        suggestion="请重新登录云端",
+                    )
+                record_consecutive_failure(
+                    failure_key,
+                    operation="flush_cloud_outbox",
+                    error=str(refresh_exc),
                 )
                 queue.mark_failed(event_keys, str(refresh_exc))
-                return {"ok": False, "message": str(refresh_exc), "outbox": queue.stats(), "metrics": _flush_metrics(started_at, len(events), 0)}
+                outbox_stats = queue.stats()
+                _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
+                return {"ok": False, "message": str(refresh_exc), "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)}
             try:
                 response = target_client.post_events(refreshed_access_token, events)
             except CloudClientError as refresh_exc:
@@ -655,21 +680,70 @@ def flush_cloud_outbox(
                         refresh_token=str(refreshed_session.get("refresh_token") or "").strip(),
                         workspace_id=identity["workspace_id"],
                         user_id=identity["user_id"],
+                    )
+                    record_event_safe(
+                        "cloud_sync",
+                        "云端会话已过期（刷新后仍 401）",
+                        level="warning",
+                        event_key=f"cloud_session_expired:{base_url}:{identity['workspace_id']}:{identity['user_id']}",
+                        throttle_seconds=600,
+                        details={"base_url": base_url, "workspace_id": identity["workspace_id"]},
+                        suggestion="请重新登录云端",
+                    )
+                record_consecutive_failure(
+                    failure_key,
+                    operation="flush_cloud_outbox",
+                    error=str(refresh_exc),
                 )
                 queue.mark_failed(event_keys, str(refresh_exc))
-                return {"ok": False, "message": str(refresh_exc), "outbox": queue.stats(), "metrics": _flush_metrics(started_at, len(events), 0)}
+                outbox_stats = queue.stats()
+                _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
+                return {"ok": False, "message": str(refresh_exc), "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)}
         else:
+            record_consecutive_failure(
+                failure_key,
+                operation="flush_cloud_outbox",
+                error=str(exc),
+            )
             queue.mark_failed(event_keys, str(exc))
-            return {"ok": False, "message": str(exc), "outbox": queue.stats(), "metrics": _flush_metrics(started_at, len(events), 0)}
+            outbox_stats = queue.stats()
+            _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
+            return {"ok": False, "message": str(exc), "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)}
 
     queue.mark_sent(event_keys)
+    clear_consecutive_failure(failure_key)
+    outbox_stats = queue.stats()
+    _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
     return {
         "ok": True,
         "message": "上传完成",
         "response": response if isinstance(response, dict) else {},
-        "outbox": queue.stats(),
+        "outbox": outbox_stats,
         "metrics": _flush_metrics(started_at, len(events), int((response or {}).get("accepted") or 0) if isinstance(response, dict) else 0),
     }
+
+
+_OUTBOX_BACKLOG_THRESHOLD = 100
+
+
+def _maybe_warn_outbox_backlog(stats: dict[str, Any], base_url: str, identity: dict[str, Any]) -> None:
+    backlog = stats.get("pending", 0) + stats.get("failed", 0)
+    if backlog < _OUTBOX_BACKLOG_THRESHOLD:
+        return
+    record_event_safe(
+        "cloud_sync",
+        f"Outbox 堆积：{backlog} 条待处理",
+        level="warning",
+        event_key=f"outbox_backlog:{base_url}:{identity.get('workspace_id', '')}",
+        throttle_seconds=600,
+        details={
+            "backlog": backlog,
+            "pending": stats.get("pending", 0),
+            "failed": stats.get("failed", 0),
+            "dead_letter": stats.get("dead_letter", 0),
+        },
+        suggestion="检查云端连接状态或手动清理 outbox",
+    )
 
 
 def _collapse_profile_update_events(pending: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:

@@ -118,6 +118,38 @@ class BrowserProcessesTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertFalse(_is_safe_external_chrome_target_url(value))
 
+    def test_taskkill_nonzero_records_diagnostics_and_returns_false(self):
+        failed_proc = Mock(returncode=1)
+        with patch.object(browser_processes.sys, "platform", "win32"), patch.object(
+            browser_processes,
+            "browser_profile_owner_pids",
+            return_value=[999],
+        ), patch.object(
+            browser_processes,
+            "wait_for_pids_exit",
+            return_value=False,
+        ), patch.object(
+            browser_processes,
+            "pid_is_alive",
+            return_value=False,
+        ), patch.object(
+            browser_processes.os,
+            "kill",
+            side_effect=OSError("no such process"),
+        ), patch.object(
+            browser_processes.subprocess,
+            "run",
+            return_value=failed_proc,
+        ), patch.object(
+            browser_processes,
+            "record_event_safe",
+        ) as mock_diag:
+            result = browser_processes.terminate_browser_profile_processes("/tmp/profile", force=True)
+        self.assertFalse(result)
+        taskkill_calls = [c for c in mock_diag.call_args_list if "taskkill" in c[0][1]]
+        self.assertEqual(len(taskkill_calls), 1)
+        self.assertEqual(taskkill_calls[0][1]["details"]["returncode"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

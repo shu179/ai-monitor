@@ -4,6 +4,8 @@ import json
 import os
 import tempfile
 import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,17 @@ DEFAULT_CLOUD_OUTBOX_PATH = resolve_app_path("user_data/cloud_outbox.json")
 DEFAULT_MAX_ITEMS = 10_000
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_MAX_SENT_ITEMS = 1_000
+
+DEFAULT_MAX_ATTEMPTS = 5
+_RETRY_BACKOFF_SECONDS = (60, 300, 1800, 7200)
+
+
+def _backoff_delay(attempts: int) -> float:
+    """Return backoff delay in seconds for the given attempt count (1-indexed)."""
+    if attempts <= 0:
+        return 0.0
+    idx = min(attempts - 1, len(_RETRY_BACKOFF_SECONDS) - 1)
+    return float(_RETRY_BACKOFF_SECONDS[idx])
 
 
 class CloudOutbox:
@@ -114,7 +127,7 @@ class CloudOutbox:
                 "payload": dict(event.get("payload") or {}),
             })
         if not normalized_events:
-            return {"items": [], "created": 0, "requested": 0, "dropped": {"total": 0, "active": 0, "sent": 0}}
+            return {"items": [], "created": 0, "requested": 0, "dropped": _empty_dropped()}
 
         with self._lock:
             items = self._load_locked()
@@ -145,7 +158,7 @@ class CloudOutbox:
                 by_key[event["idempotency_key"]] = item
                 queued_items.append(dict(item))
                 created += 1
-            dropped = self._save_locked(items) if created else {"total": 0, "active": 0, "sent": 0}
+            dropped = self._save_locked(items) if created else _empty_dropped()
             if created:
                 self.notify_changed()
             return {
@@ -157,13 +170,17 @@ class CloudOutbox:
 
     def pending(self, *, limit: int = 100) -> list[dict[str, Any]]:
         safe_limit = min(max(int(limit or 100), 1), 500)
+        now = time.time()
         with self._lock:
             items = self._load_locked()
-        pending_items = [
-            dict(item)
-            for item in items
-            if str(item.get("status") or "pending") in {"pending", "failed"}
-        ]
+        pending_items = []
+        for item in items:
+            status = str(item.get("status") or "pending")
+            if status == "pending":
+                pending_items.append(dict(item))
+            elif status == "failed":
+                if _is_retry_ready(item, now):
+                    pending_items.append(dict(item))
         return pending_items[:safe_limit]
 
     def mark_sent(self, idempotency_keys: list[str] | set[str] | tuple[str, ...]) -> None:
@@ -184,28 +201,56 @@ class CloudOutbox:
         keys = {str(key or "").strip() for key in idempotency_keys if str(key or "").strip()}
         if not keys:
             return
-        now = local_now().isoformat(timespec="seconds")
+        now_iso = local_now().isoformat(timespec="seconds")
+        now_ts = time.time()
+        dead_letter_events: list[dict[str, Any]] = []
         with self._lock:
             items = self._load_locked()
             for item in items:
-                if str(item.get("idempotency_key") or "") in keys:
-                    if _outbox_status(item) == "sent":
-                        continue
+                if str(item.get("idempotency_key") or "") not in keys:
+                    continue
+                if _outbox_status(item) == "sent":
+                    continue
+                attempts = int(item.get("attempts") or 0) + 1
+                item["attempts"] = attempts
+                item["updated_at"] = now_iso
+                item["last_error"] = str(message or "上传失败").strip()
+                if attempts >= DEFAULT_MAX_ATTEMPTS:
+                    item["status"] = "dead_letter"
+                    item["dead_lettered_at"] = now_iso
+                    item["dead_letter_reason"] = item["last_error"]
+                    dead_letter_events.append(dict(item))
+                else:
                     item["status"] = "failed"
-                    item["updated_at"] = now
-                    item["last_error"] = str(message or "上传失败").strip()
-                    item["attempts"] = int(item.get("attempts") or 0) + 1
+                    next_ts = now_ts + _backoff_delay(attempts)
+                    item["next_attempt_ts"] = next_ts
+                    item["next_attempt_at"] = datetime.fromtimestamp(next_ts, tz=timezone.utc).isoformat(timespec="seconds")
             self._save_locked(items)
+        for evt in dead_letter_events:
+            try:
+                from .diagnostics import record_event
+                record_event(
+                    "cloud_sync",
+                    f"事件达到最大重试次数，进入 dead-letter: {evt.get('idempotency_key', '')}",
+                    level="warning",
+                    details={
+                        "idempotency_key": evt.get("idempotency_key", ""),
+                        "event_type": evt.get("event_type", ""),
+                        "attempts": evt.get("attempts", 0),
+                        "last_error": evt.get("last_error", ""),
+                    },
+                )
+            except Exception:
+                pass
 
     def stats(self) -> dict[str, int]:
         with self._lock:
             items = self._load_locked()
-        stats = {"total": len(items), "pending": 0, "failed": 0, "sent": 0}
+        stats: dict[str, int] = {"total": len(items), "pending": 0, "failed": 0, "sent": 0, "dead_letter": 0}
         for item in items:
             status = str(item.get("status") or "pending")
-            if status not in stats:
-                continue
-            stats[status] += 1
+            if status in stats:
+                stats[status] += 1
         return stats
 
     def _load_locked(self) -> list[dict[str, Any]]:
@@ -220,16 +265,34 @@ class CloudOutbox:
             return []
         return [item for item in data if isinstance(item, dict)]
 
-    def _save_locked(self, items: list[dict[str, Any]]) -> dict[str, int]:
+    def _save_locked(self, items: list[dict[str, Any]]) -> dict[str, Any]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         compacted_items, dropped = self._compact_items(items)
-        active_dropped = int(dropped.get("active") or 0)
-        if active_dropped:
-            print(
-                "[CloudOutbox] 本地队列超过容量上限，"
-                f"已清理最旧未发送事件 {active_dropped} 条: {self.path}"
-            )
         serialized = json.dumps(compacted_items, ensure_ascii=False, indent=2, sort_keys=True)
+        encoded_size = len(serialized.encode("utf-8"))
+        protected_count = sum(1 for item in compacted_items if _outbox_status(item) != "sent")
+        overflow = protected_count > 0 and (len(compacted_items) > self._max_items or encoded_size > self._max_bytes)
+        dropped["overflow"] = overflow
+        dropped["overflow_items"] = max(0, len(compacted_items) - self._max_items) if overflow else 0
+        dropped["overflow_bytes"] = max(0, encoded_size - self._max_bytes) if overflow else 0
+        dropped["active_retained"] = protected_count if overflow else 0
+        if overflow:
+            try:
+                from .diagnostics import record_event
+                record_event(
+                    "cloud_sync",
+                    "本地 Outbox 队列超过容量上限，已保留所有未发送事件",
+                    level="warning",
+                    details={
+                        "path": str(self.path),
+                        "total_items": len(compacted_items),
+                        "active_retained": protected_count,
+                        "overflow_items": dropped["overflow_items"],
+                        "overflow_bytes": dropped["overflow_bytes"],
+                    },
+                )
+            except Exception:
+                pass
         fd, tmp_path = tempfile.mkstemp(dir=str(self.path.parent), prefix=".cloud_outbox_", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -245,7 +308,7 @@ class CloudOutbox:
 
     def _compact_items(self, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
         compacted = [dict(item) for item in items if isinstance(item, dict)]
-        dropped = {"total": 0, "active": 0, "sent": 0}
+        dropped: dict[str, int] = {"total": 0, "active": 0, "sent": 0, "dead_letter": 0}
 
         def _add_dropped(total: int, active: int) -> None:
             dropped["total"] += int(total or 0)
@@ -269,23 +332,15 @@ class CloudOutbox:
             )
             _add_dropped(total, active)
 
-        while len(compacted) > self._max_items and len(compacted) > 1:
-            index = self._oldest_index(compacted, lambda item: True)
-            if index is None:
-                break
-            item = compacted.pop(index)
-            _add_dropped(1, 0 if _outbox_status(item) == "sent" else 1)
-
+        # Only drop sent items for bytes limit — never active/dead_letter
         if self._encoded_size(compacted) > self._max_bytes:
             total, active = self._drop_oldest_until_size(
                 compacted,
                 lambda item: _outbox_status(item) == "sent",
             )
             _add_dropped(total, active)
-        if self._encoded_size(compacted) > self._max_bytes:
-            total, active = self._drop_oldest_until_size(compacted, lambda item: True)
-            _add_dropped(total, active)
 
+        # If still over limits, all remaining are active — keep them all (overflow)
         return compacted, dropped
 
     @staticmethod
@@ -338,6 +393,21 @@ class CloudOutbox:
 
 def _outbox_status(item: dict[str, Any]) -> str:
     return str(item.get("status") or "pending").strip() or "pending"
+
+
+def _is_retry_ready(item: dict[str, Any], now: float) -> bool:
+    """Check if a failed item is ready for retry. Treats bad/missing next_attempt_ts as ready."""
+    next_ts = item.get("next_attempt_ts")
+    if next_ts is None:
+        return True
+    try:
+        return float(next_ts) <= now
+    except (TypeError, ValueError):
+        return True
+
+
+def _empty_dropped() -> dict[str, Any]:
+    return {"total": 0, "active": 0, "sent": 0, "dead_letter": 0, "overflow": False, "overflow_items": 0, "overflow_bytes": 0, "active_retained": 0}
 
 
 def _outbox_sort_key(item: dict[str, Any]) -> str:

@@ -395,7 +395,7 @@ def accept_sync_events(db: Session, user: User, events: list[SyncEventIn]) -> tu
                 idempotency_key=event.idempotency_key,
                 payload_json=payload,
             )
-            .on_conflict_do_nothing(index_elements=["idempotency_key"])
+            .on_conflict_do_nothing(index_elements=["workspace_id", "idempotency_key"])
             .returning(SyncEvent.id)
         )
         inserted_id = db.scalar(stmt)
@@ -476,7 +476,7 @@ def _materialize_run_record(db: Session, user: User, event: SyncEventIn) -> None
             idempotency_key=event.idempotency_key,
             executed_at=payload.get("executed_at") or None,
         )
-        .on_conflict_do_nothing(index_elements=["idempotency_key"])
+        .on_conflict_do_nothing(index_elements=["workspace_id", "idempotency_key"])
     )
     db.execute(stmt)
 
@@ -653,7 +653,7 @@ def _materialize_article_reference_event(db: Session, user: User, event: SyncEve
             idempotency_key=event.idempotency_key,
             event_json=payload,
         )
-        .on_conflict_do_nothing(index_elements=["idempotency_key"])
+        .on_conflict_do_nothing(index_elements=["workspace_id", "idempotency_key"])
     )
     db.execute(stmt)
 

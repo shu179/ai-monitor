@@ -76,6 +76,7 @@ from core.recognition_progress import (
     keyword_state_complete_for_platforms as _progress_keyword_state_complete_for_platforms,
 )
 from core.time_utils import local_now, local_today
+from core.diagnostic_events import record_event_safe
 
 
 class ClipboardRecognitionManager:
@@ -1817,6 +1818,15 @@ class ClipboardRecognitionManager:
             print(f"[Recognition] 已缓存截图，等待识别: {image_path.name}")
         except queue.Full:
             print("[Recognition] 待识别队列已满，本次截图已跳过")
+            record_event_safe(
+                "recognition",
+                "识别队列已满，截图被跳过",
+                level="warning",
+                event_key="recognition_queue_blocked",
+                throttle_seconds=600,
+                details={"queue_capacity": getattr(self._recognition_queue, "maxsize", 0)},
+                suggestion="检查识别线程是否卡死或增加队列容量",
+            )
             try:
                 image_path.unlink(missing_ok=True)
             except Exception:
@@ -2110,6 +2120,15 @@ class ClipboardRecognitionManager:
             print(f"[Recognition] 文本已识别品牌 {matched_brands}，已直接入队等待最终渲染")
         except queue.Full:
             print("[Recognition] 待识别队列已满，本次文本已跳过")
+            record_event_safe(
+                "recognition",
+                "识别队列已满，文本被跳过",
+                level="warning",
+                event_key="recognition_queue_blocked",
+                throttle_seconds=600,
+                details={"queue_capacity": getattr(self._recognition_queue, "maxsize", 0)},
+                suggestion="检查识别线程是否卡死或增加队列容量",
+            )
 
     def _recognize_loop(self):
         while True:

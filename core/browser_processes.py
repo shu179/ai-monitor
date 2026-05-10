@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+from .diagnostic_events import record_event_safe
+
 
 def _normalize_path(path: str | Path) -> str:
     try:
@@ -243,7 +245,15 @@ def terminate_browser_profile_processes(
                 os.kill(pid, signal.SIGTERM)
                 terminated = True
             except Exception:
-                pass
+                record_event_safe(
+                    "browser_runtime",
+                    f"浏览器进程 SIGTERM 失败 (pid={pid})",
+                    level="warning",
+                    event_key=f"browser_cleanup_failed:{profile_path}",
+                    throttle_seconds=1800,
+                    details={"pid": pid, "profile_path": str(profile_path), "signal": "SIGTERM"},
+                    suggestion="检查浏览器进程是否卡死",
+                )
     if wait_for_pids_exit(pids, graceful_timeout):
         return terminated
     if not force:
@@ -251,17 +261,37 @@ def terminate_browser_profile_processes(
     for pid in pids:
         try:
             if sys.platform == "win32":
-                subprocess.run(
+                proc = subprocess.run(
                     ["taskkill", "/PID", str(pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=4,
                     check=False,
                 )
+                if proc.returncode != 0:
+                    record_event_safe(
+                        "browser_runtime",
+                        f"浏览器进程 taskkill 失败 (pid={pid})",
+                        level="error",
+                        event_key=f"browser_cleanup_failed:{profile_path}",
+                        throttle_seconds=1800,
+                        details={"pid": pid, "profile_path": str(profile_path), "signal": "taskkill", "returncode": proc.returncode},
+                        suggestion="浏览器进程可能需要手动终止",
+                    )
+                else:
+                    terminated = True
             else:
                 os.kill(pid, signal.SIGKILL)
-            terminated = True
+                terminated = True
         except Exception:
-            pass
+            record_event_safe(
+                "browser_runtime",
+                f"浏览器进程 SIGKILL 失败 (pid={pid})",
+                level="error",
+                event_key=f"browser_cleanup_failed:{profile_path}",
+                throttle_seconds=1800,
+                details={"pid": pid, "profile_path": str(profile_path), "signal": "SIGKILL"},
+                suggestion="浏览器进程可能需要手动终止",
+            )
     wait_for_pids_exit(pids, 2.0)
     return terminated

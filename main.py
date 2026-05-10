@@ -10,12 +10,14 @@ import logging
 import subprocess
 import traceback
 from collections import defaultdict
-from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 # 添加项目目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
+
+from core.windows_bootstrap import install_windows_bootstrap
+install_windows_bootstrap()
 
 from core import load_config, SmartScheduler, WeComNotifier, ensure_config_task_ids
 from core.app_paths import resolve_app_dir, resolve_app_path
@@ -107,7 +109,6 @@ from core.task_results import (
     summarize_keyword_result as _summarize_keyword_result,
     task_for_daily_state as _task_for_daily_state,
 )
-from core.time_utils import local_now, local_today
 from core.version import APP_NAME, get_version_label, get_version_title
 from platforms import (
     DoubaoPlatform, DeepSeekPlatform, KimiPlatform,
@@ -187,42 +188,9 @@ def setup_logging():
 
 
 def cleanup_screenshots(config: dict):
-    """清理过期截图（按天数和总大小）"""
-    cfg = config.get('screenshot', {})
-    if not cfg.get('auto_cleanup', False):
-        return
-
-    screenshots_dir = resolve_app_path("screenshots")
-    if not screenshots_dir.exists():
-        return
-
-    keep_days = cfg.get('keep_days', 7)
-    max_size_mb = cfg.get('max_size_mb', 500)
-    cutoff = local_now().replace(tzinfo=None) - timedelta(days=keep_days)
-
-    # 删除超过保留天数的文件（递归包含 recognition/ 子目录）
-    for f in screenshots_dir.rglob('*.jpg'):
-        try:
-            if datetime.fromtimestamp(f.stat().st_mtime) < cutoff:
-                f.unlink()
-                print(f"[Cleanup] 已删除过期截图: {f.relative_to(screenshots_dir)}")
-        except Exception as e:
-            print(f"[Cleanup] 删除截图失败 {f.name}: {e}")
-
-    # 如果总大小超限，删除最旧的文件（递归包含 recognition/ 子目录）
-    try:
-        files = sorted(screenshots_dir.rglob('*.jpg'), key=lambda f: f.stat().st_mtime)
-        total_mb = sum(f.stat().st_size for f in files) / (1024 * 1024)
-        while total_mb > max_size_mb and files:
-            oldest = files.pop(0)
-            try:
-                total_mb -= oldest.stat().st_size / (1024 * 1024)
-                oldest.unlink()
-                print(f"[Cleanup] 截图超限，已删除: {oldest.relative_to(screenshots_dir)}")
-            except Exception as e:
-                print(f"[Cleanup] 删除截图失败 {oldest.name}: {e}")
-    except Exception as e:
-        print(f"[Cleanup] 截图大小检查失败: {e}")
+    """清理过期截图（按天数和总大小）。委托给 core.screenshot_cleanup。"""
+    from core.screenshot_cleanup import cleanup_screenshots as _cleanup
+    _cleanup(config)
 
 
 def check_gui_runtime():
