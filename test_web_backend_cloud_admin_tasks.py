@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import threading
 import unittest
+from datetime import date
 from unittest.mock import Mock, patch
 
 from web_backend import AppRuntime
@@ -159,6 +161,157 @@ class FakeLoginClient:
 
 
 class WebBackendCloudAdminTaskTests(unittest.TestCase):
+    def _install_light_snapshot_runtime(self, runtime: AppRuntime, config_store: dict, base_snapshot: dict) -> None:
+        holder = {"config": copy.deepcopy(config_store)}
+
+        def load_config() -> dict:
+            return copy.deepcopy(holder["config"])
+
+        def save_config(config: dict) -> None:
+            holder["config"] = copy.deepcopy(config)
+
+        runtime._lock = threading.RLock()
+        runtime.load_config = Mock(side_effect=load_config)  # type: ignore[method-assign]
+        runtime.save_config = Mock(side_effect=save_config)  # type: ignore[method-assign]
+        runtime._invalidate_tasks_full_cache = Mock()  # type: ignore[method-assign]
+        runtime._invalidate_article_cache = Mock()  # type: ignore[method-assign]
+        runtime._refresh_monitoring_runtime = Mock()  # type: ignore[method-assign]
+        runtime.task_overview_service = Mock()
+        runtime.task_overview_service.get_cached_task_snapshot.return_value = copy.deepcopy(base_snapshot)
+        runtime.task_overview_service.get_tasks_full.side_effect = AssertionError("full snapshot should not be rebuilt")
+
+    def test_update_task_returns_light_snapshot_without_rebuilding_tasks_full(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        self._install_light_snapshot_runtime(
+            runtime,
+            {
+                "detection_mode": "browser",
+                "scheduler": {"weekly_times": {"0": "09:30"}},
+                "tasks": [
+                    {
+                        "task_id": "task-1",
+                        "name": "旧品牌",
+                        "brand": "旧品牌",
+                        "enabled": True,
+                        "webhook_url": "https://example.com/hook-secret",
+                        "weekdays": [0],
+                        "keywords": [{"keyword": "旧词", "brand": "旧品牌", "platforms": ["doubao"], "mode": "browser"}],
+                    }
+                ],
+            },
+            {
+                "id": "task-1",
+                "total_records": 12,
+                "success_records": 9,
+                "success_rate": 75.0,
+                "article_count": 7,
+                "optimization_trend": [{"value": 80.0}],
+            },
+        )
+
+        with patch("web_backend.local_today", return_value=date(2026, 1, 5)):
+            with patch(
+                "web_backend.get_task_day_status",
+                return_value={"status": "pending", "brand_status": "pending", "gap_reasons": []},
+            ):
+                with patch(
+                    "web_backend._build_task_failure_summary_impl",
+                    return_value={
+                        "failedToday": False,
+                        "failedModes": [],
+                        "failedUpdatedAt": "",
+                        "failureKind": "",
+                        "statusMessage": "",
+                    },
+                ):
+                    with patch(
+                        "web_backend._collect_today_successful_task_payload_impl",
+                        return_value={
+                            "completedKeywords": ["新词"],
+                            "detectedPlatforms": ["doubao"],
+                            "actualScreenshotCount": 1,
+                        },
+                    ):
+                        result = runtime.update_task(
+                            "task-1",
+                            {
+                                "name": "新品牌",
+                                "brand": "新品牌",
+                                "weekdays": [0],
+                                "keywords": [{"keyword": "新词", "brand": "新品牌", "platforms": ["doubao"], "mode": "browser"}],
+                            },
+                        )
+
+        self.assertTrue(result["ok"])
+        task = result["task"]
+        self.assertEqual(task["id"], "task-1")
+        self.assertEqual(task["name"], "新品牌")
+        self.assertEqual(task["article_count"], 7)
+        self.assertEqual(task["total_records"], 12)
+        self.assertEqual(task["completed_keywords_today"], ["新词"])
+        runtime.task_overview_service.get_tasks_full.assert_not_called()
+
+    def test_sync_cloud_admin_task_returns_light_local_snapshot_without_rebuilding_tasks_full(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        self._install_light_snapshot_runtime(
+            runtime,
+            {
+                "detection_mode": "browser",
+                "scheduler": {"weekly_times": {"0": "09:30"}},
+                "tasks": [
+                    {
+                        "task_id": "task-1",
+                        "name": "品牌A",
+                        "brand": "品牌A",
+                        "enabled": True,
+                        "weekdays": [0],
+                        "keywords": [{"keyword": "品牌A", "brand": "品牌A", "platforms": ["doubao"], "mode": "browser"}],
+                    }
+                ],
+            },
+            {
+                "id": "task-1",
+                "total_records": 5,
+                "success_records": 4,
+                "success_rate": 80.0,
+                "article_count": 3,
+                "optimization_trend": [{"value": 88.0}],
+            },
+        )
+        client = FakeAdminTaskClient()
+        runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]
+        runtime._cloud_request_with_refresh = Mock(  # type: ignore[method-assign]
+            side_effect=lambda operation: (True, operation(client, "access-token"), "")
+        )
+
+        with patch("web_backend.CloudSessionStore", return_value=FakeCloudSessionStore()):
+            with patch("web_backend.local_today", return_value=date(2026, 1, 5)):
+                with patch(
+                    "web_backend.get_task_day_status",
+                    return_value={"status": "pending", "brand_status": "pending", "gap_reasons": []},
+                ):
+                    with patch(
+                        "web_backend._build_task_failure_summary_impl",
+                        return_value={
+                            "failedToday": False,
+                            "failedModes": [],
+                            "failedUpdatedAt": "",
+                            "failureKind": "",
+                            "statusMessage": "",
+                        },
+                    ):
+                        with patch(
+                            "web_backend._collect_today_successful_task_payload_impl",
+                            return_value={"completedKeywords": [], "detectedPlatforms": [], "actualScreenshotCount": 0},
+                        ):
+                            result = runtime.sync_cloud_admin_task({"local_task_id": "task-1", "operator_user_id": 7})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["local_task"]["cloud_task_id"], 100)
+        self.assertEqual(result["local_task"]["article_count"], 3)
+        self.assertEqual(client.assigned[0]["user_id"], 7)
+        runtime.task_overview_service.get_tasks_full.assert_not_called()
+
     def test_admin_task_list_ensures_unsynced_local_tasks_exist_in_cloud(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         client = FakeAdminTaskClient([

@@ -230,6 +230,7 @@ from core.daily_task_state import (
     build_task_state_extra,
     derive_task_id,
     get_task_day_status,
+    get_task_status_label,
     write_task_status,
 )
 from core.logging_utils import redact_secret_text, redact_secrets
@@ -261,6 +262,7 @@ from core.platform_sessions import (
 )
 from core.quick_todos import normalize_quick_todos
 from core.runtime_state import set_auto_resume_monitoring, should_auto_resume_monitoring
+from core.scheduler import describe_task_schedule
 from core.scheduler_notifications import SchedulerWebhookReporter
 from core.scheduler_state import get_entry as get_scheduler_state_entry
 from core.screenshot_tools import get_decoration_theme, get_default_decoration_theme
@@ -2313,6 +2315,231 @@ class AppRuntime:
         except Exception as exc:
             print(f"[WebBackend] 获取任务完整快照失败: task_id={normalized_task_id}, error={exc}")
         return {}
+
+    def _get_cached_task_snapshot(self, task_id: str) -> dict[str, Any]:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return {}
+        try:
+            getter = getattr(self.task_overview_service, "get_cached_task_snapshot", None)
+            if callable(getter):
+                snapshot = getter(normalized_task_id)
+                if isinstance(snapshot, dict):
+                    return snapshot
+        except Exception:
+            pass
+        return {}
+
+    def _get_light_task_snapshot(
+        self,
+        task_id: str,
+        *,
+        config: dict[str, Any] | None = None,
+        task: dict[str, Any] | None = None,
+        base_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return {}
+
+        current_config = config if isinstance(config, dict) else self.load_config()
+        if not isinstance(current_config, dict):
+            current_config = {}
+        target_task = dict(task or {})
+        if not target_task:
+            for candidate in current_config.get("tasks", []) or []:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_id = str(candidate.get("task_id") or derive_task_id(candidate)).strip()
+                if candidate_id == normalized_task_id:
+                    target_task = dict(candidate)
+                    break
+        if not target_task:
+            return copy.deepcopy(base_snapshot) if isinstance(base_snapshot, dict) else {}
+
+        resolved_task_id = str(target_task.get("task_id") or derive_task_id(target_task) or normalized_task_id).strip()
+        target_task["task_id"] = resolved_task_id
+        task_name = str(target_task.get("name") or resolved_task_id).strip()
+        scheduler_config = current_config.get("scheduler", {}) if isinstance(current_config, dict) else {}
+
+        snapshot = (
+            copy.deepcopy(base_snapshot)
+            if isinstance(base_snapshot, dict)
+            else self._get_cached_task_snapshot(resolved_task_id)
+        )
+
+        try:
+            status = get_task_day_status(target_task)
+        except Exception:
+            status = {}
+        current_status = str(status.get("status") or snapshot.get("status") or "pending").strip() or "pending"
+        brand_status = str(status.get("brand_status") or snapshot.get("brand_status") or "pending").strip() or "pending"
+
+        try:
+            schedule_text = describe_task_schedule(target_task, scheduler_config)
+        except Exception:
+            schedule_text = str(snapshot.get("schedule") or "")
+        try:
+            scheduled_today = _task_is_scheduled_for_day(target_task, scheduler_config, local_today())
+        except Exception:
+            scheduled_today = bool(snapshot.get("scheduled_today"))
+        try:
+            failure_summary = _build_task_failure_summary_impl(
+                target_task,
+                day_status_loader=get_task_day_status,
+                platform_display_name=_pid_to_display,
+            )
+        except Exception:
+            failure_summary = {}
+        try:
+            success_progress = _collect_today_successful_task_payload_impl(
+                target_task,
+                day_status_loader=get_task_day_status,
+                normalize_string_list=_normalize_string_list,
+            )
+        except Exception:
+            success_progress = {}
+
+        completed_keywords_today = [
+            str(item).strip()
+            for item in (success_progress.get("completedKeywords") or [])
+            if str(item).strip()
+        ]
+        detected_platforms_today = [
+            str(item).strip()
+            for item in (success_progress.get("detectedPlatforms") or [])
+            if str(item).strip()
+        ]
+        actual_screenshot_count_today = _safe_int(success_progress.get("actualScreenshotCount"), 0)
+        fixed_screenshot_target_today = _compute_fixed_screenshot_target_impl(target_task)
+        completed_by_quota_today = (
+            fixed_screenshot_target_today > 0
+            and actual_screenshot_count_today >= fixed_screenshot_target_today
+        )
+
+        raw_keywords = [kw for kw in (target_task.get("keywords") or []) if isinstance(kw, dict)]
+        raw_platforms: list[Any] = []
+        for keyword in raw_keywords:
+            raw_platforms.extend(keyword.get("platforms") or [])
+        if isinstance(target_task.get("platforms"), list):
+            raw_platforms.extend(target_task.get("platforms") or [])
+        platforms = sorted({
+            _pid_to_display(str(platform or "").strip())
+            for platform in raw_platforms
+            if str(platform or "").strip()
+        })
+
+        keyword_payloads: list[dict[str, Any]] = []
+        for keyword in raw_keywords:
+            item = copy.deepcopy(keyword)
+            item["platforms"] = [
+                _pid_to_display(str(platform or "").strip())
+                for platform in (keyword.get("platforms") or [])
+                if str(platform or "").strip()
+            ]
+            deep_think = keyword.get("deep_think")
+            if isinstance(deep_think, dict):
+                item["deep_think"] = {
+                    _pid_to_display(str(platform or "").strip()): enabled
+                    for platform, enabled in deep_think.items()
+                    if str(platform or "").strip()
+                }
+            elif "deep_think" in item:
+                item["deep_think"] = {}
+            keyword_payloads.append(item)
+
+        test_failure_notice = None
+        try:
+            getter = getattr(self, "_get_test_failure_notice", None)
+            if callable(getter):
+                test_failure_notice = getter(resolved_task_id)
+        except Exception:
+            test_failure_notice = None
+        if not test_failure_notice:
+            test_failure_notice = snapshot.get("test_failure_notice")
+
+        total_records = _safe_int(snapshot.get("total_records"), 0)
+        success_records = _safe_int(snapshot.get("success_records"), 0)
+        success_rate = _safe_float(snapshot.get("success_rate"), 0.0)
+        article_count = _safe_int(snapshot.get("article_count"), 0)
+        optimization_trend = (
+            snapshot.get("optimization_trend")
+            if isinstance(snapshot.get("optimization_trend"), list)
+            else []
+        )
+
+        snapshot.update({
+            "id": resolved_task_id,
+            "name": task_name,
+            "brand": str(target_task.get("brand", "") or "").strip(),
+            "enabled": target_task.get("enabled", True),
+            "mode": str(current_config.get("detection_mode", "browser") or "browser").strip(),
+            "schedule": schedule_text,
+            "status": current_status,
+            "status_label": get_task_status_label(current_status),
+            "brand_status": brand_status,
+            "sent_today": bool(status.get("sent_today")),
+            "sent_at": str(status.get("sent_at") or ""),
+            "scheduled_today": bool(scheduled_today),
+            "formal_started": bool(status.get("formal_started")),
+            "formal_running": bool(status.get("formal_running")),
+            "has_gap": bool(status.get("has_gap")),
+            "gap_reasons": list(status.get("gap_reasons") or []),
+            "status_source": str(status.get("source") or "").strip(),
+            "test_status": str(status.get("test_status") or "").strip(),
+            "test_status_source": str(status.get("test_source") or "").strip(),
+            "failed_today": bool(failure_summary.get("failedToday", snapshot.get("failed_today", False))),
+            "failed_modes_today": list(failure_summary.get("failedModes") or snapshot.get("failed_modes_today") or []),
+            "failed_updated_at": str(failure_summary.get("failedUpdatedAt") or snapshot.get("failed_updated_at") or ""),
+            "failure_kind_today": str(failure_summary.get("failureKind") or snapshot.get("failure_kind_today") or ""),
+            "status_message": str(failure_summary.get("statusMessage") or snapshot.get("status_message") or ""),
+            "completed_keywords_today": completed_keywords_today,
+            "detected_platforms_today": detected_platforms_today,
+            "actual_screenshot_count_today": actual_screenshot_count_today,
+            "fixed_screenshot_target_today": fixed_screenshot_target_today,
+            "completed_by_quota_today": completed_by_quota_today,
+            "test_failure_notice": test_failure_notice,
+            "platforms": platforms,
+            "keywords": keyword_payloads,
+            "webhook_url": _mask_secret(target_task.get("webhook_url", "")),
+            "weekdays": target_task.get("weekdays", [0, 1, 2, 3, 4]),
+            "industry_tags": target_task.get("industry_tags", []),
+            "region_tags": target_task.get("region_tags", []),
+            "inspect": bool(target_task.get("inspect", False)),
+            "recognition_enabled": bool(target_task.get("recognition_enabled", False)),
+            "recognition_brands": target_task.get("recognition_brands", ""),
+            "recognition_batch_size": max(1, _safe_int(target_task.get("recognition_batch_size", 3), 3)),
+            "extract_references_enabled": bool(target_task.get("extract_references_enabled", False)),
+            "fixed_screenshot_enabled": bool(target_task.get("fixed_screenshot_enabled", False)),
+            "fixed_screenshot_count": max(
+                1,
+                _safe_int(
+                    target_task.get("fixed_screenshot_count", target_task.get("recognition_batch_size", 3)),
+                    1,
+                ),
+            ),
+            "optimization_start_date": target_task.get("optimization_start_date", ""),
+            "optimization_end_date": target_task.get("optimization_end_date", ""),
+            "created_at": str(target_task.get("created_at") or ""),
+            "delete_pending": bool(target_task.get("delete_pending")),
+            "delete_pending_at": str(target_task.get("delete_pending_at") or ""),
+            "delete_pending_expires_at": str(target_task.get("delete_pending_expires_at") or ""),
+            "delete_pending_error": str(target_task.get("delete_pending_error") or ""),
+            "cloud_task_id": target_task.get("cloud_task_id"),
+            "cloud_task_key": str(target_task.get("cloud_task_key") or ""),
+            "cloud_workspace_id": target_task.get("cloud_workspace_id"),
+            "cloud_access_level": str(target_task.get("cloud_access_level") or ""),
+            "cloud_config_version": target_task.get("cloud_config_version"),
+            "cloud_assigned_operator_user_id": target_task.get("cloud_assigned_operator_user_id"),
+            "cloud_assigned_operator_username": str(target_task.get("cloud_assigned_operator_username") or ""),
+            "cloud_synced_at": str(target_task.get("cloud_synced_at") or ""),
+            "total_records": total_records,
+            "success_records": success_records,
+            "success_rate": success_rate,
+            "article_count": article_count,
+            "optimization_trend": optimization_trend,
+        })
+        return snapshot
 
     def _invalidate_article_cache(self) -> None:
         with self._article_cache_lock:
@@ -4987,6 +5214,9 @@ return changedCount
         if not isinstance(saved_task, dict):
             saved_task = {}
 
+        base_snapshot = self._get_cached_task_snapshot(local_task_id)
+        local_task_snapshot: dict[str, Any] = {}
+        snapshot_config: dict[str, Any] = {}
         with self._lock:
             config = self.load_config()
             tasks = config.get("tasks", []) or []
@@ -5005,9 +5235,11 @@ return changedCount
                     task["cloud_assigned_operator_username"] = ""
                 task["cloud_synced_at"] = _local_iso_seconds()
                 tasks[index] = task
+                local_task_snapshot = copy.deepcopy(task)
                 break
             config["tasks"] = tasks
             self.save_config(config)
+            snapshot_config = copy.deepcopy(config)
             self._invalidate_tasks_full_cache()
             self._invalidate_article_cache()
         self._refresh_monitoring_runtime(restart_scheduler=False)
@@ -5015,7 +5247,12 @@ return changedCount
             "ok": True,
             "message": "云端任务已同步",
             "task": saved_task,
-            "local_task": self._get_full_task_snapshot(local_task_id),
+            "local_task": self._get_light_task_snapshot(
+                local_task_id,
+                config=snapshot_config,
+                task=local_task_snapshot,
+                base_snapshot=base_snapshot,
+            ),
             "cloud": self.get_cloud_status().get("cloud"),
         }
 
@@ -7515,11 +7752,23 @@ return changedCount
             tasks.append(new_task)
             config["tasks"] = tasks
             self.save_config(config)
+            task_id = str(new_task.get("task_id", "") or "").strip()
+            base_snapshot = self._get_cached_task_snapshot(task_id)
+            snapshot_config = copy.deepcopy(config)
+            snapshot_task = copy.deepcopy(new_task)
             self._invalidate_tasks_full_cache()
             self._invalidate_article_cache()
         self._refresh_monitoring_runtime()
-        task_id = str(new_task.get("task_id", "") or "").strip()
-        return {"ok": True, "task_id": task_id, "task": self._get_full_task_snapshot(task_id)}
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "task": self._get_light_task_snapshot(
+                task_id,
+                config=snapshot_config,
+                task=snapshot_task,
+                base_snapshot=base_snapshot,
+            ),
+        }
 
     def update_task(self, task_id: str, payload: dict) -> dict:
         """合并更新任务（只覆盖 payload 中存在的字段）。"""
@@ -7540,10 +7789,21 @@ return changedCount
             tasks[target_idx] = existing
             config["tasks"] = tasks
             self.save_config(config)
+            base_snapshot = self._get_cached_task_snapshot(task_id)
+            snapshot_config = copy.deepcopy(config)
+            snapshot_task = copy.deepcopy(existing)
             self._invalidate_tasks_full_cache()
             self._invalidate_article_cache()
         self._refresh_monitoring_runtime()
-        return {"ok": True, "task": self._get_full_task_snapshot(task_id)}
+        return {
+            "ok": True,
+            "task": self._get_light_task_snapshot(
+                task_id,
+                config=snapshot_config,
+                task=snapshot_task,
+                base_snapshot=base_snapshot,
+            ),
+        }
 
     def delete_task(self, task_id: str) -> dict:
         """软删除任务，保留三天可恢复备份。"""
@@ -10703,13 +10963,22 @@ def _safe_write_response(handler: BaseHTTPRequestHandler, data: bytes) -> None:
         return
 
 
+def _safe_end_headers(handler: BaseHTTPRequestHandler) -> bool:
+    try:
+        handler.end_headers()
+        return True
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+        return False
+
+
 def _json_response(handler: BaseHTTPRequestHandler, payload: dict, status: int = HTTPStatus.OK) -> None:
     data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(data)))
     _apply_cors_headers(handler)
-    handler.end_headers()
+    if not _safe_end_headers(handler):
+        return
     _safe_write_response(handler, data)
 
 
@@ -10719,7 +10988,8 @@ def _text_response(handler: BaseHTTPRequestHandler, text: str, status: int = HTT
     handler.send_header("Content-Type", content_type)
     handler.send_header("Content-Length", str(len(data)))
     _apply_cors_headers(handler)
-    handler.end_headers()
+    if not _safe_end_headers(handler):
+        return
     _safe_write_response(handler, data)
 
 
@@ -10730,7 +11000,8 @@ def _bytes_response(handler: BaseHTTPRequestHandler, data: bytes, status: int = 
     handler.send_header("Content-Length", str(len(payload)))
     handler.send_header("Cache-Control", "private, max-age=300")
     _apply_cors_headers(handler)
-    handler.end_headers()
+    if not _safe_end_headers(handler):
+        return
     _safe_write_response(handler, payload)
 
 
@@ -10744,7 +11015,8 @@ def _download_file_response(handler: BaseHTTPRequestHandler, path: Path, file_na
     handler.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quoted_name}")
     handler.send_header("Cache-Control", "no-store")
     _apply_cors_headers(handler)
-    handler.end_headers()
+    if not _safe_end_headers(handler):
+        return
     _safe_write_response(handler, data)
 
 
@@ -10759,7 +11031,8 @@ def _stream_json_lines_response(
     handler.send_header("Cache-Control", "no-cache, no-transform")
     handler.send_header("X-Accel-Buffering", "no")
     _apply_cors_headers(handler)
-    handler.end_headers()
+    if not _safe_end_headers(handler):
+        return
     for event in events:
         payload = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
         try:
@@ -10809,7 +11082,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         _apply_cors_headers(self)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", f"Content-Type, {SESSION_TOKEN_HEADER}, X-CSRF-Token")
-        self.end_headers()
+        _safe_end_headers(self)
 
     def do_GET(self) -> None:  # noqa: N802
         try:
@@ -11206,7 +11479,8 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_header("Cache-Control", "public, max-age=31536000, immutable")
         _apply_cors_headers(self)
-        self.end_headers()
+        if not _safe_end_headers(self):
+            return
         _safe_write_response(self, data)
 
 

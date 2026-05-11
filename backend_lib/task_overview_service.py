@@ -58,6 +58,20 @@ class TaskOverviewService:
         with self._cache_lock:
             self._cache = None
 
+    def get_cached_task_snapshot(self, task_id: str) -> dict[str, Any]:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return {}
+        with self._cache_lock:
+            cached = self._cache
+            payload = cached.get("payload") if isinstance(cached, dict) else None
+            if not isinstance(payload, dict):
+                return {}
+            for task in payload.get("tasks", []) or []:
+                if isinstance(task, dict) and str(task.get("id") or "").strip() == normalized_task_id:
+                    return copy.deepcopy(task)
+        return {}
+
     def get_tasks_full(self) -> dict[str, Any]:
         now = time.monotonic()
         with self._cache_lock:

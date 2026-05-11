@@ -16,6 +16,18 @@ class FakePage:
     url = "https://example.test/chat"
 
 
+class FakeMouse:
+    def __init__(self):
+        self.moves = []
+        self.wheels = []
+
+    def move(self, x, y):
+        self.moves.append((x, y))
+
+    def wheel(self, delta_x, delta_y):
+        self.wheels.append((delta_x, delta_y))
+
+
 class FakeCDPSession:
     def __init__(self):
         self.commands = []
@@ -51,12 +63,12 @@ class BrowserPollingAndCDPTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             platform = FakePlatform(tmpdir)
 
-            self.assertTrue(platform._consume_answer_read_scroll())
+            self.assertFalse(platform._consume_answer_read_scroll())
 
             with patch("platforms.base.random.randint", return_value=5):
                 platform._begin_answer_capture(keyword="keyword", brand="brand")
                 platform._schedule_answer_poll_read()
-                self.assertTrue(platform._consume_answer_read_scroll())
+                self.assertFalse(platform._consume_answer_read_scroll())
                 self.assertFalse(platform._consume_answer_read_scroll())
 
                 for _ in range(4):
@@ -64,7 +76,23 @@ class BrowserPollingAndCDPTests(unittest.TestCase):
                     self.assertFalse(platform._consume_answer_read_scroll())
 
                 platform._schedule_answer_poll_read()
-                self.assertTrue(platform._consume_answer_read_scroll())
+                self.assertFalse(platform._consume_answer_read_scroll())
+
+    def test_answer_scroll_uses_virtual_wheel_without_js_scroll_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            platform = FakePlatform(tmpdir)
+            mouse = FakeMouse()
+            platform.page = type("WheelPage", (), {"mouse": mouse})()
+            platform._answer_scroll_target_point = lambda: {"x": 120, "y": 240}  # type: ignore[method-assign]
+
+            with patch("platforms.base.random.randint", return_value=900), patch("platforms.base.random.uniform", return_value=0):
+                platform._begin_answer_capture(keyword="keyword", brand="brand")
+                platform._schedule_answer_poll_read()
+                should_js_scroll = platform._consume_answer_read_scroll()
+
+            self.assertFalse(should_js_scroll)
+            self.assertEqual(mouse.moves, [(120.0, 240.0)])
+            self.assertEqual(mouse.wheels, [(0, 900)])
 
     def test_overlay_scan_is_throttled_for_polling_checks(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -180,7 +208,7 @@ class BrowserPollingAndCDPTests(unittest.TestCase):
             with patch("platforms.base.random.randint", return_value=5):
                 platform._begin_answer_capture(keyword="keyword", brand="brand")
                 platform._schedule_answer_poll_read()
-                self.assertTrue(platform._consume_answer_read_scroll())
+                self.assertFalse(platform._consume_answer_read_scroll())
                 platform._schedule_answer_poll_read()
                 self.assertFalse(platform._consume_answer_read_scroll())
 

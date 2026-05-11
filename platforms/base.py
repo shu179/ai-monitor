@@ -1310,14 +1310,102 @@ class BasePlatform(ABC):
     def _consume_answer_read_scroll(self, *, force: bool = False) -> bool:
         if force or self._answer_capture_session is None:
             self._record_answer_text_read(should_scroll=True)
-            return True
+            self._wheel_answer_view()
+            return False
         remaining = int(self._answer_scroll_reads_remaining or 0)
         if remaining <= 0:
             self._record_answer_text_read(should_scroll=False)
             return False
         self._answer_scroll_reads_remaining = remaining - 1
         self._record_answer_text_read(should_scroll=True)
-        return True
+        self._wheel_answer_view()
+        return False
+
+    def _answer_scroll_target_point(self) -> dict[str, float] | None:
+        if not getattr(self, "page", None):
+            return None
+
+        viewport = getattr(self.page, "viewport_size", None) or {}
+        viewport_width = float(viewport.get("width") or 1280)
+        viewport_height = float(viewport.get("height") or 900)
+        input_top = viewport_height
+
+        if self.input_selector:
+            try:
+                input_box = self.page.locator(self.input_selector).first.bounding_box(timeout=250)
+                if input_box:
+                    input_top = max(0.0, float(input_box.get("y") or input_top))
+            except Exception as exc:
+                self._reraise_stop_requested(exc)
+
+        def clamp(value: float, lower: float, upper: float) -> float:
+            return max(lower, min(upper, value))
+
+        def locator_box(selector: str, *, last: bool) -> dict | None:
+            if not selector:
+                return None
+            try:
+                locator = self.page.locator(selector)
+                count = int(locator.count())
+                if count <= 0:
+                    return None
+                item = locator.nth(count - 1) if last else locator.first
+                box = item.bounding_box(timeout=300)
+                if not box:
+                    return None
+                width = float(box.get("width") or 0)
+                height = float(box.get("height") or 0)
+                if width <= 8 or height <= 8:
+                    return None
+                return box
+            except Exception as exc:
+                self._reraise_stop_requested(exc)
+                return None
+
+        box = (
+            locator_box(self.chat_container_selector or "", last=True)
+            or locator_box(self.result_selector or "", last=True)
+            or locator_box("main, [role='main']", last=False)
+        )
+        if box:
+            x = clamp(
+                float(box.get("x") or 0) + float(box.get("width") or 0) * random.uniform(0.45, 0.62),
+                8,
+                viewport_width - 8,
+            )
+            raw_y = float(box.get("y") or 0) + float(box.get("height") or 0) * random.uniform(0.62, 0.78)
+            upper_y = max(8, min(input_top - 24, viewport_height - 8))
+            y = clamp(raw_y, 8, upper_y)
+            return {"x": x, "y": y}
+
+        return {
+            "x": clamp(viewport_width * random.uniform(0.48, 0.62), 8, viewport_width - 8),
+            "y": clamp(min(viewport_height * random.uniform(0.62, 0.76), input_top - 24), 8, viewport_height - 8),
+        }
+
+    def _wheel_answer_view(self, *, delta_y: int | None = None, steps: int = 1) -> bool:
+        if not getattr(self, "page", None):
+            return False
+        target = self._answer_scroll_target_point()
+        if not target:
+            return False
+        try:
+            x = float(target.get("x") or 0)
+            y = float(target.get("y") or 0)
+            amount = int(delta_y if delta_y is not None else random.randint(760, 1180))
+            count = max(1, min(3, int(steps or 1)))
+            for index in range(count):
+                self.page.mouse.move(
+                    x + random.uniform(-2.0, 2.0),
+                    y + random.uniform(-2.0, 2.0),
+                )
+                self.page.mouse.wheel(0, amount)
+                if index + 1 < count:
+                    self._cooperative_sleep(random.uniform(0.06, 0.14))
+            return True
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return False
 
     def _browser_proxy_settings(self) -> dict | None:
         server = str(getattr(self, "browser_proxy_server", "") or "").strip()
@@ -4751,16 +4839,7 @@ class BasePlatform(ABC):
 
     def _scroll_answer_view_to_top(self) -> None:
         try:
-            if self.chat_container_selector:
-                self.page.evaluate(
-                    """(selector) => {
-                        const el = document.querySelector(selector);
-                        if (el) el.scrollTop = 0;
-                    }""",
-                    self.chat_container_selector,
-                )
-            else:
-                self.page.evaluate("window.scrollTo(0, 0)")
+            self._wheel_answer_view(delta_y=-random.randint(760, 1180), steps=3)
             self._cooperative_sleep(0.8)
         except Exception:
             pass
