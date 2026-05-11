@@ -15,6 +15,7 @@ from .time_utils import local_now, local_today, parse_local_date
 
 
 SCHEMA_VERSION = 1
+ARTICLE_PAGE_MAX_LIMIT = 5000
 
 REQUIRED_TABLE_COLUMNS: dict[str, set[str]] = {
     "store_meta": {"key", "value"},
@@ -68,9 +69,11 @@ class ArticleHistorySQLiteStore:
         db_path: str | Path,
         *,
         normalize_article_url: Callable[[str], str] | None = None,
+        sqlite_timeout: float = 30.0,
     ) -> None:
         self.db_path = Path(db_path)
         self._normalize_article_url = normalize_article_url
+        self._sqlite_timeout = max(0.0, float(sqlite_timeout or 0.0))
 
     def initialize(self) -> None:
         with self._connection() as conn:
@@ -447,7 +450,7 @@ class ArticleHistorySQLiteStore:
             media_type=media_type,
             search=search,
         )
-        limit = max(1, min(500, int(limit or 100)))
+        limit = max(1, min(ARTICLE_PAGE_MAX_LIMIT, int(limit or 100)))
         offset = max(0, int(offset or 0))
         today_text = self._date_text(today if today is not None else local_today().isoformat())[:10]
         with self._connection() as conn:
@@ -593,7 +596,12 @@ class ArticleHistorySQLiteStore:
             """,
             params,
         ).fetchall()
-        deduped = self._dedupe_articles_by_url([self._json_loads(row[0]) for row in rows])
+        filtered_articles = [self._json_loads(row[0]) for row in rows]
+        supplemental_articles = self._supplemental_url_articles_for_missing_fingerprints(
+            conn,
+            filtered_articles,
+        )
+        deduped = self._dedupe_articles_by_url([*filtered_articles, *supplemental_articles])
         return {
             "total": len(deduped),
             "today_total": sum(
@@ -1023,9 +1031,9 @@ class ArticleHistorySQLiteStore:
 
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn = sqlite3.connect(self.db_path, timeout=self._sqlite_timeout)
         try:
-            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute(f"PRAGMA busy_timeout = {int(self._sqlite_timeout * 1000)}")
             conn.execute("PRAGMA foreign_keys = ON")
         except BaseException:
             conn.close()
@@ -1095,7 +1103,7 @@ class ArticleHistorySQLiteStore:
         if duplicate_hits:
             merged["reference_hits"] = {**base_hits, **duplicate_hits}
 
-        for key in ("url", "title", "media_name", "platform", "published_at", "ts"):
+        for key in ("url", "raw_url", "title", "media_name", "platform", "published_at", "ts"):
             if not cls._text(merged.get(key)) and cls._text(duplicate.get(key)):
                 merged[key] = duplicate.get(key)
         return merged
@@ -1276,7 +1284,7 @@ class ArticleHistorySQLiteStore:
             normalized_url = self._normalized_url(article)
             fingerprint = self._article_url_fingerprint(article)
             if normalized_url and fingerprint and fingerprint not in url_by_fingerprint:
-                url_by_fingerprint[fingerprint] = self._text(article.get("url"))
+                url_by_fingerprint[fingerprint] = self._display_url(article)
 
         for article in articles:
             if not isinstance(article, dict):
@@ -1299,6 +1307,42 @@ class ArticleHistorySQLiteStore:
             deduped[existing_index] = self._merge_article_for_duplicate_url(deduped[existing_index], item)
         return deduped
 
+    def _supplemental_url_articles_for_missing_fingerprints(
+        self,
+        conn: sqlite3.Connection,
+        articles: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        target_fingerprints = {
+            self._article_url_fingerprint(article)
+            for article in articles
+            if isinstance(article, dict) and not self._normalized_url(article)
+        }
+        target_fingerprints.discard("")
+        if not target_fingerprints:
+            return []
+
+        supplemental: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        rows = conn.execute(
+            """
+            SELECT raw_json
+            FROM articles
+            WHERE normalized_url IS NOT NULL AND normalized_url != ''
+            ORDER BY sort_published_ts DESC, sort_imported_ts DESC, id DESC
+            """
+        ).fetchall()
+        for row in rows:
+            article = self._json_loads(row[0])
+            fingerprint = self._article_url_fingerprint(article)
+            if fingerprint not in target_fingerprints:
+                continue
+            normalized_url = self._normalized_url(article)
+            if not normalized_url or normalized_url in seen_urls:
+                continue
+            supplemental.append(article)
+            seen_urls.add(normalized_url)
+        return supplemental
+
     @classmethod
     def _article_url_fingerprint(cls, article: dict[str, Any]) -> str:
         title = re.sub(r"\s+", " ", cls._text(article.get("title"))).lower()
@@ -1311,6 +1355,16 @@ class ArticleHistorySQLiteStore:
         if not title or not source:
             return ""
         return "|".join([title, source, published])
+
+    def _display_url(self, article: dict[str, Any]) -> str:
+        stored_url = self._text(article.get("url"))
+        raw_url = self._text(article.get("raw_url"))
+        if raw_url:
+            normalized_raw_url = self._normalize_url_text(raw_url)
+            normalized_stored_url = self._normalize_url_text(stored_url)
+            if normalized_raw_url and (not normalized_stored_url or normalized_raw_url == normalized_stored_url):
+                return raw_url
+        return stored_url
 
     @classmethod
     def _article_matches_today(cls, article: dict[str, Any], today_text: str) -> bool:
@@ -1346,7 +1400,13 @@ class ArticleHistorySQLiteStore:
         return f"record:{digest}"
 
     def _normalized_url(self, article: dict[str, Any]) -> str:
-        raw_url = self._text(article.get("url"))
+        raw_url = self._text(article.get("url")) or self._text(article.get("raw_url"))
+        if not raw_url:
+            return ""
+        return self._normalize_url_text(raw_url)
+
+    def _normalize_url_text(self, value: Any) -> str:
+        raw_url = self._text(value)
         if not raw_url:
             return ""
         if self._normalize_article_url is None:

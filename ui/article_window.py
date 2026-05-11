@@ -26,8 +26,11 @@ from core.article_store import (
     add_article,
     analyze_article_matches,
     build_article_export_keyword_order,
+    build_article_export_keyword_plan,
+    build_article_export_keyword_signature,
     get_articles,
     extract_domain,
+    resolve_article_display_url,
     resolve_article_export_source,
     resolve_article_export_keywords,
     resolve_article_source,
@@ -220,8 +223,9 @@ def _article_export_items(
     show_keyword_category: bool,
     keyword_order: dict[str, int] | None = None,
 ) -> list[tuple[str, dict]]:
+    rows = _sort_articles_for_export(rows)
     if not show_keyword_category:
-        return [("", row) for row in _sort_articles_for_export(rows)]
+        return [("", row) for row in rows]
     resolved_keyword_order = keyword_order or {}
     items: list[tuple[str, dict]] = []
     for row in rows:
@@ -229,28 +233,11 @@ def _article_export_items(
             str(label or "").strip()
             for label in (row.get("keyword_categories") or [])
             if str(label or "").strip()
-        ] or ["未识别关键词"]
-        for label in labels:
-            items.append((label, row))
+        ]
+        labels.sort(key=lambda label: _article_export_keyword_sort_key(label, resolved_keyword_order))
+        items.append(("、".join(labels), row))
 
-    def sort_key(item: tuple[str, dict]) -> tuple[tuple[int, str], float, float, str]:
-        label, row = item
-        published = _first_article_export_timestamp(
-            row,
-            ("published_ts", "published_at", "published", "ts"),
-        )
-        imported = _first_article_export_timestamp(
-            row,
-            ("imported_at", "created_at", "ts"),
-        )
-        return (
-            _article_export_keyword_sort_key(label, resolved_keyword_order),
-            published or -1,
-            imported or -1,
-            str(row.get("id") or ""),
-        )
-
-    return sorted(items, key=sort_key)
+    return items
 
 
 def _build_articles_xlsx(
@@ -953,7 +940,8 @@ class ArticleWindow:
 
         for article in articles:
             ts         = article.get("ts", "")[:16]
-            title      = article.get("title") or article.get("url", "")[:60]
+            display_url = resolve_article_display_url(article)
+            title      = article.get("title") or display_url[:60]
             platform   = resolve_article_source(article) or article.get("platform", "")
             media_type = article.get("media_type", "selfmedia")
             tasks      = "、".join(article.get("matched_tasks") or [])
@@ -1153,6 +1141,8 @@ class ArticleWindow:
         )
         keyword_task_name = "" if include_brand else brand
         keyword_order = build_article_export_keyword_order(self._config or {}, keyword_task_name)
+        keyword_plan = build_article_export_keyword_plan(self._config or {}, keyword_task_name)
+        keyword_config_signature = build_article_export_keyword_signature(self._config or {})
         for article in articles:
             title = str(article.get("title") or "").strip()
             platform = (
@@ -1160,7 +1150,7 @@ class ArticleWindow:
                     article,
                     show_selfmedia_account=show_selfmedia_account,
                 )
-                or extract_domain(article.get("url", ""))
+                or extract_domain(resolve_article_display_url(article))
                 or "未知来源"
             )
             matched_brands = [
@@ -1175,10 +1165,12 @@ class ArticleWindow:
                     article,
                     self._config or {},
                     keyword_task_name,
+                    keyword_plan=keyword_plan,
+                    keyword_config_signature=keyword_config_signature,
                 ),
                 "platform": platform,
                 "title": title,
-                "url": str(article.get("url") or "").strip(),
+                "url": resolve_article_display_url(article),
                 "published_at": article.get("published_at", ""),
                 "imported_at": article.get("imported_at", article.get("created_at", "")),
                 "ts": str(article.get("ts") or "").strip(),

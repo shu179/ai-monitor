@@ -547,11 +547,14 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
 
             result = store.import_articles(articles, replace=True)
             page = store.get_article_page(limit=50)
+            large_page = store.get_article_page(limit=5000)
             brand_page = store.get_article_page(task_name="品牌3", limit=25)
 
             self.assertEqual(result, {"created": 5000, "updated": 0, "skipped": 0})
             self.assertEqual(page["total"], 5000)
             self.assertEqual(len(page["items"]), 50)
+            self.assertEqual(large_page["total"], 5000)
+            self.assertEqual(len(large_page["items"]), 5000)
             self.assertEqual(brand_page["total"], 1000)
             self.assertEqual(len(brand_page["items"]), 25)
 
@@ -663,6 +666,8 @@ class ArticleHistorySQLiteStoreTests(unittest.TestCase):
             self.assertEqual(brand_b_page["total"], 1)
             self.assertEqual(brand_b_page["today_total"], 1)
             self.assertEqual([item["id"] for item in brand_b_page["items"]], ["article-b"])
+            self.assertEqual(brand_b_page["items"][0]["url"], "https://example.com/a")
+            self.assertEqual(brand_b_page["items"][0]["matched_tasks"], ["品牌B", "品牌A"])
 
             fallback_page = store.get_article_page(limit=10, today=today, dedupe_scan_limit=1)
             self.assertTrue(fallback_page["fallback_required"])

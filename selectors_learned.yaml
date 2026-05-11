@@ -2,5 +2,5 @@ new_chat_selector:
   selector: button.new
   source: selector_agent
   note: deepseek:新建对话按钮
-  updated_at: '2026-05-09T10:42:18+08:00'
-  hit_count: 35
+  updated_at: '2026-05-10T13:30:05+08:00'
+  hit_count: 39

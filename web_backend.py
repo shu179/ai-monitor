@@ -137,7 +137,7 @@ from backend_lib.todo_service import TodoService, _todo_to_api
 from core import SmartScheduler
 from core.app_runtime import BrowserAuthSessionStore, TestRunStateStore
 from core.article_history_sqlite_mirror import default_shadow_db_path, rebuild_shadow_store
-from core.article_history_sqlite_store import ArticleHistorySQLiteStore
+from core.article_history_sqlite_store import ARTICLE_PAGE_MAX_LIMIT, ArticleHistorySQLiteStore
 from core.app_paths import get_app_root, get_data_root, resolve_app_path
 from core.account_crawler import (
     crawl_account_articles,
@@ -303,6 +303,7 @@ TEST_RUN_TERMINAL_TTL_SECONDS = 6 * 60 * 60
 SEARCH_FILE_CACHE_TTL_SECONDS = 24 * 60 * 60
 BROWSER_AUTH_SESSION_TTL_SECONDS = 6 * 60 * 60
 CLOUD_ARTICLE_DEFERRED_REFRESH_RETRY_SECONDS = 2.0
+ARTICLE_SQLITE_PAGE_LIMIT_GUARD = ARTICLE_PAGE_MAX_LIMIT
 
 _HISTORY_READ_AUTO_VALUES = {"auto", "sqlite_auto", "sqlite_shadow_auto", "auto_sqlite_shadow"}
 _HISTORY_READ_SQLITE_VALUES = {"sqlite_shadow", "sqlite_structured", "structured", "sqlite"}
@@ -5894,7 +5895,7 @@ return changedCount
         if not read_backend:
             return None
         resolved_limit = max(1, int(limit or 50))
-        if resolved_limit > 500:
+        if resolved_limit > ARTICLE_SQLITE_PAGE_LIMIT_GUARD:
             self._record_sqlite_shadow_fallback(read_backend, "limit_exceeded")
             return None
         cooldown_reason = self._sqlite_shadow_cooldown_reason()
@@ -5919,7 +5920,11 @@ return changedCount
                 )
                 return None
 
-            store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+            store = ArticleHistorySQLiteStore(
+                db_path,
+                normalize_article_url=normalize_article_url,
+                sqlite_timeout=0.2,
+            )
             page = store.get_article_page(
                 limit=resolved_limit,
                 offset=0,
@@ -6302,7 +6307,11 @@ return changedCount
                 self._schedule_sqlite_shadow_article_rebuild(config, db_path=db_path, reason=reason)
                 return False
 
-            store = ArticleHistorySQLiteStore(db_path, normalize_article_url=normalize_article_url)
+            store = ArticleHistorySQLiteStore(
+                db_path,
+                normalize_article_url=normalize_article_url,
+                sqlite_timeout=0.2,
+            )
             stored_source_signature = str(store.get_meta("article_source_signature") or "").strip()
             stored_match_signature = str(store.get_meta("article_match_config_signature") or "").strip()
             if stored_source_signature == source_signature and stored_match_signature == match_key:

@@ -464,6 +464,27 @@ class AccountCrawlExclusionTests(unittest.TestCase):
         self.assertEqual([item["title"] for item in articles], ["RSSHub 本账号文章"])
         self.assertEqual(account_crawler._normalize_published_at(articles[0]["published_at"]), "2024-01-02")
 
+    def test_rss_parser_uses_url_guid_when_link_is_missing(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0">
+          <channel>
+            <item>
+              <title>博客园 GUID 链接文章</title>
+              <guid>https://www.cnblogs.com/example/p/123456.html</guid>
+              <pubDate>Tue, 02 Jan 2024 09:30:00 +0800</pubDate>
+            </item>
+          </channel>
+        </rss>
+        """
+
+        articles = account_crawler._parse_rss_feed(
+            xml,
+            "https://www.cnblogs.com/example/rss",
+            "cnblogs",
+        )
+
+        self.assertEqual([item["url"] for item in articles], ["https://www.cnblogs.com/example/p/123456.html"])
+
     def test_scoped_task_removal_keeps_article_for_other_brands(self) -> None:
         article = article_store.add_article({
             "url": "https://example.com/news/shared",

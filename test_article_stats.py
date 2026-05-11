@@ -10,6 +10,25 @@ class _ArticleStatsConfigProvider:
         return {}
 
 
+class _LightArticleStatsConfigProvider:
+    def __init__(self):
+        self.light_loads = 0
+
+    def load(self):
+        raise AssertionError("article list reads must not run config load hooks")
+
+    def load_without_hooks(self):
+        self.light_loads += 1
+        return {
+            "tasks": [
+                {
+                    "name": "品牌A",
+                    "keywords": [{"keyword": "新品"}],
+                }
+            ]
+        }
+
+
 def _article_service(articles, sqlite_article_page_loader=None, sqlite_article_compare_recorder=None):
     return ArticleService(
         config_provider=_ArticleStatsConfigProvider(),
@@ -60,6 +79,59 @@ class ArticleStatsTests(unittest.TestCase):
         self.assertEqual(result["total"], 3)
         self.assertEqual(result["today_total"], 1)
         self.assertEqual(len(result["articles"]), 3)
+
+    def test_article_list_uses_light_config_load_without_hooks(self):
+        provider = _LightArticleStatsConfigProvider()
+        service = ArticleService(
+            config_provider=provider,
+            synced_articles_loader=lambda config: [
+                {
+                    "id": "article-a",
+                    "url": "https://example.com/a",
+                    "title": "品牌A 新品发布",
+                    "media_type": "authority",
+                    "matched_tasks": ["品牌A"],
+                    "published_at": "2026-05-09",
+                }
+            ],
+            invalidate_article_cache=lambda: None,
+            lock=threading.RLock(),
+            import_batch_store=ArticleImportBatchStore(),
+            sqlite_article_page_loader=None,
+            sqlite_article_compare_recorder=None,
+        )
+
+        result = service.get_articles_filtered(limit=20, include_export_keywords=True)
+
+        self.assertEqual(provider.light_loads, 1)
+        self.assertEqual(result["articles"][0]["exportKeywords"], ["新品"])
+
+    def test_article_list_preserves_deleted_task_classification(self):
+        provider = _LightArticleStatsConfigProvider()
+        service = ArticleService(
+            config_provider=provider,
+            synced_articles_loader=lambda config: [
+                {
+                    "id": "article-a",
+                    "url": "https://example.com/a",
+                    "title": "已删除品牌历史文章",
+                    "media_type": "authority",
+                    "matched_tasks": ["已删除品牌"],
+                    "match_reasons": {"已删除品牌": ["历史归类"]},
+                    "published_at": "2026-05-09",
+                }
+            ],
+            invalidate_article_cache=lambda: None,
+            lock=threading.RLock(),
+            import_batch_store=ArticleImportBatchStore(),
+            sqlite_article_page_loader=None,
+            sqlite_article_compare_recorder=None,
+        )
+
+        result = service.get_articles_filtered(limit=20)
+
+        self.assertEqual(result["articles"][0]["matchedTasks"], ["已删除品牌"])
+        self.assertEqual(result["articles"][0]["classificationStatus"], "matched")
 
     def test_article_list_dedupes_repeated_urls(self):
         service = _article_service([
@@ -112,6 +184,34 @@ class ArticleStatsTests(unittest.TestCase):
         ])
 
         result = service.get_articles_filtered(limit=20)
+
+        self.assertEqual(result["articles"][0]["url"], "https://example.com/same")
+
+    def test_task_article_list_fills_missing_url_from_unmatched_duplicate(self):
+        service = _article_service([
+            {
+                "id": "without-link",
+                "url": "",
+                "title": "同一篇报道",
+                "media_name": "示例媒体",
+                "media_type": "selfmedia",
+                "matched_tasks": ["品牌A"],
+                "published_at": "2024-03-04",
+                "ts": "2024-03-04",
+            },
+            {
+                "id": "with-link",
+                "url": "https://example.com/same",
+                "title": "同一篇报道",
+                "media_name": "示例媒体",
+                "media_type": "selfmedia",
+                "matched_tasks": [],
+                "published_at": "2024-03-04",
+                "ts": "2024-03-04",
+            },
+        ])
+
+        result = service.get_articles_filtered(limit=20, task_name="品牌A")
 
         self.assertEqual(result["articles"][0]["url"], "https://example.com/same")
 

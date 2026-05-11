@@ -190,7 +190,13 @@ function formatArticleExportKeywords(article: Article) {
   const labels = (article.exportKeywords || [])
     .map((name) => String(name || "").trim())
     .filter(Boolean);
-  return labels.length ? labels : ["未识别关键词"];
+  return labels.length ? labels : [""];
+}
+
+function formatArticleExportKeywordCell(article: Article) {
+  return formatArticleExportKeywords(article)
+    .filter(Boolean)
+    .join("、");
 }
 
 function mergeArticleExportKeywords(baseArticles: Article[], keywordArticles: Article[]) {
@@ -281,15 +287,7 @@ function downloadArticlesCsv(
   includeKeywordCategory = false,
   includeSelfMediaAccount = true,
 ) {
-  const articleRows = includeKeywordCategory
-    ? articles.flatMap((article) => formatArticleExportKeywords(article).map((keyword) => ({ article, keyword })))
-    : articles.map((article) => ({ article, keyword: "" }));
-  const orderedRows = articleRows.sort((left, right) => {
-    if (includeKeywordCategory && left.keyword !== right.keyword) {
-      return left.keyword.localeCompare(right.keyword);
-    }
-    return sortArticlesAsc(left.article, right.article);
-  });
+  const orderedRows = [...articles].sort(sortArticlesAsc);
   const headers = [
     ...(includeKeywordCategory ? ["关键词大类"] : []),
     ...(includeBrand ? ["品牌"] : []),
@@ -301,7 +299,7 @@ function downloadArticlesCsv(
   ];
   const rows = [
     headers,
-    ...orderedRows.map(({ article, keyword }) => {
+    ...orderedRows.map((article) => {
       const row = [
         formatArticleExportSource(article, includeSelfMediaAccount),
         article.type === "self-media" ? "自媒体" : "权威媒体",
@@ -313,7 +311,7 @@ function downloadArticlesCsv(
         row.unshift(formatArticleExportBrand(article));
       }
       if (includeKeywordCategory) {
-        row.unshift(keyword || "未识别关键词");
+        row.unshift(formatArticleExportKeywordCell(article));
       }
       return row;
     }),
@@ -490,6 +488,8 @@ export function ArticleSummaryModal({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const articleListRef = useRef<HTMLDivElement | null>(null);
   const platformFilterMenuRef = useRef<HTMLDivElement | null>(null);
+  const articleLoadRequestRef = useRef(0);
+  const hasLoadedArticlesRef = useRef(false);
   const [isPlatformFilterMenuOpen, setIsPlatformFilterMenuOpen] = useState(false);
   const [rankingSinglePlatformId, setRankingSinglePlatformId] = useState("");
 
@@ -550,39 +550,50 @@ export function ArticleSummaryModal({
     };
   }, []);
 
+  const loadArticles = useCallback(async (options?: { showLoading?: boolean }) => {
+    const requestId = articleLoadRequestRef.current + 1;
+    articleLoadRequestRef.current = requestId;
+    const showLoading = Boolean(options?.showLoading || !hasLoadedArticlesRef.current);
+    if (showLoading) {
+      setIsLoadingArticles(true);
+    }
+    try {
+      const result = await fetchArticles({
+        limit: ARTICLE_FETCH_LIMIT,
+        task_name: taskName || undefined,
+      });
+      if (articleLoadRequestRef.current !== requestId) {
+        return;
+      }
+      const mapped: Article[] = (result.articles || [])
+        .map(articleSnapshotToSummaryArticle)
+        .sort(sortArticlesDesc);
+      hasLoadedArticlesRef.current = true;
+      setArticles(mapped);
+    } finally {
+      if (articleLoadRequestRef.current === requestId) {
+        setIsLoadingArticles(false);
+      }
+    }
+  }, [taskName]);
+
   useEffect(() => {
     let cancelled = false;
-    const load = async () => {
-      setIsLoadingArticles(true);
-      try {
-        const result = await fetchArticles({
-          limit: ARTICLE_FETCH_LIMIT,
-          task_name: taskName || undefined,
-        });
-        const mapped: Article[] = (result.articles || [])
-          .map(articleSnapshotToSummaryArticle)
-          .sort(sortArticlesDesc);
-        if (cancelled) {
-          return;
-        }
-        setArticles(mapped);
-      } finally {
-        if (!cancelled) {
-          setIsLoadingArticles(false);
-        }
-      }
-    };
-
-    void load();
+    hasLoadedArticlesRef.current = false;
+    void loadArticles({ showLoading: true });
     const handleArticleDataChanged = () => {
-      void load();
+      if (cancelled) {
+        return;
+      }
+      void loadArticles({ showLoading: false });
     };
     window.addEventListener(ARTICLE_DATA_CHANGED_EVENT, handleArticleDataChanged);
     return () => {
       cancelled = true;
+      articleLoadRequestRef.current += 1;
       window.removeEventListener(ARTICLE_DATA_CHANGED_EVENT, handleArticleDataChanged);
     };
-  }, [taskName]);
+  }, [loadArticles]);
 
   useEffect(() => {
     if (!canShowRanking || !isRankingMode || !taskId) {
@@ -655,7 +666,7 @@ export function ArticleSummaryModal({
   useEffect(() => {
     setVisibleArticleCount(ARTICLE_INITIAL_RENDER_COUNT);
     articleListRef.current?.scrollTo({ top: 0 });
-  }, [articles, dateRange.end, dateRange.start, filterType, isRankingMode]);
+  }, [dateRange.end, dateRange.start, filterType, isRankingMode]);
 
   const visibleArticles = useMemo(
     () => filteredArticles.slice(0, visibleArticleCount),
@@ -942,7 +953,7 @@ export function ArticleSummaryModal({
         skippedCount: Number(result.skipped_count || 0),
         message: result.message || "表格导入已完成，等待确认",
       });
-      window.dispatchEvent(new CustomEvent(ARTICLE_DATA_CHANGED_EVENT));
+      void loadArticles({ showLoading: false });
     } catch (error) {
       setExportNotice({
         tone: "error",
@@ -966,7 +977,7 @@ export function ArticleSummaryModal({
       }
       setPendingArticleImport(null);
       setExportNotice({ tone: "success", message: result.message || "已确认本次导入" });
-      window.dispatchEvent(new CustomEvent(ARTICLE_DATA_CHANGED_EVENT));
+      void loadArticles({ showLoading: false });
     } finally {
       setPendingImportAction(null);
     }
@@ -985,7 +996,7 @@ export function ArticleSummaryModal({
       }
       setPendingArticleImport(null);
       setExportNotice({ tone: "success", message: result.message || "已撤销本次导入" });
-      window.dispatchEvent(new CustomEvent(ARTICLE_DATA_CHANGED_EVENT));
+      void loadArticles({ showLoading: false });
     } finally {
       setPendingImportAction(null);
     }

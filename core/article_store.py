@@ -73,6 +73,15 @@ _article_store_migration_threads: list[threading.Thread] = []
 _match_refresh_worker_lock = threading.RLock()
 _match_refresh_worker_thread: threading.Thread | None = None
 
+_BUILTIN_MEDIA_SITE_PROFILES: dict[str, dict[str, str]] = {
+    "redsh.com": {"name": "红商网", "media_type": "authority"},
+    "gc-zb.com": {"name": "招标与采购网", "media_type": "authority"},
+    "xnnews.com.cn": {"name": "咸宁新闻网", "media_type": "authority"},
+    "lfnews.cn": {"name": "廊坊新闻网", "media_type": "authority"},
+    "bozhou.cn": {"name": "亳州新闻网", "media_type": "authority"},
+    "redhongan.com": {"name": "红安网", "media_type": "authority"},
+}
+
 # 权威媒体域名白名单（内置初始值，可通过手动切换覆盖）
 AUTHORITY_DOMAINS: set = {
     "news.cn",
@@ -136,8 +145,12 @@ AUTHORITY_DOMAINS: set = {
     "cnr.cn",
     "gov.cn",
     "cnjiayu.com.cn",
-    "redhongan.com",
 }
+AUTHORITY_DOMAINS.update(
+    domain
+    for domain, profile in _BUILTIN_MEDIA_SITE_PROFILES.items()
+    if profile.get("media_type") == "authority"
+)
 
 SELF_MEDIA_DOMAIN_SUFFIXES: set = {
     "mp.weixin.qq.com",
@@ -180,6 +193,7 @@ SELF_MEDIA_PATH_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("sohu.com", ("/a/", "/mp/")),
     ("163.com", ("/dy/article/", "/article/", "/news/article/")),
     ("qq.com", ("/rain/a/", "/omn/")),
+    ("inews.qq.com", ("/a/",)),
     ("uc.cn", ("/article.html", "/article/")),
     ("sina.com.cn", ("/article_",)),
     ("zhihu.com", ("/p/", "/question/")),
@@ -307,8 +321,12 @@ _MEDIA_NAME_BY_DOMAIN_SUFFIX: dict[str, str] = {
     "gmw.cn": "光明网",
     "cnr.cn": "央广网",
     "gov.cn": "中国政府网",
-    "redhongan.com": "红安网",
 }
+_MEDIA_NAME_BY_DOMAIN_SUFFIX.update({
+    domain: str(profile.get("name") or "").strip()
+    for domain, profile in _BUILTIN_MEDIA_SITE_PROFILES.items()
+    if str(profile.get("name") or "").strip()
+})
 
 
 def _articles_file() -> Path:
@@ -1239,12 +1257,99 @@ _MEDIA_NAME_TRAILING_NOISE = (
     "政务发布",
 )
 
+_ARTICLE_MEDIA_PLATFORM_LABEL_ALIASES: dict[str, str] = {
+    "头条": "今日头条",
+    "今日头条": "今日头条",
+    "头条号": "今日头条",
+    "搜狐": "搜狐",
+    "搜狐号": "搜狐",
+    "腾讯": "腾讯新闻",
+    "腾讯新闻": "腾讯新闻",
+    "腾讯号": "腾讯新闻",
+    "官方腾讯号": "腾讯新闻",
+    "腾讯网新闻": "腾讯新闻",
+    "知乎": "知乎",
+    "博客园": "博客园",
+    "公众号": "微信公众号",
+    "微信": "微信公众号",
+    "微信公众号": "微信公众号",
+    "百家号": "百家号",
+    "微博": "微博",
+    "小红书": "小红书",
+    "抖音": "抖音",
+    "快手": "快手",
+    "哔哩哔哩": "哔哩哔哩",
+    "b站": "哔哩哔哩",
+}
+
 _CHANNEL_MEDIA_NAME_PATTERN = re.compile(
     r"^(?:产经|财经|产业|要闻|时政|政务|民生|社会|本地|国内|国际|科技|教育|旅游|文化|体育|娱乐|健康|汽车|房产|专题|公告|视频|图片)?(?:新闻|资讯|频道)$"
 )
 _LIKELY_MEDIA_NAME_PATTERN = re.compile(
     r"(日报|晚报|晨报|时报|周报|周刊|新闻网|新闻客户端|客户端|融媒体中心|电视台|广播电台|报业集团|网|台|报|刊|号)$"
 )
+
+
+def _compact_article_media_label(value: str) -> str:
+    return re.sub(r"[\s_:\-—–|｜/\\（）()【】\[\]\"'“”‘’]+", "", str(value or "").strip().lower())
+
+
+def _resolve_article_media_platform_label(value: str) -> str:
+    key = _compact_article_media_label(value)
+    if not key:
+        return ""
+    normalized_aliases = {
+        _compact_article_media_label(alias): label
+        for alias, label in _ARTICLE_MEDIA_PLATFORM_LABEL_ALIASES.items()
+    }
+    return normalized_aliases.get(key, "")
+
+
+def _is_article_media_parenthetical_noise(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or _resolve_article_media_platform_label(text):
+        return False
+    normalized = _compact_article_media_label(text)
+    if normalized in {"官方", "官媒", "news", "geo", "排名", "可发", "好出稿", "出稿", "可发排名"}:
+        return True
+    return bool(
+        "geo" in normalized
+        or "可发" in normalized
+        or "排名" in normalized
+        or "好出稿" in normalized
+        or normalized == "官方"
+        or normalized.endswith("news")
+    )
+
+
+def _strip_article_media_qualifier(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for _ in range(3):
+        match = re.fullmatch(r"(.+?)[（(【\[]([^（）()【】\[\]]+)[）)】\]]", text)
+        if not match or not _is_article_media_parenthetical_noise(match.group(2)):
+            break
+        text = match.group(1).strip()
+    return text
+
+
+def _split_legacy_article_media_platform_account(value: str) -> tuple[str, str]:
+    text = str(value or "").strip()
+    if not text:
+        return "", ""
+    match = re.fullmatch(r"(.+?)[（(【\[]([^（）()【】\[\]]+)[）)】\]]", text)
+    if not match:
+        return "", ""
+    left = match.group(1).strip()
+    right = match.group(2).strip()
+    left_platform = _resolve_article_media_platform_label(left)
+    right_platform = _resolve_article_media_platform_label(right)
+    if right_platform and left and not left_platform:
+        return right_platform, left
+    if left_platform and right and not _is_article_media_parenthetical_noise(right):
+        return left_platform, right
+    return "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -1277,6 +1382,23 @@ _TRACKING_QUERY_KEYS = {
     "mc_eid",
     "spm",
 }
+_SITE_TRACKING_QUERY_KEYS: dict[str, set[str]] = {
+    "redhongan.com": {"timestamp"},
+}
+_SITE_TRACKING_QUERY_KEY_ITEMS = tuple(
+    sorted(_SITE_TRACKING_QUERY_KEYS.items(), key=lambda item: len(item[0]), reverse=True)
+)
+
+
+def _is_site_tracking_query_key(host: str, key: str) -> bool:
+    normalized_host = str(host or "").strip().lower()
+    normalized_key = str(key or "").strip().lower()
+    if not normalized_host or not normalized_key:
+        return False
+    for suffix, keys in _SITE_TRACKING_QUERY_KEY_ITEMS:
+        if normalized_key in keys and (normalized_host == suffix or normalized_host.endswith("." + suffix)):
+            return True
+    return False
 
 
 def normalize_article_url(url: str) -> str:
@@ -1312,7 +1434,11 @@ def normalize_article_url(url: str) -> str:
             normalized_key = str(key or "").strip().lower()
             if not normalized_key:
                 continue
-            if normalized_key.startswith("utm_") or normalized_key in _TRACKING_QUERY_KEYS:
+            if (
+                normalized_key.startswith("utm_")
+                or normalized_key in _TRACKING_QUERY_KEYS
+                or _is_site_tracking_query_key(host, normalized_key)
+            ):
                 continue
             filtered_query.append((key, value))
         filtered_query.sort()
@@ -1320,6 +1446,20 @@ def normalize_article_url(url: str) -> str:
         return urlunsplit((scheme, host, path, query, ""))
     except Exception:
         return raw
+
+
+def resolve_article_display_url(article: dict) -> str:
+    """Return the user-facing URL while keeping normalized URLs for matching."""
+    if not isinstance(article, dict):
+        return ""
+    stored_url = str(article.get("url") or "").strip()
+    normalized_stored_url = normalize_article_url(stored_url)
+    raw_url = str(article.get("raw_url") or "").strip()
+    if raw_url and re.match(r"(?i)^(?:https?://|www\.)", raw_url):
+        normalized_raw_url = normalize_article_url(raw_url)
+        if normalized_raw_url and (not normalized_stored_url or normalized_raw_url == normalized_stored_url):
+            return raw_url
+    return stored_url
 
 
 def _clean_media_name_text(value: str) -> str:
@@ -1934,10 +2074,62 @@ def _normalize_article_entry(entry: dict) -> tuple[dict, bool]:
     media_name = str(normalized.get("media_name", "") or "").strip()
     account_name = str(normalized.get("account_name", "") or "").strip()
     account_platform_label = str(normalized.get("account_platform_label", "") or "").strip()
+    split_platform, split_account = _split_legacy_article_media_platform_account(media_name)
+    if split_platform:
+        normalized["media_name"] = split_platform
+        media_name = split_platform
+        changed = True
+        if split_account and not account_name:
+            normalized["account_name"] = split_account
+            account_name = split_account
+            changed = True
+    else:
+        stripped_media_name = _strip_article_media_qualifier(media_name)
+        if stripped_media_name and stripped_media_name != media_name:
+            normalized["media_name"] = stripped_media_name
+            media_name = stripped_media_name
+            changed = True
+
+    media_platform_label = _resolve_article_media_platform_label(media_name)
+    if media_platform_label and media_platform_label != media_name:
+        normalized["media_name"] = media_platform_label
+        media_name = media_platform_label
+        changed = True
+
+    account_platform_from_name = _resolve_article_media_platform_label(account_name)
+    if account_platform_from_name and media_name and media_name != account_platform_from_name:
+        normalized["media_name"] = account_platform_from_name
+        normalized["account_name"] = _strip_article_media_qualifier(media_name) or media_name
+        media_name = account_platform_from_name
+        account_name = str(normalized.get("account_name", "") or "").strip()
+        changed = True
+    elif account_platform_from_name and media_name == account_platform_from_name:
+        normalized["account_name"] = ""
+        account_name = ""
+        changed = True
+
     if account_name and media_name == account_name and account_platform_label:
         normalized["media_name"] = account_platform_label
         media_name = account_platform_label
         changed = True
+    canonical_platform_media_name = _canonical_selfmedia_platform_media_name(normalized_url or normalized.get("url", ""))
+    if canonical_platform_media_name:
+        candidate_account_name = _strip_article_media_qualifier(media_name)
+        candidate_is_platform = bool(_resolve_article_media_platform_label(candidate_account_name))
+        if (
+            not account_name
+            and candidate_account_name
+            and candidate_account_name != canonical_platform_media_name
+            and not candidate_is_platform
+            and not _looks_like_channel_media_name(candidate_account_name)
+        ):
+            normalized["account_name"] = candidate_account_name
+            account_name = candidate_account_name
+            changed = True
+        if media_name != canonical_platform_media_name:
+            normalized["media_name"] = canonical_platform_media_name
+            media_name = canonical_platform_media_name
+            changed = True
     resolved = resolve_article_source(normalized)
     if resolved and media_name != resolved:
         normalized["media_name"] = resolved
@@ -2058,6 +2250,45 @@ def _normalize_article_entry(entry: dict) -> tuple[dict, bool]:
             changed = changed or hit_changed
         if cleaned_reference_hits != reference_hits:
             normalized["reference_hits"] = cleaned_reference_hits
+            changed = True
+
+    export_keyword_categories = normalized.get("export_keyword_categories", [])
+    if not isinstance(export_keyword_categories, list):
+        normalized["export_keyword_categories"] = []
+        changed = True
+    else:
+        cleaned_categories = _dedupe_texts([
+            str(label or "").strip()
+            for label in export_keyword_categories
+            if str(label or "").strip()
+        ])
+        if cleaned_categories != export_keyword_categories:
+            normalized["export_keyword_categories"] = cleaned_categories
+            changed = True
+
+    export_keyword_categories_by_task = normalized.get("export_keyword_categories_by_task", {})
+    if not isinstance(export_keyword_categories_by_task, dict):
+        normalized["export_keyword_categories_by_task"] = {}
+        changed = True
+    else:
+        cleaned_by_task: dict[str, list[str]] = {}
+        for task_name, labels in export_keyword_categories_by_task.items():
+            task_text = str(task_name or "").strip()
+            if not task_text:
+                continue
+            cleaned_by_task[task_text] = _dedupe_texts([
+                str(label or "").strip()
+                for label in (labels or [])
+                if str(label or "").strip()
+            ])
+        if cleaned_by_task != export_keyword_categories_by_task:
+            normalized["export_keyword_categories_by_task"] = cleaned_by_task
+            changed = True
+
+    for key in ("_export_keyword_config_signature", "_export_keyword_article_signature"):
+        value = str(normalized.get(key, "") or "").strip()
+        if value != normalized.get(key, ""):
+            normalized[key] = value
             changed = True
 
     return normalized, changed
@@ -2620,20 +2851,13 @@ def _confirm_article_import_batch_sqlite(
     if not target_ids:
         return 0
     store = _article_sqlite_store()
-    updated_count = 0
     with _lock:
-        for article_id in target_ids:
-            updated = store.update_article(
-                article_id,
-                {
-                    "import_status": "confirmed",
-                    "import_batch_id": str(import_id or "").strip(),
-                    "import_confirmed_at": str(confirmed_at or "").strip(),
-                },
-            )
-            if updated is not None:
-                updated_count += 1
-    return updated_count
+        updated_articles = store.bulk_confirm_import(
+            target_ids,
+            import_id=str(import_id or "").strip(),
+            confirmed_at=str(confirmed_at or "").strip(),
+        )
+    return len(updated_articles)
 
 
 def _undo_article_import_batch_sqlite(
@@ -2825,8 +3049,9 @@ def _prune_cloud_articles_by_visible_task_ids_sqlite(
 
 def _refresh_article_matches_sqlite(config: dict) -> list:
     compiled_matcher = compile_article_matcher(config)
-    valid_task_names = compiled_matcher.valid_task_names
     config_signature = compiled_matcher.config_signature
+    export_keyword_plan = build_article_export_keyword_plan(config)
+    export_keyword_config_signature = build_article_export_keyword_signature(config)
     store = _article_sqlite_store()
     stats = store.get_match_refresh_stats(config_signature)
     if int(stats.get("needs_refresh_count") or 0) <= 0:
@@ -2850,7 +3075,7 @@ def _refresh_article_matches_sqlite(config: dict) -> list:
             stored = [
                 str(name or "").strip()
                 for name in (article.get("matched_tasks") or [])
-                if str(name or "").strip() in valid_task_names
+                if str(name or "").strip()
                 and str(name or "").strip() not in excluded_task_names
             ]
             existing_reasons = article.get("match_reasons") if isinstance(article.get("match_reasons"), dict) else {}
@@ -2866,20 +3091,31 @@ def _refresh_article_matches_sqlite(config: dict) -> list:
                     for task_name in stored
                 }
                 unmatched_reason = "" if stored else str(article.get("unmatched_reason", "") or "").strip()
+                update_payload = {
+                    "id": article.get("id"),
+                    "matched_tasks": stored,
+                    "match_reasons": match_reasons,
+                    "unmatched_reason": unmatched_reason,
+                    "_match_signature": current_signature,
+                    "_match_config_signature": config_signature,
+                }
+                cache_article = dict(article)
+                cache_article.update(update_payload)
+                cache_changed = update_article_export_keyword_cache(
+                    cache_article,
+                    config,
+                    keyword_plan=export_keyword_plan,
+                    config_signature=export_keyword_config_signature,
+                )
                 if (
                     stored != raw_matched
                     or match_reasons != existing_reasons
                     or unmatched_reason != str(article.get("unmatched_reason", "") or "").strip()
                     or metadata_changed
+                    or cache_changed
                 ):
-                    updates.append({
-                        "id": article.get("id"),
-                        "matched_tasks": stored,
-                        "match_reasons": match_reasons,
-                        "unmatched_reason": unmatched_reason,
-                        "_match_signature": current_signature,
-                        "_match_config_signature": config_signature,
-                    })
+                    update_payload.update(article_export_keyword_cache_fields(cache_article))
+                    updates.append(update_payload)
                 continue
 
             analyzed = analyze_article_matches(
@@ -2914,14 +3150,24 @@ def _refresh_article_matches_sqlite(config: dict) -> list:
                 for task_name in merged
             }
             unmatched_reason = "" if merged else str(analyzed.get("unmatched_reason", "") or "").strip()
-            updates.append({
+            update_payload = {
                 "id": article.get("id"),
                 "matched_tasks": merged,
                 "match_reasons": match_reasons,
                 "unmatched_reason": unmatched_reason,
                 "_match_signature": current_signature,
                 "_match_config_signature": config_signature,
-            })
+            }
+            cache_article = dict(article)
+            cache_article.update(update_payload)
+            update_article_export_keyword_cache(
+                cache_article,
+                config,
+                keyword_plan=export_keyword_plan,
+                config_signature=export_keyword_config_signature,
+            )
+            update_payload.update(article_export_keyword_cache_fields(cache_article))
+            updates.append(update_payload)
         if updates:
             store.bulk_update_match_fields(updates)
 
@@ -5225,6 +5471,16 @@ def _task_keyword_terms(task: dict) -> list[str]:
     ])
 
 
+ARTICLE_EXPORT_KEYWORD_CACHE_VERSION = 2
+ARTICLE_EXPORT_KEYWORD_CACHE_FIELDS = (
+    "export_keyword_categories",
+    "export_keyword_categories_by_task",
+    "_export_keyword_config_signature",
+    "_export_keyword_article_signature",
+    "_export_keyword_cache_version",
+)
+
+
 def build_article_export_keyword_order(config: dict | None, task_name: str = "") -> dict[str, int]:
     """Return keyword display order for article exports, preserving task config order."""
     order: dict[str, int] = {}
@@ -5241,20 +5497,237 @@ def build_article_export_keyword_order(config: dict | None, task_name: str = "")
     return order
 
 
+def _is_ascii_alnum_char(value: str) -> bool:
+    return ("a" <= value <= "z") or ("0" <= value <= "9")
+
+
+def _contains_ascii_token(haystack: str, needle: str) -> bool:
+    if not haystack or not needle:
+        return False
+    position = 0
+    while True:
+        index = haystack.find(needle, position)
+        if index < 0:
+            return False
+        before_ok = index == 0 or not _is_ascii_alnum_char(haystack[index - 1])
+        after_index = index + len(needle)
+        after_ok = after_index >= len(haystack) or not _is_ascii_alnum_char(haystack[after_index])
+        if before_ok and after_ok:
+            return True
+        position = index + 1
+
+
 def _export_keyword_matches_title(title: str, keyword: str) -> bool:
+    raw_title = str(title or "")
     normalized_title = _normalize_match_text(title)
     normalized_keyword = _normalize_match_text(keyword)
+    return _export_keyword_matches_normalized_title(
+        raw_title.lower(),
+        normalized_title,
+        normalized_keyword,
+    )
+
+
+def _export_keyword_matches_normalized_title(
+    raw_title_lower: str,
+    normalized_title: str,
+    normalized_keyword: str,
+) -> bool:
     if not normalized_title or not normalized_keyword:
         return False
-    if normalized_keyword in normalized_title:
-        return True
-    segments = [seg for seg in _build_match_segments(keyword) if len(seg) >= 2 or re.search(r"[a-z]", seg)]
-    return len(segments) >= 2 and _ordered_segments_match(normalized_title, segments)
+    if re.fullmatch(r"[a-z0-9]{1,3}", normalized_keyword):
+        return (
+            _contains_ascii_token(raw_title_lower, normalized_keyword)
+            or _contains_ascii_token(normalized_title, normalized_keyword)
+        )
+    return normalized_keyword in normalized_title
 
 
-def resolve_article_export_keywords(article: dict, config: dict | None, task_name: str = "") -> list[str]:
+def build_article_export_keyword_plan(config: dict | None, task_name: str = "") -> list[dict[str, str]]:
+    """Precompute user-configured keyword labels for repeated article export matching."""
+    scoped_task_name = str(task_name or "").strip()
+    plan: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for task in (config or {}).get("tasks", []) or []:
+        if not isinstance(task, dict):
+            continue
+        current_task_name = str(task.get("name", "") or "").strip()
+        if scoped_task_name and current_task_name != scoped_task_name:
+            continue
+        for keyword in _task_keyword_terms(task):
+            normalized_keyword = _normalize_match_text(keyword)
+            if not normalized_keyword:
+                continue
+            key = (current_task_name, keyword)
+            if key in seen:
+                continue
+            seen.add(key)
+            plan.append({
+                "task_name": current_task_name,
+                "label": keyword,
+                "normalized_keyword": normalized_keyword,
+            })
+    return plan
+
+
+def build_article_export_keyword_signature(config: dict | None) -> str:
+    """Return a stable signature for configured export keyword labels."""
+    tasks: list[dict[str, object]] = []
+    for task in (config or {}).get("tasks", []) or []:
+        if not isinstance(task, dict):
+            continue
+        tasks.append({
+            "name": str(task.get("name", "") or "").strip(),
+            "keywords": _task_keyword_terms(task),
+        })
+    payload = json.dumps(
+        {
+            "version": ARTICLE_EXPORT_KEYWORD_CACHE_VERSION,
+            "tasks": tasks,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _article_export_keyword_article_signature(article: dict | None) -> str:
+    item = article or {}
+    matched_tasks = [
+        str(name or "").strip()
+        for name in (item.get("matched_tasks") or [])
+        if str(name or "").strip()
+    ]
+    payload = json.dumps(
+        {
+            "version": ARTICLE_EXPORT_KEYWORD_CACHE_VERSION,
+            "title": str(item.get("title", "") or ""),
+            "matched_tasks": matched_tasks,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _valid_article_export_keyword_cache(
+    article: dict | None,
+    config_signature: str,
+    article_signature: str,
+) -> tuple[list[str], dict[str, list[str]]] | None:
+    if not isinstance(article, dict):
+        return None
+    if str(article.get("_export_keyword_cache_version") or "") != str(ARTICLE_EXPORT_KEYWORD_CACHE_VERSION):
+        return None
+    if str(article.get("_export_keyword_config_signature") or "") != str(config_signature or ""):
+        return None
+    if str(article.get("_export_keyword_article_signature") or "") != str(article_signature or ""):
+        return None
+    labels = [
+        str(label or "").strip()
+        for label in (article.get("export_keyword_categories") or [])
+        if str(label or "").strip()
+    ]
+    raw_by_task = article.get("export_keyword_categories_by_task")
+    if not isinstance(raw_by_task, dict):
+        return None
+    by_task: dict[str, list[str]] = {}
+    for raw_task_name, raw_labels in raw_by_task.items():
+        task_name = str(raw_task_name or "").strip()
+        if not task_name:
+            continue
+        by_task[task_name] = [
+            str(label or "").strip()
+            for label in (raw_labels or [])
+            if str(label or "").strip()
+        ]
+    return labels, by_task
+
+
+def build_article_export_keyword_cache(
+    article: dict,
+    config: dict | None,
+    *,
+    keyword_plan: list[dict[str, str]] | None = None,
+    config_signature: str = "",
+) -> dict[str, object]:
+    plan = keyword_plan if keyword_plan is not None else build_article_export_keyword_plan(config)
+    resolved_config_signature = config_signature or build_article_export_keyword_signature(config)
+    article_signature = _article_export_keyword_article_signature(article)
+    article_title = str((article or {}).get("title", "") or "")
+    raw_title_lower = article_title.lower()
+    normalized_title = _normalize_match_text(article_title)
+    matched_task_set = {
+        str(name or "").strip()
+        for name in ((article or {}).get("matched_tasks") or [])
+        if str(name or "").strip()
+    }
+    labels: list[str] = []
+    by_task: dict[str, list[str]] = {}
+    for entry in plan:
+        task_name = str(entry.get("task_name", "") or "").strip()
+        label = str(entry.get("label", "") or "").strip()
+        normalized_keyword = str(entry.get("normalized_keyword", "") or "").strip()
+        if (
+            not task_name
+            or not label
+            or not _export_keyword_matches_normalized_title(raw_title_lower, normalized_title, normalized_keyword)
+        ):
+            continue
+        task_labels = by_task.setdefault(task_name, [])
+        if label not in task_labels:
+            task_labels.append(label)
+        if (not matched_task_set or task_name in matched_task_set) and label not in labels:
+            labels.append(label)
+    return {
+        "export_keyword_categories": labels,
+        "export_keyword_categories_by_task": by_task,
+        "_export_keyword_config_signature": resolved_config_signature,
+        "_export_keyword_article_signature": article_signature,
+        "_export_keyword_cache_version": ARTICLE_EXPORT_KEYWORD_CACHE_VERSION,
+    }
+
+
+def article_export_keyword_cache_fields(article: dict) -> dict[str, object]:
+    return {
+        field: article.get(field)
+        for field in ARTICLE_EXPORT_KEYWORD_CACHE_FIELDS
+        if field in article
+    }
+
+
+def update_article_export_keyword_cache(
+    article: dict,
+    config: dict | None,
+    *,
+    keyword_plan: list[dict[str, str]] | None = None,
+    config_signature: str = "",
+) -> bool:
+    cache = build_article_export_keyword_cache(
+        article,
+        config,
+        keyword_plan=keyword_plan,
+        config_signature=config_signature,
+    )
+    changed = any(article.get(key) != value for key, value in cache.items())
+    article.update(cache)
+    return changed
+
+
+def resolve_article_export_keywords(
+    article: dict,
+    config: dict | None,
+    task_name: str = "",
+    *,
+    keyword_plan: list[dict[str, str]] | None = None,
+    keyword_config_signature: str = "",
+) -> list[str]:
     """Resolve export keyword labels from user-configured task keywords only."""
-    fields = _build_match_fields(str((article or {}).get("title", "") or ""), article)
+    article_title = str((article or {}).get("title", "") or "")
+    raw_title_lower = article_title.lower()
+    normalized_title = _normalize_match_text(article_title)
     matched_tasks = [
         str(name or "").strip()
         for name in ((article or {}).get("matched_tasks") or [])
@@ -5262,25 +5735,30 @@ def resolve_article_export_keywords(article: dict, config: dict | None, task_nam
     ]
     matched_task_set = set(matched_tasks)
     scoped_task_name = str(task_name or "").strip()
-    labels: list[str] = []
-
-    for task in (config or {}).get("tasks", []) or []:
-        if not isinstance(task, dict):
-            continue
-        current_task_name = str(task.get("name", "") or "").strip()
+    config_signature = keyword_config_signature or build_article_export_keyword_signature(config)
+    article_signature = _article_export_keyword_article_signature(article)
+    cached = _valid_article_export_keyword_cache(article, config_signature, article_signature)
+    if cached is not None:
+        cached_labels, cached_by_task = cached
         if scoped_task_name:
-            if current_task_name != scoped_task_name:
-                continue
-        elif matched_task_set and current_task_name not in matched_task_set:
-            continue
+            return list(cached_by_task.get(scoped_task_name) or [])
+        return list(cached_labels)
 
-        task_labels: list[str] = []
-        for keyword in _task_keyword_terms(task):
-            if _export_keyword_matches_title(fields["title"], keyword):
-                task_labels.append(keyword)
-        for label in task_labels:
-            if label and label not in labels:
-                labels.append(label)
+    labels: list[str] = []
+    plan = keyword_plan if keyword_plan is not None else build_article_export_keyword_plan(config, scoped_task_name)
+
+    for entry in plan:
+        current_task_name = str(entry.get("task_name", "") or "").strip()
+        if not scoped_task_name and matched_task_set and current_task_name not in matched_task_set:
+            continue
+        label = str(entry.get("label", "") or "").strip()
+        normalized_keyword = str(entry.get("normalized_keyword", "") or "").strip()
+        if (
+            label
+            and label not in labels
+            and _export_keyword_matches_normalized_title(raw_title_lower, normalized_title, normalized_keyword)
+        ):
+            labels.append(label)
 
     return labels
 
@@ -5348,14 +5826,15 @@ def _article_match_signature(
 def refresh_article_matches(config: dict) -> list:
     """
     根据当前配置重建文章与任务的关联关系，返回最新文章列表。
-    会自动清理失效任务名，并补齐新匹配到的任务。
+    保留历史归类任务名，并补齐新匹配到的任务。
     """
     if _article_store_sqlite_enabled():
         return _refresh_article_matches_sqlite(config)
 
     compiled_matcher = compile_article_matcher(config)
-    valid_task_names = compiled_matcher.valid_task_names
     config_signature = compiled_matcher.config_signature
+    export_keyword_plan = build_article_export_keyword_plan(config)
+    export_keyword_config_signature = build_article_export_keyword_signature(config)
 
     updated_articles: list[dict] = []
     shadow_context: dict[str, object] | None = None
@@ -5376,7 +5855,7 @@ def refresh_article_matches(config: dict) -> list:
             stored = [
                 str(name or "").strip()
                 for name in (article.get("matched_tasks") or [])
-                if str(name or "").strip() in valid_task_names
+                if str(name or "").strip()
                 and str(name or "").strip() not in excluded_task_names
             ]
             existing_reasons = article.get("match_reasons") if isinstance(article.get("match_reasons"), dict) else {}
@@ -5388,14 +5867,22 @@ def refresh_article_matches(config: dict) -> list:
                     for task_name in stored
                 }
                 unmatched_reason = "" if stored else str(article.get("unmatched_reason", "") or "").strip()
-                if (
+                match_fields_changed = (
                     stored != raw_matched
                     or match_reasons != existing_reasons
                     or unmatched_reason != str(article.get("unmatched_reason", "") or "").strip()
-                ):
+                )
+                if match_fields_changed:
                     article["matched_tasks"] = stored
                     article["match_reasons"] = match_reasons
                     article["unmatched_reason"] = unmatched_reason
+                cache_changed = update_article_export_keyword_cache(
+                    article,
+                    config,
+                    keyword_plan=export_keyword_plan,
+                    config_signature=export_keyword_config_signature,
+                )
+                if match_fields_changed or cache_changed:
                     updated_articles.append(dict(article))
                     changed = True
                 continue
@@ -5442,6 +5929,12 @@ def refresh_article_matches(config: dict) -> list:
                 article["match_reasons"] = match_reasons
                 article["unmatched_reason"] = unmatched_reason
                 article["_match_signature"] = current_signature
+                update_article_export_keyword_cache(
+                    article,
+                    config,
+                    keyword_plan=export_keyword_plan,
+                    config_signature=export_keyword_config_signature,
+                )
                 updated_articles.append(dict(article))
                 changed = True
         if changed:
@@ -5550,6 +6043,8 @@ def _run_article_match_refresh_worker(config: dict, reason: str) -> None:
     try:
         compiled = compile_article_matcher(config)
         config_signature = compiled.config_signature
+        export_keyword_plan = build_article_export_keyword_plan(config)
+        export_keyword_config_signature = build_article_export_keyword_signature(config)
         store = _article_sqlite_store()
         batch_size = _match_refresh_batch_size()
         sleep_seconds = _match_refresh_sleep_seconds()
@@ -5591,7 +6086,7 @@ def _run_article_match_refresh_worker(config: dict, reason: str) -> None:
                 stored = [
                     str(name or "").strip()
                     for name in (article.get("matched_tasks") or [])
-                    if str(name or "").strip() in compiled.valid_task_names
+                    if str(name or "").strip()
                     and str(name or "").strip() not in excluded_task_names
                 ]
                 existing_reasons = article.get("match_reasons") if isinstance(article.get("match_reasons"), dict) else {}
@@ -5607,20 +6102,31 @@ def _run_article_match_refresh_worker(config: dict, reason: str) -> None:
                         for task_name in stored
                     }
                     unmatched_reason = "" if stored else str(article.get("unmatched_reason", "") or "").strip()
+                    update_payload = {
+                        "id": article.get("id"),
+                        "matched_tasks": stored,
+                        "match_reasons": match_reasons,
+                        "unmatched_reason": unmatched_reason,
+                        "_match_signature": current_signature,
+                        "_match_config_signature": config_signature,
+                    }
+                    cache_article = dict(article)
+                    cache_article.update(update_payload)
+                    cache_changed = update_article_export_keyword_cache(
+                        cache_article,
+                        config,
+                        keyword_plan=export_keyword_plan,
+                        config_signature=export_keyword_config_signature,
+                    )
                     if (
                         stored != raw_matched
                         or match_reasons != existing_reasons
                         or unmatched_reason != str(article.get("unmatched_reason", "") or "").strip()
                         or metadata_changed
+                        or cache_changed
                     ):
-                        updates.append({
-                            "id": article.get("id"),
-                            "matched_tasks": stored,
-                            "match_reasons": match_reasons,
-                            "unmatched_reason": unmatched_reason,
-                            "_match_signature": current_signature,
-                            "_match_config_signature": config_signature,
-                        })
+                        update_payload.update(article_export_keyword_cache_fields(cache_article))
+                        updates.append(update_payload)
                     processed += 1
                     continue
                 analyzed_result = analyze_article_matches(
@@ -5656,14 +6162,24 @@ def _run_article_match_refresh_worker(config: dict, reason: str) -> None:
                     for task_name in merged
                 }
                 unmatched_reason = "" if merged else str(analyzed_result.get("unmatched_reason", "") or "").strip()
-                updates.append({
+                update_payload = {
                     "id": article.get("id"),
                     "matched_tasks": merged,
                     "match_reasons": match_reasons_map,
                     "unmatched_reason": unmatched_reason,
                     "_match_signature": current_signature,
                     "_match_config_signature": config_signature,
-                })
+                }
+                cache_article = dict(article)
+                cache_article.update(update_payload)
+                update_article_export_keyword_cache(
+                    cache_article,
+                    config,
+                    keyword_plan=export_keyword_plan,
+                    config_signature=export_keyword_config_signature,
+                )
+                update_payload.update(article_export_keyword_cache_fields(cache_article))
+                updates.append(update_payload)
                 processed += 1
             if updates:
                 results = store.bulk_update_match_fields(updates)

@@ -80,6 +80,26 @@ class ArticleStorageCharacterizationTests(unittest.TestCase):
         self.assertFalse(article_store.is_article_url_excluded("https://example.com/news/a?b=2"))
         self.assertEqual(len(article_store.get_articles()), 1)
 
+    def test_normalize_article_url_strips_redhongan_timestamp_only(self) -> None:
+        self.assertEqual(
+            article_store.normalize_article_url("https://m.redhongan.com/p/198758.html?timestamp=1778221397826"),
+            "https://m.redhongan.com/p/198758.html",
+        )
+        self.assertEqual(
+            article_store.normalize_article_url("https://example.com/p/1?timestamp=1778221397826"),
+            "https://example.com/p/1?timestamp=1778221397826",
+        )
+
+    def test_builtin_media_site_profiles_resolve_name_and_type(self) -> None:
+        self.assertEqual(
+            article_store.resolve_media_name("https://www.redsh.com/pinpai/20260508/115118.shtml"),
+            "红商网",
+        )
+        self.assertEqual(
+            article_store.classify_article_media_type("https://www.gc-zb.com/about/read/id/11471.html"),
+            "authority",
+        )
+
     def test_get_articles_normalizes_legacy_json_entries_on_read(self) -> None:
         article_store.ARTICLES_FILE.write_text(
             json.dumps([

@@ -9,6 +9,7 @@ import unittest
 import core.article_store as article_store
 from backend_lib.article_service import (
     _ARTICLE_IMPORT_BATCHES_LOCK,
+    _article_to_api,
     _article_import_batches_lock_file,
     _load_article_import_batches_file,
     _save_article_import_batches_file,
@@ -55,7 +56,9 @@ class ArticleTableImportTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
         self._original_data_dir = os.environ.get("AIBRANDMONITOR_DATA_DIR")
+        self._original_article_store_backend = os.environ.get("AIBRANDMONITOR_ARTICLE_STORE_BACKEND")
         os.environ["AIBRANDMONITOR_DATA_DIR"] = self._tmpdir.name
+        os.environ["AIBRANDMONITOR_ARTICLE_STORE_BACKEND"] = "json"
         self._original_paths = {
             "ARTICLES_FILE": article_store.ARTICLES_FILE,
             "DOMAIN_OVERRIDES_FILE": article_store.DOMAIN_OVERRIDES_FILE,
@@ -77,6 +80,10 @@ class ArticleTableImportTests(unittest.TestCase):
             os.environ.pop("AIBRANDMONITOR_DATA_DIR", None)
         else:
             os.environ["AIBRANDMONITOR_DATA_DIR"] = self._original_data_dir
+        if self._original_article_store_backend is None:
+            os.environ.pop("AIBRANDMONITOR_ARTICLE_STORE_BACKEND", None)
+        else:
+            os.environ["AIBRANDMONITOR_ARTICLE_STORE_BACKEND"] = self._original_article_store_backend
         self._tmpdir.cleanup()
 
     def _build_workbook(self) -> bytes:
@@ -301,6 +308,290 @@ class ArticleTableImportTests(unittest.TestCase):
         article = article_store.get_articles()[0]
         self.assertEqual(article.get("media_name"), "今日头条")
 
+    def test_import_recognizes_publish_url_reject_reason_column(self) -> None:
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "发布网址/拒稿理由", "媒体名称", "发布时间"])
+        worksheet.append([
+            "品牌A 招标采购报道",
+            "https://www.gc-zb.com/about/read/id/11471.html",
+            "招标与采购网（GEO）",
+            "2026-05-08 14:49:37",
+        ])
+        worksheet.append([
+            "品牌A 红商报道",
+            "http://www.redsh.com/pinpai/20260508/115118.shtml",
+            "红商网（官方）",
+            "2026-05-08 12:15:04",
+        ])
+        worksheet.append([
+            "品牌A 咸宁报道",
+            "http://www.xnnews.com.cn/zxsd25178/zx/202605/t20260508_4582053.shtml",
+            "咸宁新闻网（可发GEO排名）",
+            "2026-05-08 11:32:41",
+        ])
+        output = BytesIO()
+        workbook.save(output)
+
+        items, details = _extract_article_import_items("发布网址.xlsx", output.getvalue())
+
+        self.assertEqual(len(items), 3)
+        self.assertEqual(details["sheets"][0]["columns"]["url"], "发布网址/拒稿理由")
+        self.assertEqual(items[0]["url"], "https://www.gc-zb.com/about/read/id/11471.html")
+        self.assertEqual(items[1]["url"], "http://www.redsh.com/pinpai/20260508/115118.shtml")
+        self.assertEqual(items[2]["url"], "http://www.xnnews.com.cn/zxsd25178/zx/202605/t20260508_4582053.shtml")
+
+    def test_actual_media_order_files_parse_without_missing_urls(self) -> None:
+        cases = [
+            (Path("/Users/shuao/Desktop/media-order-20260511133947.xlsx"), 76),
+            (Path("/Users/shuao/Desktop/媒体订单记录(1).xlsx"), 299),
+        ]
+        for path, expected_rows in cases:
+            with self.subTest(file=path.name):
+                if not path.exists():
+                    self.skipTest(f"缺少实际测试文件：{path}")
+                items, _ = _extract_article_import_items(path.name, path.read_bytes())
+                missing_urls = [
+                    item for item in items
+                    if not str(item.get("url") or "").strip()
+                ]
+
+                self.assertEqual(len(items), expected_rows)
+                self.assertEqual(missing_urls, [])
+
+    def test_actual_media_order_import_dedupes_same_url_for_json_and_sqlite(self) -> None:
+        path = Path("/Users/shuao/Desktop/media-order-20260511133947.xlsx")
+        if not path.exists():
+            self.skipTest(f"缺少实际测试文件：{path}")
+        original_db_file = article_store.ARTICLE_STORE_DB_FILE
+        root = Path(self._tmpdir.name)
+        try:
+            for backend in ("json", "sqlite"):
+                with self.subTest(backend=backend):
+                    os.environ["AIBRANDMONITOR_ARTICLE_STORE_BACKEND"] = backend
+                    article_store.ARTICLE_STORE_DB_FILE = root / "logs" / f"article_store_{backend}.sqlite3"
+                    for target in (article_store.ARTICLES_FILE, article_store.ARTICLE_STORE_DB_FILE):
+                        try:
+                            target.unlink()
+                        except FileNotFoundError:
+                            pass
+                    service, _ = _article_import_service()
+
+                    result = service.import_articles_from_file(path.name, path.read_bytes())
+                    articles = article_store.get_articles()
+                    smzdm_url = article_store.normalize_article_url("https://post.smzdm.com/zz/p/aqzedvpx/")
+                    smzdm_articles = [
+                        article for article in articles
+                        if article_store.normalize_article_url(
+                            article_store.resolve_article_display_url(article)
+                        ) == smzdm_url
+                    ]
+
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(result["added_count"], 70)
+                    self.assertEqual(result["duplicate_count"], 6)
+                    self.assertEqual(len(articles), 70)
+                    self.assertEqual(len(smzdm_articles), 1)
+                    self.assertFalse([
+                        article for article in articles
+                        if not article_store.normalize_article_url(
+                            article_store.resolve_article_display_url(article)
+                        )
+                    ])
+        finally:
+            article_store.ARTICLE_STORE_DB_FILE = original_db_file
+
+    def test_actual_order_record_import_preserves_redhongan_display_urls(self) -> None:
+        path = Path("/Users/shuao/Desktop/媒体订单记录(1).xlsx")
+        if not path.exists():
+            self.skipTest(f"缺少实际测试文件：{path}")
+        original_db_file = article_store.ARTICLE_STORE_DB_FILE
+        expected_urls = [
+            "https://m.redhongan.com/p/200044.html?timestamp=1778468821795",
+            "https://m.redhongan.com/p/200008.html?timestamp=1778467837147",
+            "https://www.redhongan.com/p/199231.html",
+            "https://m.redhongan.com/p/198758.html?timestamp=1778221397826",
+        ]
+        root = Path(self._tmpdir.name)
+        try:
+            for backend in ("json", "sqlite"):
+                with self.subTest(backend=backend):
+                    os.environ["AIBRANDMONITOR_ARTICLE_STORE_BACKEND"] = backend
+                    article_store.ARTICLE_STORE_DB_FILE = root / "logs" / f"article_store_redhongan_{backend}.sqlite3"
+                    for target in (article_store.ARTICLES_FILE, article_store.ARTICLE_STORE_DB_FILE):
+                        try:
+                            target.unlink()
+                        except FileNotFoundError:
+                            pass
+                    service, _ = _article_import_service()
+
+                    result = service.import_articles_from_file(path.name, path.read_bytes())
+                    articles = article_store.get_articles()
+                    redhongan_urls = [
+                        article_store.resolve_article_display_url(article)
+                        for article in articles
+                        if article.get("media_name") == "红安网"
+                    ]
+
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(result["added_count"], 299)
+                    self.assertEqual(result["duplicate_count"], 0)
+                    self.assertCountEqual(redhongan_urls, expected_urls)
+        finally:
+            article_store.ARTICLE_STORE_DB_FILE = original_db_file
+
+    def test_import_keeps_original_publish_url_for_display(self) -> None:
+        from openpyxl import Workbook
+
+        original_url = "https://m.redhongan.com/p/200044.html?timestamp=1778468821795"
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "发布链接", "媒体名称", "发布时间"])
+        worksheet.append(["品牌A 红安报道", original_url, "红安网", "2026-05-11 13:30:00"])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+
+        result = service.import_articles_from_file("原始链接.xlsx", output.getvalue())
+        stored = article_store.get_articles()[0]
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(stored.get("raw_url"), original_url)
+        self.assertEqual(stored.get("url"), "https://m.redhongan.com/p/200044.html")
+        self.assertEqual(_article_to_api(stored)["url"], original_url)
+        self.assertIsNotNone(article_store.find_article_by_url(original_url))
+
+    def test_import_ignores_reject_reason_in_publish_url_column(self) -> None:
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "发布网址/拒稿理由", "媒体名称", "发布时间"])
+        worksheet.append(["品牌A 被拒稿件", "内容不符合发布要求", "红商网（官方）", "2026-05-08 12:15:04"])
+        output = BytesIO()
+        workbook.save(output)
+
+        items, _ = _extract_article_import_items("拒稿理由.xlsx", output.getvalue())
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["url"], "")
+
+    def test_import_extracts_url_from_embedded_and_unmapped_cells(self) -> None:
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "媒体名称", "备注", "发布时间", "发布状态"])
+        worksheet.append([
+            "品牌A 备注里带链接",
+            "示例媒体",
+            "已发布：https://example.com/from-note?x=1",
+            "2026-05-08",
+            "",
+        ])
+        worksheet.append([
+            "品牌A 未映射超链接",
+            "示例媒体",
+            "",
+            "2026-05-08",
+            "打开",
+        ])
+        worksheet["E3"].hyperlink = "https://example.com/from-unmapped-hyperlink"
+        worksheet.append([
+            "品牌A 只有拒稿理由",
+            "示例媒体",
+            "内容不符合发布要求",
+            "2026-05-08",
+            "拒稿",
+        ])
+        output = BytesIO()
+        workbook.save(output)
+
+        items, details = _extract_article_import_items("未映射链接.xlsx", output.getvalue())
+
+        self.assertEqual(len(items), 3)
+        self.assertNotIn("url", details["sheets"][0]["columns"])
+        self.assertEqual(items[0]["url"], "https://example.com/from-note?x=1")
+        self.assertEqual(items[1]["url"], "https://example.com/from-unmapped-hyperlink")
+        self.assertEqual(items[2]["url"], "")
+
+    def test_import_does_not_treat_reject_reason_column_as_url(self) -> None:
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "拒稿理由", "媒体名称", "发布时间"])
+        worksheet.append(["品牌A 被拒稿件", "内容不符合发布要求", "红商网（官方）", "2026-05-08 12:15:04"])
+        output = BytesIO()
+        workbook.save(output)
+
+        items, details = _extract_article_import_items("拒稿理由列.xlsx", output.getvalue())
+
+        self.assertEqual(len(items), 1)
+        self.assertNotIn("url", details["sheets"][0]["columns"])
+        self.assertEqual(items[0]["url"], "")
+
+    def test_import_tencent_news_bracket_media_uses_account_name(self) -> None:
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "发布网址/拒稿理由", "媒体名称", "发布时间"])
+        worksheet.append([
+            "品牌A 腾讯新闻账号文章",
+            "https://page.om.qq.com/page/OLbKqsxlvaA6jHk3rr7F86DA0",
+            "无线昆明（腾讯新闻）",
+            "2026-04-30 17:50:05",
+        ])
+        worksheet.append([
+            "品牌A 官方腾讯号文章",
+            "https://view.inews.qq.com/a/20260428A03XKS00",
+            "濮阳市广播电视台（官方腾讯号）",
+            "2026-04-28 11:50:05",
+        ])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+
+        result = service.import_articles_from_file("腾讯新闻账号.xlsx", output.getvalue())
+
+        self.assertTrue(result["ok"])
+        articles = {article.get("title"): article for article in article_store.get_articles()}
+        wireless = articles["品牌A 腾讯新闻账号文章"]
+        self.assertEqual(wireless.get("media_name"), "腾讯新闻")
+        self.assertEqual(wireless.get("account_name"), "无线昆明")
+        self.assertEqual(wireless.get("media_type"), "selfmedia")
+        official = articles["品牌A 官方腾讯号文章"]
+        self.assertEqual(official.get("media_name"), "腾讯新闻")
+        self.assertEqual(official.get("account_name"), "濮阳市广播电视台")
+        self.assertEqual(official.get("media_type"), "selfmedia")
+
+    def test_import_strips_order_qualifier_without_creating_account_name(self) -> None:
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "文章链接", "来源媒体", "发布时间"])
+        worksheet.append([
+            "品牌A 红商报道",
+            "http://www.redsh.com/pinpai/20260508/115118.shtml",
+            "红商网（官方）",
+            "2026-05-08 12:15:04",
+        ])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+
+        result = service.import_articles_from_file("媒体标签.xlsx", output.getvalue())
+
+        self.assertTrue(result["ok"])
+        article = article_store.get_articles()[0]
+        self.assertEqual(article.get("media_name"), "红商网")
+        self.assertFalse(article.get("account_name"))
+        self.assertEqual(article.get("media_type"), "authority")
+
     def test_self_media_platform_domain_repairs_learned_account_name(self) -> None:
         article_store.DOMAIN_MEDIA_NAMES_FILE.parent.mkdir(parents=True, exist_ok=True)
         article_store.DOMAIN_MEDIA_NAMES_FILE.write_text(
@@ -329,12 +620,77 @@ class ArticleTableImportTests(unittest.TestCase):
         stored = json.loads(article_store.ARTICLES_FILE.read_text(encoding="utf-8"))[0]
 
         self.assertEqual(article.get("media_name"), "搜狐")
+        self.assertEqual(article.get("account_name"), "时尚潮流家")
         self.assertEqual(article_store.resolve_article_source(article), "搜狐")
         self.assertEqual(stored.get("media_name"), "搜狐")
+        self.assertEqual(stored.get("account_name"), "时尚潮流家")
 
         article_store.save_domain_media_name("sohu.com", "另一个搜狐账号", force=True)
         media_names = json.loads(article_store.DOMAIN_MEDIA_NAMES_FILE.read_text(encoding="utf-8"))
         self.assertEqual(media_names.get("sohu.com"), "搜狐")
+
+    def test_legacy_article_records_repair_media_and_account_on_load(self) -> None:
+        article_store.ARTICLES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        article_store.ARTICLES_FILE.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "legacy-tencent-bracket",
+                        "url": "https://page.om.qq.com/page/OLbKqsxlvaA6jHk3rr7F86DA0",
+                        "title": "品牌A 腾讯新闻账号文章",
+                        "media_name": "无线昆明（腾讯新闻）",
+                        "media_type": "authority",
+                        "ts": "2026-04-30",
+                    },
+                    {
+                        "id": "legacy-tencent-swapped",
+                        "url": "https://view.inews.qq.com/a/20260428A03XKS00",
+                        "title": "品牌A 官方腾讯号文章",
+                        "media_name": "濮阳市广播电视台",
+                        "account_name": "官方腾讯号",
+                        "media_type": "authority",
+                        "ts": "2026-04-28",
+                    },
+                    {
+                        "id": "legacy-redsh",
+                        "url": "http://www.redsh.com/pinpai/20260508/115118.shtml",
+                        "title": "品牌A 红商报道",
+                        "media_name": "红商网（官方）",
+                        "media_type": "selfmedia",
+                        "ts": "2026-05-08",
+                    },
+                    {
+                        "id": "legacy-gczb",
+                        "url": "https://www.gc-zb.com/about/read/id/11471.html",
+                        "title": "品牌A 招标采购报道",
+                        "media_name": "招标与采购网（GEO）",
+                        "media_type": "selfmedia",
+                        "ts": "2026-05-08",
+                    },
+                ],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        articles = {article["id"]: article for article in article_store.get_articles()}
+        stored = {
+            article["id"]: article
+            for article in json.loads(article_store.ARTICLES_FILE.read_text(encoding="utf-8"))
+        }
+
+        self.assertEqual(articles["legacy-tencent-bracket"].get("media_name"), "腾讯新闻")
+        self.assertEqual(articles["legacy-tencent-bracket"].get("account_name"), "无线昆明")
+        self.assertEqual(articles["legacy-tencent-bracket"].get("media_type"), "selfmedia")
+        self.assertEqual(articles["legacy-tencent-swapped"].get("media_name"), "腾讯新闻")
+        self.assertEqual(articles["legacy-tencent-swapped"].get("account_name"), "濮阳市广播电视台")
+        self.assertEqual(articles["legacy-tencent-swapped"].get("media_type"), "selfmedia")
+        self.assertEqual(articles["legacy-redsh"].get("media_name"), "红商网")
+        self.assertEqual(articles["legacy-redsh"].get("media_type"), "authority")
+        self.assertEqual(articles["legacy-gczb"].get("media_name"), "招标与采购网")
+        self.assertEqual(articles["legacy-gczb"].get("media_type"), "authority")
+        self.assertEqual(stored["legacy-tencent-bracket"].get("account_name"), "无线昆明")
+        self.assertEqual(stored["legacy-redsh"].get("media_name"), "红商网")
 
     def test_import_self_media_account_name_in_media_column_is_kept_as_account_name(self) -> None:
         from openpyxl import Workbook
@@ -418,6 +774,91 @@ class ArticleTableImportTests(unittest.TestCase):
         self.assertEqual(restored.get("title"), "旧标题")
         self.assertEqual(restored.get("media_name"), "旧媒体")
         self.assertEqual(restored.get("published_at"), "2024-01-01")
+
+    def test_import_repairs_existing_missing_url_record(self) -> None:
+        original = article_store.add_article({
+            "id": "missing-url",
+            "url": "",
+            "title": "品牌A 红安报道",
+            "media_name": "红安网",
+            "media_type": "authority",
+            "published_at": "2026-05-11",
+            "ts": "2026-05-11",
+            "matched_tasks": ["品牌A"],
+        })
+        from openpyxl import Workbook
+
+        original_url = "https://m.redhongan.com/p/200044.html?timestamp=1778468821795"
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "发布链接", "媒体名称", "发布时间"])
+        worksheet.append(["品牌A 红安报道", original_url, "红安网", "2026-05-11 13:30:00"])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+
+        result = service.import_articles_from_file("修复缺链接.xlsx", output.getvalue())
+        articles = article_store.get_articles()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["added_count"], 0)
+        self.assertEqual(result["updated_count"], 1)
+        self.assertEqual(len(articles), 1)
+        self.assertEqual(articles[0].get("id"), original.get("id"))
+        self.assertEqual(articles[0].get("url"), "https://m.redhongan.com/p/200044.html")
+        self.assertEqual(articles[0].get("raw_url"), original_url)
+
+    def test_import_existing_url_preserves_deleted_task_classification(self) -> None:
+        article_store.add_article({
+            "url": "https://example.com/deleted-task",
+            "title": "已删除品牌历史文章",
+            "media_name": "旧媒体",
+            "media_type": "authority",
+            "published_at": "2024-01-01",
+            "ts": "2024-01-01",
+            "matched_tasks": ["已删除品牌"],
+            "match_reasons": {"已删除品牌": ["历史归类"]},
+            "unmatched_reason": "",
+        })
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "文章链接", "来源媒体", "发布时间"])
+        worksheet.append(["行业更新报道", "https://example.com/deleted-task", "新媒体", "2024-01-10"])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+
+        result = service.import_articles_from_file("历史任务更新.xlsx", output.getvalue())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["updated_count"], 1)
+        updated = article_store.get_articles()[0]
+        self.assertEqual(updated.get("matched_tasks"), ["已删除品牌"])
+        self.assertEqual(updated.get("match_reasons"), {"已删除品牌": ["历史归类"]})
+
+    def test_update_article_preserves_deleted_task_classification(self) -> None:
+        article = article_store.add_article({
+            "url": "https://example.com/edit-deleted-task",
+            "title": "已删除品牌历史文章",
+            "media_name": "旧媒体",
+            "media_type": "authority",
+            "published_at": "2024-01-01",
+            "ts": "2024-01-01",
+            "matched_tasks": ["已删除品牌"],
+            "match_reasons": {"已删除品牌": ["历史归类"]},
+            "unmatched_reason": "",
+        })
+        service, _ = _article_import_service()
+
+        result = service.update_article(article["id"], {"title": "行业更新报道"})
+
+        self.assertTrue(result["ok"])
+        updated = article_store.get_articles()[0]
+        self.assertEqual(updated.get("title"), "行业更新报道")
+        self.assertEqual(updated.get("matched_tasks"), ["已删除品牌"])
+        self.assertEqual(updated.get("match_reasons"), {"已删除品牌": ["历史归类"]})
 
     def test_import_splits_platform_account_text(self) -> None:
         self.assertEqual(_split_article_import_platform_account("头条（野渡泛舟客）"), ("今日头条", "野渡泛舟客"))

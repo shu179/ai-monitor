@@ -16,6 +16,7 @@ from .time_utils import local_now, local_today, parse_local_date
 
 
 SCHEMA_VERSION = 1
+ARTICLE_PAGE_MAX_LIMIT = 5000
 
 REQUIRED_TABLE_COLUMNS: dict[str, set[str]] = {
     "store_meta": {"key", "value"},
@@ -217,7 +218,7 @@ class ArticleSQLiteStore:
             media_type=media_type,
             search=search,
         )
-        capped_limit = max(1, min(500, int(limit or 100)))
+        capped_limit = max(1, min(ARTICLE_PAGE_MAX_LIMIT, int(limit or 100)))
         capped_offset = max(0, int(offset or 0))
         today_text = self._date_text(today if today is not None else local_today().isoformat())[:10]
         with self._connection() as conn:
@@ -225,6 +226,21 @@ class ArticleSQLiteStore:
                 f"SELECT COUNT(*) FROM articles a {where_sql}",
                 params,
             ).fetchone()[0]
+            empty_url_count = self._article_count_with_extra_condition(
+                conn,
+                where_sql,
+                params,
+                "(a.normalized_url IS NULL OR a.normalized_url = '')",
+            )
+            if empty_url_count:
+                return self._get_article_page_with_bounded_url_dedupe(
+                    conn,
+                    where_sql=where_sql,
+                    params=params,
+                    limit=capped_limit,
+                    offset=capped_offset,
+                    today_text=today_text,
+                )
             today_total = self._article_today_count_with_conn(conn, where_sql, params, today_text)
             rows = conn.execute(
                 f"""
@@ -333,6 +349,55 @@ class ArticleSQLiteStore:
             article = self._normalize_article(merged)
             self._upsert_article_row(conn, article, updated_at_ns=updated_at_ns)
         return dict(article)
+
+    def bulk_confirm_import(
+        self,
+        article_ids: Iterable[str],
+        *,
+        import_id: str,
+        confirmed_at: str,
+    ) -> list[dict[str, Any]]:
+        target_ids = sorted({
+            self._text(article_id)
+            for article_id in (article_ids or [])
+            if self._text(article_id)
+        })
+        if not target_ids:
+            return []
+        self.initialize()
+        updated_at_ns = time.time_ns()
+        now_text = self._now_text()
+        normalized_import_id = self._text(import_id)
+        normalized_confirmed_at = self._text(confirmed_at)
+        updated: list[dict[str, Any]] = []
+        with self._connection() as conn:
+            for start in range(0, len(target_ids), 900):
+                chunk = target_ids[start:start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT raw_json FROM articles WHERE id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    existing = self._json_loads(row[0])
+                    merged = dict(existing)
+                    merged.update({
+                        "import_status": "confirmed",
+                        "import_batch_id": normalized_import_id,
+                        "import_confirmed_at": normalized_confirmed_at,
+                    })
+                    merged["id"] = existing.get("id", merged.get("id", ""))
+                    merged["ts"] = existing.get("ts", merged.get("ts", ""))
+                    merged = self._clear_match_metadata(merged)
+                    merged = self._apply_article_defaults(
+                        merged,
+                        now_text=now_text,
+                        existing=existing,
+                    )
+                    article = self._normalize_article(merged)
+                    self._upsert_article_row(conn, article, updated_at_ns=updated_at_ns)
+                    updated.append(dict(article))
+        return updated
 
     def delete_article(self, article_id: str) -> dict[str, Any] | None:
         normalized_id = self._text(article_id)
@@ -491,6 +556,15 @@ class ArticleSQLiteStore:
                 article["_match_config_signature"] = self._text(
                     update.get("_match_config_signature") or update.get("match_config_signature")
                 )
+                for field in (
+                    "export_keyword_categories",
+                    "export_keyword_categories_by_task",
+                    "_export_keyword_config_signature",
+                    "_export_keyword_article_signature",
+                    "_export_keyword_cache_version",
+                ):
+                    if field in update:
+                        article[field] = update.get(field)
                 article = self._normalize_article(article)
                 self._upsert_article_row(conn, article, updated_at_ns=updated_at_ns)
                 results.append(dict(article))
@@ -809,6 +883,194 @@ class ArticleSQLiteStore:
             where = f"{where} WHERE {' AND '.join(conditions)}"
         return where, params
 
+    def _get_article_page_with_bounded_url_dedupe(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        where_sql: str,
+        params: list[Any],
+        limit: int,
+        offset: int,
+        today_text: str,
+    ) -> dict[str, Any]:
+        rows = conn.execute(
+            f"""
+            SELECT a.raw_json
+            FROM articles a
+            {where_sql}
+            ORDER BY
+                a.sort_published_ts DESC,
+                a.sort_imported_ts DESC,
+                a.id DESC
+            """,
+            params,
+        ).fetchall()
+        filtered_articles = [self._json_loads(row[0]) for row in rows]
+        supplemental_articles = self._supplemental_url_articles_for_missing_fingerprints(
+            conn,
+            filtered_articles,
+        )
+        deduped = self._dedupe_articles_by_url([*filtered_articles, *supplemental_articles])
+        return {
+            "total": len(deduped),
+            "today_total": sum(
+                1 for article in deduped
+                if self._article_matches_today(article, today_text)
+            ),
+            "limit": limit,
+            "offset": offset,
+            "items": deduped[offset:offset + limit],
+            "dedupe_strategy": "bounded_url_scan",
+        }
+
+    def _article_count_with_extra_condition(
+        self,
+        conn: sqlite3.Connection,
+        where_sql: str,
+        params: list[Any],
+        condition: str,
+    ) -> int:
+        row = conn.execute(
+            f"SELECT COUNT(*) FROM articles a {self._append_article_condition(where_sql, condition)}",
+            params,
+        ).fetchone()
+        return int((row or [0])[0] or 0)
+
+    def _dedupe_articles_by_url(self, articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduped: list[dict[str, Any]] = []
+        index_by_url: dict[str, int] = {}
+        url_by_fingerprint: dict[str, str] = {}
+        for article in articles:
+            if not isinstance(article, dict):
+                continue
+            normalized_url = self._normalized_url(article)
+            fingerprint = self._article_url_fingerprint(article)
+            if normalized_url and fingerprint and fingerprint not in url_by_fingerprint:
+                url_by_fingerprint[fingerprint] = self._display_url(article)
+
+        for article in articles:
+            if not isinstance(article, dict):
+                continue
+            item = dict(article)
+            normalized_url = self._normalized_url(item)
+            if not normalized_url:
+                fallback_url = url_by_fingerprint.get(self._article_url_fingerprint(item), "")
+                if fallback_url:
+                    item["url"] = fallback_url
+                    normalized_url = self._normalized_url(item)
+            if not normalized_url:
+                deduped.append(item)
+                continue
+            existing_index = index_by_url.get(normalized_url)
+            if existing_index is None:
+                index_by_url[normalized_url] = len(deduped)
+                deduped.append(item)
+                continue
+            deduped[existing_index] = self._merge_article_for_duplicate_url(deduped[existing_index], item)
+        return deduped
+
+    def _supplemental_url_articles_for_missing_fingerprints(
+        self,
+        conn: sqlite3.Connection,
+        articles: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        target_fingerprints = {
+            self._article_url_fingerprint(article)
+            for article in articles
+            if isinstance(article, dict) and not self._normalized_url(article)
+        }
+        target_fingerprints.discard("")
+        if not target_fingerprints:
+            return []
+
+        supplemental: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        rows = conn.execute(
+            """
+            SELECT raw_json
+            FROM articles
+            WHERE normalized_url IS NOT NULL AND normalized_url != ''
+            ORDER BY sort_published_ts DESC, sort_imported_ts DESC, id DESC
+            """
+        ).fetchall()
+        for row in rows:
+            article = self._json_loads(row[0])
+            fingerprint = self._article_url_fingerprint(article)
+            if fingerprint not in target_fingerprints:
+                continue
+            normalized_url = self._normalized_url(article)
+            if not normalized_url or normalized_url in seen_urls:
+                continue
+            supplemental.append(article)
+            seen_urls.add(normalized_url)
+        return supplemental
+
+    @classmethod
+    def _merge_article_for_duplicate_url(
+        cls,
+        base: dict[str, Any],
+        duplicate: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(base)
+        for key in ("matched_tasks", "referenced_tasks", "cloud_task_ids"):
+            merged[key] = cls._merge_unique_texts(merged.get(key), duplicate.get(key))
+
+        base_reasons = merged.get("match_reasons") if isinstance(merged.get("match_reasons"), dict) else {}
+        duplicate_reasons = duplicate.get("match_reasons") if isinstance(duplicate.get("match_reasons"), dict) else {}
+        if base_reasons or duplicate_reasons:
+            next_reasons: dict[str, list[str]] = {}
+            for task_name in set(base_reasons.keys()) | set(duplicate_reasons.keys()):
+                next_reasons[str(task_name)] = cls._merge_unique_texts(
+                    base_reasons.get(task_name),
+                    duplicate_reasons.get(task_name),
+                )
+            merged["match_reasons"] = next_reasons
+
+        base_hits = merged.get("reference_hits") if isinstance(merged.get("reference_hits"), dict) else {}
+        duplicate_hits = duplicate.get("reference_hits") if isinstance(duplicate.get("reference_hits"), dict) else {}
+        if duplicate_hits:
+            merged["reference_hits"] = {**base_hits, **duplicate_hits}
+
+        for key in ("url", "raw_url", "title", "media_name", "platform", "published_at", "ts"):
+            if not cls._text(merged.get(key)) and cls._text(duplicate.get(key)):
+                merged[key] = duplicate.get(key)
+        return merged
+
+    @classmethod
+    def _merge_unique_texts(cls, left: Any, right: Any) -> list[str]:
+        result: list[str] = []
+        for values in (left, right):
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                text = cls._text(value)
+                if text and text not in result:
+                    result.append(text)
+        return result
+
+    @classmethod
+    def _article_url_fingerprint(cls, article: dict[str, Any]) -> str:
+        title = re.sub(r"\s+", " ", cls._text(article.get("title"))).lower()
+        source = re.sub(
+            r"\s+",
+            " ",
+            cls._text(article.get("media_name") or article.get("source") or article.get("platform")),
+        ).lower()
+        published = cls._text(article.get("published_at") or article.get("published") or article.get("ts"))[:10]
+        if not title or not source:
+            return ""
+        return "|".join([title, source, published])
+
+    def _display_url(self, article: dict[str, Any]) -> str:
+        stored_url = self._text(article.get("url"))
+        raw_url = self._text(article.get("raw_url"))
+        if raw_url:
+            normalized_raw_url = self._normalize_url_text(raw_url)
+            normalized_stored_url = self._normalize_url_text(stored_url)
+            if normalized_raw_url and (not normalized_stored_url or normalized_raw_url == normalized_stored_url):
+                return raw_url
+        return stored_url
+
     def _article_today_count_with_conn(
         self,
         conn: sqlite3.Connection,
@@ -886,7 +1148,7 @@ class ArticleSQLiteStore:
         return f"article:{digest}"
 
     def _normalized_url(self, article: dict[str, Any]) -> str:
-        return self._normalize_url_text(article.get("url"))
+        return self._normalize_url_text(article.get("url") or article.get("raw_url"))
 
     def _normalize_url_text(self, value: Any) -> str:
         raw_url = self._text(value)

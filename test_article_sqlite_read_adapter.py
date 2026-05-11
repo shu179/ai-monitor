@@ -331,7 +331,7 @@ class ArticleSQLiteReadAdapterTests(unittest.TestCase):
         runtime = self._runtime()
 
         with patch.dict(os.environ, {"AIBRANDMONITOR_ARTICLE_READ_BACKEND": "sqlite_shadow"}):
-            result = runtime._get_sqlite_shadow_article_page({}, limit=501)
+            result = runtime._get_sqlite_shadow_article_page({}, limit=5001)
 
         self.assertIsNone(result)
         status = runtime.get_article_sqlite_shadow_compare_status()

@@ -19,21 +19,28 @@ from backend_lib.article_import import (
     _normalize_article_import_media_type,
     _resolve_article_import_platform_label,
     _split_article_import_platform_account,
+    _strip_article_import_media_qualifier,
 )
 from backend_lib.config_provider import RuntimeConfigProvider
 from core.app_paths import resolve_app_path
 from core.article_store import (
     analyze_article_matches,
+    article_export_keyword_cache_fields,
     bulk_upsert_articles,
+    compile_article_matcher,
     confirm_article_import_batch,
     extract_domain,
+    build_article_export_keyword_plan,
+    build_article_export_keyword_signature,
     get_articles_file_path,
     get_articles,
     normalize_article_url,
+    resolve_article_display_url,
     resolve_article_export_keywords,
     resolve_article_source,
     save_domain_media_name,
     undo_article_import_batch,
+    update_article_export_keyword_cache,
     update_article,
     update_media_type as update_article_media_type,
 )
@@ -55,12 +62,31 @@ def _article_published_date(article: dict[str, Any]) -> date | None:
     return parse_local_date(article.get("ts"))
 
 
+def _with_article_export_keyword_cache(
+    article: dict[str, Any],
+    config: dict[str, Any] | None,
+    *,
+    keyword_plan: list[dict[str, str]] | None = None,
+    config_signature: str = "",
+) -> dict[str, Any]:
+    cached_article = dict(article or {})
+    update_article_export_keyword_cache(
+        cached_article,
+        config or {},
+        keyword_plan=keyword_plan,
+        config_signature=config_signature,
+    )
+    return cached_article
+
+
 def _article_to_api(
     article: dict[str, Any],
     config: dict[str, Any] | None = None,
     task_name: str = "",
     *,
-    include_export_keywords: bool = True,
+    include_export_keywords: bool = False,
+    export_keyword_plan: list[dict[str, str]] | None = None,
+    export_keyword_config_signature: str = "",
 ) -> dict[str, Any]:
     media_type = str(article.get("media_type", "") or "").strip()
     source = resolve_article_source(article)
@@ -112,7 +138,7 @@ def _article_to_api(
         "title": article.get("title", ""),
         "type": "media" if media_type == "authority" else "self-media",
         "category": "媒体" if media_type == "authority" else "自媒体",
-        "url": article.get("url", ""),
+        "url": resolve_article_display_url(article),
         "ts": article_ts,
         "imported_at": imported_at,
         "fetch_method": article.get("fetch_method", ""),
@@ -134,7 +160,13 @@ def _article_to_api(
         "lastReferencedAt": last_referenced_at,
     }
     if include_export_keywords:
-        payload["exportKeywords"] = resolve_article_export_keywords(article, config or {}, task_name)
+        payload["exportKeywords"] = resolve_article_export_keywords(
+            article,
+            config or {},
+            task_name,
+            keyword_plan=export_keyword_plan,
+            keyword_config_signature=export_keyword_config_signature,
+        )
     return payload
 
 
@@ -148,6 +180,57 @@ def _merge_unique_texts(left: Any, right: Any) -> list[str]:
             if text and text not in result:
                 result.append(text)
     return result
+
+
+def _configured_article_task_names(config: dict[str, Any] | None) -> set[str]:
+    names: set[str] = set()
+    for task in (config or {}).get("tasks", []) or []:
+        if not isinstance(task, dict):
+            continue
+        task_name = str(task.get("name") or derive_task_id(task)).strip()
+        if task_name:
+            names.add(task_name)
+    return names
+
+
+def _merge_preserved_historical_task_matches(
+    analyzed: dict[str, object],
+    current_article: dict[str, Any],
+    config: dict[str, Any] | None,
+) -> dict[str, object]:
+    configured_task_names = _configured_article_task_names(config)
+    excluded_task_names = {
+        str(name or "").strip()
+        for name in (current_article.get("excluded_tasks") or [])
+        if str(name or "").strip()
+    }
+    preserved_tasks = [
+        str(name or "").strip()
+        for name in (current_article.get("matched_tasks") or [])
+        if str(name or "").strip()
+        and str(name or "").strip() not in configured_task_names
+        and str(name or "").strip() not in excluded_task_names
+    ]
+    if not preserved_tasks:
+        return analyzed
+
+    matched_tasks = _merge_unique_texts(preserved_tasks, analyzed.get("matched_tasks"))
+    existing_reasons = current_article.get("match_reasons") if isinstance(current_article.get("match_reasons"), dict) else {}
+    analyzed_reasons = analyzed.get("match_reasons") if isinstance(analyzed.get("match_reasons"), dict) else {}
+    match_reasons = dict(analyzed_reasons)
+    for task_name in preserved_tasks:
+        reasons = [
+            str(reason or "").strip()
+            for reason in (existing_reasons.get(task_name) or [])
+            if str(reason or "").strip()
+        ]
+        match_reasons[task_name] = reasons or ["保留历史归类"]
+
+    merged = dict(analyzed)
+    merged["matched_tasks"] = matched_tasks
+    merged["match_reasons"] = match_reasons
+    merged["unmatched_reason"] = "" if matched_tasks else str(analyzed.get("unmatched_reason", "") or "")
+    return merged
 
 
 def _merge_article_for_duplicate_url(base: dict[str, Any], duplicate: dict[str, Any]) -> dict[str, Any]:
@@ -171,7 +254,7 @@ def _merge_article_for_duplicate_url(base: dict[str, Any], duplicate: dict[str, 
     if duplicate_hits:
         merged["reference_hits"] = {**base_hits, **duplicate_hits}
 
-    for key in ("url", "title", "media_name", "platform", "published_at", "ts"):
+    for key in ("url", "raw_url", "title", "media_name", "platform", "published_at", "ts"):
         if not str(merged.get(key) or "").strip() and str(duplicate.get(key) or "").strip():
             merged[key] = duplicate.get(key)
     return merged
@@ -190,28 +273,39 @@ def _article_url_fingerprint(article: dict[str, Any]) -> str:
     return "|".join([title, source, published])
 
 
-def _dedupe_articles_by_url(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    index_by_url: dict[str, int] = {}
+def _hydrate_article_urls_from_fingerprints(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
     url_by_fingerprint: dict[str, str] = {}
     for article in articles:
         if not isinstance(article, dict):
             continue
-        normalized_url = normalize_article_url(str(article.get("url") or ""))
+        display_url = resolve_article_display_url(article)
+        normalized_url = normalize_article_url(display_url or str(article.get("url") or ""))
         fingerprint = _article_url_fingerprint(article)
         if normalized_url and fingerprint and fingerprint not in url_by_fingerprint:
-            url_by_fingerprint[fingerprint] = str(article.get("url") or "").strip()
-
+            url_by_fingerprint[fingerprint] = display_url or str(article.get("url") or "").strip()
+    if not url_by_fingerprint:
+        return list(articles)
+    hydrated: list[dict[str, Any]] = []
     for article in articles:
         if not isinstance(article, dict):
             continue
         item = dict(article)
-        normalized_url = normalize_article_url(str(item.get("url") or ""))
-        if not normalized_url:
+        if not normalize_article_url(str(item.get("url") or "")):
             fallback_url = url_by_fingerprint.get(_article_url_fingerprint(item), "")
             if fallback_url:
                 item["url"] = fallback_url
-                normalized_url = normalize_article_url(fallback_url)
+        hydrated.append(item)
+    return hydrated
+
+
+def _dedupe_articles_by_url(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    index_by_url: dict[str, int] = {}
+    for article in _hydrate_article_urls_from_fingerprints(articles):
+        if not isinstance(article, dict):
+            continue
+        item = dict(article)
+        normalized_url = normalize_article_url(str(item.get("url") or ""))
         if not normalized_url:
             deduped.append(item)
             continue
@@ -426,11 +520,31 @@ def _article_import_task_terms(task: dict[str, Any]) -> list[str]:
     return terms
 
 
+def _build_article_import_match_plan(config: dict[str, Any]) -> list[tuple[str, list[tuple[str, str]]]]:
+    plan: list[tuple[str, list[tuple[str, str]]]] = []
+    for task in config.get("tasks", []) or []:
+        if not isinstance(task, dict):
+            continue
+        task_name = str(task.get("name") or "").strip()
+        if not task_name:
+            continue
+        terms: list[tuple[str, str]] = []
+        for term in _article_import_task_terms(task):
+            term_key = _compact_article_import_match_text(term)
+            if len(term_key) >= 2:
+                terms.append((term, term_key))
+        if terms:
+            plan.append((task_name, terms))
+    return plan
+
+
 def _merge_article_import_matches(
     analyzed: dict[str, object],
     config: dict[str, Any],
     raw_item: dict[str, Any],
     file_name: str,
+    *,
+    import_match_plan: list[tuple[str, list[tuple[str, str]]]] | None = None,
 ) -> dict[str, object]:
     matched_tasks = [
         str(task_name or "").strip()
@@ -443,22 +557,17 @@ def _merge_article_import_matches(
         ("表格品牌列", raw_item.get("brand_name")),
         ("导入文件名", Path(str(file_name or "")).stem),
     ]
+    source_keys = [
+        (source_label, _compact_article_import_match_text(source_value))
+        for source_label, source_value in source_texts
+    ]
+    plan = import_match_plan if import_match_plan is not None else _build_article_import_match_plan(config)
 
-    for task in config.get("tasks", []):
-        if not isinstance(task, dict):
-            continue
-        task_name = str(task.get("name") or "").strip()
-        if not task_name:
-            continue
-        task_terms = _article_import_task_terms(task)
-        for source_label, source_value in source_texts:
-            source_key = _compact_article_import_match_text(source_value)
+    for task_name, task_terms in plan:
+        for source_label, source_key in source_keys:
             if len(source_key) < 2:
                 continue
-            for term in task_terms:
-                term_key = _compact_article_import_match_text(term)
-                if len(term_key) < 2:
-                    continue
+            for term, term_key in task_terms:
                 if term_key not in source_key and source_key not in term_key:
                     continue
                 if task_name not in matched_tasks:
@@ -573,7 +682,22 @@ class ArticleService:
         task_name: str = "",
         include_export_keywords: bool = False,
     ) -> dict:
-        config = self._config_provider.load()
+        light_config_loader = getattr(self._config_provider, "load_without_hooks", None)
+        config = (
+            light_config_loader()
+            if callable(light_config_loader) else
+            self._config_provider.load()
+        )
+        export_keyword_plan = (
+            build_article_export_keyword_plan(config, task_name)
+            if include_export_keywords else
+            None
+        )
+        export_keyword_config_signature = (
+            build_article_export_keyword_signature(config)
+            if include_export_keywords else
+            ""
+        )
         sqlite_page = self._load_sqlite_article_page(
             config,
             media_type=media_type,
@@ -588,6 +712,8 @@ class ArticleService:
                         config,
                         task_name,
                         include_export_keywords=include_export_keywords,
+                        export_keyword_plan=export_keyword_plan,
+                        export_keyword_config_signature=export_keyword_config_signature,
                     )
                     for article in sqlite_page["articles"]
                 ],
@@ -601,6 +727,8 @@ class ArticleService:
             limit=limit,
             task_name=task_name,
             include_export_keywords=include_export_keywords,
+            export_keyword_plan=export_keyword_plan,
+            export_keyword_config_signature=export_keyword_config_signature,
         )
         if sqlite_page is not None and bool(sqlite_page.get("compare_only")):
             self._compare_sqlite_article_page(
@@ -620,8 +748,11 @@ class ArticleService:
         limit: int,
         task_name: str,
         include_export_keywords: bool,
+        export_keyword_plan: list[dict[str, str]] | None,
+        export_keyword_config_signature: str,
     ) -> dict:
         articles = self._get_synced_articles(config)
+        articles = _hydrate_article_urls_from_fingerprints(articles)
         if task_name:
             articles = [article for article in articles if task_name in (article.get("matched_tasks") or [])]
         if media_type:
@@ -640,6 +771,8 @@ class ArticleService:
                     config,
                     task_name,
                     include_export_keywords=include_export_keywords,
+                    export_keyword_plan=export_keyword_plan,
+                    export_keyword_config_signature=export_keyword_config_signature,
                 )
                 for article in articles
             ],
@@ -750,9 +883,11 @@ class ArticleService:
                     "fetch_method": info.get("fetch_method", existing_article.get("fetch_method", "html")),
                 }
                 analyzed = analyze_article_matches(refreshed_article["title"], config, article=refreshed_article)
+                analyzed = _merge_preserved_historical_task_matches(analyzed, existing_article, config)
                 refreshed_article["matched_tasks"] = analyzed.get("matched_tasks") or []
                 refreshed_article["match_reasons"] = analyzed.get("match_reasons") or {}
                 refreshed_article["unmatched_reason"] = analyzed.get("unmatched_reason", "") or ""
+                refreshed_article = _with_article_export_keyword_cache(refreshed_article, config)
                 updated_article = update_article(existing_article.get("id", ""), refreshed_article) or refreshed_article
                 self._invalidate_article_cache()
                 print(
@@ -785,12 +920,12 @@ class ArticleService:
                 "fetch_method": info.get("fetch_method", "html"),
             }
             analyzed = analyze_article_matches(draft_article["title"], config, article=draft_article)
-            article = add_article({
+            article = add_article(_with_article_export_keyword_cache({
                 **draft_article,
                 "matched_tasks": analyzed.get("matched_tasks") or [],
                 "match_reasons": analyzed.get("match_reasons") or {},
                 "unmatched_reason": analyzed.get("unmatched_reason", "") or "",
-            })
+            }, config))
             self._invalidate_article_cache()
             print(
                 "[WebBackend] 文章录入完成",
@@ -830,7 +965,16 @@ class ArticleService:
                     "details": details,
                 }
 
-            config = self._config_provider.load()
+            light_config_loader = getattr(self._config_provider, "load_without_hooks", None)
+            config = (
+                light_config_loader()
+                if callable(light_config_loader) else
+                self._config_provider.load()
+            )
+            compiled_matcher = compile_article_matcher(config)
+            import_match_plan = _build_article_import_match_plan(config)
+            export_keyword_plan = build_article_export_keyword_plan(config)
+            export_keyword_config_signature = build_article_export_keyword_signature(config)
             now_text = local_now().strftime("%Y-%m-%d %H:%M")
             import_id = uuid4().hex
             imported_articles: list[dict[str, Any]] = []
@@ -839,16 +983,29 @@ class ArticleService:
             duplicate_count = 0
             skipped_count = 0
             seen_keys: set[str] = set()
+            existing_articles = [
+                article
+                for article in get_articles()
+                if isinstance(article, dict)
+            ]
             existing_by_url = {
                 normalize_article_url(str(article.get("url") or "")): article
-                for article in get_articles()
-                if isinstance(article, dict) and normalize_article_url(str(article.get("url") or ""))
+                for article in existing_articles
+                if normalize_article_url(str(article.get("url") or ""))
+            }
+            existing_missing_url_by_fingerprint = {
+                fingerprint: article
+                for article in existing_articles
+                if not normalize_article_url(str(article.get("url") or ""))
+                for fingerprint in [_article_url_fingerprint(article)]
+                if fingerprint
             }
             pending_upserts: list[dict[str, Any]] = []
             pending_kinds: list[str] = []
 
             mutable_import_fields = (
                 "url",
+                "raw_url",
                 "title",
                 "platform",
                 "media_name",
@@ -881,10 +1038,9 @@ class ArticleService:
                     str(raw_item.get("media_name") or "").strip(),
                     str(raw_item.get("published_at") or "").strip(),
                 ])
-                if row_key in seen_keys:
-                    duplicate_count += 1
-                    continue
-                seen_keys.add(row_key)
+                is_duplicate_import_row = row_key in seen_keys
+                if not is_duplicate_import_row:
+                    seen_keys.add(row_key)
 
                 raw_media_name = str(raw_item.get("media_name") or "").strip()
                 account_name = str(raw_item.get("account_name") or "").strip()
@@ -907,10 +1063,14 @@ class ArticleService:
                     raw_media_name = platform_from_account
                 if account_from_account:
                     account_name = account_from_account
+                raw_media_name = _strip_article_import_media_qualifier(raw_media_name)
                 bracket_match = re.fullmatch(r"(.+?)[（(]([^（）()]+)[）)]", raw_media_name)
                 if bracket_match and not account_name:
                     raw_media_name = bracket_match.group(1).strip()
                     account_name = bracket_match.group(2).strip()
+                platform_label = _resolve_article_import_platform_label(raw_media_name)
+                if platform_label:
+                    raw_media_name = platform_label
 
                 url_media_name = resolve_media_name(normalized_url or raw_url)
                 if (
@@ -939,6 +1099,7 @@ class ArticleService:
                 )
                 draft_article: dict[str, Any] = {
                     "url": normalized_url or raw_url,
+                    "raw_url": raw_url,
                     "title": title,
                     "platform": media_name,
                     "media_name": media_name,
@@ -957,19 +1118,17 @@ class ArticleService:
                 if account_name:
                     draft_article["account_name"] = account_name
 
-                analyzed = analyze_article_matches(title, config, article=draft_article)
-                analyzed = _merge_article_import_matches(analyzed, config, raw_item, original_name)
-                draft_article.update({
-                    "matched_tasks": analyzed.get("matched_tasks") or [],
-                    "match_reasons": analyzed.get("match_reasons") or {},
-                    "unmatched_reason": analyzed.get("unmatched_reason", "") or "",
-                })
-
                 existing_article = existing_by_url.get(normalized_url) if normalized_url else None
+                if existing_article is None:
+                    existing_article = existing_missing_url_by_fingerprint.get(_article_url_fingerprint(draft_article))
+                if existing_article is None and is_duplicate_import_row:
+                    duplicate_count += 1
+                    continue
                 if existing_article:
                     candidate_article = dict(existing_article)
                     candidate_article.update({
                         "url": normalized_url or raw_url or str(existing_article.get("url") or ""),
+                        "raw_url": raw_url or str(existing_article.get("raw_url") or ""),
                         "title": title or str(existing_article.get("title") or ""),
                         "last_table_import_at": now_text,
                         "last_table_import_file": original_name,
@@ -993,11 +1152,29 @@ class ArticleService:
                         str(candidate_article.get("title") or ""),
                         config,
                         article=candidate_article,
+                        compiled_matcher=compiled_matcher,
                     )
-                    candidate_analysis = _merge_article_import_matches(candidate_analysis, config, raw_item, original_name)
+                    candidate_analysis = _merge_article_import_matches(
+                        candidate_analysis,
+                        config,
+                        raw_item,
+                        original_name,
+                        import_match_plan=import_match_plan,
+                    )
+                    candidate_analysis = _merge_preserved_historical_task_matches(
+                        candidate_analysis,
+                        existing_article,
+                        config,
+                    )
                     candidate_article["matched_tasks"] = candidate_analysis.get("matched_tasks") or []
                     candidate_article["match_reasons"] = candidate_analysis.get("match_reasons") or {}
                     candidate_article["unmatched_reason"] = candidate_analysis.get("unmatched_reason", "") or ""
+                    candidate_article = _with_article_export_keyword_cache(
+                        candidate_article,
+                        config,
+                        keyword_plan=export_keyword_plan,
+                        config_signature=export_keyword_config_signature,
+                    )
                     if not values_changed(existing_article, candidate_article):
                         duplicate_count += 1
                         continue
@@ -1010,6 +1187,30 @@ class ArticleService:
                     pending_kinds.append("update")
                     continue
 
+                analyzed = analyze_article_matches(
+                    title,
+                    config,
+                    article=draft_article,
+                    compiled_matcher=compiled_matcher,
+                )
+                analyzed = _merge_article_import_matches(
+                    analyzed,
+                    config,
+                    raw_item,
+                    original_name,
+                    import_match_plan=import_match_plan,
+                )
+                draft_article.update({
+                    "matched_tasks": analyzed.get("matched_tasks") or [],
+                    "match_reasons": analyzed.get("match_reasons") or {},
+                    "unmatched_reason": analyzed.get("unmatched_reason", "") or "",
+                })
+                draft_article = _with_article_export_keyword_cache(
+                    draft_article,
+                    config,
+                    keyword_plan=export_keyword_plan,
+                    config_signature=export_keyword_config_signature,
+                )
                 pending_upserts.append(draft_article)
                 pending_kinds.append("create")
 
@@ -1263,7 +1464,12 @@ class ArticleService:
                 "brandName",
             )
         )
-        config = self._config_provider.load()
+        light_config_loader = getattr(self._config_provider, "load_without_hooks", None)
+        config = (
+            light_config_loader()
+            if callable(light_config_loader) else
+            self._config_provider.load()
+        )
         manual_task_names: list[str] = []
         if manual_task_assignment:
             manual_task_names, task_error = self._resolve_article_task_names(config, current_article, payload)
@@ -1294,6 +1500,7 @@ class ArticleService:
                     config,
                     article=merged_article,
                 )
+                analyzed = _merge_preserved_historical_task_matches(analyzed, current_article, config)
                 patch["matched_tasks"] = analyzed.get("matched_tasks") or []
                 patch["match_reasons"] = analyzed.get("match_reasons") or {}
                 patch["unmatched_reason"] = analyzed.get("unmatched_reason", "") or ""
@@ -1302,6 +1509,10 @@ class ArticleService:
                 domain = extract_domain(str(current_article.get("url", "") or ""))
                 if domain:
                     save_domain_media_name(domain, str(patch["media_name"]), force=True)
+
+            cache_article = {**current_article, **patch}
+            update_article_export_keyword_cache(cache_article, config)
+            patch.update(article_export_keyword_cache_fields(cache_article))
 
             updated_article = update_article(article_id, patch)
             if updated_article is None:

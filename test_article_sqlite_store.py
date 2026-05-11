@@ -72,6 +72,43 @@ class ArticleSQLiteStoreTests(unittest.TestCase):
             self.assertEqual(store.get_meta("article_source_signature"), "sig-1")
             self.assertTrue(ArticleSQLiteStore.validate_readiness(store.db_path)["ready"])
 
+    def test_task_page_hydrates_legacy_missing_url_from_unmatched_duplicate(self) -> None:
+        today = "2026-05-09"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(Path(tmpdir) / "article_store.sqlite3")
+            store.import_from_articles(
+                [
+                    {
+                        "id": "with-link",
+                        "url": "https://example.com/same",
+                        "title": "同一篇报道",
+                        "media_name": "示例媒体",
+                        "media_type": "authority",
+                        "published_at": today,
+                        "ts": today,
+                        "matched_tasks": [],
+                    },
+                    {
+                        "id": "without-link",
+                        "url": "",
+                        "title": "同一篇报道",
+                        "media_name": "示例媒体",
+                        "media_type": "authority",
+                        "published_at": today,
+                        "ts": today,
+                        "matched_tasks": ["品牌A"],
+                    },
+                ],
+                replace=True,
+            )
+
+            page = store.get_article_page(task_name="品牌A", limit=10, today=today)
+
+            self.assertEqual(page["total"], 1)
+            self.assertEqual([item["id"] for item in page["items"]], ["without-link"])
+            self.assertEqual(page["items"][0]["url"], "https://example.com/same")
+            self.assertEqual(page["items"][0]["matched_tasks"], ["品牌A"])
+
     def test_crud_preserves_article_store_upsert_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(Path(tmpdir) / "article_store.sqlite3")
@@ -185,6 +222,48 @@ class ArticleSQLiteStoreTests(unittest.TestCase):
                     ("Brand R", "referenced"),
                 },
             )
+
+    def test_bulk_confirm_import_updates_rows_in_one_store_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(Path(tmpdir) / "article_store.sqlite3")
+            store.import_from_articles(
+                [
+                    {
+                        "id": "article-a",
+                        "url": "https://example.com/a",
+                        "title": "A",
+                        "published_at": "2026-05-08",
+                        "ts": "2026-05-08",
+                        "matched_tasks": ["Brand A"],
+                        "import_status": "pending",
+                        "import_batch_id": "import-1",
+                    },
+                    {
+                        "id": "article-b",
+                        "url": "https://example.com/b",
+                        "title": "B",
+                        "published_at": "2026-05-09",
+                        "ts": "2026-05-09",
+                        "matched_tasks": ["Brand B"],
+                        "import_status": "pending",
+                        "import_batch_id": "import-1",
+                    },
+                ],
+                replace=True,
+            )
+
+            updated = store.bulk_confirm_import(
+                ["article-a", "article-b", "missing"],
+                import_id="import-1",
+                confirmed_at="2026-05-09 11:00",
+            )
+            refreshed = {article["id"]: article for article in store.list_articles()}
+
+            self.assertEqual({article["id"] for article in updated}, {"article-a", "article-b"})
+            self.assertEqual(refreshed["article-a"]["import_status"], "confirmed")
+            self.assertEqual(refreshed["article-a"]["import_confirmed_at"], "2026-05-09 11:00")
+            self.assertEqual(refreshed["article-a"]["matched_tasks"], ["Brand A"])
+            self.assertEqual(refreshed["article-a"]["ts"], "2026-05-08")
 
 
 class ArticleStoreSQLiteParityTests(unittest.TestCase):
@@ -522,6 +601,27 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
         sqlite_result = self._run_refresh_scenario("sqlite")
 
         self.assertEqual(sqlite_result, json_result)
+
+    def test_refresh_article_matches_preserves_deleted_task_classification(self) -> None:
+        for backend in ("json", "sqlite"):
+            with self.subTest(backend=backend):
+                self._configure_paths(f"legacy-deleted-article-label-{backend}")
+                os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = backend
+                article_store.bulk_upsert_articles([
+                    {
+                        "id": "article-deleted-task",
+                        "url": "https://example.com/deleted-task",
+                        "title": "历史品牌报道",
+                        "published_at": "2026-05-09",
+                        "matched_tasks": ["已删除品牌"],
+                        "match_reasons": {"已删除品牌": ["历史归类"]},
+                    }
+                ])
+
+                refreshed = article_store.refresh_article_matches({"tasks": []})
+
+                self.assertEqual(refreshed[0]["matched_tasks"], ["已删除品牌"])
+                self.assertIn("已删除品牌", refreshed[0]["match_reasons"])
 
     def test_sqlite_warm_refresh_does_not_analyze_articles(self) -> None:
         self._configure_paths("sqlite-warm-refresh")

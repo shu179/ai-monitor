@@ -31,12 +31,18 @@ class RuntimeConfigProvider:
     def set_path(self, config_path: str | Path) -> None:
         self.config_path = Path(config_path)
 
-    def load(self) -> dict[str, Any]:
+    def _load(self, *, run_on_load: bool) -> dict[str, Any]:
         config = read_config(self.config_path)
         ensure_config_task_ids(config)
-        if self._on_load is not None:
+        if run_on_load and self._on_load is not None:
             self._on_load(config)
         return config
+
+    def load(self) -> dict[str, Any]:
+        return self._load(run_on_load=True)
+
+    def load_without_hooks(self) -> dict[str, Any]:
+        return self._load(run_on_load=False)
 
     def save(self, config: dict[str, Any]) -> Path:
         return write_config(config, str(self.config_path))

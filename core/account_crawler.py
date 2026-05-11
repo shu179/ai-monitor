@@ -1667,6 +1667,16 @@ def _parse_rss_feed(
                     link = str(child.attrib.get("href") or "").strip()
                     if link:
                         break
+        if not link:
+            for candidate in (
+                _xml_child_text(item, {"origLink"}),
+                _xml_child_text(item, {"guid"}),
+                _xml_child_text(item, {"id"}),
+            ):
+                candidate = str(candidate or "").strip()
+                if re.match(r"(?i)^(?:https?://|www\.)", candidate):
+                    link = candidate
+                    break
         published = _xml_child_text(item, {"pubDate", "published", "updated", "date", "created"})
         url = urljoin(base_url, link)
         if normalized_platform == "sohu" and not _looks_like_article_url("sohu", url, account_xpt=account_xpt):

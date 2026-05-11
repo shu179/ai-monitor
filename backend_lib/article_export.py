@@ -12,7 +12,10 @@ from xml.sax.saxutils import escape as xml_escape
 
 from core.article_store import (
     build_article_export_keyword_order,
+    build_article_export_keyword_plan,
+    build_article_export_keyword_signature,
     normalize_article_url,
+    resolve_article_display_url,
     resolve_article_export_keywords,
     resolve_article_export_source,
 )
@@ -205,7 +208,7 @@ def _hydrate_article_export_urls(articles: list[dict[str, Any]]) -> list[dict[st
     for article in articles:
         if not isinstance(article, dict):
             continue
-        raw_url = str(article.get("url") or "").strip()
+        raw_url = resolve_article_display_url(article)
         if not normalize_article_url(raw_url):
             continue
         fingerprint = _article_export_url_fingerprint(article)
@@ -218,7 +221,7 @@ def _hydrate_article_export_urls(articles: list[dict[str, Any]]) -> list[dict[st
     hydrated: list[dict[str, Any]] = []
     for article in articles:
         item = dict(article)
-        if not normalize_article_url(str(item.get("url") or "")):
+        if not normalize_article_url(resolve_article_display_url(item) or str(item.get("url") or "")):
             fallback_url = url_by_fingerprint.get(_article_export_url_fingerprint(item), "")
             if fallback_url:
                 item["url"] = fallback_url
@@ -238,35 +241,33 @@ def _article_export_items(
     config: dict[str, Any] | None = None,
     task_name: str = "",
 ) -> list[tuple[str, dict[str, Any]]]:
-    articles = _hydrate_article_export_urls(articles)
+    articles = _sort_articles_for_export(_hydrate_article_export_urls(articles))
     if not show_keyword_category:
-        return [("", article) for article in _sort_articles_for_export(articles)]
+        return [("", article) for article in articles]
 
     keyword_order = build_article_export_keyword_order(config or {}, task_name)
+    keyword_plan = build_article_export_keyword_plan(config or {}, task_name)
+    keyword_config_signature = build_article_export_keyword_signature(config or {})
     items: list[tuple[str, dict[str, Any]]] = []
     for article in articles:
-        labels = resolve_article_export_keywords(article, config or {}, task_name) or ["未识别关键词"]
-        for label in labels:
-            items.append((label, article))
-
-    def sort_key(item: tuple[str, dict[str, Any]]) -> tuple[tuple[int, str], float, float, str]:
-        label, article = item
-        published = _first_article_export_timestamp(
+        labels = resolve_article_export_keywords(
             article,
-            ("published_ts", "published_at", "published", "ts"),
+            config or {},
+            task_name,
+            keyword_plan=keyword_plan,
+            keyword_config_signature=keyword_config_signature,
         )
-        imported = _first_article_export_timestamp(
-            article,
-            ("imported_at", "created_at", "ts"),
+        ordered_labels = sorted(
+            [
+                str(label or "").strip()
+                for label in labels
+                if str(label or "").strip()
+            ],
+            key=lambda label: _article_export_keyword_sort_key(label, keyword_order),
         )
-        return (
-            _article_export_keyword_sort_key(label, keyword_order),
-            published or -1,
-            imported or -1,
-            str(article.get("id") or ""),
-        )
+        items.append(("、".join(ordered_labels), article))
 
-    return sorted(items, key=sort_key)
+    return items
 
 
 def _build_article_export_xlsx(
@@ -328,7 +329,7 @@ def _build_article_export_xlsx(
 
     for row_idx, (keyword_category, article) in enumerate(export_items, start=6):
         title = str(article.get("title", "") or "").strip()
-        url = str(article.get("url", "") or "").strip()
+        url = resolve_article_display_url(article)
         row_values = [
             resolve_article_export_source(article, show_selfmedia_account=show_selfmedia_account),
             "权威媒体" if str(article.get("media_type", "") or "").strip() == "authority" else "自媒体",

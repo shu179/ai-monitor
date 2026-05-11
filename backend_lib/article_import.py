@@ -14,7 +14,7 @@ from core.time_utils import parse_local_date
 
 _ARTICLE_IMPORT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "title": ("标题", "文章标题", "新闻标题", "稿件标题", "内容标题", "题名", "题目", "标题名称", "title", "headline", "subject"),
-    "url": ("链接", "文章链接", "原文链接", "发布链接", "网址", "地址", "url", "link", "href"),
+    "url": ("链接", "文章链接", "原文链接", "发布链接", "网址", "发布网址", "原文网址", "文章网址", "发布网址/拒稿理由", "地址", "url", "link", "href"),
     "media_name": ("媒体", "媒体名", "媒体名称", "来源", "来源媒体", "发布媒体", "发布平台", "平台", "平台名称", "站点", "站点名称", "source", "media", "outlet", "publisher"),
     "media_type": ("类型", "媒体类型", "来源类型", "平台类型", "分类", "类别", "type", "category"),
     "published_at": ("发布时间", "发布日期", "发表时间", "发文时间", "刊发时间", "推送时间", "日期", "时间", "published", "published_at", "publishdate", "date", "time", "ts"),
@@ -25,6 +25,20 @@ _ARTICLE_IMPORT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 _CELL_HYPERLINK_MARKER = "\x1eHYPERLINK:"
+_ARTICLE_IMPORT_URL_RE = re.compile(
+    r"(?i)\b(?:https?://|www\.)[^\s<>\]）)】}，,;；\"'“”‘’]+"
+)
+
+
+def _looks_like_article_import_url(value: Any) -> bool:
+    text = _stringify_table_cell(value)
+    if not text:
+        return False
+    if re.search(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text) or re.search(r"^www\.", text, re.IGNORECASE):
+        return True
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return False
+    return bool(re.search(r"(?:^|[./])[\w-]+\.[a-zA-Z]{2,}(?:[/:?#]|$)", text))
 
 
 def _normalize_import_header(value: Any) -> str:
@@ -36,7 +50,7 @@ def _match_article_import_field(value: Any) -> str:
     normalized = _normalize_import_header(text)
     if not normalized:
         return ""
-    if len(normalized) > 40 or re.search(r"https?://|www\.|/", text, re.IGNORECASE):
+    if len(normalized) > 40 or _looks_like_article_import_url(text):
         return ""
     for field, aliases in _ARTICLE_IMPORT_FIELD_ALIASES.items():
         for alias in aliases:
@@ -92,6 +106,19 @@ def _split_cell_hyperlink(value: Any) -> tuple[str, str]:
         return text, ""
     display, hyperlink = text.split(_CELL_HYPERLINK_MARKER, 1)
     return display.strip(), hyperlink.strip()
+
+
+def _extract_article_import_url_from_text(value: Any) -> str:
+    text, hyperlink = _split_cell_hyperlink(value)
+    if hyperlink and _looks_like_article_import_url(hyperlink):
+        return hyperlink
+    if _looks_like_article_import_url(text):
+        return text
+    for match in _ARTICLE_IMPORT_URL_RE.finditer(text):
+        candidate = match.group(0).rstrip("。.")
+        if candidate and _looks_like_article_import_url(candidate):
+            return candidate
+    return ""
 
 
 def _decode_csv_rows(data: bytes) -> list[list[str]]:
@@ -392,6 +419,11 @@ _ARTICLE_IMPORT_PLATFORM_LABEL_ALIASES: dict[str, str] = {
     "头条号": "头条号",
     "搜狐": "搜狐",
     "搜狐号": "搜狐号",
+    "腾讯": "腾讯新闻",
+    "腾讯新闻": "腾讯新闻",
+    "腾讯号": "腾讯新闻",
+    "官方腾讯号": "腾讯新闻",
+    "腾讯网新闻": "腾讯新闻",
     "知乎": "知乎",
     "博客园": "博客园",
     "公众号": "微信公众号",
@@ -420,6 +452,39 @@ def _resolve_article_import_platform_label(value: Any) -> str:
     return normalized_aliases.get(key, "")
 
 
+def _is_article_import_parenthetical_noise(value: Any) -> bool:
+    text = _stringify_table_cell(value)
+    if not text:
+        return False
+    if _resolve_article_import_platform_label(text):
+        return False
+    normalized = _normalize_import_header(text)
+    if not normalized:
+        return False
+    if normalized in {"官方", "官媒", "news", "geo", "排名", "可发", "好出稿", "出稿", "可发排名"}:
+        return True
+    return bool(
+        "geo" in normalized
+        or "可发" in normalized
+        or "排名" in normalized
+        or "好出稿" in normalized
+        or "官方" == normalized
+        or normalized.endswith("news")
+    )
+
+
+def _strip_article_import_media_qualifier(value: Any) -> str:
+    text = _stringify_table_cell(value)
+    if not text:
+        return ""
+    for _ in range(3):
+        match = re.fullmatch(r"(.+?)[（(【\[]([^（）()【】\[\]]+)[）)】\]]", text)
+        if not match or not _is_article_import_parenthetical_noise(match.group(2)):
+            break
+        text = match.group(1).strip()
+    return text
+
+
 def _split_article_import_platform_account(value: Any, *, allow_unknown_bracket_platform: bool = False) -> tuple[str, str]:
     text = _stringify_table_cell(value)
     if not text:
@@ -436,6 +501,14 @@ def _split_article_import_platform_account(value: Any, *, allow_unknown_bracket_
         platform = str(raw_platform or "").strip()
         account = str(raw_account or "").strip()
         normalized_platform = _resolve_article_import_platform_label(platform)
+        normalized_account_platform = _resolve_article_import_platform_label(account)
+        account_is_noise = _is_article_import_parenthetical_noise(account)
+        if kind == "bracket" and not normalized_platform and normalized_account_platform and platform:
+            return normalized_account_platform, platform
+        if kind == "bracket" and account_is_noise and not normalized_platform:
+            return "", ""
+        if normalized_platform and account_is_noise:
+            return normalized_platform, ""
         if not normalized_platform and kind == "bracket" and allow_unknown_bracket_platform:
             normalized_platform = platform
         if normalized_platform and account and normalized_platform != account:
@@ -509,10 +582,19 @@ def _extract_article_import_items(file_name: str, data: bytes) -> tuple[list[dic
                     skipped_without_title += 1
                     continue
                 item_url = value_for("url")
+                if item_url:
+                    item_url = _extract_article_import_url_from_text(item_url)
                 if not item_url:
                     for fallback_field in ("title", "excerpt", "media_name", "account_name"):
-                        item_url = hyperlink_for(fallback_field)
-                        if item_url:
+                        fallback_url = hyperlink_for(fallback_field)
+                        if fallback_url and _looks_like_article_import_url(fallback_url):
+                            item_url = fallback_url
+                            break
+                if not item_url:
+                    for cell in segment:
+                        fallback_url = _extract_article_import_url_from_text(cell)
+                        if fallback_url:
+                            item_url = fallback_url
                             break
 
                 item = {
