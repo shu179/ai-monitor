@@ -10,6 +10,18 @@ from core.recognition import ClipboardRecognitionManager
 
 
 class RecognitionTextMatchingTests(unittest.TestCase):
+    def setUp(self):
+        ClipboardRecognitionManager._last_opened_capture_platform = ""
+
+    def test_running_dom_text_mode_keeps_runtime_mode_when_config_changes(self):
+        config = {"recognition": {"dom_render_mode": True}}
+        manager = ClipboardRecognitionManager(lambda: config)
+        manager._runtime_dom_render_mode = True
+
+        config["recognition"]["dom_render_mode"] = False
+
+        self.assertTrue(manager._dom_render_mode_enabled())
+
     def test_global_recognition_mode_uses_active_task_brands_even_if_task_flag_is_false(self):
         config = {
             "detection_mode": "recognition",
@@ -331,7 +343,7 @@ class RecognitionTextMatchingTests(unittest.TestCase):
         self.assertEqual(state["items"][0]["platforms"], ["deepseek"])
         self.assertEqual(manager._send_queue.qsize(), 1)
 
-    def test_multi_platform_keyword_without_platform_hint_does_not_advance(self):
+    def test_dom_text_without_payload_hint_uses_recently_opened_platform(self):
         config = {
             "detection_mode": "recognition",
             "recognition": {
@@ -354,6 +366,7 @@ class RecognitionTextMatchingTests(unittest.TestCase):
             ],
         }
         manager = ClipboardRecognitionManager(lambda: config)
+        manager.set_active_capture_platform("doubao")
         tasks = manager._get_enabled_tasks()
 
         manager._route_to_batches(
@@ -368,7 +381,45 @@ class RecognitionTextMatchingTests(unittest.TestCase):
         state = manager.get_keyword_guide_state()
         self.assertEqual(state["index"], 0)
         self.assertEqual(state["items"][0]["keyword"], "成都考研集训营")
-        self.assertEqual(state["items"][0]["platforms"], ["deepseek", "doubao"])
+        self.assertEqual(state["items"][0]["platforms"], ["deepseek"])
+
+    def test_recently_opened_platform_survives_new_recognition_manager(self):
+        previous = ClipboardRecognitionManager(lambda: {})
+        previous.set_active_capture_platform("doubao")
+        config = {
+            "detection_mode": "recognition",
+            "recognition": {
+                "safe_mode_ocr_enabled": False,
+                "dom_render_mode": True,
+            },
+            "tasks": [
+                {
+                    "name": "启航考研",
+                    "task_id": "unit_qihang_recent_platform_survives",
+                    "enabled": True,
+                    "brand": "启航考研",
+                    "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                    "recognition_batch_size": 3,
+                    "keywords": [
+                        {"keyword": "成都考研集训营", "brand": "启航考研", "platforms": ["doubao", "deepseek"]},
+                    ],
+                }
+            ],
+        }
+        manager = ClipboardRecognitionManager(lambda: config)
+        tasks = manager._get_enabled_tasks()
+
+        manager._route_to_batches(
+            image_path="",
+            brands=["启航考研"],
+            summary="检测到品牌: 启航考研",
+            tasks=tasks,
+            ocr_text="未携带平台的回答文本",
+            platform_hint="",
+        )
+
+        state = manager.get_keyword_guide_state()
+        self.assertEqual(state["items"][0]["platforms"], ["deepseek"])
 
     def test_dom_text_batch_ready_prefers_same_brand_next_keyword_before_next_brand(self):
         config = {

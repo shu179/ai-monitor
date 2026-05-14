@@ -79,12 +79,17 @@ from core.time_utils import local_now, local_today
 from core.diagnostic_events import record_event_safe
 
 
+DOM_RENDER_DEFAULT_MIN_LENGTH = 500
+DOM_RENDER_DEFAULT_MAX_LENGTH = 5000
+
+
 class ClipboardRecognitionManager:
     """识别模式后台管理器。"""
 
     _instance = None
     _active_listener = None
     _active_listener_lock = threading.Lock()
+    _last_opened_capture_platform = ""
 
     def __init__(self, config_getter, on_batch_ready=None, on_send_complete=None,
                  on_mode_change=None, on_manual_switch_required=None,
@@ -118,6 +123,7 @@ class ClipboardRecognitionManager:
         self._clipboard_grab_lock = threading.Lock()
         self._clipboard_grab_inflight = False
         self._clipboard_grab_timeout_logged_at = 0.0
+        self._last_text_length_skip_hash = ""
         self._reference_clipboard_armed = True
         self._startup_reference_text_hash = None
         self._seen_reference_hashes = deque(maxlen=200)
@@ -131,6 +137,7 @@ class ClipboardRecognitionManager:
         self._guide_status_text = ""
         self._suppressed_tasks = set()
         self._active_capture_platform = ""
+        self._runtime_dom_render_mode: bool | None = None
 
         self._save_dir = resolve_app_path("screenshots/recognition")
         self._save_dir.mkdir(parents=True, exist_ok=True)
@@ -175,6 +182,7 @@ class ClipboardRecognitionManager:
             self._guide_status_text = ""
             self._suppressed_tasks = set()
             self._active_capture_platform = ""
+            self._runtime_dom_render_mode = self._config_dom_render_mode_enabled()
         self._prime_clipboard_baseline()
         self._prime_reference_clipboard_baseline()
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
@@ -192,7 +200,8 @@ class ClipboardRecognitionManager:
             self._set_guide_status("本地 OCR 自动识别中，识别成功后会自动切到下一个关键词")
         else:
             self._set_guide_status("等待新的剪切板截图…")
-        self._notify_mode_change("recognition", "识别模式已启动，仅监听启动后的新截图")
+        startup_target = "新文本" if self._dom_render_mode_enabled() else "新截图"
+        self._notify_mode_change("recognition", f"识别模式已启动，仅监听启动后的{startup_target}")
         self._notify_manual_state_change()
         task_preview = "、".join(task.get("name", "") for task in enabled_tasks[:3]) or "无任务"
         if len(enabled_tasks) > 3:
@@ -231,6 +240,7 @@ class ClipboardRecognitionManager:
             self._buffers.clear()
             self._pending_batches.clear()
             self._suppressed_tasks.clear()
+            self._runtime_dom_render_mode = None
         self._release_active_listener()
         print("[Recognition] 识别模式已停止")
 
@@ -298,6 +308,8 @@ class ClipboardRecognitionManager:
             self._reference_clipboard_armed = bool(payload.get("reference_clipboard_armed", True))
             self._startup_reference_text_hash = payload.get("startup_reference_text_hash")
             self._active_capture_platform = self._normalize_platform_id(payload.get("active_capture_platform", ""))
+            if self._active_capture_platform:
+                self.__class__._last_opened_capture_platform = self._active_capture_platform
         self._notify_manual_state_change()
 
     def _safe_mode_ocr_enabled(self) -> bool:
@@ -305,10 +317,45 @@ class ClipboardRecognitionManager:
         recognition_cfg = config.get("recognition", {})
         return bool(recognition_cfg.get("safe_mode_ocr_enabled", True))
 
-    def _dom_render_mode_enabled(self) -> bool:
+    def _config_dom_render_mode_enabled(self) -> bool:
         config = self._config_getter() or {}
         recognition_cfg = config.get("recognition", {})
         return bool(recognition_cfg.get("dom_render_mode", False))
+
+    def _dom_render_mode_enabled(self) -> bool:
+        with self._lock:
+            runtime_mode = self._runtime_dom_render_mode
+        if runtime_mode is not None:
+            return bool(runtime_mode)
+        return self._config_dom_render_mode_enabled()
+
+    def _dom_render_text_length_limits(self) -> tuple[int, int]:
+        config = self._config_getter() or {}
+        recognition_cfg = config.get("recognition", {})
+        if not isinstance(recognition_cfg, dict):
+            recognition_cfg = {}
+
+        def _coerce_length(value, default: int) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        min_length = max(
+            1,
+            _coerce_length(
+                recognition_cfg.get("dom_render_min_length"),
+                DOM_RENDER_DEFAULT_MIN_LENGTH,
+            ),
+        )
+        max_length = max(
+            min_length,
+            _coerce_length(
+                recognition_cfg.get("dom_render_max_length"),
+                DOM_RENDER_DEFAULT_MAX_LENGTH,
+            ),
+        )
+        return min_length, max_length
 
     def _auto_send_recognition_batches_enabled(self) -> bool:
         return self._safe_mode_ocr_enabled() or self._dom_render_mode_enabled()
@@ -355,10 +402,13 @@ class ClipboardRecognitionManager:
         normalized = self._normalize_platform_id(platform_name)
         with self._lock:
             self._active_capture_platform = normalized
+        if normalized:
+            self.__class__._last_opened_capture_platform = normalized
 
     def _get_active_capture_platform(self) -> str:
         with self._lock:
-            return self._normalize_platform_id(self._active_capture_platform)
+            active = self._normalize_platform_id(self._active_capture_platform)
+        return active or self._normalize_platform_id(self.__class__._last_opened_capture_platform)
 
     def _is_manual_test_task(self, task_payload: dict | None) -> bool:
         return str((task_payload or {}).get("_daily_state_source") or "").strip() == "manual_test"
@@ -1007,9 +1057,7 @@ class ClipboardRecognitionManager:
         items = self._build_keyword_guide_items(tasks)
         manual_mode = not self._auto_send_recognition_batches_enabled()
 
-        # 判断识别模式类型
-        config = self._config_getter() or {}
-        dom_render_mode = config.get("recognition", {}).get("dom_render_mode", False)
+        dom_render_mode = self._dom_render_mode_enabled()
 
         if manual_mode:
             mode_label = "手动确认模式"
@@ -1706,8 +1754,7 @@ class ClipboardRecognitionManager:
             try:
                 if self.has_recognition_tasks():
                     # 根据配置选择监听模式
-                    config = self._config_getter() or {}
-                    if config.get("recognition", {}).get("dom_render_mode", False):
+                    if self._dom_render_mode_enabled():
                         self._poll_once_text_mode()  # 文本模式
                     else:
                         self._poll_once_reference_url_mode()  # 截图模式下同步监听复制的网址引用
@@ -2067,11 +2114,21 @@ class ClipboardRecognitionManager:
             return
 
         # 文本长度过滤
-        config = self._config_getter() or {}
         text_length = len(text)
-        min_length = config.get("recognition", {}).get("dom_render_min_length", 10)
-        max_length = config.get("recognition", {}).get("dom_render_max_length", 50000)
+        min_length, max_length = self._dom_render_text_length_limits()
         if text_length < min_length or text_length > max_length:
+            text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
+            if text_hash != self._last_text_length_skip_hash:
+                self._last_text_length_skip_hash = text_hash
+                message = (
+                    f"DOM 文本长度 {text_length} 不在 "
+                    f"{min_length}-{max_length} 字符范围内，已跳过"
+                )
+                self._set_guide_status(message)
+                self._notify_manual_state_change()
+                print(
+                    f"[Recognition] {message}"
+                )
             return
 
         # 计算文本哈希用于去重
@@ -2360,9 +2417,8 @@ class ClipboardRecognitionManager:
         self._clipboard_armed = True
         self._startup_clipboard_hash = None
         try:
-            config = self._config_getter() or {}
             # 根据模式记录启动时的剪贴板状态
-            if config.get("recognition", {}).get("dom_render_mode", False):
+            if self._dom_render_mode_enabled():
                 # 文本模式：记录文本哈希
                 text = self._poll_clipboard_text()
                 if text:
@@ -3058,6 +3114,44 @@ class ClipboardRecognitionManager:
             platform_hint=platform_hint,
         )
 
+    def _default_text_mode_platform_hint(self, current_item: dict | None, task: dict | None = None) -> str:
+        item_platforms = [
+            self._normalize_platform_id(platform)
+            for platform in ((current_item or {}).get("platforms") or [])
+            if self._normalize_platform_id(platform)
+        ]
+        if item_platforms:
+            return item_platforms[0]
+        task_platforms = [
+            self._normalize_platform_id(platform)
+            for platform in ((task or {}).get("platform_candidates") or [])
+            if self._normalize_platform_id(platform)
+        ]
+        return task_platforms[0] if len(task_platforms) == 1 else ""
+
+    def _platform_hint_allowed_for_text_item(
+        self,
+        platform_hint: str,
+        current_item: dict | None,
+        task: dict | None = None,
+    ) -> bool:
+        normalized_hint = self._normalize_platform_id(platform_hint)
+        if not normalized_hint:
+            return False
+        item_platforms = [
+            self._normalize_platform_id(platform)
+            for platform in ((current_item or {}).get("platforms") or [])
+            if self._normalize_platform_id(platform)
+        ]
+        if item_platforms:
+            return normalized_hint in item_platforms
+        task_platforms = [
+            self._normalize_platform_id(platform)
+            for platform in ((task or {}).get("platform_candidates") or [])
+            if self._normalize_platform_id(platform)
+        ]
+        return not task_platforms or normalized_hint in task_platforms
+
     def _is_duplicate(self, image_hash: str) -> bool:
         with self._lock:
             if image_hash in self._seen_set:
@@ -3101,6 +3195,34 @@ class ClipboardRecognitionManager:
             task = task_map.get(task_name)
             if not task:
                 continue
+            route_platform_hint = self._normalize_platform_id(platform_hint) or self._get_active_capture_platform()
+            if (
+                not route_platform_hint
+                and not str(image_path or "").strip()
+                and str(ocr_text or "").strip()
+                and self._dom_render_mode_enabled()
+            ):
+                hint_item = current_item if str((current_item or {}).get("task_name") or "").strip() == task_name else None
+                route_platform_hint = self._default_text_mode_platform_hint(hint_item, task)
+                if route_platform_hint:
+                    print(
+                        f"[Recognition] DOM 文本未携带平台提示，按当前引导平台归类: "
+                        f"{route_platform_hint}"
+                    )
+            elif (
+                route_platform_hint
+                and not str(image_path or "").strip()
+                and str(ocr_text or "").strip()
+                and self._dom_render_mode_enabled()
+            ):
+                hint_item = current_item if str((current_item or {}).get("task_name") or "").strip() == task_name else None
+                if not self._platform_hint_allowed_for_text_item(route_platform_hint, hint_item, task):
+                    fallback_hint = self._default_text_mode_platform_hint(hint_item, task)
+                    print(
+                        f"[Recognition] 最近打开平台 {route_platform_hint} 不属于当前待补平台，"
+                        f"改按当前引导平台归类: {fallback_hint or '未指定'}"
+                    )
+                    route_platform_hint = fallback_hint
             progress = self._get_task_daily_progress(task)
             historical_count = int(progress.get("historical_screenshot_count", 0) or 0)
             progress_status_message = ""
@@ -3109,7 +3231,7 @@ class ClipboardRecognitionManager:
                 matched_brands=matched_brands,
                 current_item=current_item,
                 guide_items=guide_items,
-                platform_hint=platform_hint,
+                platform_hint=route_platform_hint,
             )
 
             with self._lock:

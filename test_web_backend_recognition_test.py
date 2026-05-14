@@ -452,6 +452,31 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
         self.assertEqual(scope, "default")
         self.assertIsNone(runtime._recognition_test_manager)
 
+    def test_finished_recognition_test_session_stays_active_until_window_close(self):
+        runtime = AppRuntime()
+        runtime._recognition_manager = FakeRecognitionManager(running=True)
+        runtime._recognition_test_manager = FakeRecognitionManager(running=False)
+        runtime._recognition_test_session = {
+            "task_id": "task-4",
+            "task_name": "测试任务",
+            "restore_running": True,
+            "previous_state": {"manual_index": 1},
+            "keep_until_closed": True,
+        }
+
+        manager, scope = runtime._get_active_recognition_manager(init_if_missing=False)
+
+        self.assertIs(manager, runtime._recognition_test_manager)
+        self.assertEqual(scope, "test")
+        self.assertIsNotNone(runtime._recognition_test_manager)
+
+        result = runtime.recognition_action({"action": "stop"})
+
+        self.assertTrue(result["ok"])
+        self.assertIsNone(runtime._recognition_test_manager)
+        self.assertTrue(runtime._recognition_manager.started)
+        self.assertEqual(runtime._recognition_manager.imported_state, {"manual_index": 1})
+
     def test_recognition_action_can_open_platform_from_current_keyword(self):
         runtime = AppRuntime()
         runtime._recognition_manager = FakeRecognitionManager(running=True)

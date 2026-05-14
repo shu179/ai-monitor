@@ -38,6 +38,7 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         os.environ["AIBRANDMONITOR_DATA_DIR"] = self._tmpdir.name
         dts.STATE_PATH = Path(self._tmpdir.name) / "daily_task_status.json"
         ClipboardRecognitionManager._active_listener = None
+        ClipboardRecognitionManager._last_opened_capture_platform = ""
         WeComNotifier._shared_last_post = {}
         WeComNotifier._shared_post_locks = {}
         clear_retry_queue()
@@ -48,6 +49,7 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         clear_retry_queue()
         dts.STATE_PATH = self._original_state_path
         ClipboardRecognitionManager._active_listener = None
+        ClipboardRecognitionManager._last_opened_capture_platform = ""
         if self._original_data_dir is None:
             os.environ.pop("AIBRANDMONITOR_DATA_DIR", None)
         else:
@@ -967,6 +969,26 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertTrue(payload["skip_ai_recognition"])
         self.assertEqual(payload["platform_hint"], "doubao")
 
+    def test_dom_text_mode_skips_short_text_when_length_config_missing(self) -> None:
+        config = {
+            "detection_mode": "recognition",
+            "recognition": {
+                "dom_render_mode": True,
+            },
+        }
+        manager = ClipboardRecognitionManager(config_getter=lambda: config)
+        manager._clipboard_armed = True
+        manager.set_active_capture_platform("doubao")
+
+        with patch.object(manager, "_poll_clipboard_text", return_value="品牌R短文本"):
+            with patch.object(manager, "_match_brands_from_text", return_value=["品牌R"]) as match_mock:
+                manager._poll_once_text_mode()
+
+        self.assertEqual(manager._dom_render_text_length_limits(), (500, 5000))
+        self.assertEqual(manager._recognition_queue.qsize(), 0)
+        self.assertIn("500-5000", manager._guide_status_text)
+        match_mock.assert_not_called()
+
     def test_dom_text_send_rerenders_template_without_intermediate_image(self) -> None:
         batch = {
             "task_name": "品牌R",
@@ -1062,6 +1084,87 @@ class RecognitionDailyPoolTests(unittest.TestCase):
             )
 
         self.assertEqual(result, str(send_path))
+
+    def test_dom_text_no_platform_hint_sends_after_all_pending_platforms_complete(self) -> None:
+        task = {
+            "name": "品牌R",
+            "task_id": "task_r_dom_no_hint",
+            "brand": "品牌R",
+            "enabled": True,
+            "weekdays": [0, 1, 2, 3, 4, 5, 6],
+            "webhook_url": "https://example.com/webhook",
+            "recognition_batch_size": 1,
+            "keywords": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao", "deepseek"], "mode": "recognition"},
+            ],
+        }
+        config = {
+            "detection_mode": "recognition",
+            "recognition": {"dom_render_mode": True},
+            "tasks": [task],
+        }
+        manager = ClipboardRecognitionManager(config_getter=lambda: config)
+        manager.set_active_capture_platform("deepseek")
+
+        render_count = 0
+
+        def _fake_render_text_to_screenshot(text, platform, keyword="", brand="", output_path=None, include_badges=True):
+            nonlocal render_count
+            render_count += 1
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_bytes(f"rendered-{platform}".encode("utf-8"))
+            return str(output_path)
+
+        notifier_calls: list[tuple] = []
+
+        class FakeNotifier:
+            def __init__(self, *args, **kwargs):
+                self.last_error = ""
+
+            def send_detected_images(self, *args, **kwargs):
+                notifier_calls.append((args, kwargs))
+                return True
+
+        with patch("core.recognition.WeComNotifier", FakeNotifier):
+            with patch("platforms.html_renderer.render_text_to_screenshot", side_effect=_fake_render_text_to_screenshot):
+                tasks = manager._get_enabled_tasks()
+                manager._route_to_batches(
+                    image_path="",
+                    brands=["品牌R"],
+                    summary="检测到品牌: 品牌R",
+                    tasks=tasks,
+                    ocr_text="DeepSeek 回答提到品牌R",
+                    platform_hint="",
+                )
+                first_batch = manager._send_queue.get_nowait()
+                manager._send_batch(first_batch)
+
+                self.assertEqual(notifier_calls, [])
+                first_status = dts.get_task_day_status({"task_id": task["task_id"], "name": task["name"], **task})
+                self.assertTrue(first_status.get("has_gap"))
+                platform_states = dict(first_status["keyword_states"]["词R"].get("platform_states") or {})
+                self.assertTrue(platform_states["deepseek"]["screenshot_saved"])
+                self.assertFalse(dict(platform_states.get("doubao") or {}).get("screenshot_saved", False))
+
+                tasks = manager._get_enabled_tasks()
+                manager._route_to_batches(
+                    image_path="",
+                    brands=["品牌R"],
+                    summary="检测到品牌: 品牌R",
+                    tasks=tasks,
+                    ocr_text="豆包回答提到品牌R",
+                    platform_hint="",
+                )
+                second_batch = manager._send_queue.get_nowait()
+                manager._send_batch(second_batch)
+
+        self.assertEqual(render_count, 2)
+        self.assertEqual(len(notifier_calls), 1)
+        sent_paths = notifier_calls[0][1]["screenshot_paths"]
+        self.assertEqual(len(sent_paths), 2)
+        final_status = dts.get_task_day_status({"task_id": task["task_id"], "name": task["name"], **task})
+        self.assertFalse(final_status.get("has_gap"))
+        self.assertEqual(final_status.get("completed_keywords"), ["词R"])
 
     def test_manual_test_progress_ignores_official_history_for_batch_threshold(self) -> None:
         screenshots_dir = Path(self._tmpdir.name) / "screenshots"

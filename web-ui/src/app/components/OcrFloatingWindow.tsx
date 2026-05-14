@@ -441,7 +441,7 @@ export function OcrFloatingWindow({
       const isRunning = Boolean(status.running);
 
       if (!isRunning && hasLoadedOnceRef.current && !resident) {
-        await dismissFloatingWindow();
+        await dismissFloatingWindow({ stop: stopOnClose });
         return;
       }
 
@@ -575,7 +575,7 @@ export function OcrFloatingWindow({
     })();
     statusRequestRef.current = request;
     return request;
-  }, [applyViewState, dismissFloatingWindow, resident]);
+  }, [applyViewState, dismissFloatingWindow, resident, stopOnClose]);
 
   useEffect(() => {
     if (!resident) {

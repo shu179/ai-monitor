@@ -6501,6 +6501,9 @@ return changedCount
             running = False
         if running:
             return
+        session = self._recognition_test_session if isinstance(self._recognition_test_session, dict) else {}
+        if bool(session.get("keep_until_closed")):
+            return
         self._stop_recognition_test_session(restore_previous=restore_previous)
 
     def _on_recognition_test_send_complete(self, batch: dict, ok: bool, reason: str) -> None:
@@ -6711,6 +6714,7 @@ return changedCount
             "task_name": str(test_task.get("name") or "").strip(),
             "restore_running": restore_running,
             "previous_state": previous_state,
+            "keep_until_closed": True,
         }
         recognition_cfg = dict((runtime_config or {}).get("recognition") or {})
         dom_render_mode = bool(recognition_cfg.get("dom_render_mode", False))
