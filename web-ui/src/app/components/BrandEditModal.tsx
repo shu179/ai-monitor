@@ -22,6 +22,44 @@ const DEFAULT_PLATFORMS: PlatformState[] = [
   { name: "Gemini", active: false, deep: false },
 ];
 
+const INDUSTRY_OPTIONS = [
+  "科技互联网",
+  "人工智能与软件服务",
+  "电子信息与通信",
+  "教育培训",
+  "医疗健康",
+  "医药生物",
+  "农林牧渔",
+  "食品饮料",
+  "餐饮服务",
+  "旅游文旅与酒店",
+  "金融保险",
+  "房地产与建筑工程",
+  "工业制造",
+  "汽车与交通出行",
+  "能源电力",
+  "环保与新能源",
+  "化工与新材料",
+  "消费零售",
+  "电商与本地生活",
+  "服饰鞋包",
+  "美妆个护",
+  "母婴宠物",
+  "家居家电",
+  "文化传媒",
+  "广告营销",
+  "娱乐体育",
+  "游戏动漫",
+  "物流供应链",
+  "企业服务",
+  "法律财税与咨询",
+  "人力资源",
+  "政府公共服务",
+  "公益社会组织",
+  "安全安防",
+  "其他行业",
+];
+
 type Keyword = {
   id: string;
   text: string;
@@ -296,7 +334,9 @@ export function BrandEditModal({
   const [isImportingKeywords, setIsImportingKeywords] = useState(false);
   const [keywordImportNotice, setKeywordImportNotice] = useState<ImportNotice | null>(null);
   const keywordFileInputRef = useRef<HTMLInputElement | null>(null);
+  const industryDropdownRef = useRef<HTMLDivElement | null>(null);
   const cloudOperatorDropdownRef = useRef<HTMLDivElement | null>(null);
+  const [industryDropdownOpen, setIndustryDropdownOpen] = useState(false);
   const [cloudOperatorDropdownOpen, setCloudOperatorDropdownOpen] = useState(false);
 
   const clonePlatformStates = (items: PlatformState[]) => items.map((item) => ({ ...item }));
@@ -598,6 +638,19 @@ export function BrandEditModal({
   };
 
   useEffect(() => {
+    if (!industryDropdownOpen) {
+      return;
+    }
+    function handlePointerDown(event: MouseEvent) {
+      if (industryDropdownRef.current && !industryDropdownRef.current.contains(event.target as Node)) {
+        setIndustryDropdownOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [industryDropdownOpen]);
+
+  useEffect(() => {
     if (!cloudOperatorDropdownOpen) {
       return;
     }
@@ -766,6 +819,7 @@ export function BrandEditModal({
 
   const inputClass = "w-full border-0 border-b border-gray-200 bg-transparent px-0 py-2.5 text-[12px] text-gray-900 font-medium outline-none transition-colors placeholder:text-gray-400 focus:border-[var(--brand-navy)]";
   const alignedInputClass = `${inputClass} h-10 py-0 leading-10`;
+  const selectorButtonClass = "flex h-10 w-full items-center justify-between gap-3 border-b border-gray-200 bg-transparent px-0 text-left text-[12px] font-medium text-gray-900 outline-none transition-colors hover:border-gray-300 focus:border-[var(--brand-navy)]";
   const operatorButtonClass = "flex h-10 w-full items-center justify-between gap-3 border-b border-gray-200 bg-transparent px-0 text-left text-[12px] font-medium text-gray-900 outline-none transition-colors hover:border-gray-300 focus:border-[var(--brand-navy)]";
   const subtleInputClass = "w-full border-0 border-b border-gray-200 bg-transparent px-0 py-2.5 text-[12px] text-gray-900 font-medium outline-none transition-colors placeholder:text-gray-400 focus:border-[var(--brand-navy)]";
   const helperTextClass = "text-[11px] text-gray-400 leading-5";
@@ -952,13 +1006,40 @@ export function BrandEditModal({
                   <label className="text-[11px] font-bold text-gray-500 tracking-widest uppercase">
                     所属行业
                   </label>
-                  <input 
-                    type="text" 
-                    value={industry}
-                    onChange={e => setIndustry(e.target.value)}
-                    placeholder="例如：科技互联网"
-                    className={inputClass}
-                  />
+                  <div ref={industryDropdownRef} className="relative">
+                    <button
+                      type="button"
+                      aria-expanded={industryDropdownOpen}
+                      onClick={() => setIndustryDropdownOpen((open) => !open)}
+                      className={selectorButtonClass}
+                    >
+                      <span className={`min-w-0 truncate ${industry ? "text-gray-900" : "text-gray-400"}`}>
+                        {industry || "请选择所属行业"}
+                      </span>
+                      <ChevronDown className={`h-4 w-4 shrink-0 text-gray-500 transition-transform ${industryDropdownOpen ? "rotate-180" : ""}`} strokeWidth={2.4} />
+                    </button>
+                    {industryDropdownOpen && (
+                      <div className="absolute left-0 right-0 top-[calc(100%+6px)] z-50 max-h-64 overflow-y-auto rounded-lg border border-gray-200 bg-white py-1 shadow-[0_16px_36px_-24px_rgba(15,23,42,0.35)]">
+                        {INDUSTRY_OPTIONS.map((option) => {
+                          const selected = industry === option;
+                          return (
+                            <button
+                              key={option}
+                              type="button"
+                              onClick={() => {
+                                setIndustry(option);
+                                setIndustryDropdownOpen(false);
+                              }}
+                              className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-[12px] font-bold transition-colors hover:bg-gray-50 ${selected ? "text-[var(--brand-navy)]" : "text-gray-700"}`}
+                            >
+                              <span className="min-w-0 truncate">{option}</span>
+                              {selected && <Check className="h-3.5 w-3.5 shrink-0" strokeWidth={2.8} />}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
                 </div>
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[11px] font-bold text-gray-500 tracking-widest uppercase">
