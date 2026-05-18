@@ -971,6 +971,149 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertTrue(any(path.endswith("_doubao.jpg") for path in sent_paths))
         self.assertEqual(notifier_calls[0][1]["detected_platforms"], ["deepseek", "doubao"])
 
+    def test_manual_test_gap_reports_positive_capture_progress(self) -> None:
+        """单平台先落库进入缺口等待时，必须给出“已捕获 X/Y”的正向反馈，
+        而不是“未运行/仍有关键词缺口”，否则用户会以为粘贴没成功而反复重粘。"""
+        deepseek_path = (
+            Path(self._tmpdir.name)
+            / "screenshots"
+            / "recognition"
+            / "decorated"
+            / "deepseek_dom.jpg"
+        )
+        deepseek_path.parent.mkdir(parents=True, exist_ok=True)
+        deepseek_path.write_bytes(b"deepseek-image")
+
+        task = {
+            "name": "品牌R",
+            "task_id": "task_r_manual_gap_feedback",
+            "brand": "品牌R",
+            "webhook_url": "https://example.com/webhook",
+            "recognition_batch_size": 2,
+            "_daily_state_source": "manual_test",
+            "keywords": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["deepseek", "doubao"], "mode": "recognition"},
+            ],
+        }
+        batch = {
+            "id": "manual-gap-feedback",
+            "task_name": "品牌R",
+            "brands": ["品牌R"],
+            "image_paths": [str(deepseek_path)],
+            "image_items": [{"path": str(deepseek_path), "ocr_text": "示例", "source_text": "示例"}],
+            "matched_pairs": [{"keyword": "词R", "brand": "品牌R", "platforms": ["deepseek"]}],
+            "task": task,
+        }
+
+        notifier_calls: list = []
+
+        class FakeNotifier:
+            def __init__(self, *args, **kwargs):
+                self.last_error = ""
+
+            def send_detected_images(self, *args, **kwargs):
+                notifier_calls.append((args, kwargs))
+                return True
+
+        with patch("core.recognition.WeComNotifier", FakeNotifier):
+            with patch.object(
+                self.manager,
+                "_prepare_send_images",
+                return_value=([str(deepseek_path)], ["deepseek"]),
+            ):
+                self.manager._send_batch(batch)
+
+        status = dts.get_task_day_status({"task_id": task["task_id"], "name": task["name"]})
+        self.assertTrue(status.get("has_gap"))
+        # 缺口时不应发送
+        self.assertEqual(notifier_calls, [])
+        guide_text = self.manager._guide_status_text
+        self.assertIn("已捕获 1/2", guide_text)
+        self.assertIn("待补", guide_text)
+        self.assertNotIn("未运行", guide_text)
+        self.assertNotIn("仍有关键词缺口待补齐", guide_text)
+
+    def test_duplicate_text_repaste_surfaces_already_captured_hint(self) -> None:
+        """DOM 文本模式下重复粘贴同一段回答时，应提示“已捕获，无需重复粘贴”，
+        而不是静默丢弃让用户以为没成功。"""
+        config = {
+            "detection_mode": "recognition",
+            "recognition": {"safe_mode_ocr_enabled": False, "dom_render_mode": True},
+            "tasks": [
+                {
+                    "name": "品牌R",
+                    "task_id": "task_r_dup_hint",
+                    "enabled": True,
+                    "brand": "品牌R",
+                    "_daily_state_source": "manual_test",
+                    "recognition_batch_size": 2,
+                    "keywords": [
+                        {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao", "deepseek"]},
+                    ],
+                }
+            ],
+        }
+        manager = ClipboardRecognitionManager(lambda: config)
+        manager._clipboard_armed = True
+        manager._startup_clipboard_hash = None
+        sample_text = "这是一段包含品牌R的较长回答文本。" * 8
+
+        with patch.object(manager, "_dom_render_text_length_limits", return_value=(1, 100000)):
+            with patch.object(manager, "_poll_clipboard_text", return_value=sample_text):
+                manager._poll_once_text_mode()
+                manager._set_guide_status("")
+                manager._poll_once_text_mode()
+
+        guide_text = manager._guide_status_text
+        self.assertIn("已捕获", guide_text)
+        self.assertIn("无需重复粘贴", guide_text)
+
+    def test_manual_test_buffer_flushes_within_short_window(self) -> None:
+        """手动测试任务不能再干等默认 30~120s 的批次超时，
+        短窗口（默认 4s）内即应 flush 落库以尽快反馈。"""
+        config = {
+            "detection_mode": "recognition",
+            "recognition": {"safe_mode_ocr_enabled": False, "dom_render_mode": True},
+            "tasks": [
+                {
+                    "name": "品牌R",
+                    "task_id": "task_r_fast_flush",
+                    "enabled": True,
+                    "brand": "品牌R",
+                    "_daily_state_source": "manual_test",
+                    "recognition_batch_size": 2,
+                    "keywords": [
+                        {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao", "deepseek"]},
+                    ],
+                }
+            ],
+        }
+        manager = ClipboardRecognitionManager(lambda: config)
+        self.assertGreaterEqual(manager._batch_flush_seconds(), 30)
+        self.assertLessEqual(manager._manual_test_flush_seconds(), 5)
+        self.assertLess(manager._manual_test_flush_seconds(), manager._batch_flush_seconds())
+
+        tasks = manager._get_enabled_tasks()
+        manager.set_active_capture_platform("doubao")
+        manager._route_to_batches(
+            image_path="",
+            brands=["品牌R"],
+            summary="检测到品牌: 品牌R",
+            tasks=tasks,
+            ocr_text="豆包回答文本",
+            platform_hint=manager._get_active_capture_platform(),
+        )
+        # 单平台粘贴后处于 buffer 中、尚未发送
+        self.assertTrue(any(manager._buffers.values()))
+        self.assertTrue(manager._send_queue.empty())
+
+        manager._work_started = True
+        # 模拟距上次捕获已过 10s：默认窗口(>=30s)不会 flush，短窗口(4s)应 flush
+        manager._last_image_seen_monotonic = time.monotonic() - 10
+        manager._check_flush_timeout()
+
+        self.assertFalse(manager._send_queue.empty())
+
     def test_dom_text_send_rerenders_template_with_matched_keyword(self) -> None:
         send_path = Path(self._tmpdir.name) / "screenshots" / "dom_text.jpg"
         send_path.parent.mkdir(parents=True, exist_ok=True)

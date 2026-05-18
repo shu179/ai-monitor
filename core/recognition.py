@@ -1,5 +1,5 @@
 """
-识别模式：低频剪切板截图监听 + AI 品牌识别 + 按任务组批次归类
+识别模式：低频剪切板截图监听 + 本地 OCR 品牌识别 + 按任务组批次归类
 """
 
 import copy
@@ -19,7 +19,6 @@ from typing import List, Optional
 
 from PIL import Image, ImageGrab
 
-from core.ai_runtime import detect_brands_from_image
 from core.app_paths import resolve_app_path
 from core.daily_task_state import (
     apply_task_keyword_updates,
@@ -35,7 +34,6 @@ from core.local_ocr import (
     build_match_summary,
     dump_provider_status,
     extract_text_from_image,
-    is_ai_fallback_enabled,
     match_candidate_brands,
 )
 from core.notifier import WeComNotifier
@@ -2141,8 +2139,20 @@ class ClipboardRecognitionManager:
             self._clipboard_armed = True
             self._startup_clipboard_hash = None
 
-        # 去重检查
+        # 去重检查：同一段文本重复粘贴时给出明确反馈，
+        # 避免用户因为看不到进度而以为“粘贴没成功”从而反复重粘。
         if self._is_duplicate(text_hash):
+            duplicate_brands = self._match_brands_from_text(text)
+            if duplicate_brands:
+                self._set_guide_status(
+                    f"该回答（{', '.join(duplicate_brands)}）已捕获，无需重复粘贴；"
+                    "如还有其他平台，请复制对应平台的回答后再粘贴"
+                )
+                self._notify_manual_state_change()
+                print(
+                    f"[Recognition] 文本重复，{duplicate_brands} 已捕获，"
+                    "提示用户无需重复粘贴"
+                )
             return
 
         active_tasks = self._get_enabled_tasks()
@@ -2213,7 +2223,7 @@ class ClipboardRecognitionManager:
     def _recognize_one(self, item: dict):
         image_path = item.get("path", "")
         source_text = item.get("source_text")  # DOM文本模式下的原始文本
-        skip_ai = item.get("skip_ai_recognition", False)  # 是否跳过AI识别
+        skip_ai = item.get("skip_ai_recognition", False)  # 是否直接复用文本匹配结果
         matched_brands = item.get("matched_brands", [])  # 已匹配的品牌
         platform_hint = self._normalize_platform_id(item.get("platform_hint", "")) or self._get_active_capture_platform()
 
@@ -2250,18 +2260,11 @@ class ClipboardRecognitionManager:
             return
         config = self._config_getter() or {}
         current_item = self._get_current_guide_item(tasks)
-        focus_task = None
         focus_candidates = []
-        hint_text = ""
         if current_item:
             focus_task = next((task for task in tasks if task.get("name") == current_item.get("task_name")), None)
             if focus_task:
                 focus_candidates = self._get_current_item_candidates(current_item, focus_task)
-                hint_text = (
-                    f"当前任务组: {focus_task.get('name', '')}\n"
-                    f"当前关键词: {current_item.get('keyword', '')}\n"
-                    f"优先品牌: {', '.join(current_item.get('brands', []))}"
-                )
 
         candidate_brands = focus_candidates or self._collect_global_candidates(tasks)
         if not candidate_brands:
@@ -2283,44 +2286,20 @@ class ClipboardRecognitionManager:
             self._route_to_batches(image_path, brands, summary, tasks, platform_hint=platform_hint)
             return
 
-        if focus_candidates and focus_task and is_ai_fallback_enabled(config):
+        if ocr_text:
+            provider = ocr_meta.get("provider", "") or "local"
+            variant = ocr_meta.get("variant", "") or "base"
+            self._set_guide_status("本地 OCR 未识别到目标品牌，继续等待截图")
             print(
-                f"[Recognition] 当前任务组 {focus_task.get('name', '')} 本地OCR未命中，"
-                "进入 AI fallback 复核"
+                f"[Recognition] 本地OCR未命中目标品牌; provider={provider}; "
+                f"variant={variant}; text_len={len(ocr_text)}"
             )
-            brands, summary = detect_brands_from_image(
-                config,
-                image_path,
-                focus_candidates,
-                hint_text=hint_text,
-            )
-
-        if not brands and is_ai_fallback_enabled(config):
-            global_candidates = self._collect_global_candidates(tasks)
-            if global_candidates and global_candidates != candidate_brands:
-                print("[Recognition] 本地OCR与任务内 fallback 均未命中，扩大到全局候选复核")
-                brands, summary = detect_brands_from_image(config, image_path, global_candidates)
-
-        if not brands:
-            if ocr_text:
-                provider = ocr_meta.get("provider", "") or "local"
-                variant = ocr_meta.get("variant", "") or "base"
-                self._set_guide_status("本地 OCR 未识别到目标品牌，继续等待截图")
-                print(
-                    f"[Recognition] 本地OCR未命中目标品牌; provider={provider}; "
-                    f"variant={variant}; text_len={len(ocr_text)}"
-                )
-            else:
-                self._set_guide_status("未检测到可用本地 OCR 结果，继续等待截图")
-                print("[Recognition] 本地OCR未产出有效文本，继续等待截图")
-            self._notify_manual_state_change()
-            print("[Recognition] 剪切板截图未识别到目标品牌")
-            return
-
-        self._set_guide_status(f"截图识别成功：{', '.join(brands)}")
+        else:
+            self._set_guide_status("未检测到可用本地 OCR 结果，继续等待截图")
+            print("[Recognition] 本地OCR未产出有效文本，继续等待截图")
         self._notify_manual_state_change()
-        print(f"[Recognition] 识别到品牌: {', '.join(brands)}; 总结: {summary or '无'}")
-        self._route_to_batches(image_path, brands, summary, tasks, ocr_text=ocr_text, platform_hint=platform_hint)
+        print("[Recognition] 剪切板截图未识别到目标品牌")
+        return
 
     def _route_manual_capture(self, image_path: str, tasks: list[dict], platform_hint: str = ""):
         items = self._build_keyword_guide_items(tasks)
@@ -2992,6 +2971,23 @@ class ClipboardRecognitionManager:
         recognition_cfg = config.get("recognition", {})
         return max(30, float(recognition_cfg.get("batch_flush_seconds", 120) or 120))
 
+    def _manual_test_flush_seconds(self):
+        """手动品牌测试的批次 flush 窗口。
+
+        测试场景下用户在前台主动粘贴并等待结果，单平台粘贴若仍要干等
+        默认 30~120s 的批次超时，会让人误以为“粘贴没成功/未出现”。
+        因此测试任务用一个很短的窗口，尽快落库并给出反馈（缺口仍由
+        共享池逻辑兜底，不会提前误发）。
+        """
+        config = self._config_getter() or {}
+        recognition_cfg = config.get("recognition", {})
+        if not isinstance(recognition_cfg, dict):
+            recognition_cfg = {}
+        return max(
+            2.0,
+            float(recognition_cfg.get("manual_test_batch_flush_seconds", 4) or 4),
+        )
+
     def _check_flush_timeout(self):
         """若 buffer 中有未满批次且超过 flush 超时，自动发送。"""
         if not self._work_started:
@@ -2999,7 +2995,9 @@ class ClipboardRecognitionManager:
         elapsed = self._last_image_elapsed_seconds()
         if elapsed is None:
             return
-        if elapsed < self._batch_flush_seconds():
+        default_flush_seconds = self._batch_flush_seconds()
+        manual_test_flush_seconds = self._manual_test_flush_seconds()
+        if elapsed < min(default_flush_seconds, manual_test_flush_seconds):
             return
         tasks = self._get_enabled_tasks()
         task_map = {t["name"]: t for t in tasks}
@@ -3008,6 +3006,13 @@ class ClipboardRecognitionManager:
         for task_name, items in to_flush:
             task = task_map.get(task_name)
             if not task:
+                continue
+            task_flush_seconds = (
+                manual_test_flush_seconds
+                if self._is_manual_test_task(task)
+                else default_flush_seconds
+            )
+            if elapsed < task_flush_seconds:
                 continue
             with self._lock:
                 bucket = self._buffers.get(task_name, [])
@@ -3794,14 +3799,56 @@ class ClipboardRecognitionManager:
 
         if bool(updated_status.get("has_gap")):
             gap_text = "、".join(str(item).strip() for item in (updated_status.get("gap_reasons") or []) if str(item).strip())
-            status_message = (
-                f"识别模式已写入共享池，但仍有关键词缺口待补齐"
-                + (f"：{gap_text}" if gap_text else "")
-            )
+            gap_current_count = 0
+            if daily_state_source == "manual_test":
+                # 手动测试时，单平台先落库会进入缺口等待。这里必须给出
+                # “已捕获 X/Y + 已捕获哪些平台”的正向反馈，否则用户只看到
+                # “未运行/未出现”，会误以为粘贴没成功而反复重粘。
+                captured_paths, captured_platforms = self._extract_completed_send_state_from_pool(
+                    applied_pool or get_task_day_status(task).get("pool") or {}
+                )
+                gap_current_count = len(captured_paths)
+                batch_size = max(1, int(task.get("recognition_batch_size") or 1))
+                captured_norm = {
+                    self._normalize_platform_id(platform)
+                    for platform in captured_platforms
+                    if str(platform or "").strip()
+                }
+                pool_for_state = applied_pool or get_task_day_status(task).get("pool") or {}
+                pending_platforms: list[str] = []
+                for keyword_state in (pool_for_state.get("keywords") or {}).values():
+                    for platform in (keyword_state or {}).get("required_platforms") or []:
+                        normalized_platform = self._normalize_platform_id(platform)
+                        if (
+                            normalized_platform
+                            and normalized_platform not in captured_norm
+                            and normalized_platform not in pending_platforms
+                        ):
+                            pending_platforms.append(normalized_platform)
+                captured_label = "、".join(
+                    self._display_platform_name(platform)
+                    for platform in captured_platforms
+                    if str(platform or "").strip()
+                )
+                pending_label = "、".join(
+                    self._display_platform_name(platform)
+                    for platform in pending_platforms
+                )
+                status_message = (
+                    f"已捕获 {gap_current_count}/{batch_size}"
+                    + (f"（{captured_label}✓）" if captured_label else "")
+                    + "，请继续复制其余平台的回答后粘贴"
+                    + (f"；待补：{pending_label}" if pending_label else "")
+                )
+            else:
+                status_message = (
+                    f"识别模式已写入共享池，但仍有关键词缺口待补齐"
+                    + (f"：{gap_text}" if gap_text else "")
+                )
             self._set_guide_status(status_message)
             self._persist_task_progress_status(
                 task,
-                current_count=0,
+                current_count=gap_current_count,
                 batch_size=int(task.get("recognition_batch_size") or 1),
                 historical_count=int(updated_progress.get("historical_screenshot_count", 0) or 0),
                 status_message=status_message,
