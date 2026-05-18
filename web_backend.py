@@ -3145,6 +3145,29 @@ class AppRuntime:
             return False
         return left.scheme == right.scheme and left.netloc == right.netloc
 
+    def _recognition_tab_matches_platform_url(self, platform_name: str, tab_url: str, target_url: str) -> bool:
+        if self._same_browser_origin(tab_url, target_url):
+            return True
+
+        platform_cls = get_browser_platform_class(platform_name)
+        if platform_cls is None:
+            return False
+
+        candidate_urls = [
+            str(target_url or "").strip(),
+            str(getattr(platform_cls, "target_url", "") or "").strip(),
+            *[
+                str(value or "").strip()
+                for value in (getattr(platform_cls, "target_url_aliases", None) or [])
+            ],
+        ]
+        normalized_candidates: list[str] = []
+        for value in candidate_urls:
+            if value and value not in normalized_candidates:
+                normalized_candidates.append(value)
+
+        return any(self._same_browser_origin(tab_url, candidate) for candidate in normalized_candidates)
+
     def _recognition_browser_json(self, path: str, *, timeout: float = 1.0) -> Any | None:
         port = int(self._recognition_browser_debug_port or 0)
         if port <= 0:
@@ -3399,7 +3422,7 @@ class AppRuntime:
                 continue
             tab_id = str(tab.get("id") or "").strip()
             tab_url = str(tab.get("url") or "").strip()
-            if not tab_id or not self._same_browser_origin(tab_url, target_url):
+            if not tab_id or not self._recognition_tab_matches_platform_url(normalized, tab_url, target_url):
                 continue
             self._recognition_browser_tabs[normalized] = tab_id
             self._activate_recognition_tab_by_id(tab_id)

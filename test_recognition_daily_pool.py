@@ -897,6 +897,80 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertNotEqual(sent_paths[0], str(current_path))
         self.assertTrue(Path(sent_paths[0]).exists())
 
+    def test_manual_test_send_collects_all_completed_platform_images_for_touched_keyword(self) -> None:
+        first_path = Path(self._tmpdir.name) / "screenshots" / "recognition" / "decorated" / "deepseek_dom.jpg"
+        second_path = Path(self._tmpdir.name) / "screenshots" / "recognition" / "decorated" / "doubao_dom.jpg"
+        first_path.parent.mkdir(parents=True, exist_ok=True)
+        first_path.write_bytes(b"deepseek-image")
+        second_path.write_bytes(b"doubao-image")
+
+        task = {
+            "name": "品牌R",
+            "task_id": "task_r_manual_multi_platform_send",
+            "brand": "品牌R",
+            "webhook_url": "https://example.com/webhook",
+            "recognition_batch_size": 2,
+            "_daily_state_source": "manual_test",
+            "keywords": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["deepseek", "doubao"], "mode": "recognition"},
+            ],
+        }
+        dts.apply_task_keyword_updates(
+            task,
+            [
+                {
+                    "keyword": "词R",
+                    "brand": "品牌R",
+                    "run_success": True,
+                    "screenshot_saved": True,
+                    "failure_reason": "",
+                    "platform": "deepseek",
+                    "image_path": str(first_path),
+                }
+            ],
+            source_mode="test",
+        )
+        first_status = dts.get_task_day_status({"task_id": task["task_id"], "name": task["name"]})
+        self.assertTrue(first_status.get("has_gap"))
+
+        batch = {
+            "id": "manual-batch-multi-platform",
+            "task_name": "品牌R",
+            "brands": ["品牌R"],
+            "image_paths": [str(second_path)],
+            "image_items": [{"path": str(second_path), "ocr_text": "豆包示例", "source_text": "豆包示例"}],
+            "matched_pairs": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao"]},
+            ],
+            "task": task,
+        }
+
+        notifier_calls: list[tuple] = []
+
+        class FakeNotifier:
+            def __init__(self, *args, **kwargs):
+                self.last_error = ""
+
+            def send_detected_images(self, *args, **kwargs):
+                notifier_calls.append((args, kwargs))
+                return True
+
+        with patch("core.recognition.WeComNotifier", FakeNotifier):
+            with patch.object(
+                self.manager,
+                "_prepare_send_images",
+                return_value=([str(second_path)], ["doubao"]),
+            ):
+                self.manager._send_batch(batch)
+
+        self.assertEqual(len(notifier_calls), 1)
+        sent_paths = notifier_calls[0][1]["screenshot_paths"]
+        self.assertEqual(len(sent_paths), 2)
+        self.assertTrue(all(Path(path).exists() for path in sent_paths))
+        self.assertTrue(any(path.endswith("_deepseek.jpg") for path in sent_paths))
+        self.assertTrue(any(path.endswith("_doubao.jpg") for path in sent_paths))
+        self.assertEqual(notifier_calls[0][1]["detected_platforms"], ["deepseek", "doubao"])
+
     def test_dom_text_send_rerenders_template_with_matched_keyword(self) -> None:
         send_path = Path(self._tmpdir.name) / "screenshots" / "dom_text.jpg"
         send_path.parent.mkdir(parents=True, exist_ok=True)

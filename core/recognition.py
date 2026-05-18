@@ -2812,34 +2812,59 @@ class ClipboardRecognitionManager:
         keyword_updates: list[dict],
         applied_pool: dict,
     ) -> tuple[list[str], list[str]]:
-        """Resolve paths moved by the daily-state canonicalization for this send only."""
+        """Resolve canonicalized paths for the keywords touched by the current send.
+
+        For multi-platform keywords in manual-test mode, an earlier platform can
+        already be stored in the pool while the current platform is being moved
+        into its canonical path. In that case we need to send every completed
+        platform image for the touched keywords, not only the platform updated
+        in this round.
+        """
         pool_keywords = dict((applied_pool or {}).get("keywords") or {})
         image_paths: list[str] = []
         platforms: list[str] = []
         seen_paths: set[str] = set()
+        seen_keywords: set[str] = set()
+
+        def collect_state(state_payload: dict, platform_hint: str = "") -> bool:
+            state = dict(state_payload or {})
+            if not bool(state.get("run_success")) or not bool(state.get("screenshot_saved")):
+                return False
+
+            collected = False
+            path = str(state.get("image_path") or "").strip()
+            if path and path not in seen_paths and Path(path).exists():
+                seen_paths.add(path)
+                image_paths.append(path)
+                collected = True
+
+            platform_text = self._normalize_platform_id(platform_hint or state.get("platform", ""))
+            if platform_text and platform_text not in platforms:
+                platforms.append(platform_text)
+            return collected
 
         for update in keyword_updates or []:
             keyword = str((update or {}).get("keyword") or "").strip()
-            if not keyword:
+            if not keyword or keyword in seen_keywords:
                 continue
-            update_platform = self._normalize_platform_id((update or {}).get("platform", ""))
+            seen_keywords.add(keyword)
             state = pool_keywords.get(keyword)
             if not isinstance(state, dict):
                 continue
 
-            candidate_state = state
             platform_states = state.get("platform_states") if isinstance(state.get("platform_states"), dict) else {}
+            if platform_states:
+                collected_any = False
+                for platform_name, platform_state in platform_states.items():
+                    collected_any = collect_state(platform_state, str(platform_name or "")) or collected_any
+                if collected_any:
+                    continue
+
+            update_platform = self._normalize_platform_id((update or {}).get("platform", ""))
+            candidate_state = state
             if update_platform and isinstance(platform_states.get(update_platform), dict):
                 candidate_state = platform_states[update_platform]
-
-            path = str((candidate_state or {}).get("image_path") or "").strip()
-            if path and path not in seen_paths and Path(path).exists():
-                seen_paths.add(path)
-                image_paths.append(path)
-
-            platform_text = self._normalize_platform_id((candidate_state or {}).get("platform", "")) or update_platform
-            if platform_text and platform_text not in platforms:
-                platforms.append(platform_text)
+            collect_state(candidate_state, update_platform)
 
         return image_paths, platforms
 

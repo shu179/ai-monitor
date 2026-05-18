@@ -544,6 +544,22 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
             timeout=1.5,
         )
 
+    def test_activate_existing_recognition_tab_accepts_tongyi_alias_origin(self):
+        runtime = AppRuntime()
+        runtime._activate_recognition_tab_by_id = Mock(return_value=True)
+        runtime._recognition_browser_json = Mock(return_value=[
+            {"id": "tab-qwen", "url": "https://www.qianwen.com/chat"},
+        ])
+
+        matched = runtime._activate_existing_recognition_tab(
+            "tongyi",
+            "https://tongyi.aliyun.com/qianwen",
+        )
+
+        self.assertTrue(matched)
+        self.assertEqual(runtime._recognition_browser_tabs["tongyi"], "tab-qwen")
+        runtime._activate_recognition_tab_by_id.assert_called_once_with("tab-qwen")
+
     def test_recognition_action_can_trigger_system_screenshot(self):
         runtime = AppRuntime()
         runtime._recognition_manager = FakeRecognitionManager(running=True)
