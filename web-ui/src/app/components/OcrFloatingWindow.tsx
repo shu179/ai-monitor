@@ -14,6 +14,9 @@ import surfacedAppIcon from "../../assets/surfaced-app-icon1.png";
 type KeywordEntry = {
   keyword: string;
   platforms: string[];
+  allPlatforms: string[];
+  completedPlatforms: string[];
+  failedPlatforms: string[];
   screenshotCount: number;
   screenshotTotal: number;
   completedKeywordCount: number;
@@ -30,6 +33,9 @@ type GuideItem = {
   keyword: string;
   brands?: string[];
   platforms?: string[];
+  all_platforms?: string[];
+  completed_platforms?: string[];
+  failed_platforms?: string[];
   screenshot_count?: number;
   screenshot_total?: number;
   completed_keyword_count?: number;
@@ -51,6 +57,7 @@ type RecognitionViewState = {
   taskGroups: TaskGroup[];
   currentGroupIdx: number;
   currentKwIdx: number;
+  currentActivePlatform: string;
   detailText: string;
   manualMode: boolean;
   controlsVisible: boolean;
@@ -165,6 +172,7 @@ export function OcrFloatingWindow({
   const [taskGroups, setTaskGroups] = useState<TaskGroup[]>([]);
   const [currentGroupIdx, setCurrentGroupIdx] = useState(0);
   const [currentKwIdx, setCurrentKwIdx] = useState(0);
+  const [currentActivePlatform, setCurrentActivePlatform] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [detailText, setDetailText] = useState("");
@@ -395,6 +403,7 @@ export function OcrFloatingWindow({
     setTaskGroups(nextState.taskGroups);
     setCurrentGroupIdx(nextState.currentGroupIdx);
     setCurrentKwIdx(nextState.currentKwIdx);
+    setCurrentActivePlatform(nextState.currentActivePlatform);
     setDetailText(nextState.detailText);
     setManualMode(nextState.manualMode);
     setControlsVisible(nextState.controlsVisible);
@@ -423,6 +432,7 @@ export function OcrFloatingWindow({
           taskGroups: [],
           currentGroupIdx: 0,
           currentKwIdx: 0,
+          currentActivePlatform: "",
           detailText: "",
           manualMode: false,
           controlsVisible: true,
@@ -462,6 +472,7 @@ export function OcrFloatingWindow({
           taskGroups: [],
           currentGroupIdx: 0,
           currentKwIdx: 0,
+          currentActivePlatform: "",
           detailText: String(guide?.detail_text || "").trim(),
           manualMode: false,
           controlsVisible: true,
@@ -486,6 +497,7 @@ export function OcrFloatingWindow({
       const nextControlsVisible = guide.controls_visible !== false;
       const nextActionLabel = guide.action_label ? String(guide.action_label) : null;
       const nextActionEnabled = guide.action_enabled !== "disabled" && guide.action_enabled !== false;
+      const nextActivePlatform = String(status.active_capture_platform || "").trim();
 
       const groupMap = new Map<string, TaskGroup>();
       const groupOrder: string[] = [];
@@ -503,6 +515,27 @@ export function OcrFloatingWindow({
           platforms: Array.from(
             new Set(
               (item.platforms || [])
+                .map((platform) => String(platform || "").trim())
+                .filter(Boolean),
+            ),
+          ),
+          allPlatforms: Array.from(
+            new Set(
+              (item.all_platforms || item.platforms || [])
+                .map((platform) => String(platform || "").trim())
+                .filter(Boolean),
+            ),
+          ),
+          completedPlatforms: Array.from(
+            new Set(
+              (item.completed_platforms || [])
+                .map((platform) => String(platform || "").trim())
+                .filter(Boolean),
+            ),
+          ),
+          failedPlatforms: Array.from(
+            new Set(
+              (item.failed_platforms || [])
                 .map((platform) => String(platform || "").trim())
                 .filter(Boolean),
             ),
@@ -540,6 +573,7 @@ export function OcrFloatingWindow({
         taskGroups: groups,
         currentGroupIdx: nextGroupIdx,
         currentKwIdx: nextKwIdx,
+        currentActivePlatform: nextActivePlatform,
         detailText: nextDetailText,
         manualMode: nextManualMode,
         controlsVisible: nextControlsVisible,
@@ -556,6 +590,7 @@ export function OcrFloatingWindow({
         taskGroups: [],
         currentGroupIdx: 0,
         currentKwIdx: 0,
+        currentActivePlatform: "",
         detailText: "",
         manualMode: false,
         controlsVisible: true,
@@ -706,7 +741,10 @@ export function OcrFloatingWindow({
   const currentKeywordEntry = currentGroup ? currentGroup.keywords[currentKwIdx] : null;
   const currentKeyword = currentKeywordEntry?.keyword || "";
   const currentPlatforms = currentKeywordEntry?.platforms || [];
-  const currentPlatformSet = new Set(currentPlatforms);
+  const currentAllPlatforms = currentKeywordEntry?.allPlatforms || currentPlatforms;
+  const currentPendingPlatformSet = new Set(currentPlatforms);
+  const currentCompletedPlatformSet = new Set(currentKeywordEntry?.completedPlatforms || []);
+  const currentFailedPlatformSet = new Set(currentKeywordEntry?.failedPlatforms || []);
   const screenshotCount = currentKeywordEntry?.screenshotCount ?? 0;
   const screenshotTotal = Math.max(1, currentKeywordEntry?.screenshotTotal ?? 1);
   const keywordProgressTotal = Math.max(0, currentKeywordEntry?.totalKeywordCount ?? totalKeywords);
@@ -978,23 +1016,38 @@ export function OcrFloatingWindow({
       <div className="space-y-0.5">
         {BROWSER_PLATFORM_OPTIONS.map((platform) => {
           const isBusy = busyAction === platform.id;
-          const isRelevant = !isResidentToolMode && currentPlatformSet.has(platform.id);
+          const isPending = !isResidentToolMode && currentPendingPlatformSet.has(platform.id);
+          const isCompleted = !isResidentToolMode && currentCompletedPlatformSet.has(platform.id);
+          const isFailed = !isResidentToolMode && currentFailedPlatformSet.has(platform.id);
+          const isVisible = !isResidentToolMode && currentAllPlatforms.includes(platform.id);
+          const isActivePlatform = !isResidentToolMode && currentActivePlatform === platform.id;
+          const badgeClass = isPending
+            ? "bg-[linear-gradient(180deg,var(--brand-navy)_0%,rgba(18,44,91,0.94)_100%)] text-white ring-1 ring-white/35 shadow-[0_10px_22px_-12px_rgba(15,23,42,0.42)]"
+            : isFailed
+              ? "bg-[linear-gradient(180deg,rgba(255,247,247,0.98)_0%,rgba(255,237,237,0.94)_100%)] text-rose-600 ring-1 ring-rose-200/80 shadow-[inset_0_1px_0_rgba(255,255,255,0.78)]"
+              : "bg-[linear-gradient(180deg,rgba(248,250,252,0.92)_0%,rgba(241,245,249,0.9)_100%)] text-slate-400 ring-1 ring-white/70";
+          const labelClass = isPending || isFailed
+            ? "text-gray-800"
+            : isCompleted || isVisible
+              ? "text-gray-700"
+              : "text-gray-500";
+          const rowClass = isActivePlatform
+            ? "bg-slate-900/[0.035] hover:bg-slate-900/[0.07]"
+            : "hover:bg-slate-900/[0.055]";
           return (
             <button
               key={platform.id}
               type="button"
               disabled={Boolean(busyAction)}
               onClick={() => void handleOpenPlatform(platform.id)}
-              className="group relative flex h-8.5 w-full items-center gap-2 rounded-lg px-2 text-left text-gray-800 transition hover:bg-slate-900/[0.055] hover:text-gray-950 disabled:cursor-wait disabled:opacity-60"
+              className={`group relative flex h-8.5 w-full items-center gap-2 rounded-lg px-2 text-left text-gray-800 transition hover:text-gray-950 disabled:cursor-wait disabled:opacity-60 ${rowClass}`}
             >
               <span
-                className={`flex h-[21px] w-[21px] shrink-0 items-center justify-center rounded-full text-[9.5px] font-semibold ${
-                  isRelevant ? "bg-[var(--brand-navy)] text-white" : "bg-gray-100 text-gray-600"
-                }`}
+                className={`flex h-[21px] w-[21px] shrink-0 items-center justify-center rounded-full text-[9.5px] font-semibold ${badgeClass}`}
               >
                 {isBusy ? <Loader2 className="h-[13px] w-[13px] animate-spin" /> : platform.short}
               </span>
-              <span className="min-w-0 flex-1 truncate text-[11.5px] font-medium tracking-[-0.012em]">{platform.label}</span>
+              <span className={`min-w-0 flex-1 truncate text-[11.5px] font-medium tracking-[-0.012em] ${labelClass}`}>{platform.label}</span>
             </button>
           );
         })}

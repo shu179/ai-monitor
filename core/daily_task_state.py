@@ -49,6 +49,8 @@ _PROGRESS_EXTRA_KEYS = (
     "brands",
     "completed_keywords",
     "detected_platforms",
+    "screenshot_paths",
+    "actual_screenshot_count",
     "found_results",
     "image_count",
     "selected_screenshot_results",
@@ -781,6 +783,7 @@ def _default_scoped_entry(task: dict | None = None, target_date: date | None = N
         "official": _default_status_payload(),
         "test": _default_status_payload(),
         "pool": _default_task_pool(task, target_date),
+        "test_pool": _default_task_pool(task, target_date),
     }
 
 
@@ -789,6 +792,12 @@ def _extract_pool(entry: dict | None, task: dict | None, target_date: date | Non
         return _ensure_pool_shape(entry.get("pool"), task, target_date)
     if isinstance(entry, dict):
         return _build_pool_from_legacy_entry(entry, task, target_date)
+    return _default_task_pool(task, target_date)
+
+
+def _extract_test_pool(entry: dict | None, task: dict | None, target_date: date | None = None) -> dict:
+    if isinstance(entry, dict) and isinstance(entry.get("test_pool"), dict):
+        return _ensure_pool_shape(entry.get("test_pool"), task, target_date)
     return _default_task_pool(task, target_date)
 
 
@@ -807,20 +816,41 @@ def get_task_day_pool(task: dict, target_date: date | None = None) -> dict:
     return _extract_pool(_load_entry(task, target_date), task, target_date)
 
 
+def get_task_test_day_pool(task: dict, target_date: date | None = None) -> dict:
+    return _extract_test_pool(_load_entry(task, target_date), task, target_date)
+
+
 def get_task_day_status(task: dict, target_date: date | None = None) -> dict:
     entry = _load_entry(task, target_date)
     official, test = _split_status_entry(entry)
     pool = _extract_pool(entry, task, target_date)
+    test_pool = _extract_test_pool(entry, task, target_date)
     brand = dict(pool.get("brand") or {})
     brand_status = _derive_brand_status(pool)
     legacy_status = _legacy_status_from_brand_status(brand_status)
     extra = _pool_extra(pool, brand_status=brand_status)
+    test_brand = dict(test_pool.get("brand") or {})
+    test_brand_status = _derive_brand_status(test_pool)
+    test_legacy_status = _legacy_status_from_brand_status(test_brand_status)
+    test_extra = _pool_extra(test_pool, brand_status=test_brand_status)
 
     message = str(brand.get("status_message") or "").strip()
     if not message and legacy_status == STATUS_QUERY_FAILED:
         message = "当前仍有关键词缺口待补齐"
     if not message and legacy_status == STATUS_SENT:
         message = "今日已发送"
+
+    test_message = str(test.get("message") or test_brand.get("status_message") or "").strip()
+    if not test_message and test_legacy_status == STATUS_QUERY_FAILED:
+        test_message = "当前测试任务仍有关键词缺口待补齐"
+    if not test_message and test_legacy_status == STATUS_SENT:
+        test_message = "测试任务今日已发送"
+    test_has_started = bool(
+        str(test.get("updated_at") or test_brand.get("updated_at") or "").strip()
+        or str(test.get("source") or test_brand.get("source_mode") or "").strip()
+        or list(test_extra.get("completed_keywords") or [])
+        or int(test_extra.get("actual_screenshot_count") or 0) > 0
+    )
 
     payload = {
         "status": legacy_status,
@@ -833,11 +863,11 @@ def get_task_day_status(task: dict, target_date: date | None = None) -> dict:
         "official_updated_at": str(official.get("updated_at") or brand.get("updated_at") or "").strip(),
         "official_message": str(official.get("message") or message).strip(),
         "official_extra": dict(official.get("extra") or extra) if isinstance(official.get("extra"), dict) else dict(extra),
-        "test_status": str(test.get("status") or legacy_status).strip() or legacy_status,
-        "test_source": str(test.get("source") or brand.get("source_mode") or "").strip(),
-        "test_updated_at": str(test.get("updated_at") or brand.get("updated_at") or "").strip(),
-        "test_message": str(test.get("message") or message).strip(),
-        "test_extra": dict(test.get("extra") or extra) if isinstance(test.get("extra"), dict) else dict(extra),
+        "test_status": str(test.get("status") or test_legacy_status).strip() or test_legacy_status,
+        "test_source": str(test.get("source") or test_brand.get("source_mode") or "").strip(),
+        "test_updated_at": str(test.get("updated_at") or test_brand.get("updated_at") or "").strip(),
+        "test_message": test_message,
+        "test_extra": dict(test.get("extra") or test_extra) if isinstance(test.get("extra"), dict) else dict(test_extra),
         "brand_status": brand_status,
         "brand_status_label": _STATUS_LABELS.get(_legacy_status_from_brand_status(brand_status), "未知状态"),
         "sent_today": bool(brand.get("sent_today")),
@@ -852,6 +882,15 @@ def get_task_day_status(task: dict, target_date: date | None = None) -> dict:
         "actual_screenshot_count": int(extra.get("actual_screenshot_count") or 0),
         "keyword_states": deepcopy(pool.get("keywords") or {}),
         "pool": deepcopy(pool),
+        "test_brand_status": test_brand_status,
+        "test_brand_status_label": _STATUS_LABELS.get(test_legacy_status, "未知状态"),
+        "test_has_gap": bool(test_brand.get("has_gap")) if test_has_started else False,
+        "test_gap_reasons": list(test_brand.get("gap_reasons") or []) if test_has_started else [],
+        "test_completed_keywords": list(test_extra.get("completed_keywords") or []),
+        "test_detected_platforms": list(test_extra.get("detected_platforms") or []),
+        "test_actual_screenshot_count": int(test_extra.get("actual_screenshot_count") or 0),
+        "test_keyword_states": deepcopy(test_pool.get("keywords") or {}),
+        "test_pool": deepcopy(test_pool),
     }
     return payload
 
@@ -1022,8 +1061,26 @@ def _with_pool_lock(
     if isinstance(entry, dict):
         scoped_entry["official"], scoped_entry["test"] = _split_status_entry(entry)
         scoped_entry["pool"] = _extract_pool(entry, task, target_date)
+        scoped_entry["test_pool"] = _extract_test_pool(entry, task, target_date)
     state[key] = scoped_entry
     return state, key, scoped_entry
+
+
+def reset_manual_test_session_state(
+    task: dict,
+    *,
+    target_date: date | None = None,
+) -> dict:
+    with _LOCK:
+        state, key, scoped_entry = _with_pool_lock(task, target_date=target_date)
+        scoped_entry["test"] = _default_status_payload()
+        test_pool = _default_task_pool(task, target_date)
+        test_pool["brand"]["has_gap"] = False
+        test_pool["brand"]["gap_reasons"] = []
+        scoped_entry["test_pool"] = test_pool
+        state[key] = scoped_entry
+        _save_state(state)
+        return deepcopy(scoped_entry["test_pool"])
 
 
 def start_formal_task_run(
@@ -1077,6 +1134,91 @@ def finish_formal_task_run(
     return deepcopy(pool)
 
 
+def _apply_keyword_update_to_pool(
+    pool: dict,
+    *,
+    task: dict,
+    update: dict,
+    normalized_source: str,
+    now_text: str,
+) -> tuple[dict, bool]:
+    keyword_states = dict(pool.get("keywords") or {})
+    keyword = _normalize_keyword_key(update.get("keyword"))
+    if not keyword:
+        return pool, False
+
+    brand = str(update.get("brand") or keyword_states.get(keyword, {}).get("brand") or pool.get("brand_name") or "").strip()
+    current_state = _coerce_keyword_state(keyword_states.get(keyword), keyword=keyword, brand=brand)
+    run_success = _coerce_bool(update.get("run_success"))
+    screenshot_saved = _coerce_bool(update.get("screenshot_saved"))
+    failure_reason = str(update.get("failure_reason") or "").strip()
+    if normalized_source == SOURCE_MODE_TEST and not run_success:
+        return pool, False
+
+    image_path = str(update.get("image_path") or "").strip()
+    platform = str(update.get("platform") or current_state.get("platform") or "").strip()
+    if run_success and screenshot_saved and image_path:
+        target_path = build_canonical_screenshot_path(
+            task,
+            keyword=keyword,
+            brand=brand,
+            platform=platform,
+            source_mode=SOURCE_MODE_FORMAL if normalized_source == SOURCE_MODE_TEST else normalized_source,
+            original_path=image_path,
+        )
+        image_path = _move_file_if_needed(image_path, target_path)
+    update["image_path"] = image_path
+
+    if run_success and screenshot_saved:
+        failure_reason = ""
+    elif run_success and not failure_reason:
+        failure_reason = KEYWORD_REASON_SCREENSHOT_SAVE_FAILED
+    elif not run_success and not failure_reason:
+        failure_reason = KEYWORD_REASON_RUN_FAILED
+
+    current_state.update({
+        "keyword": keyword,
+        "brand": brand,
+        "run_success": run_success,
+        "screenshot_saved": screenshot_saved,
+        "failure_reason": failure_reason or ("" if run_success and screenshot_saved else KEYWORD_REASON_NOT_RUN),
+        "source_mode": normalized_source,
+        "image_path": image_path,
+        "platform": platform,
+        "updated_at": str(update.get("updated_at") or now_text).strip() or now_text,
+    })
+    if platform and current_state.get("required_platforms"):
+        platform_states = dict(current_state.get("platform_states") or {})
+        platform_state = _coerce_keyword_state(
+            platform_states.get(platform),
+            keyword=keyword,
+            brand=brand,
+            platforms=[],
+        )
+        platform_state.update({
+            "keyword": keyword,
+            "brand": brand,
+            "run_success": run_success,
+            "screenshot_saved": screenshot_saved,
+            "failure_reason": failure_reason or ("" if run_success and screenshot_saved else KEYWORD_REASON_NOT_RUN),
+            "source_mode": normalized_source,
+            "image_path": image_path,
+            "platform": platform,
+            "required_platforms": [],
+            "platform_states": {},
+            "updated_at": str(update.get("updated_at") or now_text).strip() or now_text,
+        })
+        platform_states[platform] = platform_state
+        current_state["platform_states"] = platform_states
+        current_state["run_success"] = any(_coerce_bool((item or {}).get("run_success")) for item in platform_states.values())
+        current_state["screenshot_saved"] = _is_keyword_complete(current_state)
+        if current_state["screenshot_saved"]:
+            current_state["failure_reason"] = ""
+    keyword_states[keyword] = current_state
+    pool["keywords"] = keyword_states
+    return pool, True
+
+
 def apply_task_keyword_updates(
     task: dict,
     keyword_updates: list[dict],
@@ -1088,99 +1230,39 @@ def apply_task_keyword_updates(
     normalized_source = SOURCE_MODE_TEST if str(source_mode or "").strip() == SOURCE_MODE_TEST else SOURCE_MODE_FORMAL
     with _LOCK:
         state, key, scoped_entry = _with_pool_lock(task, target_date=target_date)
-        pool = _ensure_pool_shape(scoped_entry.get("pool"), task, target_date)
-        keyword_states = dict(pool.get("keywords") or {})
+        pool_key = "test_pool" if normalized_source == SOURCE_MODE_TEST else "pool"
+        pool = _ensure_pool_shape(scoped_entry.get(pool_key), task, target_date)
+        shared_pool = _ensure_pool_shape(scoped_entry.get("pool"), task, target_date) if normalized_source == SOURCE_MODE_TEST else None
         for raw_update in keyword_updates or []:
             update = dict(raw_update or {})
-            keyword = _normalize_keyword_key(update.get("keyword"))
-            if not keyword:
-                continue
-            brand = str(update.get("brand") or keyword_states.get(keyword, {}).get("brand") or pool.get("brand_name") or "").strip()
-            current_state = _coerce_keyword_state(keyword_states.get(keyword), keyword=keyword, brand=brand)
-            run_success = _coerce_bool(update.get("run_success"))
-            screenshot_saved = _coerce_bool(update.get("screenshot_saved"))
-            failure_reason = str(update.get("failure_reason") or "").strip()
-            if normalized_source == SOURCE_MODE_TEST and not run_success:
-                continue
-            if normalized_source == SOURCE_MODE_TEST and _is_keyword_complete(current_state):
-                continue
-
-            image_path = str(update.get("image_path") or "").strip()
-            platform = str(update.get("platform") or current_state.get("platform") or "").strip()
-            if run_success and screenshot_saved and image_path:
-                target_path = build_canonical_screenshot_path(
-                    task,
-                    keyword=keyword,
-                    brand=brand,
-                    platform=platform,
-                    source_mode=normalized_source,
-                    original_path=image_path,
+            pool, applied = _apply_keyword_update_to_pool(
+                pool,
+                task=task,
+                update=update,
+                normalized_source=normalized_source,
+                now_text=now_text,
+            )
+            if normalized_source == SOURCE_MODE_TEST and applied and shared_pool is not None:
+                shared_pool, _ = _apply_keyword_update_to_pool(
+                    shared_pool,
+                    task=task,
+                    update=update,
+                    normalized_source=normalized_source,
+                    now_text=now_text,
                 )
-                if normalized_source == SOURCE_MODE_TEST and not _is_keyword_complete(current_state):
-                    target_path = build_canonical_screenshot_path(
-                        task,
-                        keyword=keyword,
-                        brand=brand,
-                        platform=platform,
-                        source_mode=SOURCE_MODE_FORMAL,
-                        original_path=image_path,
-                    )
-                image_path = _move_file_if_needed(image_path, target_path)
-
-            if run_success and screenshot_saved:
-                failure_reason = ""
-            elif run_success and not failure_reason:
-                failure_reason = KEYWORD_REASON_SCREENSHOT_SAVE_FAILED
-            elif not run_success and not failure_reason:
-                failure_reason = KEYWORD_REASON_RUN_FAILED
-
-            current_state.update({
-                "keyword": keyword,
-                "brand": brand,
-                "run_success": run_success,
-                "screenshot_saved": screenshot_saved,
-                "failure_reason": failure_reason or ("" if run_success and screenshot_saved else KEYWORD_REASON_NOT_RUN),
-                "source_mode": normalized_source,
-                "image_path": image_path,
-                "platform": platform,
-                "updated_at": str(update.get("updated_at") or now_text).strip() or now_text,
-            })
-            if platform and current_state.get("required_platforms"):
-                platform_states = dict(current_state.get("platform_states") or {})
-                platform_state = _coerce_keyword_state(
-                    platform_states.get(platform),
-                    keyword=keyword,
-                    brand=brand,
-                    platforms=[],
-                )
-                platform_state.update({
-                    "keyword": keyword,
-                    "brand": brand,
-                    "run_success": run_success,
-                    "screenshot_saved": screenshot_saved,
-                    "failure_reason": failure_reason or ("" if run_success and screenshot_saved else KEYWORD_REASON_NOT_RUN),
-                    "source_mode": normalized_source,
-                    "image_path": image_path,
-                    "platform": platform,
-                    "required_platforms": [],
-                    "platform_states": {},
-                    "updated_at": str(update.get("updated_at") or now_text).strip() or now_text,
-                })
-                platform_states[platform] = platform_state
-                current_state["platform_states"] = platform_states
-                current_state["run_success"] = any(_coerce_bool((item or {}).get("run_success")) for item in platform_states.values())
-                current_state["screenshot_saved"] = _is_keyword_complete(current_state)
-                if current_state["screenshot_saved"]:
-                    current_state["failure_reason"] = ""
-            keyword_states[keyword] = current_state
-
-        pool["keywords"] = keyword_states
         pool["brand"]["source_mode"] = normalized_source
         pool["brand"]["updated_at"] = now_text
         gap_details = _normalize_gap_details(pool)
         pool["brand"]["has_gap"] = bool(gap_details)
         pool["brand"]["gap_reasons"] = _format_gap_reasons(gap_details)
-        scoped_entry["pool"] = pool
+        scoped_entry[pool_key] = pool
+        if normalized_source == SOURCE_MODE_TEST and shared_pool is not None:
+            shared_pool["brand"]["source_mode"] = normalized_source
+            shared_pool["brand"]["updated_at"] = now_text
+            shared_gap_details = _normalize_gap_details(shared_pool)
+            shared_pool["brand"]["has_gap"] = bool(shared_gap_details)
+            shared_pool["brand"]["gap_reasons"] = _format_gap_reasons(shared_gap_details)
+            scoped_entry["pool"] = shared_pool
         state[key] = scoped_entry
         _save_state(state)
     return deepcopy(pool)
@@ -1197,7 +1279,8 @@ def mark_task_sent(
     normalized_source = SOURCE_MODE_TEST if str(source_mode or "").strip() == SOURCE_MODE_TEST else SOURCE_MODE_FORMAL
     with _LOCK:
         state, key, scoped_entry = _with_pool_lock(task, target_date=target_date)
-        pool = _ensure_pool_shape(scoped_entry.get("pool"), task, target_date)
+        pool_key = "test_pool" if normalized_source == SOURCE_MODE_TEST else "pool"
+        pool = _ensure_pool_shape(scoped_entry.get(pool_key), task, target_date)
         pool["brand"]["sent_today"] = True
         pool["brand"]["sent_at"] = now_text
         pool["brand"]["source_mode"] = normalized_source
@@ -1211,7 +1294,31 @@ def mark_task_sent(
         gap_details = _normalize_gap_details(pool)
         pool["brand"]["has_gap"] = bool(gap_details)
         pool["brand"]["gap_reasons"] = _format_gap_reasons(gap_details)
-        scoped_entry["pool"] = pool
+        scoped_entry[pool_key] = pool
+        if normalized_source == SOURCE_MODE_TEST:
+            shared_pool = _ensure_pool_shape(scoped_entry.get("pool"), task, target_date)
+            shared_pool["brand"]["sent_today"] = True
+            shared_pool["brand"]["sent_at"] = now_text
+            shared_pool["brand"]["source_mode"] = normalized_source
+            shared_pool["brand"]["updated_at"] = now_text
+            if message:
+                shared_pool["brand"]["status_message"] = str(message or "").strip()
+            test_keywords = dict(pool.get("keywords") or {})
+            merged_keywords = dict(shared_pool.get("keywords") or {})
+            for keyword, raw_state in test_keywords.items():
+                test_state = _coerce_keyword_state(
+                    raw_state,
+                    keyword=keyword,
+                    brand=str((raw_state or {}).get("brand") or shared_pool.get("brand_name") or "").strip(),
+                )
+                if not _is_keyword_complete(test_state):
+                    continue
+                merged_keywords[keyword] = deepcopy(test_state)
+            shared_pool["keywords"] = merged_keywords
+            shared_gap_details = _normalize_gap_details(shared_pool)
+            shared_pool["brand"]["has_gap"] = bool(shared_gap_details)
+            shared_pool["brand"]["gap_reasons"] = _format_gap_reasons(shared_gap_details)
+            scoped_entry["pool"] = shared_pool
         state[key] = scoped_entry
         _save_state(state)
     return deepcopy(pool)
@@ -1258,6 +1365,7 @@ def _apply_legacy_status_to_pool(
 ) -> None:
     normalized_status = str(status or "").strip()
     normalized_source = SOURCE_MODE_TEST if str(source or "").strip() == "manual_test" else SOURCE_MODE_FORMAL
+    pool_key = "test_pool" if normalized_source == SOURCE_MODE_TEST else "pool"
     extra_payload = dict(extra or {})
     completed_keywords = _dedupe_text_list(extra_payload.get("completed_keywords"))
     detected_platforms = _dedupe_text_list(extra_payload.get("detected_platforms"))
@@ -1304,11 +1412,38 @@ def _apply_legacy_status_to_pool(
         start_formal_task_run(task, source=source, message=message, target_date=target_date)
         return
 
-    if normalized_source == SOURCE_MODE_TEST and normalized_status != STATUS_SUCCESS:
-        return
-
     if normalized_status in {STATUS_SUCCESS, STATUS_SENT} and bool(extra_payload.get("notification_success")):
         mark_task_sent(task, source_mode=normalized_source, message=message, target_date=target_date)
+        return
+
+    if normalized_source == SOURCE_MODE_TEST:
+        if normalized_status == STATUS_SUCCESS:
+            now_text = local_now().isoformat(timespec="seconds")
+            with _LOCK:
+                state, key, scoped_entry = _with_pool_lock(task, target_date=target_date)
+                pool = _ensure_pool_shape(scoped_entry.get(pool_key), task, target_date)
+                pool["brand"]["source_mode"] = normalized_source
+                pool["brand"]["updated_at"] = now_text
+                if message:
+                    pool["brand"]["status_message"] = str(message or "").strip()
+                gap_details = _normalize_gap_details(pool)
+                pool["brand"]["has_gap"] = bool(gap_details)
+                pool["brand"]["gap_reasons"] = _format_gap_reasons(gap_details)
+                scoped_entry[pool_key] = pool
+                if not gap_details:
+                    shared_pool = _ensure_pool_shape(scoped_entry.get("pool"), task, target_date)
+                    shared_pool["brand"]["source_mode"] = normalized_source
+                    shared_pool["brand"]["updated_at"] = now_text
+                    if message:
+                        shared_pool["brand"]["status_message"] = str(message or "").strip()
+                    shared_pool["brand"]["formal_started"] = True
+                    shared_gap_details = _normalize_gap_details(shared_pool)
+                    shared_pool["brand"]["has_gap"] = bool(shared_gap_details)
+                    shared_pool["brand"]["gap_reasons"] = _format_gap_reasons(shared_gap_details)
+                    scoped_entry["pool"] = shared_pool
+                state[key] = scoped_entry
+                _save_state(state)
+            return
         return
 
     if normalized_status == STATUS_SEND_FAILED:
@@ -1393,6 +1528,7 @@ def _write_status(
         scoped_entry["official"] = dict(existing_official)
         scoped_entry["test"] = dict(existing_test)
         scoped_entry["pool"] = pool
+        scoped_entry["test_pool"] = _extract_test_pool(existing_entry, task, target_date)
         scoped_entry[normalized_scope] = payload
         state[key] = scoped_entry
         _save_state(state)

@@ -218,7 +218,7 @@ from core.profile_assets import (
     store_profile_avatar,
 )
 from core.shutdown import install_shutdown_handlers, register_shutdown_callback, run_shutdown_callbacks
-from core.context_snapshots import ensure_context_snapshots
+from core.context_snapshots import DEFAULT_CONTEXT_SNAPSHOTS_CONFIG, ensure_context_snapshots
 from core.cycle_state import (
     is_report_success,
     resolve_report_display_message,
@@ -231,6 +231,7 @@ from core.daily_task_state import (
     derive_task_id,
     get_task_day_status,
     get_task_status_label,
+    reset_manual_test_session_state,
     write_task_status,
 )
 from core.logging_utils import redact_secret_text, redact_secrets
@@ -1151,55 +1152,8 @@ def _deep_merge_dict(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, A
 
 
 def _build_screenshot_theme_patch(payload: dict[str, Any]) -> dict[str, Any]:
-    patch: dict[str, Any] = {}
-    if "enabled" in payload:
-        patch["enabled"] = bool(payload["enabled"])
-    if "title" in payload:
-        patch["title"] = str(payload["title"] or "").strip()
-    if "subtitle" in payload:
-        patch["subtitle"] = str(payload["subtitle"] or "").strip()
-    if "footer" in payload:
-        patch["footer"] = str(payload["footer"] or "").strip()
-    if "show_time" in payload:
-        patch["show_timestamp"] = bool(payload["show_time"])
-    if "show_footer" in payload:
-        patch["show_footer"] = bool(payload["show_footer"])
-    if "show_highlight" in payload:
-        patch["draw_highlight_boxes"] = bool(payload["show_highlight"])
-    if "accent_color" in payload:
-        patch["accent_color"] = str(payload["accent_color"] or "").strip()
-
-    background_patch: dict[str, Any] = {}
-    if "background_start" in payload:
-        background_patch["start"] = str(payload["background_start"] or "").strip()
-    if "background_end" in payload:
-        background_patch["end"] = str(payload["background_end"] or "").strip()
-    if background_patch:
-        patch["background"] = background_patch
-
-    header_patch: dict[str, Any] = {}
-    if "header_start" in payload:
-        header_patch["start"] = str(payload["header_start"] or "").strip()
-    if "header_end" in payload:
-        header_patch["end"] = str(payload["header_end"] or "").strip()
-    if header_patch:
-        patch["header"] = header_patch
-
-    layout_patch: dict[str, Any] = {}
-    for source_key, target_key in (
-        ("outer_padding", "outer_padding"),
-        ("header_height", "header_height"),
-        ("radius", "radius"),
-        ("image_radius", "image_radius"),
-    ):
-        if source_key in payload:
-            try:
-                layout_patch[target_key] = max(0, int(payload[source_key]))
-            except Exception:
-                continue
-    if layout_patch:
-        patch["layout"] = layout_patch
-    return patch
+    del payload
+    return get_default_decoration_theme()
 
 
 def _schema_type_label(schema: dict[str, Any]) -> str:
@@ -1540,29 +1494,6 @@ ASSISTANT_TOOLS: list[dict[str, Any]] = [
             "required": ["enabled"],
             "properties": {
                 "enabled": {"type": "boolean"},
-            },
-        },
-    ),
-    _tool(
-        "set_recognition_ai_fallback",
-        "修改识别模式在本地 OCR 未命中时是否启用 AI 辅助。",
-        {
-            "type": "object",
-            "required": ["enabled"],
-            "properties": {
-                "enabled": {"type": "boolean"},
-            },
-        },
-    ),
-    _tool(
-        "set_recognition_model",
-        "修改识别模式复核使用的视觉模型。",
-        {
-            "type": "object",
-            "required": ["platform", "model"],
-            "properties": {
-                "platform": {"type": "string"},
-                "model": {"type": "string"},
             },
         },
     ),
@@ -2035,7 +1966,7 @@ class AppRuntime:
             synced_articles_loader=self._get_synced_articles,
         )
         self.settings_service = SettingsService(
-            context_snapshot_loader=self._ensure_context_snapshots,
+            context_snapshot_loader=lambda: self._ensure_context_snapshots(refresh_stale=False),
             browser_auth_loader=self.get_browser_auth,
             public_profile_builder=self.get_public_profile,
             cloud_sync_status_getter=lambda: self._cloud_sync_manager.get_status(),
@@ -2091,7 +2022,6 @@ class AppRuntime:
         self._account_crawl_stop_event = threading.Event()
         self._account_crawl_lock = threading.Lock()
         self._query_session_manager: PlatformSessionManager | None = None
-        self._query_serial_state: dict[str, Any] | None = None
         self._query_session_mode = ""
         self._manual_platform_session_manager: PlatformSessionManager | None = None
         self._manual_platform_lock = threading.RLock()
@@ -2156,7 +2086,6 @@ class AppRuntime:
         self._last_run = None
         self._test_run_state.clear()
         self._test_failure_notices.clear()
-        self._query_serial_state = None
         self._invalidate_tasks_full_cache()
         self._invalidate_article_cache()
 
@@ -3022,13 +2951,6 @@ class AppRuntime:
                 self._query_session_manager.close_session(normalized, reason=reason or "账号环境已切换")
             except Exception:
                 pass
-        if isinstance(self._query_serial_state, dict):
-            active_name = str(self._query_serial_state.get("name") or "").strip()
-            if active_name == normalized:
-                self._close_platform_serial_state(
-                    self._query_serial_state,
-                    reason=reason or "账号环境已切换",
-                )
         if self._manual_platform_session_manager is not None:
             try:
                 self._manual_platform_session_manager.close_session(normalized, reason=reason or "账号环境已切换")
@@ -4224,15 +4146,41 @@ return changedCount
             }
         return {"ok": False, "message": f"不支持的账号动作：{action}", "browser_auth": self.get_browser_auth()}
 
-    def _ensure_context_snapshots(self, config: dict | None = None, *, force: bool = False) -> tuple[dict, dict[str, Any]]:
+    def _ensure_context_snapshots(
+        self,
+        config: dict | None = None,
+        *,
+        force: bool = False,
+        refresh_stale: bool = True,
+        auto_locate_daily: bool = False,
+    ) -> tuple[dict, dict[str, Any]]:
         with self._context_snapshot_lock:
             current = config or self.load_config()
             result = ensure_context_snapshots(
                 current,
                 config_path=str(self.config_path),
                 force=force,
+                refresh_stale=refresh_stale,
+                auto_locate_daily=auto_locate_daily,
             )
             return result.get("config", current), result
+
+    def schedule_context_snapshot_startup_refresh(self) -> None:
+        def _runner() -> None:
+            try:
+                self._ensure_context_snapshots(
+                    force=False,
+                    refresh_stale=True,
+                    auto_locate_daily=True,
+                )
+            except Exception as exc:
+                print(f"[WebBackend] 天气与节日后台刷新失败: {exc}")
+
+        threading.Thread(
+            target=_runner,
+            name="context-snapshot-startup-refresh",
+            daemon=True,
+        ).start()
 
     def _prune_test_failure_notices(self) -> None:
         now = local_now()
@@ -4420,15 +4368,22 @@ return changedCount
 
     def get_cloud_status(self) -> dict[str, Any]:
         self._validate_cloud_session_if_needed()
+        return self._current_cloud_status()
+
+    def _current_cloud_status(self) -> dict[str, Any]:
         session = CloudSessionStore().load()
-        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        return self._cloud_status_from_session(session)
+
+    def _cloud_status_from_session(self, session: dict[str, Any] | None) -> dict[str, Any]:
+        session_payload = session if isinstance(session, dict) else {}
+        user = session_payload.get("user") if isinstance(session_payload.get("user"), dict) else {}
         with self._cloud_status_validation_lock:
             validation_error = self._cloud_status_validation_error
         return {
             "ok": True,
             "cloud": {
-                "loggedIn": bool(session.get("base_url") and session.get("access_token") and session.get("refresh_token")),
-                "baseUrl": str(session.get("base_url") or ""),
+                "loggedIn": bool(session_payload.get("base_url") and session_payload.get("access_token") and session_payload.get("refresh_token")),
+                "baseUrl": str(session_payload.get("base_url") or ""),
                 "user": {
                     "id": user.get("id"),
                     "workspace_id": user.get("workspace_id"),
@@ -4444,7 +4399,7 @@ return changedCount
                     "created_at": user.get("created_at"),
                     "deleted_at": user.get("deleted_at"),
                 },
-                "savedAt": str(session.get("saved_at") or ""),
+                "savedAt": str(session_payload.get("saved_at") or ""),
                 "localProfile": {
                     "configPath": str(current_account_config_path()),
                 },
@@ -4892,15 +4847,11 @@ return changedCount
             )
         except CloudClientError as exc:
             return {"ok": False, "message": str(exc), "cloud": self.get_cloud_status().get("cloud")}
-        self._login_cloud_account_space(
+        saved_session = self._login_cloud_account_space(
             base_url=base_url,
             token_pair=token_pair,
         )
-        pull_result = self.pull_cloud_tasks({"force": False})
-        message = "云端登录成功"
-        if isinstance(pull_result, dict) and pull_result.get("ok"):
-            message = str(pull_result.get("message") or message)
-        return {"ok": True, "message": message, "cloud": self.get_cloud_status().get("cloud")}
+        return {"ok": True, "message": "云端登录成功", "cloud": self._cloud_status_from_session(saved_session).get("cloud")}
 
     def register_cloud_admin(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
@@ -4943,15 +4894,11 @@ return changedCount
         return login_result
 
     def _save_cloud_token_pair(self, *, base_url: str, token_pair: dict[str, Any], message: str) -> dict[str, Any]:
-        self._login_cloud_account_space(
+        saved_session = self._login_cloud_account_space(
             base_url=base_url,
             token_pair=token_pair,
         )
-        pull_result = self.pull_cloud_tasks({"force": False})
-        next_message = message
-        if isinstance(pull_result, dict) and pull_result.get("ok"):
-            next_message = str(pull_result.get("message") or next_message)
-        return {"ok": True, "message": next_message, "cloud": self.get_cloud_status().get("cloud")}
+        return {"ok": True, "message": message, "cloud": self._cloud_status_from_session(saved_session).get("cloud")}
 
     def verify_cloud_email(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
@@ -5462,7 +5409,6 @@ return changedCount
             return_report=True,
             stop_checker=(self._scheduler.should_stop if self._scheduler else None),
             platform_session_manager=self._query_session_manager,
-            platform_serial_state=self._query_serial_state,
         )
         if isinstance(result, tuple):
             _, report = result
@@ -5489,41 +5435,12 @@ return changedCount
             build_round_query_plan(tasks or [], normalized_mode),
             logger=print,
         )
-        print(f"[WebBackend] {source_label} 启用平台会话池策略(实验中): mode={normalized_mode}")
+        print(f"[WebBackend] {source_label} 启用平台会话池策略: mode={normalized_mode}")
         return manager
-
-    def _create_platform_serial_state(
-        self,
-        config: dict | None,
-        mode: str,
-    ) -> dict[str, Any] | None:
-        normalized_mode = str(mode or "").strip()
-        if normalized_mode not in {"browser", "smart"}:
-            return None
-        policy = build_query_execution_policy(config or {}, normalized_mode)
-        if not policy.use_platform_serial:
-            return None
-        return {"name": "", "platform": None}
-
-    def _close_platform_serial_state(self, state: dict[str, Any] | None, *, reason: str = "") -> None:
-        if not isinstance(state, dict):
-            return
-        active_platform = state.get("platform")
-        active_name = str(state.get("name") or "").strip()
-        if active_platform is not None:
-            if reason:
-                print(f"[WebBackend] 关闭串行平台状态: {active_name or '未知平台'} ({reason})")
-            try:
-                active_platform.close()
-            except Exception:
-                pass
-        state["platform"] = None
-        state["name"] = ""
 
     def begin_mode_round(self, mode: str, ordered_units: list[dict], current_date: datetime, scheduler_runtime_config: dict) -> None:
         del current_date, scheduler_runtime_config
         config = self.load_config()
-        policy = build_query_execution_policy(config, mode)
         self._reap_inactive_recognition_test_session(restore_previous=True)
         if self._recognition_test_manager is None:
             recognition_manager = self._ensure_recognition_manager()
@@ -5539,18 +5456,17 @@ return changedCount
                         print("[WebBackend] 定时轮次开始，已启动识别监听")
                     except Exception as exc:
                         print(f"[WebBackend] 定时轮次启动识别监听失败: {exc}")
-        if policy.use_session_pool:
+        if mode in {"browser", "smart"}:
+            policy = build_query_execution_policy(config, mode)
             self._query_session_manager = PlatformSessionManager(
                 mode,
                 policy,
                 build_round_query_plan(ordered_units, mode),
                 logger=print,
             )
-            print(f"[WebBackend] {mode} 模式启用平台会话池策略(实验中)")
+            print(f"[WebBackend] {mode} 模式启用平台会话池策略")
         else:
             self._query_session_manager = None
-            print(f"[WebBackend] {mode} 模式沿用按平台分组串行策略")
-        self._query_serial_state = self._create_platform_serial_state(config, mode)
         self._query_session_mode = str(mode or "").strip()
 
     def end_mode_round(
@@ -5564,9 +5480,7 @@ return changedCount
         del mode, ordered_units, current_date, mode_reports, cancelled
         if self._query_session_manager is not None:
             self._query_session_manager.close_all(reason="当前模式轮次结束")
-        self._close_platform_serial_state(self._query_serial_state, reason="当前模式轮次结束")
         self._query_session_manager = None
-        self._query_serial_state = None
         self._query_session_mode = ""
 
     def _on_scheduler_status_change(self, status: str, message: str) -> None:
@@ -5655,8 +5569,6 @@ return changedCount
         if self._query_session_manager is not None:
             self._query_session_manager.close_all(reason="定时任务已关闭")
             self._query_session_manager = None
-        self._close_platform_serial_state(self._query_serial_state, reason="定时任务已关闭")
-        self._query_serial_state = None
         self._query_session_mode = ""
         if persist_preference:
             set_auto_resume_monitoring(False)
@@ -6680,6 +6592,7 @@ return changedCount
             task,
             recognition_batch_size=max(1, int(task.get("recognition_batch_size", 1) or 1)),
         )
+        reset_manual_test_session_state(test_task)
         self._prime_manual_test_status(test_task)
         print(
             "[WebBackend] 识别测试任务已构建: "
@@ -6827,7 +6740,7 @@ return changedCount
         }
 
     def _snapshot_locked(self) -> dict:
-        config, _ = self._ensure_context_snapshots()
+        config, _ = self._ensure_context_snapshots(refresh_stale=False)
         self._sync_recognition_mode(config)
         tasks = list(config.get("tasks", []) or [])
         enabled_tasks = [task for task in tasks if task.get("enabled", True)]
@@ -7009,7 +6922,6 @@ return changedCount
 
             items: list[dict] = []
             session_manager = None
-            serial_state = None
             try:
                 config = self.load_config()
                 default_notification = config.get("default_notification", {}) or {}
@@ -7025,7 +6937,6 @@ return changedCount
                     str(global_mode or "").strip(),
                     source_label="手动批量执行",
                 )
-                serial_state = self._create_platform_serial_state(config, str(global_mode or "").strip())
             except Exception as exc:
                 with self._lock:
                     self._last_run = {
@@ -7046,7 +6957,6 @@ return changedCount
                         execution_source="manual",
                         return_report=True,
                         platform_session_manager=session_manager,
-                        platform_serial_state=serial_state,
                     )
                     items.append(
                         {
@@ -7068,7 +6978,6 @@ return changedCount
             try:
                 if session_manager is not None:
                     session_manager.close_all(reason="手动批量执行结束")
-                self._close_platform_serial_state(serial_state, reason="手动批量执行结束")
             except Exception as exc:
                 items.append({"taskName": "资源清理", "ok": False, "error": str(exc)})
 
@@ -7820,6 +7729,11 @@ return changedCount
                 return {"ok": False, "message": f"未找到任务 {task_id}"}
             existing = dict(tasks[target_idx])
             partial = self._build_task_from_payload(payload)
+            if "webhook_url" in payload:
+                incoming_webhook = str(payload.get("webhook_url", "") or "").strip()
+                existing_webhook = str(existing.get("webhook_url", "") or "").strip()
+                if not incoming_webhook and existing_webhook:
+                    partial.pop("webhook_url", None)
             existing.update(partial)
             existing["task_id"] = task_id
             tasks[target_idx] = existing
@@ -9513,6 +9427,21 @@ return changedCount
                         article_export_payload.get("show_selfmedia_account", True)
                     )
 
+            recognition_payload = normalized_payload.get("recognition")
+            if isinstance(recognition_payload, dict):
+                recognition_payload.pop("ai_fallback_enabled", None)
+                recognition_payload.pop("platform", None)
+                recognition_payload.pop("model", None)
+                recognition_payload["safe_mode_ocr_enabled"] = True
+                if "dom_render_mode" in recognition_payload:
+                    recognition_payload["dom_render_mode"] = bool(
+                        recognition_payload.get("dom_render_mode", False)
+                    )
+                if "floating_window_resident_enabled" in recognition_payload:
+                    recognition_payload["floating_window_resident_enabled"] = bool(
+                        recognition_payload.get("floating_window_resident_enabled", False)
+                    )
+
             storage_payload = normalized_payload.get("storage")
             if isinstance(storage_payload, dict):
                 storage_payload["history_read_backend"] = _normalize_history_read_backend_setting(
@@ -9524,9 +9453,13 @@ return changedCount
                 ).strip().lower()
                 storage_payload["history_shadow_writes_enabled"] = True
 
+            context_snapshot_payload = normalized_payload.get("context_snapshots")
+            if isinstance(context_snapshot_payload, dict):
+                normalized_payload["context_snapshots"] = copy.deepcopy(DEFAULT_CONTEXT_SNAPSHOTS_CONFIG)
+
             allowed_sections = [
                 "scheduler", "ai_assistant", "local_model", "recognition",
-                "search", "smart_vision", "selector_agent", "profile", "cloud_sync",
+                "search", "smart_vision", "profile", "cloud_sync",
                 "default_notification",
                 "context_snapshots",
                 "query_execution",
@@ -9543,7 +9476,7 @@ return changedCount
                         continue
                     mode_cfg["strategy"] = normalize_query_execution_strategy(
                         mode_cfg.get("strategy"),
-                        default="platform_serial",
+                        default="session_pool",
                     )
                     mode_cfg["session_pool_dispatch"] = normalize_session_pool_dispatch(
                         mode_cfg.get("session_pool_dispatch"),
@@ -9553,12 +9486,17 @@ return changedCount
                 if section in normalized_payload and isinstance(normalized_payload[section], dict):
                     existing = config.get(section, {}) or {}
                     config[section] = _deep_merge_dict(existing, normalized_payload[section])
+            recognition_cfg = dict(config.get("recognition", {}) or {})
+            recognition_cfg["safe_mode_ocr_enabled"] = True
+            for obsolete_key in ("ai_fallback_enabled", "platform", "model"):
+                recognition_cfg.pop(obsolete_key, None)
+            config["recognition"] = recognition_cfg
             if "browser_automation" in normalized_payload and isinstance(normalized_payload["browser_automation"], dict):
                 config["browser_automation"] = _merge_browser_automation_config(
                     config.get("browser_automation", {}) or {},
                     normalized_payload["browser_automation"],
                 )
-            for section in ("ai_assistant", "recognition", "smart_vision", "selector_agent"):
+            for section in ("ai_assistant", "recognition", "smart_vision"):
                 section_cfg = config.get(section, {}) or {}
                 if isinstance(section_cfg, dict) and section_cfg.get("platform"):
                     section_cfg["platform"] = _normalize_platform_id(str(section_cfg.get("platform", "") or "").strip())
@@ -9584,9 +9522,7 @@ return changedCount
                 config["platforms"] = platforms_cfg
             if "screenshot_template" in normalized_payload and isinstance(normalized_payload["screenshot_template"], dict):
                 screenshot_cfg = dict(config.get("screenshot", {}) or {})
-                current_theme = get_decoration_theme(config)
-                theme_patch = _build_screenshot_theme_patch(normalized_payload["screenshot_template"])
-                screenshot_cfg["decoration"] = _deep_merge_dict(current_theme, theme_patch)
+                screenshot_cfg["decoration"] = get_default_decoration_theme()
                 config["screenshot"] = screenshot_cfg
             if "screenshot" in normalized_payload and isinstance(normalized_payload["screenshot"], dict):
                 existing = config.get("screenshot", {}) or {}
@@ -10647,22 +10583,18 @@ return changedCount
         return result
 
     def set_recognition_local_ocr(self, payload: dict[str, Any]) -> dict:
-        result = self.save_settings({"recognition": {"safe_mode_ocr_enabled": bool(payload.get("enabled", False))}})
-        result["message"] = "已更新识别模式的本地 OCR 设置"
+        result = self.save_settings({"recognition": {"safe_mode_ocr_enabled": True}})
+        result["message"] = "识别模式已固定启用本地 OCR"
         return result
 
     def set_recognition_ai_fallback(self, payload: dict[str, Any]) -> dict:
-        result = self.save_settings({"recognition": {"ai_fallback_enabled": bool(payload.get("enabled", False))}})
-        result["message"] = "已更新识别模式的 AI 辅助设置"
+        result = self.save_settings({"recognition": {}})
+        result["message"] = "识别模式已固定为本地 OCR，AI 辅助设置已移除"
         return result
 
     def set_recognition_model(self, payload: dict[str, Any]) -> dict:
-        platform = str(payload.get("platform", "") or "").strip()
-        model = str(payload.get("model", "") or "").strip()
-        if not platform or not model:
-            return {"ok": False, "message": "缺少 platform 或 model"}
-        result = self.save_settings({"recognition": {"platform": _normalize_platform_id(platform), "model": model}})
-        result["message"] = "已更新识别模式视觉模型"
+        result = self.save_settings({"recognition": {}})
+        result["message"] = "识别模式已固定为本地 OCR，无需配置识别模型"
         return result
 
     def set_search_provider(self, payload: dict[str, Any]) -> dict:
@@ -10710,13 +10642,14 @@ return changedCount
         return {"ok": True, "message": f"已从搜搜模型池移除 {model}"}
 
     def _save_screenshot_template_patch(self, payload: dict[str, Any], message: str) -> dict:
+        del payload, message
         with self._lock:
             config = self.load_config()
             screenshot_cfg = dict(config.get("screenshot", {}) or {})
-            screenshot_cfg["decoration"] = _deep_merge_dict(get_decoration_theme(config), _build_screenshot_theme_patch(payload))
+            screenshot_cfg["decoration"] = get_default_decoration_theme()
             config["screenshot"] = screenshot_cfg
             self.save_config(config)
-        return {"ok": True, "message": message}
+        return {"ok": True, "message": "页面原始截图装饰模板已固定为默认样式"}
 
     def set_screenshot_template_basic(self, payload: dict[str, Any]) -> dict:
         return self._save_screenshot_template_patch(payload, "已更新截图模板基础文案")
@@ -10737,7 +10670,7 @@ return changedCount
             screenshot_cfg["decoration"] = get_default_decoration_theme()
             config["screenshot"] = screenshot_cfg
             self.save_config(config)
-        return {"ok": True, "message": "已恢复默认截图模板"}
+        return {"ok": True, "message": "页面原始截图装饰模板已固定为默认样式"}
 
     def set_profile_fields(self, payload: dict[str, Any]) -> dict:
         allowed = {key: payload[key] for key in ("name", "role", "avatar", "birthday", "hire_date") if key in payload}
@@ -10932,7 +10865,6 @@ return changedCount
                 }
             items: list[dict] = []
             session_manager = None
-            serial_state = None
             try:
                 config = self.load_config()
                 default_notification = config.get("default_notification", {}) or {}
@@ -10949,7 +10881,6 @@ return changedCount
                     str(global_mode or "").strip(),
                     source_label="按选中任务执行",
                 )
-                serial_state = self._create_platform_serial_state(config, str(global_mode or "").strip())
             except Exception as exc:
                 with self._lock:
                     self._last_run = {
@@ -10966,7 +10897,6 @@ return changedCount
                         task, default_notification, config,
                         execution_source="manual", return_report=True,
                         platform_session_manager=session_manager,
-                        platform_serial_state=serial_state,
                     )
                     items.append({"taskName": task_name, "ok": True, "queryCount": len(result_items), "report": report})
                 except Exception as exc:
@@ -10974,7 +10904,6 @@ return changedCount
             try:
                 if session_manager is not None:
                     session_manager.close_all(reason="按选中任务执行结束")
-                self._close_platform_serial_state(serial_state, reason="按选中任务执行结束")
             except Exception as exc:
                 items.append({"taskName": "资源清理", "ok": False, "error": str(exc)})
             with self._lock:
@@ -11557,6 +11486,7 @@ class WebAppServer:
         thread.start()
         self._thread = thread
         self.runtime.restore_monitoring_if_needed()
+        self.runtime.schedule_context_snapshot_startup_refresh()
         # 注释掉预热：ImageGrab.grabclipboard() 会在子线程触发 tkinter 初始化，macOS 不允许
         # self.runtime.schedule_recognition_warmup()
         return self.url

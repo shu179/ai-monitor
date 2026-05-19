@@ -106,17 +106,29 @@ def render_api_screenshot_with_retries(
     max_retries: int = 3,
 ) -> str | None:
     """API 模式命中后，固定走 HTML 模版渲染，截图真实生成才算成功。"""
+    started_at = time.perf_counter()
     for attempt in range(1, max_retries + 1):
+        attempt_started = time.perf_counter()
         screenshot = render_func(text, platform_name, keyword=keyword, brand=brand)
         if screenshot_path_exists(screenshot):
+            print(
+                f"[API] 截图重试完成: platform={platform_name}, attempts={attempt}, "
+                f"attempt_elapsed={time.perf_counter() - attempt_started:.2f}s, "
+                f"total={time.perf_counter() - started_at:.2f}s"
+            )
             return str(screenshot)
 
         print(
             f"[API] 第 {attempt}/{max_retries} 次截图生成失败: "
-            f"{str(screenshot or '').strip() or '未返回有效文件路径'}"
+            f"{str(screenshot or '').strip() or '未返回有效文件路径'}; "
+            f"attempt_elapsed={time.perf_counter() - attempt_started:.2f}s"
         )
         if attempt < max_retries:
-            time.sleep(min(1.5 * attempt, 3.0))
+            time.sleep(min(0.6 * attempt, 1.2))
+    print(
+        f"[API] 截图重试失败: platform={platform_name}, attempts={max_retries}, "
+        f"total={time.perf_counter() - started_at:.2f}s"
+    )
     return None
 
 
@@ -217,9 +229,6 @@ def finalize_daily_pool_keyword_results(
         keyword, brand = key
         historical_state = dict(historical_states.get(keyword) or {})
         already_complete = bool(historical_state.get('run_success')) and bool(historical_state.get('screenshot_saved'))
-
-        if execution_source == 'manual_test' and already_complete:
-            continue
 
         for platform_name, platform_results in group_keyword_results_by_platform(grouped_results).items():
             summary = summarize_keyword_result(platform_results)

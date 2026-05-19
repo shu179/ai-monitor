@@ -122,6 +122,7 @@ class ClipboardRecognitionManager:
         self._clipboard_grab_inflight = False
         self._clipboard_grab_timeout_logged_at = 0.0
         self._last_text_length_skip_hash = ""
+        self._last_duplicate_text_feedback_hash = ""
         self._reference_clipboard_armed = True
         self._startup_reference_text_hash = None
         self._seen_reference_hashes = deque(maxlen=200)
@@ -178,6 +179,7 @@ class ClipboardRecognitionManager:
             self._last_image_seen_at = None
             self._manual_index = 0
             self._guide_status_text = ""
+            self._last_duplicate_text_feedback_hash = ""
             self._suppressed_tasks = set()
             self._active_capture_platform = ""
             self._runtime_dom_render_mode = self._config_dom_render_mode_enabled()
@@ -506,6 +508,37 @@ class ClipboardRecognitionManager:
         image_count = max(0, int(self._batch_image_count(batch_payload) or 0))
         if image_count <= 0:
             return
+        image_items = list(batch_payload.get("image_items") or [])
+        if image_items:
+            item_level_recorded = False
+            for raw_item in image_items:
+                item_payload = dict(raw_item or {})
+                has_payload = any(
+                    str(item_payload.get(field) or "").strip()
+                    for field in ("path", "source_text", "ocr_text")
+                )
+                if not has_payload:
+                    continue
+                item_slots = self._expand_matched_pair_slots(item_payload.get("matched_pairs") or [])
+                if not item_slots:
+                    continue
+                item_level_recorded = True
+                slot = dict(item_slots[0] or {})
+                keyword = str(slot.get("keyword") or "").strip()
+                brand = str(slot.get("brand") or "").strip()
+                platforms = [
+                    self._normalize_platform_id(platform)
+                    for platform in (slot.get("platforms") or [])
+                    if self._normalize_platform_id(platform)
+                ]
+                if not keyword or not platforms:
+                    continue
+                keyword_key, brand_key = self._normalize_keyword_brand_pair(keyword, brand)
+                if not keyword_key:
+                    continue
+                completed.setdefault((task_name, keyword_key, brand_key), set()).update(platforms)
+            if item_level_recorded:
+                return
         slots = self._expand_matched_pair_slots(batch_payload.get("matched_pairs") or [])
         if not slots:
             return
@@ -603,6 +636,23 @@ class ClipboardRecognitionManager:
             if self._normalize_platform_id(platform)
         }
 
+    def _runtime_completed_platform_count_for_entry(
+        self,
+        entry: dict,
+        task: dict,
+        runtime_completed: dict[tuple[str, str, str], set[str]],
+    ) -> int:
+        configured_platforms = [
+            self._normalize_platform_id(platform)
+            for platform in ((entry or {}).get("platforms") or task.get("platform_candidates") or [])
+            if self._normalize_platform_id(platform)
+        ]
+        configured_platforms = list(dict.fromkeys(configured_platforms))
+        if not configured_platforms:
+            return 0
+        completed_platforms = self._runtime_completed_platforms_for_entry(entry, task, runtime_completed)
+        return sum(1 for platform in configured_platforms if platform in completed_platforms)
+
     def _build_keyword_guide_items(self, tasks: list[dict]) -> list[dict]:
         items = []
         runtime_completed = self._collect_runtime_completed_slot_map()
@@ -611,11 +661,14 @@ class ClipboardRecognitionManager:
             if not force_show_all_entries and self._is_task_completed_for_today(task):
                 continue
             daily_state = self._get_task_daily_shared_state(task)
-            progress = dict(daily_state.get("progress") or {})
+            progress = self._get_task_daily_progress(task)
             sent_count_by_brand = dict(progress.get("historical_image_count_by_brand", {}) or {})
             for brand, count in (progress.get("recognition_image_count_by_brand", {}) or {}).items():
                 sent_count_by_brand[brand] = int(sent_count_by_brand.get(brand, 0) or 0) + int(count or 0)
-            keyword_states = dict((daily_state.get("status") or {}).get("keyword_states") or {})
+            status_payload = dict(daily_state.get("status") or {})
+            keyword_states = dict(
+                status_payload.get("test_keyword_states" if force_show_all_entries else "keyword_states") or {}
+            )
             all_entries = list(task.get("guide_keywords", []) or [])
 
             visible_entries = []
@@ -650,6 +703,11 @@ class ClipboardRecognitionManager:
                 pending_platforms = [item.get("platform", "") for item in pending_statuses if str(item.get("platform") or "").strip()]
                 failed_platforms = [item.get("platform", "") for item in pending_statuses if item.get("failed")]
                 pending_only_platforms = [item.get("platform", "") for item in pending_statuses if not item.get("failed")]
+                runtime_completed_platform_count = self._runtime_completed_platform_count_for_entry(
+                    entry,
+                    task,
+                    runtime_completed,
+                )
                 visible_entries.append({
                     **entry,
                     "pending_platforms": pending_platforms,
@@ -657,6 +715,7 @@ class ClipboardRecognitionManager:
                     "pending_only_platforms": pending_only_platforms,
                     "pending_statuses": pending_statuses,
                     "runtime_completed_platforms": sorted(runtime_completed_platforms),
+                    "runtime_completed_platform_count": int(runtime_completed_platform_count),
                     "runtime_waiting": False,
                 })
 
@@ -715,6 +774,38 @@ class ClipboardRecognitionManager:
                         if self._normalize_platform_id(platform)
                     ]
                 scope_platform = progress_platforms[0] if progress_platforms else ""
+                keyword_platforms = [
+                    self._normalize_platform_id(platform)
+                    for platform in (entry.get("platforms") or task.get("platform_candidates") or [])
+                    if self._normalize_platform_id(platform)
+                ]
+                keyword_platforms = list(dict.fromkeys(keyword_platforms))
+                progress_state = dict(keyword_states.get(str(entry.get("keyword") or "").strip()) or {})
+                runtime_completed_platform_set = {
+                    self._normalize_platform_id(platform)
+                    for platform in runtime_completed_platforms
+                    if self._normalize_platform_id(platform)
+                }
+                completed_platforms: list[str] = []
+                completed_platform_count = 0
+                for platform_name in keyword_platforms:
+                    platform_state = dict((progress_state.get("platform_states") or {}).get(platform_name) or {})
+                    platform_complete = (
+                        bool(platform_state.get("run_success")) and bool(platform_state.get("screenshot_saved"))
+                    ) if platform_state else self._keyword_state_complete_for_platforms(progress_state, [platform_name])
+                    if platform_complete:
+                        completed_platform_count += 1
+                        completed_platforms.append(platform_name)
+                        continue
+                    if platform_name in runtime_completed_platform_set:
+                        completed_platform_count += 1
+                        completed_platforms.append(platform_name)
+                completed_platform_count = max(
+                    completed_platform_count,
+                    int(entry.get("runtime_completed_platform_count") or 0),
+                )
+                completed_platforms = list(dict.fromkeys(completed_platforms))
+
                 completed_keyword_count = 0
                 total_keyword_count = 0
                 for progress_entry in all_entries:
@@ -740,11 +831,16 @@ class ClipboardRecognitionManager:
                     "keyword": entry.get("keyword", ""),
                     "brands": brands,
                     "platforms": pending_platforms,
+                    "all_platforms": keyword_platforms,
+                    "completed_platforms": completed_platforms,
+                    "failed_platforms": failed_platforms,
                     "detail_text": "；".join(part for part in detail_parts if part),
                     "batch_size": int(task.get("recognition_batch_size", 1) or 1),
                     "is_last_in_task": idx == total - 1,
                     "sent_count": int(sent_count_by_brand.get(primary_brand, 0) or 0),
                     "historical_count": int(progress.get("historical_screenshot_count", 0) or 0),
+                    "completed_platform_count": int(completed_platform_count),
+                    "total_platform_count": max(1, int(len(keyword_platforms) or 0)),
                     "completed_keyword_count": int(completed_keyword_count),
                     "total_keyword_count": int(total_keyword_count),
                     "progress_platform": scope_platform,
@@ -904,7 +1000,9 @@ class ClipboardRecognitionManager:
             return []
 
         status = self._get_task_daily_shared_state(task).get("status") or {}
-        keyword_states = dict(status.get("keyword_states") or {})
+        keyword_states = dict(
+            status.get("test_keyword_states" if is_manual_test else "keyword_states") or {}
+        )
         matched_state = None
         for brand in brands:
             state = dict(keyword_states.get(keyword) or {})
@@ -934,7 +1032,7 @@ class ClipboardRecognitionManager:
             platform_state = dict((matched_state or {}).get("platform_states", {}).get(normalized_platform) or {})
             platform_complete = bool(platform_state.get("run_success")) and bool(platform_state.get("screenshot_saved"))
             runtime_complete = normalized_platform in runtime_completed
-            if (platform_complete or runtime_complete) and not is_manual_test:
+            if platform_complete or runtime_complete:
                 continue
             platform_failure_reason = str(platform_state.get("failure_reason") or failure_reason).strip()
             platform_state_platform = self._normalize_platform_id(platform_state.get("platform", "")) or state_platform
@@ -1035,6 +1133,7 @@ class ClipboardRecognitionManager:
             "path": path_text,
             "ocr_text": str(batch_item.get("ocr_text", "") or "").strip(),
             "source_text": str(batch_item.get("source_text", "") or "").strip(),
+            "matched_pairs": self._serialize_matched_pairs(batch_item.get("matched_pairs") or []),
         })
 
         merged_pairs = list(pending_batch.get("matched_pairs") or [])
@@ -1091,11 +1190,17 @@ class ClipboardRecognitionManager:
             active_count = int(buffered_counts.get(task_name, 0) or 0) + int(pending_counts.get(task_name, 0) or 0)
             historical_count = int((item or {}).get("historical_count", 0) or 0)
             batch_size = max(1, int((item or {}).get("batch_size", 1) or 1))
+            completed_platform_count = int((item or {}).get("completed_platform_count", 0) or 0)
+            total_platform_count = max(1, int((item or {}).get("total_platform_count", 0) or 1))
+            completed_keyword_count = int((item or {}).get("completed_keyword_count", 0) or 0)
+            total_keyword_count = max(1, int((item or {}).get("total_keyword_count", 0) or 0))
             enriched_items.append({
                 **item,
                 "active_screenshot_count": active_count,
-                "screenshot_count": active_count + historical_count,
-                "screenshot_total": batch_size,
+                "batch_screenshot_count": active_count + historical_count,
+                "batch_screenshot_total": batch_size,
+                "screenshot_count": completed_platform_count,
+                "screenshot_total": total_platform_count,
             })
         items = enriched_items
 
@@ -1545,6 +1650,7 @@ class ClipboardRecognitionManager:
             "idle_seconds": idle_seconds,
             "idle_minutes": idle_minutes,
             "work_started": self._work_started,
+            "active_capture_platform": self._get_active_capture_platform(),
         }
         if include_overview:
             status["task_overview"] = self.get_task_overview()
@@ -1738,6 +1844,13 @@ class ClipboardRecognitionManager:
         with self._lock:
             self._manual_index = max(0, min(self._manual_index, len(items) - 1))
             return dict(items[self._manual_index])
+
+    def _clipboard_text_matches_current_guide_keyword(self, text: str, tasks: list[dict]) -> bool:
+        current_item = self._get_current_guide_item(tasks)
+        if not current_item:
+            return False
+        current_keyword = str((current_item or {}).get("keyword") or "").strip()
+        return bool(current_keyword and str(text or "").strip() == current_keyword)
 
     def _collect_global_candidates(self, tasks: list[dict]) -> list[str]:
         candidates = []
@@ -2111,6 +2224,10 @@ class ClipboardRecognitionManager:
                 self._startup_clipboard_hash = None
             return
 
+        active_tasks = self._get_enabled_tasks()
+        if self._clipboard_text_matches_current_guide_keyword(text, active_tasks):
+            return
+
         # 文本长度过滤
         text_length = len(text)
         min_length, max_length = self._dom_render_text_length_limits()
@@ -2143,19 +2260,24 @@ class ClipboardRecognitionManager:
         # 避免用户因为看不到进度而以为“粘贴没成功”从而反复重粘。
         if self._is_duplicate(text_hash):
             duplicate_brands = self._match_brands_from_text(text)
-            if duplicate_brands:
-                self._set_guide_status(
+            routed = self._select_task_targets(duplicate_brands, active_tasks) if duplicate_brands else {}
+            if duplicate_brands and routed:
+                message = (
                     f"该回答（{', '.join(duplicate_brands)}）已捕获，无需重复粘贴；"
                     "如还有其他平台，请复制对应平台的回答后再粘贴"
                 )
-                self._notify_manual_state_change()
-                print(
-                    f"[Recognition] 文本重复，{duplicate_brands} 已捕获，"
-                    "提示用户无需重复粘贴"
-                )
+                if text_hash != self._last_duplicate_text_feedback_hash:
+                    self._last_duplicate_text_feedback_hash = text_hash
+                    self._set_guide_status(message)
+                    self._notify_manual_state_change()
+                    print(
+                        f"[Recognition] 文本重复，{duplicate_brands} 已捕获，"
+                        "提示用户无需重复粘贴"
+                    )
             return
 
-        active_tasks = self._get_enabled_tasks()
+        self._last_duplicate_text_feedback_hash = ""
+
         self._mark_referenced_articles_from_text(
             text,
             tasks=active_tasks,
@@ -2625,22 +2747,33 @@ class ClipboardRecognitionManager:
         prepare_started = time.perf_counter()
         image_items = list(batch.get("image_items") or [])
         if not image_items:
-            image_items = [{"path": path, "ocr_text": "", "source_text": ""} for path in (batch.get("image_paths") or [])]
+            image_items = [{"path": path, "ocr_text": "", "source_text": "", "matched_pairs": []} for path in (batch.get("image_paths") or [])]
 
         processed_paths: list[str] = []
         detected_platforms: list[str] = []
+        prepared_results: list[dict] = []
         task = batch.get("task") or {}
         brand = str((batch.get("brands") or [task.get("primary_brand", "")])[0] or task.get("primary_brand", "")).strip()
         matched_pairs = self._expand_matched_pair_slots(batch.get("matched_pairs") or [])
 
         for index, item in enumerate(image_items):
+            item_started = time.perf_counter()
             image_path = str(item.get("path", "") or "").strip()
             image_file_exists = bool(image_path and Path(image_path).exists())
             ocr_text = str(item.get("ocr_text", "") or "").strip()
             source_text = str(item.get("source_text", "") or "").strip()
             if not image_file_exists and not source_text:
                 continue
-            matched_pair = matched_pairs[index] if index < len(matched_pairs) else (matched_pairs[0] if len(matched_pairs) == 1 else {})
+            item_slots = self._expand_matched_pair_slots(item.get("matched_pairs") or [])
+            matched_pair = (
+                item_slots[0]
+                if item_slots
+                else (
+                    matched_pairs[index]
+                    if index < len(matched_pairs)
+                    else (matched_pairs[0] if len(matched_pairs) == 1 else {})
+                )
+            )
             pair_platforms = [
                 self._normalize_platform_id(platform)
                 for platform in ((matched_pair or {}).get("platforms") or [])
@@ -2687,9 +2820,29 @@ class ClipboardRecognitionManager:
                 processed_path = image_path if image_file_exists else ""
             if processed_path:
                 processed_paths.append(processed_path)
+            if keyword:
+                prepared_results.append({
+                    "keyword": keyword,
+                    "brand": pair_brand,
+                    "platform": "" if platform_name == "recognition" else platform_name,
+                    "image_path": processed_path,
+                    "run_success": True,
+                    "screenshot_saved": bool(processed_path),
+                    "failure_reason": "" if processed_path else "screenshot_save_failed",
+                })
             if platform_name and platform_name != "recognition":
                 detected_platforms.append(platform_name)
+            item_mode = "dom_text" if source_text else "image_decorate"
+            print(
+                f"[Recognition] 图片预处理项耗时: task={batch.get('task_name', '')}, "
+                f"index={index + 1}/{len(image_items)}, mode={item_mode}, "
+                f"platform={platform_name or 'recognition'}, keyword={keyword or '-'}, "
+                f"input_exists={'yes' if image_file_exists else 'no'}, "
+                f"output_exists={'yes' if bool(processed_path and Path(processed_path).exists()) else 'no'}, "
+                f"elapsed={time.perf_counter() - item_started:.2f}s"
+            )
 
+        batch["_prepared_send_results"] = prepared_results
         print(
             f"[Recognition] 图片预处理耗时: task={batch.get('task_name', '')}, "
             f"items={len(image_items)}, output={len(processed_paths)}, "
@@ -2779,11 +2932,13 @@ class ClipboardRecognitionManager:
         *,
         image_paths: list[str],
         detected_platforms: list[str],
+        prepared_results: list[dict] | None = None,
     ) -> list[dict]:
         return _matching_build_keyword_updates_from_batch(
             batch,
             image_paths=image_paths,
             detected_platforms=detected_platforms,
+            prepared_results=prepared_results,
         )
 
     def _extract_current_send_state_from_pool_updates(
@@ -2846,6 +3001,93 @@ class ClipboardRecognitionManager:
             collect_state(candidate_state, update_platform)
 
         return image_paths, platforms
+
+    def _extract_completed_send_state_for_brand_group(
+        self,
+        task: dict,
+        *,
+        preferred_paths: list[str] | None = None,
+    ) -> tuple[list[str], list[str]]:
+        status = get_task_day_status(task)
+        pool = (
+            status.get("test_pool") or {}
+            if self._is_manual_test_task(task)
+            else status.get("pool") or {}
+        )
+        keyword_states = dict(pool.get("keywords") or {})
+        image_paths: list[str] = []
+        platforms: list[str] = []
+        seen_paths: set[str] = set()
+        seen_platforms: set[str] = set()
+        preferred_path_set = {
+            str(path).strip()
+            for path in (preferred_paths or [])
+            if str(path).strip()
+        }
+
+        def collect_state(state_payload: dict, platform_hint: str = "") -> None:
+            state = dict(state_payload or {})
+            if not bool(state.get("run_success")) or not bool(state.get("screenshot_saved")):
+                return
+            path = str(state.get("image_path") or "").strip()
+            if path and path not in seen_paths and Path(path).exists():
+                if path in preferred_path_set:
+                    image_paths.insert(0, path)
+                else:
+                    image_paths.append(path)
+                seen_paths.add(path)
+            platform_text = self._normalize_platform_id(platform_hint or state.get("platform", ""))
+            if platform_text and platform_text not in seen_platforms:
+                seen_platforms.add(platform_text)
+                platforms.append(platform_text)
+
+        for state in keyword_states.values():
+            keyword_state = dict(state or {})
+            platform_states = dict(keyword_state.get("platform_states") or {})
+            if platform_states:
+                for platform_name, platform_state in platform_states.items():
+                    collect_state(platform_state, str(platform_name or ""))
+                continue
+            collect_state(keyword_state)
+
+        if preferred_path_set and len(image_paths) > 1:
+            prioritized = [path for path in image_paths if path in preferred_path_set]
+            trailing = [path for path in image_paths if path not in preferred_path_set]
+            image_paths = prioritized + trailing
+        return image_paths, platforms
+
+    def _touched_keywords_from_updates(self, keyword_updates: list[dict]) -> list[str]:
+        keywords: list[str] = []
+        for update in keyword_updates or []:
+            keyword = str((update or {}).get("keyword") or "").strip()
+            if keyword and keyword not in keywords:
+                keywords.append(keyword)
+        return keywords
+
+    def _completed_touched_keywords_from_status(
+        self,
+        keyword_updates: list[dict],
+        status: dict,
+    ) -> list[str]:
+        completed_keywords: list[str] = []
+        keyword_states = dict((status or {}).get("keyword_states") or {})
+        for keyword in self._touched_keywords_from_updates(keyword_updates):
+            state = dict(keyword_states.get(keyword) or {})
+            if not state:
+                continue
+            required_platforms = [
+                self._normalize_platform_id(platform)
+                for platform in (state.get("required_platforms") or [])
+                if self._normalize_platform_id(platform)
+            ]
+            is_complete = (
+                self._keyword_state_complete_for_platforms(state, required_platforms)
+                if required_platforms
+                else bool(state.get("run_success")) and bool(state.get("screenshot_saved"))
+            )
+            if is_complete:
+                completed_keywords.append(keyword)
+        return completed_keywords
 
     def _expand_matched_pair_slots(self, matched_pairs: list[dict]) -> list[dict]:
         return _matching_expand_matched_pair_slots(matched_pairs)
@@ -3031,6 +3273,7 @@ class ClipboardRecognitionManager:
                             "path": item["path"],
                             "ocr_text": item.get("ocr_text", ""),
                             "source_text": item.get("source_text", ""),
+                            "matched_pairs": self._serialize_matched_pairs(item.get("matched_pairs") or []),
                         }
                         for item in batch_items
                     ],
@@ -3042,8 +3285,7 @@ class ClipboardRecognitionManager:
                 }
                 self._attach_historical_progress(batch)
                 auto_send = self._auto_send_recognition_batches_enabled()
-                if not auto_send:
-                    self._pending_batches[batch_id] = batch
+                self._pending_batches[batch_id] = batch
             if auto_send:
                 print(
                     f"[Recognition] {task_name} 超时自动 flush，"
@@ -3281,11 +3523,12 @@ class ClipboardRecognitionManager:
                     batch_size = task["recognition_batch_size"]
                     remaining_count = max(0, batch_size - total_count)
                     progress_text = self._format_threshold_progress_text(current_count, batch_size, historical_count)
-                    if total_count >= batch_size and self._auto_send_recognition_batches_enabled():
+                    if self._auto_send_recognition_batches_enabled():
                         batch_id = str(merged_pending_batch.get("id") or "").strip()
-                        if batch_id:
+                        if batch_id and total_count >= batch_size:
+                            self._send_queue.put(copy.deepcopy(merged_pending_batch))
+                        if batch_id and total_count >= batch_size:
                             self._pending_batches.pop(batch_id, None)
-                        self._send_queue.put(merged_pending_batch)
                         guide_position = "none"
                         if self._should_advance_for_match(focus_task_name, task_name, guide_advanced):
                             remaining_current_platforms = self._remaining_current_platforms_after_match(
@@ -3318,19 +3561,19 @@ class ClipboardRecognitionManager:
                             )
                         else:
                             self._set_guide_status(
-                                f"截图识别成功，已补齐 {task_name} "
-                                f"{progress_text}，正在自动发送"
+                                f"截图识别成功，已加入 {task_name} "
+                                f"{progress_text}，正在自动处理"
                             )
                         print(
-                            f"[Recognition] {task_name} 已补齐待确认批次，"
-                            f"{progress_text}，自动发送中"
+                            f"[Recognition] {task_name} 已写入自动发送队列，"
+                            f"{progress_text}"
                         )
                         self._persist_task_progress_status(
                             task,
                             current_count=current_count,
                             batch_size=batch_size,
                             historical_count=historical_count,
-                            status_message=f"识别模式已补齐：{progress_text}，正在自动发送",
+                            status_message=f"识别模式已捕获：{progress_text}，正在自动处理",
                         )
                         self._notify_manual_state_change()
                         continue
@@ -3369,6 +3612,89 @@ class ClipboardRecognitionManager:
                 batch_size = task["recognition_batch_size"]
                 current_count = len(bucket)
                 total_count = historical_count + current_count
+                if self._auto_send_recognition_batches_enabled():
+                    batch_items = list(bucket)
+                    del bucket[:]
+                    batch_id = f"{task_name}_{int(time.time() * 1000)}"
+                    batch = {
+                        "id": batch_id,
+                        "task_name": task_name,
+                        "brands": list(dict.fromkeys(brand for item in batch_items for brand in item["brands"])),
+                        "image_paths": [item["path"] for item in batch_items],
+                        "image_items": [
+                            {
+                                "path": item["path"],
+                                "ocr_text": item.get("ocr_text", ""),
+                                "source_text": item.get("source_text", ""),
+                                "matched_pairs": self._serialize_matched_pairs(item.get("matched_pairs") or []),
+                            }
+                            for item in batch_items
+                        ],
+                        "matched_pairs": self._serialize_matched_pairs(
+                            [pair for item in batch_items for pair in (item.get("matched_pairs") or [])]
+                        ),
+                        "summary": "；".join(item["summary"] for item in batch_items if item.get("summary")),
+                        "task": task,
+                    }
+                    self._attach_historical_progress(batch)
+                    progress_text = self._format_threshold_progress_text(current_count, batch_size, historical_count)
+                    if total_count < batch_size:
+                        self._pending_batches[batch_id] = batch
+                    self._send_queue.put(batch)
+                    advanced_in_task = False
+                    remaining_current_platforms = self._remaining_current_platforms_after_match(
+                        current_item,
+                        matched_pairs,
+                    )
+                    guide_position = "none"
+                    if self._should_advance_for_match(focus_task_name, task_name, guide_advanced):
+                        guide_position = self._set_post_match_guide_index(
+                            tasks,
+                            guide_items,
+                            current_index,
+                            current_item,
+                            remaining_current_platforms=remaining_current_platforms,
+                        )
+                        if guide_position in {"same_task", "next_task"}:
+                            guide_advanced = True
+                            advanced_in_task = guide_position == "same_task"
+                    if advanced_in_task:
+                        self._set_guide_status(
+                            f"截图识别成功，已加入 {task_name} "
+                            f"{progress_text}，"
+                            "正在自动处理并切到同品牌下一个关键词"
+                        )
+                    elif guide_position == "next_task":
+                        self._set_guide_status(
+                            f"截图识别成功，已加入 {task_name} "
+                            f"{progress_text}，"
+                            "正在自动处理并切到下一个品牌"
+                        )
+                    elif remaining_current_platforms:
+                        self._set_guide_status(
+                            f"截图识别成功，已加入 {task_name} "
+                            f"{progress_text}，"
+                            "正在自动处理并继续当前关键词剩余平台"
+                        )
+                    else:
+                        self._set_guide_status(
+                            f"截图识别成功，已加入 {task_name} "
+                            f"{progress_text}，"
+                            "正在自动处理"
+                        )
+                    self._notify_manual_state_change()
+                    print(
+                        f"[Recognition] {task_name} 已写入自动发送队列，"
+                        f"{progress_text}"
+                    )
+                    self._persist_task_progress_status(
+                        task,
+                        current_count=current_count,
+                        batch_size=batch_size,
+                        historical_count=historical_count,
+                        status_message=f"识别模式已捕获：{progress_text}，正在自动处理",
+                    )
+                    continue
                 if total_count < batch_size:
                     remaining_count = max(0, batch_size - total_count)
                     progress_text = self._format_threshold_progress_text(current_count, batch_size, historical_count)
@@ -3442,6 +3768,7 @@ class ClipboardRecognitionManager:
                             "path": item["path"],
                             "ocr_text": item.get("ocr_text", ""),
                             "source_text": item.get("source_text", ""),
+                            "matched_pairs": self._serialize_matched_pairs(item.get("matched_pairs") or []),
                         }
                         for item in batch_items
                     ],
@@ -3542,6 +3869,9 @@ class ClipboardRecognitionManager:
                 continue
             self._sending = True
             with self._lock:
+                batch_id = str((batch or {}).get("id") or "").strip()
+                if batch_id:
+                    self._pending_batches.pop(batch_id, None)
                 self._active_send_batch = copy.deepcopy(batch)
             try:
                 self._send_batch(batch)
@@ -3628,54 +3958,7 @@ class ClipboardRecognitionManager:
             self._notify_manual_state_change()
             return
         daily_state_source = str(task.get("_daily_state_source") or "recognition")
-        webhook_url = self._resolve_webhook(task)
-        if not webhook_url or "YOUR_KEY_HERE" in webhook_url:
-            print(f"[Recognition] {batch['task_name']} 未配置有效 webhook，跳过发送")
-            self._set_guide_status(f"{batch['task_name']} 未配置有效 webhook，未发送")
-            self._notify_manual_state_change()
-            record_event(
-                category="notification",
-                message="识别模式未配置有效 webhook",
-                task_name=batch["task_name"],
-                platform="recognition",
-                keyword="clipboard",
-                brand=",".join(batch.get("brands", [])),
-                details={"image_paths": batch.get("image_paths", [])},
-            )
-            status_extra = build_task_state_extra(
-                brands=list(batch.get("brands", [])),
-                image_count=len(batch.get("image_paths", [])),
-                task_failure_kind="notification",
-                notification_success=False,
-            )
-            if daily_state_source == "manual_test":
-                write_task_status(
-                    task,
-                    status="send_failed",
-                    source=daily_state_source,
-                    scope="test",
-                    message="识别模式未配置有效 webhook",
-                    extra=status_extra,
-                )
-            else:
-                write_task_status(
-                    task,
-                    status="send_failed",
-                    source=daily_state_source,
-                    message="识别模式未配置有效 webhook",
-                    extra=status_extra,
-                )
-            if self._on_send_complete:
-                self._on_send_complete(batch, False, "未配置有效 webhook")
-            return
-
         config = self._config_getter() or {}
-        default_notify = config.get("default_notification", {})
-        notifier = WeComNotifier(
-            webhook_url=webhook_url,
-            cooldown_minutes=default_notify.get("cooldown_minutes", 30),
-            send_interval=default_notify.get("send_interval", 2),
-        )
         matched_pairs = self._serialize_matched_pairs(batch.get("matched_pairs") or [])
         self._attach_historical_progress(batch)
         completed_keywords = list(batch.get("historical_completed_keywords") or [])
@@ -3696,9 +3979,16 @@ class ClipboardRecognitionManager:
 
         prepare_started = time.perf_counter()
         send_paths, detected_platforms = self._prepare_send_images(batch, config)
+        prepared_results_payload = batch.pop("_prepared_send_results", None)
+        prepared_results = (
+            list(prepared_results_payload or [])
+            if prepared_results_payload is not None
+            else None
+        )
         prepare_elapsed = time.perf_counter() - prepare_started
         if send_paths:
             batch["image_paths"] = send_paths
+        merge_started = time.perf_counter()
         merged_image_paths = []
         seen_image_paths = set()
         for path in historical_screenshot_paths + list(batch.get("image_paths") or []):
@@ -3713,6 +4003,7 @@ class ClipboardRecognitionManager:
             platform_text = str(platform_name or "").strip()
             if platform_text and platform_text not in merged_detected_platforms:
                 merged_detected_platforms.append(platform_text)
+        merge_elapsed = time.perf_counter() - merge_started
         batch["detected_platforms"] = merged_detected_platforms
         print(
             f"[Recognition] 发送批次图片清单: task={batch['task_name']}, "
@@ -3723,6 +4014,7 @@ class ClipboardRecognitionManager:
             batch,
             image_paths=list(send_paths or []),
             detected_platforms=list(merged_detected_platforms),
+            prepared_results=prepared_results,
         )
         applied_pool: dict = {}
         state_started = time.perf_counter()
@@ -3757,6 +4049,21 @@ class ClipboardRecognitionManager:
 
         updated_status = get_task_day_status(task)
         updated_progress = self._get_task_daily_progress(task)
+        scoped_has_gap = bool(
+            updated_status.get("test_has_gap")
+            if daily_state_source == "manual_test"
+            else updated_status.get("has_gap")
+        )
+        scoped_gap_reasons = [
+            str(item).strip()
+            for item in (
+                updated_status.get("test_gap_reasons")
+                if daily_state_source == "manual_test"
+                else updated_status.get("gap_reasons")
+                or []
+            )
+            if str(item).strip()
+        ]
         refreshed_image_paths: list[str] = []
         refreshed_platforms: list[str] = []
         if daily_state_source != "manual_test":
@@ -3785,7 +4092,12 @@ class ClipboardRecognitionManager:
             batch["detected_platforms"] = list(merged_detected_platforms)
         completed_keywords = [
             str(item).strip()
-            for item in (updated_status.get("completed_keywords") or [])
+            for item in (
+                updated_status.get("test_completed_keywords")
+                if daily_state_source == "manual_test"
+                else updated_status.get("completed_keywords")
+                or []
+            )
             if str(item).strip()
         ]
         supplemented_keywords = [
@@ -3796,16 +4108,26 @@ class ClipboardRecognitionManager:
         batch["supplemented_keywords"] = list(supplemented_keywords)
         batch["completed_keywords"] = list(completed_keywords)
         state_elapsed = time.perf_counter() - state_started
+        state_image_extra = {
+            "screenshot_paths": list(batch.get("image_paths") or []),
+            "actual_screenshot_count": len(batch.get("image_paths") or []),
+        }
+        print(
+            f"[Recognition] 发送批次阶段耗时: task={batch['task_name']}, "
+            f"prepare={prepare_elapsed:.2f}s, merge={merge_elapsed:.2f}s, "
+            f"state={state_elapsed:.2f}s, prepared_results={len(prepared_results or [])}, "
+            f"keyword_updates={len(keyword_updates)}, images={len(batch.get('image_paths') or [])}"
+        )
 
-        if bool(updated_status.get("has_gap")):
-            gap_text = "、".join(str(item).strip() for item in (updated_status.get("gap_reasons") or []) if str(item).strip())
+        if scoped_has_gap:
+            gap_text = "、".join(str(item).strip() for item in scoped_gap_reasons if str(item).strip())
             gap_current_count = 0
             if daily_state_source == "manual_test":
                 # 手动测试时，单平台先落库会进入缺口等待。这里必须给出
                 # “已捕获 X/Y + 已捕获哪些平台”的正向反馈，否则用户只看到
                 # “未运行/未出现”，会误以为粘贴没成功而反复重粘。
                 captured_paths, captured_platforms = self._extract_completed_send_state_from_pool(
-                    applied_pool or get_task_day_status(task).get("pool") or {}
+                    applied_pool or get_task_day_status(task).get("test_pool") or {}
                 )
                 gap_current_count = len(captured_paths)
                 batch_size = max(1, int(task.get("recognition_batch_size") or 1))
@@ -3814,7 +4136,7 @@ class ClipboardRecognitionManager:
                     for platform in captured_platforms
                     if str(platform or "").strip()
                 }
-                pool_for_state = applied_pool or get_task_day_status(task).get("pool") or {}
+                pool_for_state = applied_pool or get_task_day_status(task).get("test_pool") or {}
                 pending_platforms: list[str] = []
                 for keyword_state in (pool_for_state.get("keywords") or {}).values():
                     for platform in (keyword_state or {}).get("required_platforms") or []:
@@ -3862,6 +4184,84 @@ class ClipboardRecognitionManager:
                 "status=gap"
             )
             return
+
+        if daily_state_source == "manual_test":
+            grouped_paths, grouped_platforms = self._extract_completed_send_state_for_brand_group(
+                task,
+                preferred_paths=list(batch.get("image_paths") or []),
+            )
+            if grouped_paths:
+                if grouped_paths != merged_image_paths:
+                    print(
+                        f"[Recognition] 手动测试整组发送路径已合并: task={batch['task_name']}, "
+                        f"paths={grouped_paths}"
+                    )
+                merged_image_paths = list(grouped_paths)
+                batch["image_paths"] = list(grouped_paths)
+            if grouped_platforms:
+                merged_detected_platforms = list(dict.fromkeys(grouped_platforms))
+                batch["detected_platforms"] = list(merged_detected_platforms)
+
+        webhook_url = self._resolve_webhook(task)
+        if not webhook_url or "YOUR_KEY_HERE" in webhook_url:
+            preserved_count = len(batch.get("image_paths") or [])
+            preserved_hint = f"已保留 {preserved_count} 张截图，可在异常任务中补发" if preserved_count > 0 else "未发送"
+            message = f"{batch['task_name']} 未配置有效 webhook，{preserved_hint}"
+            print(f"[Recognition] {message}")
+            self._set_guide_status(message)
+            self._notify_manual_state_change()
+            record_event(
+                category="notification",
+                message="识别模式未配置有效 webhook",
+                task_name=batch["task_name"],
+                platform="recognition",
+                keyword="clipboard",
+                brand=",".join(batch.get("brands", [])),
+                details={"image_paths": batch.get("image_paths", [])},
+            )
+            status_extra = build_task_state_extra(
+                brands=list(batch.get("brands", [])),
+                image_count=len(batch.get("image_paths", [])),
+                completed_keywords=list(completed_keywords),
+                supplemented_keywords=list(supplemented_keywords),
+                detected_platforms=list(merged_detected_platforms),
+                task_failure_kind="notification",
+                notification_success=False,
+                extra=dict(state_image_extra),
+            )
+            if daily_state_source == "manual_test":
+                write_task_status(
+                    task,
+                    status="send_failed",
+                    source=daily_state_source,
+                    scope="test",
+                    message=message,
+                    extra=status_extra,
+                )
+            else:
+                write_task_status(
+                    task,
+                    status="send_failed",
+                    source=daily_state_source,
+                    message=message,
+                    extra=status_extra,
+                )
+            if self._on_send_complete:
+                self._on_send_complete(batch, False, "未配置有效 webhook")
+            print(
+                f"[Recognition] 发送批次耗时: task={batch['task_name']}, "
+                f"prepare={prepare_elapsed:.2f}s, state={state_elapsed:.2f}s, "
+                f"wecom=0.00s, total={time.perf_counter() - send_batch_started:.2f}s, "
+                "status=missing_webhook"
+            )
+            return
+
+        default_notify = config.get("default_notification", {})
+        notifier = WeComNotifier(
+            webhook_url=webhook_url,
+            cooldown_minutes=default_notify.get("cooldown_minutes", 30),
+            send_interval=default_notify.get("send_interval", 2),
+        )
 
         wecom_started = time.perf_counter()
         notification_identity = self._build_notification_idempotency(
@@ -3964,8 +4364,10 @@ class ClipboardRecognitionManager:
                 image_count=len(batch.get("image_paths", [])),
                 completed_keywords=list(completed_keywords),
                 supplemented_keywords=list(supplemented_keywords),
+                detected_platforms=list(merged_detected_platforms),
                 task_failure_kind="",
                 notification_success=True,
+                extra=dict(state_image_extra),
             )
             if daily_state_source == "manual_test":
                 write_task_status(
@@ -4001,9 +4403,10 @@ class ClipboardRecognitionManager:
                 image_count=len(batch.get("image_paths", [])),
                 completed_keywords=list(completed_keywords),
                 supplemented_keywords=list(supplemented_keywords),
+                detected_platforms=list(merged_detected_platforms),
                 task_failure_kind="notification",
                 notification_success=False,
-                extra=retry_extra,
+                extra={**state_image_extra, **retry_extra},
             )
             if daily_state_source == "manual_test":
                 write_task_status(

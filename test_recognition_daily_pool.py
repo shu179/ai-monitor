@@ -1,4 +1,5 @@
 import os
+import builtins
 from datetime import datetime, timedelta
 from pathlib import Path
 import tempfile
@@ -217,6 +218,8 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertEqual(items[0]["platforms"], ["deepseek"])
         self.assertEqual(items[0]["completed_keyword_count"], 0)
         self.assertEqual(items[0]["total_keyword_count"], 1)
+        self.assertEqual(items[0]["completed_platform_count"], 1)
+        self.assertEqual(items[0]["total_platform_count"], 2)
 
     def test_runtime_buffered_platform_is_removed_from_guide_before_send(self) -> None:
         screenshots_dir = Path(self._tmpdir.name) / "screenshots"
@@ -452,6 +455,67 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertEqual(items[0]["completed_keyword_count"], 0)
         self.assertEqual(items[0]["total_keyword_count"], 1)
 
+    def test_guide_state_keyword_row_progress_uses_keyword_completion_counts(self) -> None:
+        task = {
+            **TASK,
+            "task_id": "task_r_guide_keyword_progress",
+            "recognition_batch_size": 3,
+            "guide_keywords": [
+                {"keyword": "词1", "brands": ["品牌R"], "platforms": ["doubao", "deepseek"]},
+                {"keyword": "词2", "brands": ["品牌R"], "platforms": ["doubao"]},
+            ],
+            "keywords": [
+                {"keyword": "词1", "brand": "品牌R", "platforms": ["doubao", "deepseek"], "mode": "recognition"},
+                {"keyword": "词2", "brand": "品牌R", "platforms": ["doubao"], "mode": "recognition"},
+            ],
+        }
+        screenshots_dir = Path(self._tmpdir.name) / "screenshots"
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        screenshot_path = screenshots_dir / "guide_progress_doubao.jpg"
+        screenshot_path.write_bytes(b"fake-image")
+
+        dts.apply_task_keyword_updates(
+            dict(task),
+            [
+                {
+                    "keyword": "词2",
+                    "brand": "品牌R",
+                    "run_success": True,
+                    "screenshot_saved": True,
+                    "failure_reason": "",
+                    "platform": "doubao",
+                    "image_path": str(screenshot_path),
+                }
+            ],
+            source_mode="formal",
+        )
+
+        manager = ClipboardRecognitionManager(
+            config_getter=lambda: {
+                "detection_mode": "recognition",
+                "tasks": [
+                    {
+                        "name": task["name"],
+                        "task_id": task["task_id"],
+                        "enabled": True,
+                        "brand": "品牌R",
+                        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                        "recognition_batch_size": 3,
+                        "keywords": task["keywords"],
+                        "webhook_url": "https://example.com/webhook",
+                    }
+                ],
+            }
+        )
+
+        state = manager.get_keyword_guide_state()
+        item = state["items"][0]
+        self.assertEqual(item["keyword"], "词1")
+        self.assertEqual(item["completed_keyword_count"], 0)
+        self.assertEqual(item["total_keyword_count"], 1)
+        self.assertEqual(item["screenshot_count"], 0)
+        self.assertEqual(item["screenshot_total"], 2)
+
     def test_progress_status_does_not_keep_previous_failure_label(self) -> None:
         task = {**TASK, "recognition_batch_size": 3}
         dts.write_task_status(
@@ -609,6 +673,72 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertTrue(status.get("has_gap"))
         self.assertIn("词2：截图保存失败", status.get("gap_reasons") or [])
 
+    def test_send_batch_does_not_mark_unrendered_platform_slot_failed(self) -> None:
+        task = {
+            "name": "品牌R",
+            "task_id": "task_r_send_partial_slot",
+            "brand": "品牌R",
+            "enabled": True,
+            "weekdays": [0, 1, 2, 3, 4, 5, 6],
+            "webhook_url": "https://example.com/webhook",
+            "recognition_batch_size": 1,
+            "keywords": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao", "deepseek"], "mode": "recognition"},
+            ],
+        }
+        config = {
+            "detection_mode": "recognition",
+            "recognition": {"dom_render_mode": True},
+            "tasks": [task],
+        }
+        manager = ClipboardRecognitionManager(config_getter=lambda: config)
+        notifier_calls: list[tuple] = []
+
+        class FakeNotifier:
+            def __init__(self, *args, **kwargs):
+                self.last_error = ""
+
+            def send_detected_images(self, *args, **kwargs):
+                notifier_calls.append((args, kwargs))
+                return True
+
+        def _fake_render_text_to_screenshot(text, platform, keyword="", brand="", output_path=None, include_badges=True):
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_bytes(f"rendered-{platform}".encode("utf-8"))
+            return str(output_path)
+
+        batch = {
+            "id": "batch-partial-slot-1",
+            "task_name": "品牌R",
+            "brands": ["品牌R"],
+            "image_paths": [],
+            "image_items": [
+                {"path": "", "ocr_text": "豆包回答提到品牌R", "source_text": "豆包回答提到品牌R"},
+            ],
+            "matched_pairs": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao"]},
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["deepseek"]},
+            ],
+            "task": task,
+        }
+
+        with patch("core.recognition.WeComNotifier", FakeNotifier):
+            with patch("platforms.html_renderer.render_text_to_screenshot", side_effect=_fake_render_text_to_screenshot):
+                manager._send_batch(batch)
+
+        status = dts.get_task_day_status({"task_id": task["task_id"], "name": task["name"], **task})
+        keyword_state = dict((status.get("keyword_states") or {}).get("词R") or {})
+        platform_states = dict(keyword_state.get("platform_states") or {})
+
+        self.assertEqual(notifier_calls, [])
+        self.assertTrue(status.get("has_gap"))
+        self.assertTrue(dict(platform_states.get("doubao") or {}).get("screenshot_saved"))
+        self.assertIsNone(platform_states.get("deepseek"))
+        self.assertEqual(
+            manager._build_keyword_guide_items(manager._get_enabled_tasks())[0]["platforms"],
+            ["deepseek"],
+        )
+
     def test_send_batch_uses_canonical_path_after_daily_state_moves_image(self) -> None:
         send_path = Path(self._tmpdir.name) / "screenshots" / "decorated" / "send_move.jpg"
         send_path.parent.mkdir(parents=True, exist_ok=True)
@@ -718,6 +848,52 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertEqual(status.get("status"), "send_failed")
         self.assertEqual(retry_extra.get("retry_queue_id"), entries[0]["id"])
         self.assertEqual(retry_extra.get("notification_success"), False)
+
+    def test_send_batch_without_webhook_preserves_rendered_screenshots_for_force_send(self) -> None:
+        send_path = Path(self._tmpdir.name) / "screenshots" / "missing_webhook" / "send_missing.jpg"
+        send_path.parent.mkdir(parents=True, exist_ok=True)
+        send_path.write_bytes(b"fake-image")
+
+        task = {
+            "name": "品牌R",
+            "task_id": "task_r_missing_webhook",
+            "webhook_url": "",
+            "recognition_batch_size": 1,
+            "keywords": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao"], "mode": "recognition"},
+            ],
+        }
+        batch = {
+            "id": "batch-missing-webhook-1",
+            "task_name": "品牌R",
+            "brands": ["品牌R"],
+            "image_paths": [str(send_path)],
+            "image_items": [{"path": str(send_path), "ocr_text": "示例"}],
+            "matched_pairs": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao"]},
+            ],
+            "task": task,
+        }
+
+        with patch.object(
+            self.manager,
+            "_prepare_send_images",
+            return_value=([str(send_path)], ["doubao"]),
+        ):
+            self.manager._send_batch(batch)
+
+        status = dts.get_task_day_status({"task_id": task["task_id"], "name": task["name"]})
+        official_extra = status.get("official_extra") or {}
+
+        self.assertEqual(status.get("status"), "send_failed")
+        self.assertEqual(official_extra.get("notification_success"), False)
+        self.assertEqual(official_extra.get("completed_keywords"), ["词R"])
+        self.assertEqual(official_extra.get("detected_platforms"), ["doubao"])
+        self.assertEqual(len(official_extra.get("screenshot_paths") or []), 1)
+        self.assertTrue(Path(official_extra["screenshot_paths"][0]).exists())
+        self.assertTrue(official_extra["screenshot_paths"][0].endswith("_品牌R_词R_doubao.jpg"))
+        self.assertEqual(official_extra.get("actual_screenshot_count"), 1)
+        self.assertIn("可在异常任务中补发", self.manager._guide_status_text)
 
     def test_manual_test_send_is_not_blocked_by_sent_today_flag(self) -> None:
         send_path = Path(self._tmpdir.name) / "screenshots" / "manual_test_send.jpg"
@@ -832,7 +1008,13 @@ class RecognitionDailyPoolTests(unittest.TestCase):
                 with patch("core.recognition.apply_task_keyword_updates", return_value=stale_pool):
                     with patch(
                         "core.recognition.get_task_day_status",
-                        return_value={"has_gap": False, "completed_keywords": ["词R"]},
+                        return_value={
+                            "has_gap": False,
+                            "completed_keywords": ["词R"],
+                            "test_has_gap": False,
+                            "test_completed_keywords": ["词R"],
+                            "test_gap_reasons": [],
+                        },
                     ):
                         with patch.object(
                             self.manager,
@@ -844,6 +1026,90 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertEqual(len(notifier_calls), 1)
         self.assertEqual(notifier_calls[0][1]["screenshot_paths"], [str(current_path)])
         extract_from_pool.assert_not_called()
+
+    def test_manual_test_second_session_does_not_send_previous_round_image(self) -> None:
+        previous_path = Path(self._tmpdir.name) / "screenshots" / "previous_round.jpg"
+        current_path = Path(self._tmpdir.name) / "screenshots" / "current_round.jpg"
+        previous_path.parent.mkdir(parents=True, exist_ok=True)
+        previous_path.write_bytes(b"previous-image")
+        current_path.write_bytes(b"current-image")
+
+        task = {
+            "name": "品牌R",
+            "task_id": "task_r_manual_second_session",
+            "brand": "品牌R",
+            "webhook_url": "https://example.com/webhook",
+            "recognition_batch_size": 2,
+            "_daily_state_source": "manual_test",
+            "keywords": [
+                {"keyword": "词A", "brand": "品牌R", "platforms": ["doubao"], "mode": "recognition"},
+                {"keyword": "词B", "brand": "品牌R", "platforms": ["deepseek"], "mode": "recognition"},
+            ],
+        }
+
+        dts.apply_task_keyword_updates(
+            task,
+            [
+                {
+                    "keyword": "词A",
+                    "brand": "品牌R",
+                    "run_success": True,
+                    "screenshot_saved": True,
+                    "failure_reason": "",
+                    "platform": "doubao",
+                    "image_path": str(previous_path),
+                },
+                {
+                    "keyword": "词B",
+                    "brand": "品牌R",
+                    "run_success": True,
+                    "screenshot_saved": True,
+                    "failure_reason": "",
+                    "platform": "deepseek",
+                    "image_path": str(previous_path),
+                },
+            ],
+            source_mode="test",
+        )
+        dts.mark_task_sent(task, source_mode="test", message="上一轮测试已完成")
+        dts.reset_manual_test_session_state(task)
+
+        batch = {
+            "id": "manual-second-session-current",
+            "task_name": "品牌R",
+            "brands": ["品牌R"],
+            "image_paths": [str(current_path)],
+            "image_items": [{"path": str(current_path), "ocr_text": "新一轮只复制一条", "source_text": "新一轮只复制一条"}],
+            "matched_pairs": [
+                {"keyword": "词A", "brand": "品牌R", "platforms": ["doubao"]},
+            ],
+            "task": task,
+        }
+
+        notifier_calls: list[tuple] = []
+
+        class FakeNotifier:
+            def __init__(self, *args, **kwargs):
+                self.last_error = ""
+
+            def send_detected_images(self, *args, **kwargs):
+                notifier_calls.append((args, kwargs))
+                return True
+
+        with patch("core.recognition.WeComNotifier", FakeNotifier):
+            with patch.object(
+                self.manager,
+                "_prepare_send_images",
+                return_value=([str(current_path)], ["doubao"]),
+            ):
+                self.manager._send_batch(batch)
+
+        status = dts.get_task_day_status({"task_id": task["task_id"], "name": task["name"]})
+        self.assertEqual(notifier_calls, [])
+        self.assertTrue(status["brand_status"] in {"success", "sent"})
+        self.assertTrue(status["test_has_gap"])
+        self.assertEqual(status["test_actual_screenshot_count"], 1)
+        self.assertEqual(status["test_completed_keywords"], ["词A"])
 
     def test_manual_test_send_uses_canonical_path_after_state_move(self) -> None:
         current_path = Path(self._tmpdir.name) / "screenshots" / "recognition" / "decorated" / "current_dom.jpg"
@@ -971,6 +1237,80 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertTrue(any(path.endswith("_doubao.jpg") for path in sent_paths))
         self.assertEqual(notifier_calls[0][1]["detected_platforms"], ["deepseek", "doubao"])
 
+    def test_manual_test_send_collects_all_completed_keyword_images_for_brand_group(self) -> None:
+        first_path = Path(self._tmpdir.name) / "screenshots" / "recognition" / "decorated" / "keyword_a_dom.jpg"
+        second_path = Path(self._tmpdir.name) / "screenshots" / "recognition" / "decorated" / "keyword_b_dom.jpg"
+        first_path.parent.mkdir(parents=True, exist_ok=True)
+        first_path.write_bytes(b"keyword-a-image")
+        second_path.write_bytes(b"keyword-b-image")
+
+        task = {
+            "name": "品牌R",
+            "task_id": "task_r_manual_multi_keyword_send",
+            "brand": "品牌R",
+            "webhook_url": "https://example.com/webhook",
+            "recognition_batch_size": 2,
+            "_daily_state_source": "manual_test",
+            "keywords": [
+                {"keyword": "词A", "brand": "品牌R", "platforms": ["doubao"], "mode": "recognition"},
+                {"keyword": "词B", "brand": "品牌R", "platforms": ["doubao"], "mode": "recognition"},
+            ],
+        }
+        dts.apply_task_keyword_updates(
+            task,
+            [
+                {
+                    "keyword": "词A",
+                    "brand": "品牌R",
+                    "run_success": True,
+                    "screenshot_saved": True,
+                    "failure_reason": "",
+                    "platform": "doubao",
+                    "image_path": str(first_path),
+                }
+            ],
+            source_mode="test",
+        )
+        first_status = dts.get_task_day_status({"task_id": task["task_id"], "name": task["name"]})
+        self.assertTrue(first_status.get("has_gap"))
+
+        batch = {
+            "id": "manual-batch-multi-keyword",
+            "task_name": "品牌R",
+            "brands": ["品牌R"],
+            "image_paths": [str(second_path)],
+            "image_items": [{"path": str(second_path), "ocr_text": "词B示例", "source_text": "词B示例"}],
+            "matched_pairs": [
+                {"keyword": "词B", "brand": "品牌R", "platforms": ["doubao"]},
+            ],
+            "task": task,
+        }
+
+        notifier_calls: list[tuple] = []
+
+        class FakeNotifier:
+            def __init__(self, *args, **kwargs):
+                self.last_error = ""
+
+            def send_detected_images(self, *args, **kwargs):
+                notifier_calls.append((args, kwargs))
+                return True
+
+        with patch("core.recognition.WeComNotifier", FakeNotifier):
+            with patch.object(
+                self.manager,
+                "_prepare_send_images",
+                return_value=([str(second_path)], ["doubao"]),
+            ):
+                self.manager._send_batch(batch)
+
+        self.assertEqual(len(notifier_calls), 1)
+        sent_paths = notifier_calls[0][1]["screenshot_paths"]
+        self.assertEqual(len(sent_paths), 2)
+        self.assertTrue(all(Path(path).exists() for path in sent_paths))
+        self.assertTrue(any(path.endswith("_词A_doubao.jpg") for path in sent_paths))
+        self.assertTrue(any(path.endswith("_词B_doubao.jpg") for path in sent_paths))
+
     def test_manual_test_gap_reports_positive_capture_progress(self) -> None:
         """单平台先落库进入缺口等待时，必须给出“已捕获 X/Y”的正向反馈，
         而不是“未运行/仍有关键词缺口”，否则用户会以为粘贴没成功而反复重粘。"""
@@ -1068,9 +1408,98 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertIn("已捕获", guide_text)
         self.assertIn("无需重复粘贴", guide_text)
 
-    def test_manual_test_buffer_flushes_within_short_window(self) -> None:
-        """手动测试任务不能再干等默认 30~120s 的批次超时，
-        短窗口（默认 4s）内即应 flush 落库以尽快反馈。"""
+    def test_duplicate_text_repaste_feedback_is_throttled(self) -> None:
+        config = {
+            "detection_mode": "recognition",
+            "recognition": {"safe_mode_ocr_enabled": False, "dom_render_mode": True},
+            "tasks": [
+                {
+                    "name": "品牌R",
+                    "task_id": "task_r_dup_hint_throttled",
+                    "enabled": True,
+                    "brand": "品牌R",
+                    "_daily_state_source": "manual_test",
+                    "recognition_batch_size": 2,
+                    "keywords": [
+                        {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao", "deepseek"]},
+                    ],
+                }
+            ],
+        }
+        manager = ClipboardRecognitionManager(lambda: config)
+        manager._clipboard_armed = True
+        manager._startup_clipboard_hash = None
+        sample_text = "这是一段包含品牌R的较长回答文本。" * 8
+        emitted_messages: list[str] = []
+        original_print = builtins.print
+
+        def capture_print(*args, **kwargs):
+            text = " ".join(str(arg) for arg in args)
+            if "文本重复" in text and "无需重复粘贴" in manager._guide_status_text:
+                emitted_messages.append(text)
+            return original_print(*args, **kwargs)
+
+        with patch.object(manager, "_dom_render_text_length_limits", return_value=(1, 100000)):
+            with patch.object(manager, "_poll_clipboard_text", return_value=sample_text):
+                with patch("builtins.print", side_effect=capture_print):
+                    manager._poll_once_text_mode()
+                    manager._poll_once_text_mode()
+                    manager._poll_once_text_mode()
+
+        self.assertEqual(len(emitted_messages), 1)
+
+    def test_duplicate_text_repaste_does_not_override_status_when_task_has_no_pending_work(self) -> None:
+        config = {
+            "detection_mode": "recognition",
+            "recognition": {"safe_mode_ocr_enabled": False, "dom_render_mode": True},
+            "tasks": [
+                {
+                    "name": "品牌R",
+                    "task_id": "task_r_dup_no_pending",
+                    "enabled": True,
+                    "brand": "品牌R",
+                    "recognition_batch_size": 1,
+                    "keywords": [
+                        {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao"]},
+                    ],
+                }
+            ],
+        }
+        manager = ClipboardRecognitionManager(lambda: config)
+        sample_text = "这是一段包含品牌R的较长回答文本。" * 8
+        screenshot_path = Path(self._tmpdir.name) / "dup_no_pending.jpg"
+        screenshot_path.write_bytes(b"fake-image")
+
+        dts.apply_task_keyword_updates(
+            {"task_id": "task_r_dup_no_pending", "name": "品牌R", **config["tasks"][0]},
+            [
+                {
+                    "keyword": "词R",
+                    "brand": "品牌R",
+                    "run_success": True,
+                    "screenshot_saved": True,
+                    "failure_reason": "",
+                    "platform": "doubao",
+                    "image_path": str(screenshot_path),
+                }
+            ],
+            source_mode="formal",
+        )
+        manager._clipboard_armed = True
+        manager._startup_clipboard_hash = None
+        manager._set_guide_status("品牌R 未配置有效 webhook，已保留 1 张截图，可在异常任务中补发")
+
+        with patch.object(manager, "_dom_render_text_length_limits", return_value=(1, 100000)):
+            with patch.object(manager, "_poll_clipboard_text", return_value=sample_text):
+                manager._poll_once_text_mode()
+                manager._poll_once_text_mode()
+
+        self.assertIn("可在异常任务中补发", manager._guide_status_text)
+        self.assertNotIn("无需重复粘贴", manager._guide_status_text)
+
+    def test_manual_test_partial_capture_enters_send_queue_immediately(self) -> None:
+        """手动测试任务的单次命中应立即进入发送链，
+        由发送阶段统一判断整组是否补齐，而不是先卡在本地 buffer。"""
         config = {
             "detection_mode": "recognition",
             "recognition": {"safe_mode_ocr_enabled": False, "dom_render_mode": True},
@@ -1103,16 +1532,9 @@ class RecognitionDailyPoolTests(unittest.TestCase):
             ocr_text="豆包回答文本",
             platform_hint=manager._get_active_capture_platform(),
         )
-        # 单平台粘贴后处于 buffer 中、尚未发送
-        self.assertTrue(any(manager._buffers.values()))
-        self.assertTrue(manager._send_queue.empty())
-
-        manager._work_started = True
-        # 模拟距上次捕获已过 10s：默认窗口(>=30s)不会 flush，短窗口(4s)应 flush
-        manager._last_image_seen_monotonic = time.monotonic() - 10
-        manager._check_flush_timeout()
 
         self.assertFalse(manager._send_queue.empty())
+        self.assertFalse(any(manager._buffers.values()))
 
     def test_dom_text_send_rerenders_template_with_matched_keyword(self) -> None:
         send_path = Path(self._tmpdir.name) / "screenshots" / "dom_text.jpg"
@@ -1204,6 +1626,45 @@ class RecognitionDailyPoolTests(unittest.TestCase):
         self.assertEqual(manager._dom_render_text_length_limits(), (500, 5000))
         self.assertEqual(manager._recognition_queue.qsize(), 0)
         self.assertIn("500-5000", manager._guide_status_text)
+        match_mock.assert_not_called()
+
+    def test_dom_text_mode_ignores_current_guide_keyword_clipboard_text(self) -> None:
+        config = {
+            "detection_mode": "recognition",
+            "recognition": {
+                "dom_render_mode": True,
+            },
+            "tasks": [
+                {
+                    "name": "品牌R",
+                    "task_id": "task_r_ignore_current_keyword_clipboard",
+                    "enabled": True,
+                    "brand": "品牌R",
+                    "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                    "recognition_batch_size": 1,
+                    "webhook_url": "https://example.com/webhook",
+                    "keywords": [
+                        {
+                            "keyword": "词R",
+                            "brand": "品牌R",
+                            "platforms": ["doubao"],
+                            "mode": "recognition",
+                        }
+                    ],
+                }
+            ],
+        }
+        manager = ClipboardRecognitionManager(config_getter=lambda: config)
+        manager._clipboard_armed = True
+        manager.set_active_capture_platform("doubao")
+
+        with patch.object(manager, "_poll_clipboard_text", return_value="词R"):
+            with patch.object(manager, "_match_brands_from_text", return_value=["品牌R"]) as match_mock:
+                manager._poll_once_text_mode()
+
+        self.assertEqual(manager._dom_render_text_length_limits(), (500, 5000))
+        self.assertEqual(manager._recognition_queue.qsize(), 0)
+        self.assertEqual(manager._guide_status_text, "")
         match_mock.assert_not_called()
 
     def test_dom_text_send_rerenders_template_without_intermediate_image(self) -> None:
@@ -1439,10 +1900,89 @@ class RecognitionDailyPoolTests(unittest.TestCase):
             ocr_text="品牌R",
         )
 
-        self.assertEqual(manager._send_queue.qsize(), 0)
-        self.assertEqual(len(manager._buffers.get("品牌R", [])), 1)
+        self.assertEqual(manager._send_queue.qsize(), 1)
+        self.assertEqual(len(manager._buffers.get("品牌R", [])), 0)
         progress = manager._get_task_daily_progress(tasks[0])
         self.assertEqual(progress.get("historical_screenshot_count"), 0)
+
+    def test_manual_test_guide_only_highlights_pending_platforms(self) -> None:
+        screenshots_dir = Path(self._tmpdir.name) / "screenshots"
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        current_path = screenshots_dir / "manual_done.jpg"
+        current_path.write_bytes(b"current-image")
+
+        manual_task = {
+            "name": "品牌R",
+            "task_id": "task_manual_platforms_only_pending",
+            "brand": "品牌R",
+            "enabled": True,
+            "recognition_enabled": True,
+            "recognition_batch_size": 2,
+            "_daily_state_source": "manual_test",
+            "keywords": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao", "deepseek"], "mode": "recognition"},
+            ],
+        }
+        dts.reset_manual_test_session_state(manual_task)
+        dts.apply_task_keyword_updates(
+            manual_task,
+            [
+                {
+                    "keyword": "词R",
+                    "brand": "品牌R",
+                    "run_success": True,
+                    "screenshot_saved": True,
+                    "failure_reason": "",
+                    "platform": "doubao",
+                    "image_path": str(current_path),
+                }
+            ],
+            source_mode="test",
+        )
+
+        manager = ClipboardRecognitionManager(config_getter=lambda: {"detection_mode": "recognition", "tasks": [manual_task]})
+        state = manager.get_keyword_guide_state()
+
+        self.assertEqual(len(state["items"]), 1)
+        item = state["items"][0]
+        self.assertEqual(item["platforms"], ["deepseek"])
+        self.assertEqual(item["all_platforms"], ["doubao", "deepseek"])
+        self.assertEqual(item["completed_platforms"], ["doubao"])
+        self.assertEqual(item["failed_platforms"], [])
+
+    def test_formal_dom_text_partial_capture_enters_send_queue_immediately(self) -> None:
+        task = {
+            "name": "品牌R",
+            "task_id": "task_r_formal_partial_queue",
+            "brand": "品牌R",
+            "enabled": True,
+            "weekdays": [0, 1, 2, 3, 4, 5, 6],
+            "webhook_url": "https://example.com/webhook",
+            "recognition_batch_size": 2,
+            "keywords": [
+                {"keyword": "词R", "brand": "品牌R", "platforms": ["doubao", "deepseek"], "mode": "recognition"},
+            ],
+        }
+        config = {
+            "detection_mode": "recognition",
+            "recognition": {"dom_render_mode": True},
+            "tasks": [task],
+        }
+        manager = ClipboardRecognitionManager(config_getter=lambda: config)
+        manager.set_active_capture_platform("doubao")
+        tasks = manager._get_enabled_tasks()
+
+        manager._route_to_batches(
+            image_path="",
+            brands=["品牌R"],
+            summary="检测到品牌: 品牌R",
+            tasks=tasks,
+            ocr_text="豆包回答提到品牌R",
+            platform_hint="doubao",
+        )
+
+        self.assertEqual(manager._send_queue.qsize(), 1)
+        self.assertEqual(len(manager._buffers.get("品牌R", [])), 0)
 
     def test_manual_test_success_task_is_removed_from_enabled_queue(self) -> None:
         manual_task = {

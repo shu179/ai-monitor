@@ -278,6 +278,8 @@ class RecognitionTextMatchingTests(unittest.TestCase):
         self.assertEqual(state_after_first_platform["index"], 0)
         self.assertEqual(state_after_first_platform["items"][0]["keyword"], "成都考研集训营")
         self.assertEqual(state_after_first_platform["items"][0]["platforms"], ["deepseek"])
+        self.assertEqual(state_after_first_platform["items"][0]["screenshot_count"], 1)
+        self.assertEqual(state_after_first_platform["items"][0]["screenshot_total"], 2)
 
         manager.set_active_capture_platform("deepseek")
         manager._route_to_batches(

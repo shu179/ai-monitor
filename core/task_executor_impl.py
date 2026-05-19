@@ -13,12 +13,13 @@ from core.daily_task_state import (
 from core.notifier import WeComNotifier
 from core.platform_sessions import (
     PlatformSessionManager,
+    build_query_execution_policy,
+    build_round_query_plan,
 )
 from core.task_executor_api import _run_api_task
 from core.task_executor_browser import (
     _apply_browser_runtime_config,
     _create_browser_platform,
-    _should_use_platform_serial_for_query,
     _should_use_session_pool_for_query,
     _sync_reused_platform_runtime_state,
 )
@@ -33,7 +34,6 @@ from core.task_executor_plan import (
     historical_query_result as _planned_historical_query_result,
 )
 from core.task_executor_query import execute_task_query
-from core.task_executor_serial import SerialPlatformRuntime
 from core.task_executor_smart import _run_smart_browser_task
 from core.task_notifications import (
     record_diagnostic as _record_diagnostic,
@@ -65,7 +65,6 @@ def run_task_group(
     issue_callback=None,
     stop_checker=None,
     platform_session_manager: PlatformSessionManager | None = None,
-    platform_serial_state: dict | None = None,
 ) -> list | tuple[list, dict]:
     """
     执行任务组（多关键词 × 多平台），返回所有结果列表
@@ -88,6 +87,17 @@ def run_task_group(
         runtime_mode = str(task.get('_scheduler_mode') or '').strip()
     if runtime_mode not in {'browser', 'api', 'smart', 'recognition'}:
         runtime_mode = ''
+    owns_session_manager = False
+    if platform_session_manager is None and runtime_mode in {"browser", "smart"}:
+        policy = build_query_execution_policy(config or {}, runtime_mode)
+        if policy.use_session_pool:
+            platform_session_manager = PlatformSessionManager(
+                runtime_mode,
+                policy,
+                build_round_query_plan([task], runtime_mode),
+                logger=print,
+            )
+            owns_session_manager = True
 
     # 默认品牌取第一个关键词的 brand
     default_brand = keywords[0].get('brand', '') if keywords else ''
@@ -96,7 +106,12 @@ def run_task_group(
     cloud_task_id = task.get('cloud_task_id') or task.get('cloudTaskId')
     daily_state_task = _task_for_daily_state(task)
     day_status = get_task_day_status(daily_state_task)
-    historical_keyword_states = dict(day_status.get('keyword_states') or {})
+    historical_keyword_states = dict(
+        day_status.get('test_keyword_states')
+        if execution_source == 'manual_test'
+        else day_status.get('keyword_states')
+        or {}
+    )
     historical_success_map = _load_today_success_only_query_results(
         task_name,
         task_id=history_task_id,
@@ -268,12 +283,6 @@ def run_task_group(
             fixed_screenshot_enabled=fixed_screenshot_enabled,
             manual_test_replay_completed_keywords=manual_test_replay_completed_keywords,
         )
-    serial_platform_runtime = SerialPlatformRuntime(
-        platform_serial_state,
-        task=task,
-        config=config,
-        stop_checker=stop_checker,
-    )
 
     daily_state_task = _task_for_daily_state(task)
     if total_queries > 0 and execution_source != 'manual_test':
@@ -331,19 +340,6 @@ def run_task_group(
             and fixed_screenshot_target > 0
             and (len(historical_selected_results) + len(selected_results)) >= fixed_screenshot_target
         )
-
-    serial_ordered_platforms = list(ordered_platforms)
-    active_serial_platform = serial_platform_runtime.active_name
-    route1_enabled = any(
-        _should_use_platform_serial_for_query(entry['mode'], task, config, platform_session_manager)
-        for entry in executable_entries
-    )
-    if route1_enabled and active_serial_platform and active_serial_platform in serial_ordered_platforms:
-        serial_ordered_platforms = [active_serial_platform] + [
-            platform_name
-            for platform_name in serial_ordered_platforms
-            if platform_name != active_serial_platform
-        ]
 
     if total_queries <= 0:
         empty_results, report = finalize_no_pending_queries(
@@ -434,7 +430,6 @@ def run_task_group(
             stop_message=stop_message,
             record_diagnostic=_record_diagnostic,
             complete_query_result=_complete_query_result,
-            acquire_serial_platform=serial_platform_runtime.acquire,
             run_api_task=_run_api_task,
             run_smart_browser_task=_run_smart_browser_task,
         )
@@ -447,31 +442,28 @@ def run_task_group(
             keywords=keywords,
             executable_entries=executable_entries,
             ordered_platforms=ordered_platforms,
-            serial_ordered_platforms=serial_ordered_platforms,
             entries_by_platform=entries_by_platform,
             fixed_screenshot_enabled=fixed_screenshot_enabled,
             fixed_screenshot_target=fixed_screenshot_target,
             historical_selected_results=historical_selected_results,
             selected_results=selected_results,
-            route1_enabled=route1_enabled,
             platform_session_manager=platform_session_manager,
             should_stop=_should_stop_remaining_work,
             fixed_target_reached=_fixed_target_reached,
             append_selected_result=_append_selected_result,
             execute_query=_execute_query,
-            close_serial_platform=serial_platform_runtime.close,
         )
     except SchedulerStopRequested:
         scheduler_cancelled = True
     finally:
-        if serial_platform_runtime.owns_state:
-            serial_platform_runtime.close(reason="任务组执行结束")
-
-    if platform_session_manager is not None:
-        try:
-            platform_session_manager.close_exhausted_sessions()
-        except Exception as e:
-            print(f"[Main] 复用会话清理失败: {e}")
+        if platform_session_manager is not None:
+            try:
+                if owns_session_manager:
+                    platform_session_manager.close_all(reason="任务组执行结束")
+                else:
+                    platform_session_manager.close_exhausted_sessions()
+            except Exception as e:
+                print(f"[Main] 复用会话清理失败: {e}")
 
     if _should_stop_remaining_work():
         cancelled_results, report = finalize_cancelled_run(
@@ -531,7 +523,6 @@ __all__ = [
     "_create_browser_platform",
     "_run_api_task",
     "_run_smart_browser_task",
-    "_should_use_platform_serial_for_query",
     "_should_use_session_pool_for_query",
     "_sync_reused_platform_runtime_state",
     "run_task_group",
