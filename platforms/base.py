@@ -191,7 +191,7 @@ class BasePlatform(ABC):
         self.page_stabilize_wait_min_ms = 1200
         self.page_stabilize_wait_max_ms = 2600
         self.failure_backoff_base_seconds = 3.0
-        self.failure_backoff_max_seconds = 20.0
+        self.failure_backoff_max_seconds = 12.0
 
         # 增强：加载稳定的浏览器指纹配置
         from core.browser_fingerprint import BrowserFingerprint
@@ -241,6 +241,24 @@ class BasePlatform(ABC):
             if remaining <= 0:
                 return
             time.sleep(min(interval, remaining))
+
+    def _cooperative_sleep_jittered(
+        self,
+        seconds: float,
+        *,
+        spread: float = 0.22,
+        minimum_seconds: float | None = None,
+        maximum_seconds: float | None = None,
+    ) -> None:
+        base = max(0.0, float(seconds or 0.0))
+        if base <= 0:
+            return
+        spread = max(0.0, float(spread or 0.0))
+        low = base * max(0.0, 1.0 - spread) if minimum_seconds is None else float(minimum_seconds or 0.0)
+        high = base * (1.0 + spread) if maximum_seconds is None else float(maximum_seconds or 0.0)
+        low = max(0.0, low)
+        high = max(low, high)
+        self._cooperative_sleep(random.uniform(low, high) if high > low else low)
 
     def _wait_for_page_selector(self, selector: str, timeout_ms: int) -> None:
         deadline = time.monotonic() + max(0.1, timeout_ms / 1000.0)
@@ -340,7 +358,7 @@ class BasePlatform(ABC):
             current = self._conversation_snapshot()
             if self._new_chat_transition_ready(before, current):
                 return True
-            self._cooperative_sleep(0.25)
+            self._cooperative_sleep_jittered(0.25, spread=0.28)
         return False
 
     def _wait_and_confirm_new_chat(
@@ -355,28 +373,8 @@ class BasePlatform(ABC):
         self._wait_for_page_selector(self.input_selector, timeout_ms=timeout_ms)
         return self._wait_until_new_chat_ready(before)
 
-    def _attempt_selector_agent_heal(self, field_name: str, *, label: str = "") -> bool:
-        """Ask the configured model to repair one selector, then verify by clicking."""
-        try:
-            from core.selector_heal.runtime import attempt_runtime_selector_heal
-
-            result = attempt_runtime_selector_heal(self, field_name, label=label)
-            if bool(result.get("ok")):
-                selector = str(result.get("selector") or "").strip()
-                saved = "并已保存" if result.get("saved") else "但保存失败"
-                if selector:
-                    print(f"[{self.name}] selector_agent 已验证 {label or field_name}: {selector}，{saved}")
-                return True
-            message = str(result.get("message") or "").strip()
-            if message and not result.get("skipped"):
-                print(f"[{self.name}] selector_agent 未完成 {label or field_name} 自愈: {message}")
-        except Exception as exc:
-            self._reraise_stop_requested(exc)
-            print(f"[{self.name}] selector_agent 自愈异常: {exc}")
-        return False
-
     def _attempt_learned_selector_heal(self, field_name: str, *, label: str = "") -> bool:
-        """Try the learned selector cache before falling back to the model."""
+        """Try a previously verified selector from the learned selector cache."""
         selector = self._get_learned_selector(field_name)
         if not selector:
             return False
@@ -451,7 +449,7 @@ class BasePlatform(ABC):
                         self.check_for_interruption(check_input_visible=False)
                     except InterruptionDetected:
                         raise
-                self._cooperative_sleep(0.15)
+                self._cooperative_sleep_jittered(0.15, spread=0.35)
         if last_error:
             raise last_error
         raise TimeoutError("点击元素超时")
@@ -968,7 +966,7 @@ class BasePlatform(ABC):
 
             # always_headed 平台启动后最小化（有头但不占前台）
             if self.always_headed and not self.inspect:
-                self._cooperative_sleep(1)  # 等窗口完全创建
+                self._cooperative_sleep_jittered(1.0, spread=0.16)  # 等窗口完全创建
                 self._minimize_browser_app()
 
             return self
@@ -984,9 +982,7 @@ class BasePlatform(ABC):
         """点击新建对话按钮，等待新会话状态就绪。"""
         before = self._conversation_snapshot()
         if not self.new_chat_selector:
-            if not self._attempt_selector_agent_heal("new_chat_selector", label="新对话"):
-                return
-            print(f"[{self.name}] 已通过 selector_agent 开启新对话")
+            self._attempt_learned_selector_heal("new_chat_selector", label="新对话")
             return
         try:
             self._raise_if_stop_requested()
@@ -999,8 +995,7 @@ class BasePlatform(ABC):
             raise RuntimeError("已点击新对话，但未确认进入新会话")
         except Exception as e:
             self._reraise_stop_requested(e)
-            if self._attempt_selector_agent_heal("new_chat_selector", label="新对话"):
-                print(f"[{self.name}] 已通过 selector_agent 开启新对话")
+            if self._attempt_learned_selector_heal("new_chat_selector", label="新对话"):
                 return
             print(f"[{self.name}] 开启新对话失败，继续: {e}")
 
@@ -1321,16 +1316,17 @@ class BasePlatform(ABC):
         self._wheel_answer_view()
         return False
 
-    def _answer_scroll_target_point(self) -> dict[str, float] | None:
-        if not getattr(self, "page", None):
-            return None
+    @staticmethod
+    def _clamp_pointer_value(value: float, lower: float, upper: float) -> float:
+        return max(lower, min(upper, value))
 
+    def _pointer_viewport_bounds(self, *, clamp_to_input: bool = True) -> tuple[float, float, float]:
         viewport = getattr(self.page, "viewport_size", None) or {}
         viewport_width = float(viewport.get("width") or 1280)
         viewport_height = float(viewport.get("height") or 900)
         input_top = viewport_height
 
-        if self.input_selector:
+        if clamp_to_input and self.input_selector:
             try:
                 input_box = self.page.locator(self.input_selector).first.bounding_box(timeout=250)
                 if input_box:
@@ -1338,62 +1334,63 @@ class BasePlatform(ABC):
             except Exception as exc:
                 self._reraise_stop_requested(exc)
 
-        def clamp(value: float, lower: float, upper: float) -> float:
-            return max(lower, min(upper, value))
+        return viewport_width, viewport_height, input_top
 
-        def locator_box(selector: str, *, last: bool) -> dict | None:
-            if not selector:
+    def _locator_box(self, selector: str, *, last: bool, timeout_ms: int = 300) -> dict | None:
+        if not getattr(self, "page", None) or not selector:
+            return None
+        try:
+            locator = self.page.locator(selector)
+            count = int(locator.count())
+            if count <= 0:
                 return None
-            try:
-                locator = self.page.locator(selector)
-                count = int(locator.count())
-                if count <= 0:
-                    return None
-                item = locator.nth(count - 1) if last else locator.first
-                box = item.bounding_box(timeout=300)
-                if not box:
-                    return None
-                width = float(box.get("width") or 0)
-                height = float(box.get("height") or 0)
-                if width <= 8 or height <= 8:
-                    return None
-                return box
-            except Exception as exc:
-                self._reraise_stop_requested(exc)
+            item = locator.nth(count - 1) if last else locator.first
+            box = item.bounding_box(timeout=timeout_ms)
+            if not box:
                 return None
+            width = float(box.get("width") or 0)
+            height = float(box.get("height") or 0)
+            if width <= 8 or height <= 8:
+                return None
+            return box
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return None
 
-        box = (
-            locator_box(self.chat_container_selector or "", last=True)
-            or locator_box(self.result_selector or "", last=True)
-            or locator_box("main, [role='main']", last=False)
-        )
-        if box:
-            x = clamp(
-                float(box.get("x") or 0) + float(box.get("width") or 0) * random.uniform(0.45, 0.62),
-                8,
-                viewport_width - 8,
-            )
-            raw_y = float(box.get("y") or 0) + float(box.get("height") or 0) * random.uniform(0.62, 0.78)
+    def _pointer_target_from_box(
+        self,
+        box: dict | None,
+        *,
+        x_range: tuple[float, float] = (0.45, 0.62),
+        y_range: tuple[float, float] = (0.62, 0.78),
+        clamp_to_input: bool = True,
+    ) -> dict[str, float] | None:
+        if not box:
+            return None
+
+        viewport_width, viewport_height, input_top = self._pointer_viewport_bounds(clamp_to_input=clamp_to_input)
+        upper_y = viewport_height - 8
+        if clamp_to_input:
             upper_y = max(8, min(input_top - 24, viewport_height - 8))
-            y = clamp(raw_y, 8, upper_y)
-            return {"x": x, "y": y}
 
-        return {
-            "x": clamp(viewport_width * random.uniform(0.48, 0.62), 8, viewport_width - 8),
-            "y": clamp(min(viewport_height * random.uniform(0.62, 0.76), input_top - 24), 8, viewport_height - 8),
-        }
+        x = self._clamp_pointer_value(
+            float(box.get("x") or 0) + float(box.get("width") or 0) * random.uniform(*x_range),
+            8,
+            viewport_width - 8,
+        )
+        y = self._clamp_pointer_value(
+            float(box.get("y") or 0) + float(box.get("height") or 0) * random.uniform(*y_range),
+            8,
+            upper_y,
+        )
+        return {"x": x, "y": y}
 
-    def _wheel_answer_view(self, *, delta_y: int | None = None, steps: int = 1) -> bool:
+    def _wheel_pointer_scroll(self, *, x: float, y: float, delta_y: int, steps: int = 1) -> bool:
         if not getattr(self, "page", None):
             return False
-        target = self._answer_scroll_target_point()
-        if not target:
-            return False
         try:
-            x = float(target.get("x") or 0)
-            y = float(target.get("y") or 0)
-            amount = int(delta_y if delta_y is not None else random.randint(760, 1180))
             count = max(1, min(3, int(steps or 1)))
+            amount = int(delta_y)
             for index in range(count):
                 self.page.mouse.move(
                     x + random.uniform(-2.0, 2.0),
@@ -1406,6 +1403,292 @@ class BasePlatform(ABC):
         except Exception as exc:
             self._reraise_stop_requested(exc)
             return False
+
+    def _wheel_pointer_scroll_pattern(self, *, x: float, y: float, deltas: list[int]) -> bool:
+        if not getattr(self, "page", None):
+            return False
+        pulses = [int(delta) for delta in deltas if int(delta)]
+        if not pulses:
+            return False
+        try:
+            if random.random() < 0.64:
+                self.page.mouse.move(
+                    x + random.uniform(-3.0, 3.0),
+                    y + random.uniform(-3.0, 3.0),
+                )
+                self._cooperative_sleep(random.uniform(0.06, 0.16))
+            for index, amount in enumerate(pulses):
+                self.page.mouse.move(
+                    x + random.uniform(-2.4, 2.4),
+                    y + random.uniform(-2.4, 2.4),
+                )
+                self.page.mouse.wheel(0, amount)
+                if index + 1 < len(pulses):
+                    self._cooperative_sleep(random.uniform(0.14, 0.30))
+            return True
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return False
+
+    def _build_auxiliary_wheel_deltas(
+        self,
+        remaining: float,
+        *,
+        direction: int = 1,
+    ) -> list[int]:
+        rem = max(0.0, float(remaining or 0.0))
+        sign = 1 if int(direction or 1) >= 0 else -1
+        if rem <= 180:
+            target = max(72, int(round(rem * random.uniform(0.58, 0.82))))
+        elif rem <= 720:
+            target = int(max(104, min(rem * random.uniform(0.30, 0.48), random.randint(140, 260))))
+        elif rem <= 1800:
+            target = int(max(156, min(rem * random.uniform(0.24, 0.40), random.randint(220, 420))))
+        else:
+            target = int(max(196, min(rem * random.uniform(0.18, 0.32), random.randint(260, 520))))
+
+        pulse_roll = random.random()
+        if target <= 132 or pulse_roll < 0.18:
+            pulses = [target]
+        elif target <= 240 or pulse_roll < 0.42:
+            first = int(round(target * random.uniform(0.46, 0.60)))
+            second = max(48, target - first)
+            pulses = [first, second]
+        elif target <= 420 or pulse_roll < 0.88:
+            first = int(round(target * random.uniform(0.32, 0.42)))
+            remain_after_first = max(96, target - first)
+            second = int(round(remain_after_first * random.uniform(0.42, 0.56)))
+            third = max(44, target - first - second)
+            pulses = [first, second, third]
+        else:
+            first = int(round(target * random.uniform(0.24, 0.34)))
+            remaining_after_first = max(132, target - first)
+            second = int(round(remaining_after_first * random.uniform(0.30, 0.40)))
+            remaining_after_second = max(88, target - first - second)
+            third = int(round(remaining_after_second * random.uniform(0.44, 0.58)))
+            fourth = max(40, target - first - second - third)
+            pulses = [first, second, third, fourth]
+
+        return [sign * max(36, int(abs(pulse))) for pulse in pulses if abs(int(pulse or 0)) >= 36]
+
+    def _perform_auxiliary_wheel_pass(
+        self,
+        *,
+        box: dict | None,
+        remaining: float,
+        clamp_to_input: bool = True,
+        x_range: tuple[float, float] = (0.44, 0.57),
+        y_range: tuple[float, float] = (0.58, 0.74),
+        direction: int = 1,
+    ) -> bool:
+        target = self._pointer_target_from_box(
+            box,
+            x_range=x_range,
+            y_range=y_range,
+            clamp_to_input=clamp_to_input,
+        )
+        if not target:
+            return False
+        deltas = self._build_auxiliary_wheel_deltas(remaining, direction=direction)
+        if not deltas:
+            return False
+        return self._wheel_pointer_scroll_pattern(
+            x=float(target.get("x") or 0),
+            y=float(target.get("y") or 0),
+            deltas=deltas,
+        )
+
+    def _wheel_selector_view(
+        self,
+        selector: str,
+        *,
+        last: bool = True,
+        delta_y: int | None = None,
+        steps: int = 1,
+        x_range: tuple[float, float] = (0.45, 0.62),
+        y_range: tuple[float, float] = (0.62, 0.78),
+        clamp_to_input: bool = True,
+    ) -> bool:
+        box = self._locator_box(selector, last=last)
+        target = self._pointer_target_from_box(
+            box,
+            x_range=x_range,
+            y_range=y_range,
+            clamp_to_input=clamp_to_input,
+        )
+        if not target:
+            return False
+        amount = int(delta_y if delta_y is not None else random.randint(760, 1180))
+        return self._wheel_pointer_scroll(
+            x=float(target.get("x") or 0),
+            y=float(target.get("y") or 0),
+            delta_y=amount,
+            steps=steps,
+        )
+
+    def _selector_scroll_progress(self, selector: str, *, last: bool = True) -> dict | None:
+        if not getattr(self, "page", None) or not selector:
+            return None
+        try:
+            return self.page.evaluate(
+                """({selector, last}) => {
+                    const nodes = Array.from(document.querySelectorAll(selector));
+                    if (nodes.length <= 0) return null;
+                    const el = last ? nodes[nodes.length - 1] : nodes[0];
+                    if (!el) return null;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    if (
+                        style.display === 'none' ||
+                        style.visibility === 'hidden' ||
+                        rect.width <= 0 ||
+                        rect.height <= 0
+                    ) {
+                        return null;
+                    }
+                    return {
+                        scrollTop: Number(el.scrollTop || 0),
+                        scrollHeight: Number(el.scrollHeight || 0),
+                        clientHeight: Number(el.clientHeight || 0),
+                    };
+                }""",
+                {"selector": selector, "last": bool(last)},
+            )
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return None
+
+    def _wheel_scroll_selector_to_end(
+        self,
+        selector: str,
+        *,
+        last: bool = True,
+        max_passes: int = 5,
+        clamp_to_input: bool = True,
+    ) -> bool:
+        if not selector or not getattr(self, "page", None):
+            return False
+        for _ in range(max(1, int(max_passes or 1))):
+            metrics = self._selector_scroll_progress(selector, last=last)
+            if not metrics:
+                return False
+            remaining = max(
+                0.0,
+                float(metrics.get("scrollHeight", 0) or 0)
+                - float(metrics.get("clientHeight", 0) or 0)
+                - float(metrics.get("scrollTop", 0) or 0),
+            )
+            if remaining <= 10:
+                return True
+            box = self._locator_box(selector, last=last)
+            if not self._perform_auxiliary_wheel_pass(
+                box=box,
+                remaining=remaining,
+                clamp_to_input=clamp_to_input,
+            ):
+                return False
+            self._cooperative_sleep(random.uniform(0.38, 0.72))
+
+        metrics = self._selector_scroll_progress(selector, last=last)
+        if not metrics:
+            return False
+        remaining = max(
+            0.0,
+            float(metrics.get("scrollHeight", 0) or 0)
+            - float(metrics.get("clientHeight", 0) or 0)
+            - float(metrics.get("scrollTop", 0) or 0),
+        )
+        return remaining <= 16
+
+    def _wheel_scroll_probe_to_end(
+        self,
+        probe_script: str,
+        *,
+        max_passes: int = 5,
+        clamp_to_input: bool = True,
+    ) -> bool:
+        """Use a read-only JS probe to find a scrollable region, then wheel inside that region."""
+        if not getattr(self, "page", None) or not probe_script:
+            return False
+        for _ in range(max(1, int(max_passes or 1))):
+            try:
+                metrics = self.page.evaluate(probe_script) or {}
+            except Exception as exc:
+                self._reraise_stop_requested(exc)
+                return False
+            if not metrics:
+                return False
+            remaining = max(
+                0.0,
+                float(metrics.get("scrollHeight", 0) or 0)
+                - float(metrics.get("clientHeight", 0) or 0)
+                - float(metrics.get("scrollTop", 0) or 0),
+            )
+            if remaining <= 10:
+                return True
+            if not self._perform_auxiliary_wheel_pass(
+                box={
+                    "x": float(metrics.get("x", 0) or 0),
+                    "y": float(metrics.get("y", 0) or 0),
+                    "width": float(metrics.get("width", 0) or 0),
+                    "height": float(metrics.get("height", 0) or 0),
+                },
+                remaining=remaining,
+                clamp_to_input=clamp_to_input,
+                x_range=(0.44, 0.56),
+                y_range=(0.58, 0.74),
+            ):
+                return False
+            self._cooperative_sleep(random.uniform(0.38, 0.72))
+
+        try:
+            metrics = self.page.evaluate(probe_script) or {}
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return False
+        remaining = max(
+            0.0,
+            float(metrics.get("scrollHeight", 0) or 0)
+            - float(metrics.get("clientHeight", 0) or 0)
+            - float(metrics.get("scrollTop", 0) or 0),
+        )
+        return remaining <= 16
+
+    def _answer_scroll_target_point(self) -> dict[str, float] | None:
+        if not getattr(self, "page", None):
+            return None
+
+        box = (
+            self._locator_box(self.chat_container_selector or "", last=True)
+            or self._locator_box(self.result_selector or "", last=True)
+            or self._locator_box("main, [role='main']", last=False)
+        )
+        if box:
+            return self._pointer_target_from_box(box)
+
+        viewport_width, viewport_height, input_top = self._pointer_viewport_bounds()
+        return {
+            "x": self._clamp_pointer_value(viewport_width * random.uniform(0.48, 0.62), 8, viewport_width - 8),
+            "y": self._clamp_pointer_value(
+                min(viewport_height * random.uniform(0.62, 0.76), input_top - 24),
+                8,
+                viewport_height - 8,
+            ),
+        }
+
+    def _wheel_answer_view(self, *, delta_y: int | None = None, steps: int = 1) -> bool:
+        if not getattr(self, "page", None):
+            return False
+        target = self._answer_scroll_target_point()
+        if not target:
+            return False
+        amount = int(delta_y if delta_y is not None else random.randint(760, 1180))
+        return self._wheel_pointer_scroll(
+            x=float(target.get("x") or 0),
+            y=float(target.get("y") or 0),
+            delta_y=amount,
+            steps=steps,
+        )
 
     def _browser_proxy_settings(self) -> dict | None:
         server = str(getattr(self, "browser_proxy_server", "") or "").strip()
@@ -1510,7 +1793,7 @@ class BasePlatform(ABC):
         )
         max_seconds = self._runtime_float_setting(
             "failure_backoff_max_seconds",
-            20.0,
+            12.0,
             minimum=base_seconds,
             maximum=300.0,
         )
@@ -2271,12 +2554,12 @@ class BasePlatform(ABC):
         current_url = self.page.url
         # 等待浏览器把 cookie/session 数据 flush 到磁盘再关闭
         print(f"[{self.name}] 等待 cookie 写盘...")
-        self._cooperative_sleep(3)
+        self._cooperative_sleep_jittered(3.0, spread=0.12)
         if not self._current_context_headless:
             self._minimize_browser_app()
         self._release_browser_handles(stop_playwright=False)
         # 等 Chromium 进程完全退出，确保 user_data_dir 解锁
-        self._cooperative_sleep(2)
+        self._cooperative_sleep_jittered(2.0, spread=0.12)
         self.context = self._launch_browser_context(
             self._playwright,
             headless=True,
@@ -2542,7 +2825,7 @@ class BasePlatform(ABC):
                 last_error = exc
                 self._reraise_stop_requested(exc)
             if index < max(1, attempts) - 1:
-                self._cooperative_sleep(0.25)
+                self._cooperative_sleep_jittered(0.25, spread=0.28)
         if last_error:
             return False
         return False
@@ -2660,7 +2943,7 @@ class BasePlatform(ABC):
             last_state = self._collect_interruption_state(check_input_visible=check_input_visible)
             if self._is_interruption_cleared(last_state):
                 return last_state
-            self._cooperative_sleep(0.5)
+            self._cooperative_sleep_jittered(0.5, spread=0.22)
         return last_state
 
     def _wait_for_human_resolution(self, msg: str, *, trigger_state: dict | None = None) -> None:
@@ -2703,7 +2986,7 @@ class BasePlatform(ABC):
             if prompt_attempt >= 3:
                 print(f"[{self.name}] 连续 {prompt_attempt} 次人工确认后仍未恢复，继续等待进一步处理")
         if not self.inspect:
-            self._cooperative_sleep(1)  # 给浏览器时间写入 cookie
+            self._cooperative_sleep_jittered(1.0, spread=0.16)  # 给浏览器时间写入 cookie
             self._hide_browser()
         raise InterruptionDetected("人工干预完成，重新开始本次尝试")
 
@@ -2923,7 +3206,7 @@ class BasePlatform(ABC):
             current = self._normalize_compact_text(self._read_input_value())
             if current == expected or expected in current:
                 return True
-            self._cooperative_sleep(0.2)
+            self._cooperative_sleep_jittered(0.2, spread=0.32)
         return False
 
     def _wait_for_submit_started(self, before_input: str, timeout: float = 8.0) -> bool:
@@ -2937,7 +3220,7 @@ class BasePlatform(ABC):
             current_compact = self._normalize_compact_text(self._read_input_value())
             if before_compact and current_compact != before_compact and not current_compact:
                 return True
-            self._cooperative_sleep(0.2)
+            self._cooperative_sleep_jittered(0.2, spread=0.32)
         return False
 
     def submit_prompt(self) -> None:
@@ -2994,7 +3277,7 @@ class BasePlatform(ABC):
             supported = True
             if signal:
                 return True
-            self._cooperative_sleep(0.2)
+            self._cooperative_sleep_jittered(0.2, spread=0.32)
         return False if supported else False
 
     def _get_generation_debug_state(self) -> dict:
@@ -3027,7 +3310,7 @@ class BasePlatform(ABC):
                 print(f"[{self.name}] 深度思考已激活")
                 return True
             self._click_locator(btn, timeout_ms=3000)
-            self._cooperative_sleep(0.5)
+            self._cooperative_sleep_jittered(0.5, spread=0.2)
             print(f"[{self.name}] 已开启深度思考")
             return True
         except Exception as e:
@@ -3730,15 +4013,7 @@ class BasePlatform(ABC):
         """Centralized polling loop. Waits for generation to complete, then calls on_rank once."""
         if get_text is None:
             def get_text():
-                should_scroll = self._consume_answer_read_scroll()
-                if should_scroll and self.chat_container_selector:
-                    self.page.evaluate("""(selector) => {
-                        const el = document.querySelector(selector);
-                        if (el) el.scrollTop = el.scrollHeight;
-                        else window.scrollTo(0, document.body.scrollHeight);
-                    }""", self.chat_container_selector)
-                elif should_scroll:
-                    self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                self._consume_answer_read_scroll()
                 return self.page.evaluate("() => document.body.innerText") or ""
         self._begin_answer_capture(keyword=keyword, brand=brand)
         start_time = time.monotonic()
@@ -3788,7 +4063,7 @@ class BasePlatform(ABC):
                 dom_fail_count = 0
                 dom_pending_count = 0
                 last_text = ""
-                self._cooperative_sleep(2)
+                self._cooperative_sleep_jittered(2.0, spread=0.18)
                 continue
 
             elapsed = time.monotonic() - start_time
@@ -3970,7 +4245,7 @@ class BasePlatform(ABC):
                 )
                 break
 
-            self._cooperative_sleep(1)
+            self._cooperative_sleep_jittered(1.0, spread=0.22)
 
         else:
             # 超时兜底：用当前页面文本尝试解析排名
@@ -4035,54 +4310,127 @@ class BasePlatform(ABC):
                     brand=brand,
                 )
 
+    def _legacy_scroll_brand_into_view(self, brand: str, *, root_sel: str, think_sel: str) -> None:
+        self.page.evaluate("""({ containerSel, rootSel, thinkSel, brand, lastOnly }) => {
+            const container = document.querySelector(containerSel);
+            let roots = Array.from(document.querySelectorAll(rootSel));
+            if (lastOnly && roots.length > 1) {
+                roots = [roots[roots.length - 1]];
+            }
+            if (!container || roots.length <= 0) return;
+            for (const root of roots) {
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                let node;
+                while (node = walker.nextNode()) {
+                    if (!(node.textContent || '').includes(brand)) continue;
+                    if (thinkSel && node.parentElement.closest(thinkSel)) continue;
+                    const el = node.parentElement;
+                    const style = window.getComputedStyle(container);
+                    const isScrollable = style.overflowY === 'auto' || style.overflowY === 'scroll';
+                    if (isScrollable) {
+                        const elRect = el.getBoundingClientRect();
+                        const containerRect = container.getBoundingClientRect();
+                        const relTop = elRect.top - containerRect.top + container.scrollTop;
+                        const target = relTop - container.clientHeight / 2 + elRect.height / 2;
+                        container.scrollTop = Math.max(0, target);
+                    } else {
+                        el.scrollIntoView({block: 'center'});
+                    }
+                    return;
+                }
+            }
+        }""", {
+            "containerSel": self.chat_container_selector,
+            "rootSel": root_sel,
+            "thinkSel": think_sel,
+            "brand": brand,
+            "lastOnly": bool(self.prefer_last_result_block),
+        })
+
     def _scroll_brand_into_view(self, brand: str) -> None:
-        """滚动到品牌词第一次出现的位置，尽量让命中区域进入可视区。"""
+        """尽量用页内 wheel 把品牌命中区域带到视口中段，失败再回退到旧的精确滚动。"""
         if not brand or not self.chat_container_selector:
             return
+        root_sel = (
+            self.result_selector
+            if self.result_selector and self.result_selector != "body"
+            else self.chat_container_selector
+        )
+        root_sel = root_sel or "body"
+        think_sel = self.think_content_selector or ""
+        payload = {
+            "containerSel": self.chat_container_selector,
+            "rootSel": root_sel,
+            "thinkSel": think_sel,
+            "brand": brand,
+            "lastOnly": bool(self.prefer_last_result_block),
+        }
         try:
-            root_sel = (
-                self.result_selector
-                if self.result_selector and self.result_selector != "body"
-                else self.chat_container_selector
-            )
-            root_sel = root_sel or "body"
-            think_sel = self.think_content_selector or ""
-            self.page.evaluate("""({ containerSel, rootSel, thinkSel, brand, lastOnly }) => {
-                const container = document.querySelector(containerSel);
-                let roots = Array.from(document.querySelectorAll(rootSel));
-                if (lastOnly && roots.length > 1) {
-                    roots = [roots[roots.length - 1]];
-                }
-                if (!container || roots.length <= 0) return;
-                for (const root of roots) {
-                    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-                    let node;
-                    while (node = walker.nextNode()) {
-                        if (!(node.textContent || '').includes(brand)) continue;
-                        if (thinkSel && node.parentElement.closest(thinkSel)) continue;
-                        const el = node.parentElement;
-                        const style = window.getComputedStyle(container);
-                        const isScrollable = style.overflowY === 'auto' || style.overflowY === 'scroll';
-                        if (isScrollable) {
-                            const elRect = el.getBoundingClientRect();
-                            const containerRect = container.getBoundingClientRect();
-                            const relTop = elRect.top - containerRect.top + container.scrollTop;
-                            const target = relTop - container.clientHeight / 2 + elRect.height / 2;
-                            container.scrollTop = Math.max(0, target);
-                        } else {
-                            el.scrollIntoView({block: 'center'});
-                        }
-                        return;
+            for _ in range(6):
+                probe = self.page.evaluate("""({ containerSel, rootSel, thinkSel, brand, lastOnly }) => {
+                    const container = document.querySelector(containerSel);
+                    let roots = Array.from(document.querySelectorAll(rootSel));
+                    if (lastOnly && roots.length > 1) {
+                        roots = [roots[roots.length - 1]];
                     }
-                }
-            }""", {
-                "containerSel": self.chat_container_selector,
-                "rootSel": root_sel,
-                "thinkSel": think_sel,
-                "brand": brand,
-                "lastOnly": bool(self.prefer_last_result_block),
-            })
-            self._cooperative_sleep(0.5)
+                    if (!container || roots.length <= 0) return null;
+                    const style = window.getComputedStyle(container);
+                    const isScrollable =
+                        style.overflowY === 'auto' ||
+                        style.overflowY === 'scroll' ||
+                        container.scrollHeight > container.clientHeight + 4;
+                    const containerRect = container.getBoundingClientRect();
+                    for (const root of roots) {
+                        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                        let node;
+                        while (node = walker.nextNode()) {
+                            const parent = node.parentElement;
+                            if (!parent) continue;
+                            if (!(node.textContent || '').includes(brand)) continue;
+                            if (thinkSel && parent.closest(thinkSel)) continue;
+                            const elRect = parent.getBoundingClientRect();
+                            const centerOffset =
+                                (elRect.top + elRect.height / 2) -
+                                (containerRect.top + containerRect.height / 2);
+                            const comfortable =
+                                Math.abs(centerOffset) <= Math.max(72, containerRect.height * 0.18) &&
+                                elRect.top >= containerRect.top + 20 &&
+                                elRect.bottom <= containerRect.bottom - 20;
+                            return {
+                                found: true,
+                                scrollable: isScrollable,
+                                centerOffset,
+                                comfortable,
+                                suggestedDelta: Math.max(220, Math.min(640, Math.round(Math.abs(centerOffset) * 0.85))),
+                            };
+                        }
+                    }
+                    return { found: false, scrollable: isScrollable };
+                }""", payload) or {}
+                if not probe.get("found"):
+                    break
+                if probe.get("comfortable"):
+                    self._cooperative_sleep_jittered(0.24, spread=0.18)
+                    return
+                center_offset = float(probe.get("centerOffset", 0) or 0)
+                delta = int(probe.get("suggestedDelta", 0) or random.randint(260, 520))
+                direction = 1 if center_offset > 0 else -1
+                moved = False
+                if probe.get("scrollable"):
+                    moved = self._wheel_selector_view(
+                        self.chat_container_selector,
+                        last=False,
+                        delta_y=direction * delta,
+                        steps=1,
+                    )
+                if not moved:
+                    moved = self._wheel_answer_view(delta_y=direction * delta, steps=1)
+                if not moved:
+                    break
+                self._cooperative_sleep_jittered(0.22, spread=0.18)
+
+            self._legacy_scroll_brand_into_view(brand, root_sel=root_sel, think_sel=think_sel)
+            self._cooperative_sleep_jittered(0.5, spread=0.2)
         except Exception:
             pass
 
@@ -4553,7 +4901,7 @@ class BasePlatform(ABC):
                 self.page.evaluate(scroll_js, {"selector": self.chat_container_selector, "pos": scroll_pos})
             else:
                 self.page.evaluate(scroll_js, scroll_pos)
-            self._cooperative_sleep(0.5)
+            self._cooperative_sleep_jittered(0.5, spread=0.2)
             actual_scroll = (
                 self.page.evaluate(get_scroll_js, self.chat_container_selector)
                 if scroll_info['useElement']
@@ -4623,20 +4971,10 @@ class BasePlatform(ABC):
     def _get_answer_text(self) -> str:
         """获取回答文本，优先提取回答区，避免把提问内容或验证码文案混入判定。"""
         try:
+            self._consume_answer_read_scroll()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel, lastOnly, shouldScroll}) => {
+                """({containerSel, resultSel, thinkSel, lastOnly}) => {
                     const root = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (shouldScroll && root) {
-                        const style = window.getComputedStyle(root);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                            root.scrollTop = root.scrollHeight;
-                        } else {
-                            window.scrollTo(0, document.body.scrollHeight);
-                        }
-                    } else if (shouldScroll) {
-                        window.scrollTo(0, document.body.scrollHeight);
-                    }
-
                     const source = (root || document.body).cloneNode(true);
                     if (thinkSel) {
                         source.querySelectorAll(thinkSel).forEach((el) => el.remove());
@@ -4659,7 +4997,6 @@ class BasePlatform(ABC):
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
                     "lastOnly": bool(self.prefer_last_result_block),
-                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as exc:
@@ -4840,7 +5177,7 @@ class BasePlatform(ABC):
     def _scroll_answer_view_to_top(self) -> None:
         try:
             self._wheel_answer_view(delta_y=-random.randint(760, 1180), steps=3)
-            self._cooperative_sleep(0.8)
+            self._cooperative_sleep_jittered(0.8, spread=0.18)
         except Exception:
             pass
 

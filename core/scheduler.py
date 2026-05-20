@@ -19,7 +19,6 @@ from typing import Callable, Optional
 
 from .cycle_state import build_task_outcome, merge_task_outcome_from_report
 from .daily_task_state import derive_task_id, get_task_day_status, is_task_sent_today
-from .platform_sessions import build_query_execution_policy
 from .scheduler_state import get_entry as get_scheduler_entry
 from .scheduler_state import mark_processed, update_after_run
 from .time_utils import local_now
@@ -199,47 +198,6 @@ def _score_unit(task_unit: dict) -> float:
 
 def _is_fixed_screenshot_unit(task_unit: dict) -> bool:
     return bool(task_unit.get("fixed_screenshot_enabled", False))
-
-
-def _unit_platform_sequence(task_unit: dict) -> list[str]:
-    platforms: list[str] = []
-    for kw in _normalize_keywords(task_unit):
-        for platform_name in (kw.get("platforms") or []):
-            normalized = str(platform_name or "").strip()
-            if normalized and normalized not in platforms:
-                platforms.append(normalized)
-    return platforms
-
-
-def _unit_platform_execution_order(task_unit: dict, preferred_first: str = "") -> list[str]:
-    ordered = _unit_platform_sequence(task_unit)
-    normalized_preferred = str(preferred_first or "").strip()
-    if normalized_preferred and normalized_preferred in ordered:
-        ordered = [normalized_preferred] + [item for item in ordered if item != normalized_preferred]
-    return ordered
-
-
-def _reorder_units_for_platform_continuity(units: list[dict]) -> list[dict]:
-    if len(units) <= 1:
-        return list(units)
-    remaining = list(units)
-    ordered: list[dict] = []
-    active_platform = ""
-    lookahead = 3
-    while remaining:
-        selected_index = 0
-        if active_platform:
-            window = remaining[:min(len(remaining), lookahead)]
-            for idx, unit in enumerate(window):
-                if active_platform in _unit_platform_sequence(unit):
-                    selected_index = idx
-                    break
-        chosen = remaining.pop(selected_index)
-        ordered.append(chosen)
-        execution_order = _unit_platform_execution_order(chosen, active_platform)
-        active_platform = execution_order[-1] if execution_order else ""
-    return ordered
-
 
 def _is_processed_today(unit_id: str, today_text: str, scheduled_time: str = "") -> bool:
     entry = get_scheduler_entry(unit_id)
@@ -518,9 +476,6 @@ class SmartScheduler:
         on_round_complete: Optional[Callable] = None,
     ) -> dict:
         ordered_units = sorted(units, key=lambda unit: (1 if _is_fixed_screenshot_unit(unit) else 0, _score_unit(unit)))
-        policy = build_query_execution_policy(self.config, mode)
-        if policy.use_platform_serial:
-            ordered_units = _reorder_units_for_platform_continuity(ordered_units)
         mode_label = MODE_LABELS.get(mode, mode)
         scheduled_time = get_weekday_run_time(self.config, current_date.weekday()) or ""
         self._current_mode = mode

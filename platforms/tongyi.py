@@ -4,6 +4,7 @@
 
 import re
 import time
+import random
 from .base import BasePlatform
 
 
@@ -25,8 +26,26 @@ class TongyiPlatform(BasePlatform):
     # 兼容 tongyi.aliyun.com 和 qianwen.com 两个域名的新建对话按钮
     new_chat_selector = 'button:has-text("新建对话"), button[aria-label="新建对话"], button[class*="newChat"], button[class*="new-chat"]'
     chat_container_selector = ".message-list-scroll-container"
-    deep_think_selector = 'button[aria-label="深度思考"], button:has-text("深度思考")'
-    think_content_selector = '[class*="thinkingContent"]'
+    deep_think_selector = (
+        'span[data-input-capsule-login-gate^="deep-think"] button, '
+        'button[aria-label="思考"][aria-pressed], '
+        'button:has([data-icon-type="qwpcicon-deepThinking"]), '
+        'button[aria-label="深度思考"], '
+        'button:has-text("深度思考"), '
+        'button:has-text("思考")'
+    )
+    think_content_selector = (
+        '[class*="thinkingContent"], [class*="ThinkingContent"], '
+        '[class*="thinkingWrap"], [class*="ThinkingWrap"], '
+        '[class*="thinkingTitle"], [class*="ThinkingTitle"], '
+        '[class*="thinkingHeader"], [class*="ThinkingHeader"], [class*="thinking-header"], '
+        '[class*="thinkContent"], [class*="ThinkContent"], [class*="think-content"], '
+        '[class*="deep-think"], [class*="deepThink"], '
+        '[class*="reasoning"], [class*="Reasoning"], '
+        '[class*="thought"], [class*="Thought"], '
+        '[class*="cot"], [data-card_name="deep_think"], '
+        '[data-testid*="think"], [data-testid*="reason"], [data-testid*="cot"]'
+    )
     prefer_last_result_block = True
     _overlay_detection_enabled = False
 
@@ -34,26 +53,46 @@ class TongyiPlatform(BasePlatform):
         """Tongyi 只采最后一轮 assistant markdown，排除提问区、思考区和来源侧栏。"""
         try:
             self._raise_if_stop_requested()
+            self._consume_answer_read_scroll()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel, shouldScroll}) => {
+                """({containerSel, resultSel, thinkSel}) => {
                     const h = window.__aiMonitorHelpers__ || {};
                     const normalize = h.normalize || ((value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim());
-                    const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (shouldScroll && container) {
-                        const style = window.getComputedStyle(container);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                            container.scrollTop = container.scrollHeight;
-                        } else {
-                            window.scrollTo(0, document.body.scrollHeight);
-                        }
-                    } else if (shouldScroll) {
-                        window.scrollTo(0, document.body.scrollHeight);
-                    }
 
                     const isVisible = h.isVisible || ((el) => Boolean(el && el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0));
+                    const matchesSelector = (el, selector) => {
+                        if (!el || !selector) return false;
+                        try { return el.matches(selector) || Boolean(el.closest(selector)); }
+                        catch (_) { return false; }
+                    };
+                    const looksLikeThinkingText = (text) => (
+                        /^(深度思考中|思考中|正在思考|思考过程|已深度思考|已思考)/.test(normalize(text || ''))
+                    );
+                    const looksLikeThinkingNode = (el) => {
+                        if (!el) return false;
+                        if (matchesSelector(el, thinkSel)) return true;
+                        let node = el;
+                        for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
+                            const marker = [
+                                node.className,
+                                node.id,
+                                node.getAttribute && node.getAttribute('data-testid'),
+                                node.getAttribute && node.getAttribute('aria-label'),
+                                node.getAttribute && node.getAttribute('data-card_name'),
+                            ].filter(Boolean).join(' ');
+                            if (/(thinkingContent|thinkingWrap|thinkingTitle|thinkingHeader|thinking-header|thinkContent|think-content|deep-think|deepThink|reasoning|cot|thought)/i.test(String(marker || ''))) {
+                                return true;
+                            }
+                            if (node === el && looksLikeThinkingText(node.innerText || node.textContent || '')) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
                     const isExcluded = (el) => {
                         if (!el) return false;
                         try {
+                            if (looksLikeThinkingNode(el)) return true;
                             return Boolean(
                                 el.closest(
                                     '.questionItem-u8_ahH, .bubble-VIVxZ8, .contentBox-PXNuf2, .content-hKtCkw, ' +
@@ -117,6 +156,29 @@ class TongyiPlatform(BasePlatform):
                         'figcaption',
                         '[contenteditable="false"]',
                         '[aria-hidden="true"]',
+                        '[class*="thinkingContent"]',
+                        '[class*="ThinkingContent"]',
+                        '[class*="thinkingWrap"]',
+                        '[class*="ThinkingWrap"]',
+                        '[class*="thinkingTitle"]',
+                        '[class*="ThinkingTitle"]',
+                        '[class*="thinkingHeader"]',
+                        '[class*="ThinkingHeader"]',
+                        '[class*="thinking-header"]',
+                        '[class*="thinkContent"]',
+                        '[class*="ThinkContent"]',
+                        '[class*="think-content"]',
+                        '[class*="deep-think"]',
+                        '[class*="deepThink"]',
+                        '[class*="reasoning"]',
+                        '[class*="Reasoning"]',
+                        '[class*="thought"]',
+                        '[class*="Thought"]',
+                        '[class*="cot"]',
+                        '[data-card_name="deep_think"]',
+                        '[data-testid*="think"]',
+                        '[data-testid*="reason"]',
+                        '[data-testid*="cot"]',
                         '.questionItem-u8_ahH',
                         '.bubble-VIVxZ8',
                         '.contentBox-PXNuf2',
@@ -174,6 +236,7 @@ class TongyiPlatform(BasePlatform):
                     for (const block of blocks) {
                         const speech = resolveSpeech(block);
                         const text = extractCleanBlockText(block);
+                        if (looksLikeThinkingText(text)) continue;
                         if (!speech || !text) continue;
                         const last = grouped[grouped.length - 1];
                         if (!last || last.speech !== speech) {
@@ -194,7 +257,6 @@ class TongyiPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
-                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as e:
@@ -205,20 +267,9 @@ class TongyiPlatform(BasePlatform):
         """采集 Tongyi 最后一轮 assistant markdown 的干净正文快照。"""
         try:
             self._raise_if_stop_requested()
+            self._consume_answer_read_scroll()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel, shouldScroll}) => {
-                    const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (shouldScroll && container) {
-                        const style = window.getComputedStyle(container);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                            container.scrollTop = container.scrollHeight;
-                        } else {
-                            window.scrollTo(0, document.body.scrollHeight);
-                        }
-                    } else if (shouldScroll) {
-                        window.scrollTo(0, document.body.scrollHeight);
-                    }
-
+                """({containerSel, resultSel, thinkSel}) => {
                     const normalize = (value) => String(value || '').trim();
                     const isVisible = (el) => {
                         if (!el) return false;
@@ -232,9 +283,39 @@ class TongyiPlatform(BasePlatform):
                             rect.height > 0
                         );
                     };
+                    const matchesSelector = (el, selector) => {
+                        if (!el || !selector) return false;
+                        try { return el.matches(selector) || Boolean(el.closest(selector)); }
+                        catch (_) { return false; }
+                    };
+                    const looksLikeThinkingText = (text) => (
+                        /^(深度思考中|思考中|正在思考|思考过程|已深度思考|已思考)/.test(normalize(text || ''))
+                    );
+                    const looksLikeThinkingNode = (el) => {
+                        if (!el) return false;
+                        if (matchesSelector(el, thinkSel)) return true;
+                        let node = el;
+                        for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
+                            const marker = [
+                                node.className,
+                                node.id,
+                                node.getAttribute && node.getAttribute('data-testid'),
+                                node.getAttribute && node.getAttribute('aria-label'),
+                                node.getAttribute && node.getAttribute('data-card_name'),
+                            ].filter(Boolean).join(' ');
+                            if (/(thinkingContent|thinkingWrap|thinkingTitle|thinkingHeader|thinking-header|thinkContent|think-content|deep-think|deepThink|reasoning|cot|thought)/i.test(String(marker || ''))) {
+                                return true;
+                            }
+                            if (node === el && looksLikeThinkingText(node.innerText || node.textContent || '')) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
                     const isExcluded = (el) => {
                         if (!el) return false;
                         try {
+                            if (looksLikeThinkingNode(el)) return true;
                             return Boolean(
                                 el.closest(
                                     '.questionItem-u8_ahH, .bubble-VIVxZ8, .contentBox-PXNuf2, .content-hKtCkw, ' +
@@ -298,6 +379,29 @@ class TongyiPlatform(BasePlatform):
                         'figcaption',
                         '[contenteditable="false"]',
                         '[aria-hidden="true"]',
+                        '[class*="thinkingContent"]',
+                        '[class*="ThinkingContent"]',
+                        '[class*="thinkingWrap"]',
+                        '[class*="ThinkingWrap"]',
+                        '[class*="thinkingTitle"]',
+                        '[class*="ThinkingTitle"]',
+                        '[class*="thinkingHeader"]',
+                        '[class*="ThinkingHeader"]',
+                        '[class*="thinking-header"]',
+                        '[class*="thinkContent"]',
+                        '[class*="ThinkContent"]',
+                        '[class*="think-content"]',
+                        '[class*="deep-think"]',
+                        '[class*="deepThink"]',
+                        '[class*="reasoning"]',
+                        '[class*="Reasoning"]',
+                        '[class*="thought"]',
+                        '[class*="Thought"]',
+                        '[class*="cot"]',
+                        '[data-card_name="deep_think"]',
+                        '[data-testid*="think"]',
+                        '[data-testid*="reason"]',
+                        '[data-testid*="cot"]',
                         '.questionItem-u8_ahH',
                         '.bubble-VIVxZ8',
                         '.contentBox-PXNuf2',
@@ -398,6 +502,7 @@ class TongyiPlatform(BasePlatform):
                     for (const block of blocks) {
                         const speech = resolveSpeech(block);
                         const text = extractCleanBlockText(block);
+                        if (looksLikeThinkingText(text)) continue;
                         if (!speech || !text) continue;
                         const last = groups[groups.length - 1];
                         if (!last || last.speech !== speech) {
@@ -467,7 +572,6 @@ class TongyiPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
-                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or {"root_key": "", "blocks": [], "raw_text": "", "raw_html": ""}
         except Exception as e:
@@ -487,14 +591,94 @@ class TongyiPlatform(BasePlatform):
     def _get_deep_think_state(self) -> dict:
         try:
             return self.page.evaluate("""() => {
-                const btn = document.querySelector('button[aria-label="深度思考"]')
-                    || Array.from(document.querySelectorAll('button'))
-                        .find((el) => String(el.innerText || el.textContent || '').trim().includes('深度思考'));
-                if (!btn) return {found: false, active: false, text: "", attrs: {}, style: {}};
+                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return (
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.opacity !== '0' &&
+                        style.pointerEvents !== 'none' &&
+                        rect.width > 0 &&
+                        rect.height > 0
+                    );
+                };
+                const isDisabled = (el) => (
+                    el.disabled ||
+                    el.getAttribute('disabled') !== null ||
+                    String(el.getAttribute('aria-disabled') || '').toLowerCase() === 'true'
+                );
+                const iconTypesFor = (el) => Array.from(el.querySelectorAll('[data-icon-type], use'))
+                    .map((node) => [
+                        node.getAttribute('data-icon-type'),
+                        node.getAttribute('href'),
+                        node.getAttribute('xlink:href'),
+                    ].filter(Boolean).join(' '))
+                    .join(' ');
+                const collectText = (el) => normalize([
+                    el.innerText,
+                    el.textContent,
+                    el.getAttribute && el.getAttribute('aria-label'),
+                    el.getAttribute && el.getAttribute('title'),
+                    el.getAttribute && el.getAttribute('data-input-capsule-login-gate'),
+                    iconTypesFor(el),
+                ].filter(Boolean).join(' '));
+                const controlFor = (node) => (
+                    node.closest('span[data-input-capsule-login-gate^="deep-think"] button')
+                    || node.closest('button, [role="button"], [aria-pressed], [aria-checked]')
+                    || node
+                );
+                const scoreCandidate = (control, text, rect) => {
+                    const cls = String(control.className || '');
+                    const gate = control.closest('[data-input-capsule-login-gate]');
+                    const gateValue = String(gate?.getAttribute('data-input-capsule-login-gate') || '');
+                    const iconTypes = iconTypesFor(control);
+                    const aria = String(control.getAttribute('aria-label') || '');
+                    let score = 0;
+                    if (/^deep-think/.test(gateValue)) score += 260;
+                    if (/qwpcicon-deepThinking|deepThinking/i.test(iconTypes)) score += 240;
+                    if (aria === '思考' || text === '思考') score += 150;
+                    if (/深度思考/.test(text) || /深度思考/.test(aria)) score += 180;
+                    if (control.hasAttribute('aria-pressed') || control.hasAttribute('aria-checked')) score += 90;
+                    if (control.tagName === 'BUTTON') score += 70;
+                    if (cls.includes('bg-option')) score += 25;
+                    if (rect.width <= 140 && rect.height <= 56) score += 35;
+                    if (rect.width >= window.innerWidth * 0.45) score -= 160;
+                    if (text.length >= 32) score -= 120;
+                    if (/deep-research|qwpcicon-deepResearch|研究|任务助理|更多|PPT|AI生图|代码|翻译|AI写作|实时记录/i.test([gateValue, iconTypes, text].join(' '))) {
+                        score -= 260;
+                    }
+                    return score;
+                };
 
-                const text = String(btn.innerText || btn.textContent || btn.getAttribute('aria-label') || '').trim();
+                const nodes = Array.from(document.querySelectorAll(
+                    'span[data-input-capsule-login-gate^="deep-think"] button, ' +
+                    'button[aria-label="思考"][aria-pressed], ' +
+                    'button[aria-label="深度思考"], ' +
+                    'button, [role="button"], [aria-pressed], [aria-checked], [data-icon-type], use'
+                ));
+                const seen = new Set();
+                const candidates = [];
+                for (const node of nodes) {
+                    const control = controlFor(node);
+                    if (!control || seen.has(control) || !isVisible(control) || isDisabled(control)) continue;
+                    seen.add(control);
+                    const text = collectText(control) || collectText(node);
+                    if (!/(思考|深度思考|deepThinking|deep-think)/i.test(text)) continue;
+                    const rect = control.getBoundingClientRect();
+                    const score = scoreCandidate(control, text, rect);
+                    if (score <= 0) continue;
+                    candidates.push({ control, text, score });
+                }
+                candidates.sort((a, b) => b.score - a.score);
+                const best = candidates[0];
+                if (!best) return {found: false, active: false, text: "", attrs: {}, style: {}, score: 0};
+
+                const btn = best.control;
+                const text = normalize(btn.innerText || btn.textContent || btn.getAttribute('aria-label') || best.text || '');
                 const cls = String(btn.className || '');
-                const dataset = btn.dataset ? JSON.parse(JSON.stringify(btn.dataset)) : {};
                 const style = window.getComputedStyle(btn);
                 const attrs = {
                     className: cls,
@@ -503,6 +687,7 @@ class TongyiPlatform(BasePlatform):
                     ariaSelected: btn.getAttribute('aria-selected') || '',
                     dataState: btn.getAttribute('data-state') || '',
                     dataSelected: btn.getAttribute('data-selected') || '',
+                    dataInputCapsuleLoginGate: btn.closest('[data-input-capsule-login-gate]')?.getAttribute('data-input-capsule-login-gate') || '',
                     disabled: !!btn.disabled,
                 };
 
@@ -530,6 +715,7 @@ class TongyiPlatform(BasePlatform):
                         borderColor: style.borderColor,
                         boxShadow: style.boxShadow,
                     },
+                    score: best.score,
                 };
             }""")
         except Exception:
@@ -538,21 +724,113 @@ class TongyiPlatform(BasePlatform):
     def _click_deep_think_button(self) -> bool:
         try:
             self._raise_if_stop_requested()
-            btn = self.page.locator(self.deep_think_selector).first
-            self._wait_for_locator(btn, timeout_ms=4000)
-            btn.scroll_into_view_if_needed(timeout=2000)
-            try:
-                self._click_locator(btn, timeout_ms=3000, force=True)
-                return True
-            except Exception as e:
-                self._reraise_stop_requested(e)
-                pass
+            for selector in [
+                self.deep_think_selector,
+                'span[data-input-capsule-login-gate^="deep-think"] button',
+                'button[aria-label="思考"][aria-pressed]',
+                'button:has([data-icon-type="qwpcicon-deepThinking"])',
+                'button[aria-label="深度思考"]',
+                'button:has-text("深度思考")',
+                'button:has-text("思考")',
+            ]:
+                try:
+                    btn = self.page.locator(selector).first
+                    if btn.count() <= 0:
+                        continue
+                    btn.scroll_into_view_if_needed(timeout=2000)
+                    self._click_locator(btn, timeout_ms=2500, force=False)
+                    return True
+                except Exception as e:
+                    self._reraise_stop_requested(e)
+                    continue
             clicked = self.page.evaluate("""() => {
-                const btn = document.querySelector('button[aria-label="深度思考"]')
-                    || Array.from(document.querySelectorAll('button'))
-                        .find((el) => String(el.innerText || el.textContent || '').trim().includes('深度思考'));
-                if (!btn) return false;
-                btn.click();
+                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return (
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.opacity !== '0' &&
+                        style.pointerEvents !== 'none' &&
+                        rect.width > 0 &&
+                        rect.height > 0
+                    );
+                };
+                const isDisabled = (el) => (
+                    el.disabled ||
+                    el.getAttribute('disabled') !== null ||
+                    String(el.getAttribute('aria-disabled') || '').toLowerCase() === 'true'
+                );
+                const iconTypesFor = (el) => Array.from(el.querySelectorAll('[data-icon-type], use'))
+                    .map((node) => [
+                        node.getAttribute('data-icon-type'),
+                        node.getAttribute('href'),
+                        node.getAttribute('xlink:href'),
+                    ].filter(Boolean).join(' '))
+                    .join(' ');
+                const collectText = (el) => normalize([
+                    el.innerText,
+                    el.textContent,
+                    el.getAttribute && el.getAttribute('aria-label'),
+                    el.getAttribute && el.getAttribute('title'),
+                    el.getAttribute && el.getAttribute('data-input-capsule-login-gate'),
+                    iconTypesFor(el),
+                ].filter(Boolean).join(' '));
+                const controlFor = (node) => (
+                    node.closest('span[data-input-capsule-login-gate^="deep-think"] button')
+                    || node.closest('button, [role="button"], [aria-pressed], [aria-checked]')
+                    || node
+                );
+                const scoreCandidate = (control, text, rect) => {
+                    const gate = control.closest('[data-input-capsule-login-gate]');
+                    const gateValue = String(gate?.getAttribute('data-input-capsule-login-gate') || '');
+                    const iconTypes = iconTypesFor(control);
+                    const aria = String(control.getAttribute('aria-label') || '');
+                    let score = 0;
+                    if (/^deep-think/.test(gateValue)) score += 260;
+                    if (/qwpcicon-deepThinking|deepThinking/i.test(iconTypes)) score += 240;
+                    if (aria === '思考' || text === '思考') score += 150;
+                    if (/深度思考/.test(text) || /深度思考/.test(aria)) score += 180;
+                    if (control.hasAttribute('aria-pressed') || control.hasAttribute('aria-checked')) score += 90;
+                    if (control.tagName === 'BUTTON') score += 70;
+                    if (rect.width <= 140 && rect.height <= 56) score += 35;
+                    if (rect.width >= window.innerWidth * 0.45) score -= 160;
+                    if (text.length >= 32) score -= 120;
+                    if (/deep-research|qwpcicon-deepResearch|研究|任务助理|更多|PPT|AI生图|代码|翻译|AI写作|实时记录/i.test([gateValue, iconTypes, text].join(' '))) {
+                        score -= 260;
+                    }
+                    return score;
+                };
+
+                const nodes = Array.from(document.querySelectorAll(
+                    'span[data-input-capsule-login-gate^="deep-think"] button, ' +
+                    'button[aria-label="思考"][aria-pressed], ' +
+                    'button[aria-label="深度思考"], ' +
+                    'button, [role="button"], [aria-pressed], [aria-checked], [data-icon-type], use'
+                ));
+                const seen = new Set();
+                let best = null;
+                for (const node of nodes) {
+                    const control = controlFor(node);
+                    if (!control || seen.has(control) || !isVisible(control) || isDisabled(control)) continue;
+                    seen.add(control);
+                    const text = collectText(control) || collectText(node);
+                    if (!/(思考|深度思考|deepThinking|deep-think)/i.test(text)) continue;
+                    const rect = control.getBoundingClientRect();
+                    const score = scoreCandidate(control, text, rect);
+                    if (!best || score > best.score) best = { control, score };
+                }
+                if (!best || best.score < 120) return false;
+                const btn = best.control;
+                try { btn.scrollIntoView({block: 'center', inline: 'center'}); } catch (_) {}
+                for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                    try {
+                        btn.dispatchEvent(new MouseEvent(eventName, {bubbles: true, cancelable: true, view: window}));
+                    } catch (_) {}
+                }
+                try { btn.click(); } catch (_) {}
                 return true;
             }""")
             return bool(clicked)
@@ -567,10 +845,7 @@ class TongyiPlatform(BasePlatform):
         if not self.new_chat_selector:
             if self._attempt_learned_selector_heal("new_chat_selector", label="新建对话"):
                 print(f"[{self.name}] 已通过 learned selector 开启新对话")
-                return
-            if self._attempt_selector_agent_heal("new_chat_selector", label="新建对话"):
-                print(f"[{self.name}] 已通过 selector_agent 开启新对话")
-                return
+            return
             return
         try:
             self._raise_if_stop_requested()
@@ -590,7 +865,7 @@ class TongyiPlatform(BasePlatform):
                 }""")
                 if not clicked:
                     raise
-            if self._wait_and_confirm_new_chat(before, sleep_seconds=1.0):
+            if self._wait_and_confirm_new_chat(before, sleep_seconds=random.uniform(0.82, 1.18)):
                 print(f"[{self.name}] 已开启新对话")
                 return
             last_error = "已点击新建对话按钮，但未确认切换到新会话"
@@ -599,9 +874,6 @@ class TongyiPlatform(BasePlatform):
             last_error = str(e) or last_error
         if self._attempt_learned_selector_heal("new_chat_selector", label="新建对话"):
             print(f"[{self.name}] 已通过 learned selector 开启新对话")
-            return
-        if self._attempt_selector_agent_heal("new_chat_selector", label="新建对话"):
-            print(f"[{self.name}] 已通过 selector_agent 开启新对话")
             return
         print(f"[{self.name}] 开启新对话失败，继续: {last_error}")
 
@@ -630,7 +902,7 @@ class TongyiPlatform(BasePlatform):
                 print(f"[{self.name}] 深度思考按钮点击失败")
                 return False
 
-            self._cooperative_sleep(0.8)
+            self._cooperative_sleep_jittered(0.8, spread=0.18)
             state = self._get_deep_think_state()
             after_signature = {
                 "text": str(state.get("text") or ""),
@@ -668,7 +940,8 @@ class TongyiPlatform(BasePlatform):
     def is_generation_complete(self, page_text: str, start_time: float) -> bool:
         try:
             self._raise_if_stop_requested()
-            return bool(self.page.evaluate("""() => {
+            return bool(self.page.evaluate("""({thinkSel}) => {
+                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
                 const isVisible = (el) => {
                     if (!el) return false;
                     const style = window.getComputedStyle(el);
@@ -680,6 +953,35 @@ class TongyiPlatform(BasePlatform):
                         rect.width > 0 &&
                         rect.height > 0
                     );
+                };
+                const matchesSelector = (el, selector) => {
+                    if (!el || !selector) return false;
+                    try { return el.matches(selector) || Boolean(el.closest(selector)); }
+                    catch (_) { return false; }
+                };
+                const looksLikeThinkingText = (text) => (
+                    /^(深度思考中|思考中|正在思考|思考过程)/.test(normalize(text || ''))
+                );
+                const looksLikeThinkingNode = (el) => {
+                    if (!el) return false;
+                    if (matchesSelector(el, thinkSel)) return true;
+                    let node = el;
+                    for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
+                        const marker = [
+                            node.className,
+                            node.id,
+                            node.getAttribute && node.getAttribute('data-testid'),
+                            node.getAttribute && node.getAttribute('aria-label'),
+                            node.getAttribute && node.getAttribute('data-card_name'),
+                        ].filter(Boolean).join(' ');
+                        if (/(thinkingContent|thinkingWrap|thinkingTitle|thinkingHeader|thinking-header|thinkContent|think-content|deep-think|deepThink|reasoning|cot|thought)/i.test(String(marker || ''))) {
+                            return true;
+                        }
+                        if (node === el && looksLikeThinkingText(node.innerText || node.textContent || '')) {
+                            return true;
+                        }
+                    }
+                    return false;
                 };
 
                 const stopCandidates = Array.from(document.querySelectorAll('button, [role="button"]'));
@@ -696,11 +998,22 @@ class TongyiPlatform(BasePlatform):
                 });
                 if (hasStopButton) return false;
 
+                const hasActivePrinting = Array.from(document.querySelectorAll(
+                    '.qk-md-printing-text, [class*="qk-md-printing"]'
+                )).some((el) => isVisible(el));
+                if (hasActivePrinting) return false;
+
+                const hasActiveThinking = Array.from(document.querySelectorAll(
+                    '#qk-markdown-react, .qk-markdown, .markdown-pc-special-class, [class*="answerItem"], [class*="markdown"], .qk-md-paragraph'
+                )).some((el) => isVisible(el) && looksLikeThinkingText(el.innerText || el.textContent || ''));
+                if (hasActiveThinking) return false;
+
                 const blocks = Array.from(document.querySelectorAll(
-                    '[class*="answerItem"] .qk-markdown, [class*="answerItem"] .markdown-pc-special-class'
+                    '[class*="answerItem"] .qk-markdown, [class*="answerItem"] .markdown-pc-special-class, #qk-markdown-react, .qk-markdown, .markdown-pc-special-class'
                 )).filter((el) => {
                     const text = String(el.innerText || '').trim();
                     if (!text) return false;
+                    if (looksLikeThinkingNode(el) || looksLikeThinkingText(text)) return false;
                     const style = window.getComputedStyle(el);
                     const rect = el.getBoundingClientRect();
                     return (
@@ -718,18 +1031,8 @@ class TongyiPlatform(BasePlatform):
                 if (!text) return false;
 
                 const hasCompleteClass = className.includes('qk-markdown-complete');
-                const sendReady = stopCandidates.some((el) => {
-                    if (!isVisible(el) || el.disabled) return false;
-                    const signals = [
-                        el.getAttribute('aria-label'),
-                        el.getAttribute('title'),
-                        el.innerText,
-                        el.textContent,
-                    ].filter(Boolean).join(' ');
-                    return /发送消息|发送/i.test(String(signals || ''));
-                });
-                return hasCompleteClass || sendReady;
-            }"""))
+                return hasCompleteClass;
+            }""", {"thinkSel": self.think_content_selector or ""}))
         except Exception as e:
             self._reraise_stop_requested(e)
             return False
@@ -772,7 +1075,7 @@ class TongyiPlatform(BasePlatform):
         try:
             self._raise_if_stop_requested()
             snapshot = self.page.evaluate(
-                """({inputSel, resultSel}) => {
+                """({inputSel, resultSel, thinkSel}) => {
                     const normalize = (value) => String(value || '').trim();
                     const isVisible = (el) => {
                         if (!el) return false;
@@ -784,6 +1087,29 @@ class TongyiPlatform(BasePlatform):
                             style.opacity !== '0' &&
                             rect.width > 0 &&
                             rect.height > 0
+                        );
+                    };
+                    const matchesSelector = (el, selector) => {
+                        if (!el || !selector) return false;
+                        try { return el.matches(selector) || Boolean(el.closest(selector)); }
+                        catch (_) { return false; }
+                    };
+                    const looksLikeThinkingText = (text) => (
+                        /^(深度思考中|思考中|正在思考|思考过程|已深度思考|已思考)/.test(normalize(text || ''))
+                    );
+                    const looksLikeThinkingNode = (el) => {
+                        if (!el) return false;
+                        if (matchesSelector(el, thinkSel)) return true;
+                        const marker = [
+                            el.className,
+                            el.id,
+                            el.getAttribute && el.getAttribute('data-testid'),
+                            el.getAttribute && el.getAttribute('aria-label'),
+                            el.getAttribute && el.getAttribute('data-card_name'),
+                        ].filter(Boolean).join(' ');
+                        return (
+                            /(thinkingContent|thinkingWrap|thinkingTitle|thinkingHeader|thinking-header|thinkContent|think-content|deep-think|deepThink|reasoning|cot|thought)/i.test(String(marker || '')) ||
+                            looksLikeThinkingText(el.innerText || el.textContent || '')
                         );
                     };
                     const controls = Array.from(document.querySelectorAll('button, [role="button"]'));
@@ -809,14 +1135,22 @@ class TongyiPlatform(BasePlatform):
                         ].filter(Boolean).join(' ');
                         return /发送消息|发送/i.test(String(signals || ''));
                     });
+                    const activeThinking = Array.from(document.querySelectorAll(
+                        '#qk-markdown-react, .qk-markdown, .markdown-pc-special-class, [class*="answerItem"], [class*="markdown"], .qk-md-paragraph'
+                    )).some((el) => isVisible(el) && /^(深度思考中|思考中|正在思考|思考过程)/.test(normalize(el.innerText || el.textContent || '')));
+                    const activePrinting = Array.from(document.querySelectorAll(
+                        '.qk-md-printing-text, [class*="qk-md-printing"]'
+                    )).some((el) => isVisible(el));
                     const answers = resultSel
                         ? Array.from(document.querySelectorAll(resultSel))
-                            .filter((el) => isVisible(el))
+                            .filter((el) => isVisible(el) && !looksLikeThinkingNode(el))
                             .map((el) => normalize(el.innerText || el.textContent || ''))
                             .filter(Boolean)
                         : [];
                     const lastBlock = resultSel
-                        ? Array.from(document.querySelectorAll(resultSel)).filter((el) => isVisible(el)).slice(-1)[0]
+                        ? Array.from(document.querySelectorAll(resultSel))
+                            .filter((el) => isVisible(el) && !looksLikeThinkingNode(el))
+                            .slice(-1)[0]
                         : null;
                     const input = inputSel ? document.querySelector(inputSel) : null;
                     const inputText = normalize(
@@ -825,6 +1159,8 @@ class TongyiPlatform(BasePlatform):
                     return {
                         stopVisible,
                         sendReady,
+                        activeThinking,
+                        activePrinting,
                         lastBlockComplete: Boolean(lastBlock && String(lastBlock.className || '').includes('qk-markdown-complete')),
                         inputLength: inputText.length,
                         answerCount: answers.length,
@@ -834,11 +1170,14 @@ class TongyiPlatform(BasePlatform):
                 {
                     "inputSel": self.input_selector or "",
                     "resultSel": self.result_selector or "",
+                    "thinkSel": self.think_content_selector or "",
                 },
             ) or {}
             return {
                 "stop_visible": bool(snapshot.get("stopVisible")),
                 "send_ready": bool(snapshot.get("sendReady")),
+                "active_thinking": bool(snapshot.get("activeThinking")),
+                "active_printing": bool(snapshot.get("activePrinting")),
                 "last_block_complete": bool(snapshot.get("lastBlockComplete")),
                 "input_length": int(snapshot.get("inputLength", 0) or 0),
                 "answer_count": int(snapshot.get("answerCount", 0) or 0),
@@ -847,6 +1186,15 @@ class TongyiPlatform(BasePlatform):
         except Exception as e:
             self._reraise_stop_requested(e)
             return {"debug_error": str(e)}
+
+    def _allow_text_stable_completion(self, debug_state: dict | None = None) -> bool:
+        state = debug_state if isinstance(debug_state, dict) else {}
+        return (
+            not bool(state.get("stop_visible"))
+            and not bool(state.get("active_thinking"))
+            and not bool(state.get("active_printing"))
+            and bool(state.get("last_block_complete"))
+        )
 
     def extract_answer_references(self) -> list[dict]:
         """
@@ -866,7 +1214,7 @@ class TongyiPlatform(BasePlatform):
                 btn_text = btn.inner_text()
                 print(f"[{self.name}] 找到来源按钮: {btn_text}，点击展开...")
                 btn.click(timeout=3000)
-                self._cooperative_sleep(2.5)
+                self._cooperative_sleep_jittered(2.5, spread=0.15)
             except Exception as e:
                 self._reraise_stop_requested(e)
                 print(f"[{self.name}] 点击来源按钮失败: {e}")
@@ -970,7 +1318,7 @@ class TongyiPlatform(BasePlatform):
                     url = fallback_url
                     print(f"[{self.name}] 来源[{i+1}] {source}: 点击失败，用域名 {url}")
                 references.append({"index": i + 1, "title": title, "url": url, "source": source})
-                self._cooperative_sleep(0.3)
+                self._cooperative_sleep_jittered(0.3, spread=0.25)
 
 
             if isinstance(references, list):

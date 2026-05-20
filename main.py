@@ -8,8 +8,6 @@ import sys
 import time
 import logging
 import subprocess
-import traceback
-from collections import defaultdict
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -22,7 +20,6 @@ install_windows_bootstrap()
 from core import load_config, SmartScheduler, WeComNotifier, ensure_config_task_ids
 from core.app_paths import resolve_app_dir, resolve_app_path
 from core.cloud_sync import CloudSyncManager
-from core.cycle_state import resolve_report_status
 from core.logging_utils import SecretRedactingFilter
 from core.daily_task_state import (
     SOURCE_MODE_FORMAL,
@@ -39,16 +36,10 @@ from core.daily_task_state import (
 from core.local_model_manager import get_local_model_manager
 from core.local_runtime_prep import prepare_local_runtime, shutdown_owned_local_runtime
 from core.shutdown import install_shutdown_handlers, register_shutdown_callback, run_shutdown_callbacks
-from core.browser_platform_factory import (
-    apply_browser_runtime_config,
-    create_browser_platform,
-    resolve_browser_answer_screenshot_mode,
-)
 from core.platform_sessions import (
     PlatformSessionManager,
     build_query_execution_policy,
     build_round_query_plan,
-    build_session_pool_dispatch_pairs as _build_session_pool_dispatch_pairs,
 )
 from core.scheduler_notifications import (
     _PLATFORM_LABELS,
@@ -70,18 +61,7 @@ from core.task_notifications import (
     send_task_notifications as _send_task_notifications,
     should_send_single_query_notification as _should_send_single_query_notification,
 )
-# Compatibility re-exports for older imports from main.py. New code should
-# import task execution helpers from core.task_executor* modules directly.
-from core.task_executor import (
-    _apply_browser_runtime_config,
-    _create_browser_platform,
-    _run_api_task,
-    _run_smart_browser_task,
-    _should_use_platform_serial_for_query,
-    _should_use_session_pool_for_query,
-    _sync_reused_platform_runtime_state,
-    run_task_group,
-)
+from core.task_executor import run_task_group
 from core.task_results import (
     _STRUCTURAL_ERROR_PATTERNS,
     build_execution_report as _build_execution_report,
@@ -110,11 +90,6 @@ from core.task_results import (
     task_for_daily_state as _task_for_daily_state,
 )
 from core.version import APP_NAME, get_version_label, get_version_title
-from platforms import (
-    DoubaoPlatform, DeepSeekPlatform, KimiPlatform,
-    YuanbaoPlatform, TongyiPlatform, WenxinPlatform
-)
-from platforms.base import InterruptionDetected, SchedulerStopRequested
 
 
 def parse_args(argv: list[str] | None = None):
@@ -316,7 +291,6 @@ def main(argv: list[str] | None = None):
     scheduler = SmartScheduler(scheduler_config)
     runtime_state = {"config": config}
     round_session_state = {"mode": "", "manager": None}
-    round_serial_state = {"mode": "", "state": None}
     scheduler_reporter = SchedulerWebhookReporter(lambda: runtime_state.get("config") or {})
 
     def execute_task(task):
@@ -340,7 +314,6 @@ def main(argv: list[str] | None = None):
             issue_callback=scheduler_reporter.handle_issue_payload,
             stop_checker=scheduler.should_stop,
             platform_session_manager=round_session_state.get("manager"),
-            platform_serial_state=round_serial_state.get("state"),
         )
         if isinstance(results, tuple):
             result_items, execution_report = results
@@ -351,7 +324,6 @@ def main(argv: list[str] | None = None):
     def begin_mode_round(mode, ordered_units, current_date, scheduler_runtime_config):
         del current_date, scheduler_runtime_config
         current_config = runtime_state["config"] or {}
-        policy = build_query_execution_policy(current_config, mode)
         manager = None
         try:
             recognition_status = app.recognition_manager.get_runtime_status() if app.recognition_manager else {}
@@ -362,37 +334,24 @@ def main(argv: list[str] | None = None):
                 app._post(lambda root: app._start_recognition_mode())
             except Exception as exc:
                 print(f"[Main] 定时轮次启动识别监听失败: {exc}")
-        if policy.use_session_pool:
+        if mode in {"browser", "smart"}:
+            policy = build_query_execution_policy(current_config, mode)
             manager = PlatformSessionManager(
                 mode,
                 policy,
                 build_round_query_plan(ordered_units, mode),
                 logger=print,
             )
-            print(f"[Main] {mode} 模式启用平台会话池策略(实验中)")
-        else:
-            print(f"[Main] {mode} 模式沿用按平台分组串行策略")
+            print(f"[Main] {mode} 模式启用平台会话池策略")
         round_session_state["mode"] = mode
         round_session_state["manager"] = manager
-        round_serial_state["mode"] = mode
-        round_serial_state["state"] = {"name": "", "platform": None} if policy.use_platform_serial else None
 
     def _close_round_runtime(reason: str) -> None:
         manager = round_session_state.get("manager")
         if manager is not None:
             manager.close_all(reason=reason)
-        serial_state = round_serial_state.get("state")
-        if isinstance(serial_state, dict):
-            active_platform = serial_state.get("platform")
-            if active_platform is not None:
-                try:
-                    active_platform.close()
-                except Exception:
-                    pass
         round_session_state["mode"] = ""
         round_session_state["manager"] = None
-        round_serial_state["mode"] = ""
-        round_serial_state["state"] = None
 
     def end_mode_round(mode, ordered_units, current_date, mode_reports, cancelled):
         del mode, ordered_units, current_date, mode_reports, cancelled

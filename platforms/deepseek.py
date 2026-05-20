@@ -19,7 +19,11 @@ class DeepSeekPlatform(BasePlatform):
     new_chat_selector = "button:has(path[d^='M8 0.599609'])"
     chat_container_selector = ".ds-virtual-list"
     think_content_selector = ".ds-think-content"
-    deep_think_selector = "button:has-text('深度思考'), div:has-text('深度思考'), span:has-text('深度思考')"
+    deep_think_selector = (
+        "div[role='button'].ds-toggle-button:has-text('深度思考'), "
+        "[role='button'][aria-pressed]:has-text('深度思考'), "
+        "button:has-text('深度思考')"
+    )
     generation_pause_selector = 'path[d^="M2 4.88"], path[d^="M2 4.87988"], path[d^="M2 4.8"]'
     prefer_last_result_block = True
     use_automation_control_flag = True
@@ -134,7 +138,6 @@ class DeepSeekPlatform(BasePlatform):
                 ("locator_force", lambda: self._click_new_chat_button(force=True)),
                 ("dom", self._click_new_chat_via_dom),
                 ("learned", lambda: self._attempt_learned_selector_heal("new_chat_selector", label="新对话")),
-                ("selector_agent", lambda: self._attempt_selector_agent_heal("new_chat_selector", label="新对话")),
                 ("goto_home", self._open_fresh_chat_fallback),
             ]
             last_error = "未找到可用的新对话按钮"
@@ -566,6 +569,25 @@ class DeepSeekPlatform(BasePlatform):
 
     def _click_deep_think_toggle(self) -> bool:
         try:
+            self._raise_if_stop_requested()
+            for selector in [
+                self.deep_think_selector,
+                "div[role='button'].ds-toggle-button:has-text('深度思考')",
+                "[role='button'][aria-pressed]:has-text('深度思考')",
+            ]:
+                try:
+                    locator = self.page.locator(selector).filter(
+                        has_text="深度思考"
+                    ).first
+                    if locator.count() <= 0:
+                        continue
+                    locator.scroll_into_view_if_needed(timeout=1500)
+                    self._click_locator(locator, timeout_ms=2500, force=False)
+                    return True
+                except Exception as exc:
+                    self._reraise_stop_requested(exc)
+                    continue
+
             return bool(self.page.evaluate("""() => {
                 const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
                 const compact = (value) => normalize(value).toLowerCase();
@@ -607,7 +629,7 @@ class DeepSeekPlatform(BasePlatform):
                     return score;
                 };
 
-                const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="switch"], label, div, span, a'));
+                const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="switch"], [aria-pressed], [aria-checked], label, div, span, a'));
                 const seen = new Set();
                 let best = null;
 
@@ -647,7 +669,7 @@ class DeepSeekPlatform(BasePlatform):
             last_state = self._get_deep_think_state()
             if last_state.get("active") is expected_active:
                 return last_state
-            self._cooperative_sleep(0.15)
+            self._cooperative_sleep_jittered(0.15, spread=0.35)
         return last_state
 
     def enable_deep_think(self) -> bool:
@@ -670,7 +692,7 @@ class DeepSeekPlatform(BasePlatform):
                 if not self._click_deep_think_toggle():
                     print(f"[{self.name}] 深度思考按钮点击失败")
                     return False
-                self._cooperative_sleep(0.35)
+                self._cooperative_sleep_jittered(0.35, spread=0.25)
                 after_state = self._wait_for_deep_think_state(True)
                 if after_state.get('active') is True:
                     self._deep_think_cached_state = True
@@ -694,7 +716,7 @@ class DeepSeekPlatform(BasePlatform):
                 if not self._click_deep_think_toggle():
                     print(f"[{self.name}] 深度思考按钮点击失败")
                     return False
-                self._cooperative_sleep(0.35)
+                self._cooperative_sleep_jittered(0.35, spread=0.25)
                 after_state = self._wait_for_deep_think_state(False)
                 if after_state.get('active') is False:
                     self._deep_think_cached_state = False
@@ -726,7 +748,7 @@ class DeepSeekPlatform(BasePlatform):
                     button_text = ref_button.inner_text()
                     print(f"[{self.name}] 找到引用按钮: {button_text}，点击展开...")
                     self._click_locator(ref_button, timeout_ms=3000)
-                    self._cooperative_sleep(2.0)  # 等待引用列表加载
+                    self._cooperative_sleep_jittered(2.0, spread=0.16)  # 等待引用列表加载
                 else:
                     print(f"[{self.name}] 未找到引用按钮")
                     return []
@@ -965,20 +987,10 @@ class DeepSeekPlatform(BasePlatform):
         """DeepSeek 只采最后一轮 assistant message 的 markdown 正文，排除思考和引用面板。"""
         try:
             self._raise_if_stop_requested()
+            self._consume_answer_read_scroll()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel, shouldScroll}) => {
+                """({containerSel, resultSel, thinkSel}) => {
                     const normalize = (value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
-                    const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (shouldScroll && container) {
-                        const style = window.getComputedStyle(container);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                            container.scrollTop = container.scrollHeight;
-                        } else {
-                            window.scrollTo(0, document.body.scrollHeight);
-                        }
-                    } else if (shouldScroll) {
-                        window.scrollTo(0, document.body.scrollHeight);
-                    }
 
                     const isVisible = (el) => {
                         if (!el) return false;
@@ -1111,7 +1123,6 @@ class DeepSeekPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
-                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as e:
@@ -1122,20 +1133,9 @@ class DeepSeekPlatform(BasePlatform):
         """采集最后一轮 DeepSeek assistant message 的完整正文块，保留干净 HTML。"""
         try:
             self._raise_if_stop_requested()
+            self._consume_answer_read_scroll()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel, shouldScroll}) => {
-                    const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (shouldScroll && container) {
-                        const style = window.getComputedStyle(container);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                            container.scrollTop = container.scrollHeight;
-                        } else {
-                            window.scrollTo(0, document.body.scrollHeight);
-                        }
-                    } else if (shouldScroll) {
-                        window.scrollTo(0, document.body.scrollHeight);
-                    }
-
+                """({containerSel, resultSel, thinkSel}) => {
                     const normalize = (value) => String(value || '').trim();
                     const compact = (value) => normalize(value).replace(/[\\s\\W_]+/g, '').toLowerCase();
                     const isVisible = (el) => {
@@ -1352,7 +1352,6 @@ class DeepSeekPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
-                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or {"root_key": "", "blocks": [], "raw_text": "", "raw_html": ""}
         except Exception as e:

@@ -197,46 +197,6 @@ class SelectorHealServiceTests(unittest.TestCase):
         self.assertTrue(created[0].inspect)
         self.assertTrue(created[0].prefer_headed_runtime)
 
-    def test_diagnose_uses_selector_agent_when_enabled(self):
-        created = []
-        config = {
-            "browser_automation": {"deepseek": {"new_chat_selector": "button.old"}},
-            "selector_agent": {"enabled": True, "platform": "local_model", "model": "gemma4:e2b"},
-        }
-
-        def factory(platform_name, *, config=None, inspect=False, stop_checker=None):
-            self.assertEqual(platform_name, "deepseek")
-            self.assertTrue(inspect)
-            self.assertIsNone(stop_checker)
-            platform = _FakePlatform()
-            created.append(platform)
-            return platform
-
-        service = SelectorHealService(
-            config_loader=lambda: config,
-            platform_factory=factory,
-        )
-
-        with patch(
-            "backend_lib.selector_heal_service.send_platform_chat_messages",
-            return_value='{"selected_selector":"button.new","confidence":0.91,"reason":"视觉上更像左侧新建按钮"}',
-        ) as mocked_chat:
-            result = service.diagnose({
-                "platform": "deepseek",
-                "fields": ["new_chat_selector"],
-                "verify": True,
-            })
-
-        field_result = result["results"][0]
-        self.assertTrue(result["ok"])
-        self.assertTrue(field_result["selector_agent_used"])
-        self.assertEqual(field_result["selector_agent_platform"], "local_model")
-        self.assertEqual(field_result["selector_agent_model"], "gemma4:e2b")
-        self.assertEqual(field_result["candidates"][0]["selector"], "button.new")
-        self.assertEqual(field_result["verified_selector"], "button.new")
-        self.assertEqual(created[0].page.clicked_selectors[0], "button.new")
-        self.assertEqual(mocked_chat.call_count, 1)
-
     def test_verify_true_verifies_deepseek_new_chat_in_temporary_platform(self):
         created = []
         service = SelectorHealService(

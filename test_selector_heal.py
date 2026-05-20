@@ -1,12 +1,10 @@
 import unittest
-from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from core.diagnostics import _default_suggestion
 from core.selector_cache import get_learned_selector, load_selector_cache, set_learned_selector
-from core.selector_heal.runtime import attempt_runtime_selector_heal
 from core.selector_heal.fingerprint import browser_automation_hash, platform_browser_automation_hash
 from core.selector_heal.ranker import rank_candidates
 from core.selector_heal.registry import get_field_intent
@@ -61,13 +59,6 @@ class _LearnedCacheLocator:
 
     def click(self, timeout=None, **kwargs):
         self._page.clicked_selectors.append(self.selector)
-
-
-class _RuntimePlatform:
-    def __init__(self):
-        self.name = "deepseek"
-        self.page = object()
-        self.new_chat_selector = "button.old"
 
 
 class SelectorHealTests(unittest.TestCase):
@@ -215,80 +206,6 @@ class SelectorHealTests(unittest.TestCase):
 
         self.assertEqual(ranked[0]["selector"], 'text="开启新对话"')
 
-    def test_runtime_selector_heal_saves_verified_selector_and_updates_platform(self):
-        platform = _RuntimePlatform()
-        config = {
-            "selector_agent": {
-                "enabled": True,
-                "platform": "local_model",
-                "model": "gemma4:e2b",
-            },
-            "browser_automation": {
-                "deepseek": {
-                    "new_chat_selector": "button.old",
-                }
-            },
-        }
-        saved_configs = []
-
-        diagnosis = {
-            "ok": True,
-            "platform": "deepseek",
-            "field": "new_chat_selector",
-            "intent": "新建对话按钮",
-            "current_selector": "button.old",
-            "current_status": "missing",
-            "candidates": [
-                {
-                    "selector": "button.new",
-                    "score": 0.9,
-                    "reason": "text 命中",
-                    "verified": False,
-                }
-            ],
-        }
-
-        verification = {
-            "ok": True,
-            "verify_status": "passed",
-            "verified_selector": "button.new",
-            "verify_reason": "clicked",
-            "candidates": [
-                {
-                    "selector": "button.new",
-                    "score": 0.9,
-                    "reason": "text 命中",
-                    "verified": True,
-                    "verify_reason": "clicked",
-                }
-            ],
-        }
-
-        with patch("core.selector_heal.runtime.load_config", side_effect=lambda: deepcopy(config)), patch(
-            "core.selector_heal.runtime.save_config",
-            side_effect=lambda next_config: saved_configs.append(deepcopy(next_config)),
-        ), patch(
-            "core.selector_heal.runtime.diagnose_selector_field",
-            return_value=diagnosis,
-        ), patch(
-            "core.selector_heal.runtime.send_platform_chat_messages",
-            return_value='{"selected_selector":"button.new","confidence":0.91,"reason":"更稳定"}',
-        ), patch(
-            "core.selector_heal.runtime.verify_selector_candidates",
-            return_value=verification,
-        ):
-            result = attempt_runtime_selector_heal(
-                platform,
-                "new_chat_selector",
-                config=config,
-            )
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["saved"])
-        self.assertEqual(result["selector"], "button.new")
-        self.assertEqual(platform.new_chat_selector, "button.new")
-        self.assertEqual(saved_configs[0]["browser_automation"]["deepseek"]["new_chat_selector"], "button.new")
-
     def test_selector_cache_round_trip_is_profile_scoped(self):
         with TemporaryDirectory() as tempdir:
             self.assertEqual(get_learned_selector(tempdir, "new_chat_selector"), "")
@@ -359,7 +276,7 @@ class SelectorHealTests(unittest.TestCase):
 
         self.assertTrue(BasePlatform._new_chat_transition_ready(platform, before, after))
 
-    def test_start_new_chat_falls_back_to_selector_agent_after_selector_miss(self):
+    def test_start_new_chat_falls_back_to_learned_selector_after_selector_miss(self):
         platform = BasePlatform.__new__(BasePlatform)
         platform.name = "deepseek"
         platform.new_chat_selector = "button.old"
@@ -368,11 +285,11 @@ class SelectorHealTests(unittest.TestCase):
         platform._stop_requested = False
         platform.stop_checker = None
         platform.last_error = ""
-        platform._attempt_selector_agent_heal = Mock(return_value=True)
+        platform._attempt_learned_selector_heal = Mock(return_value=True)
 
         BasePlatform.start_new_chat(platform)
 
-        platform._attempt_selector_agent_heal.assert_called_once_with("new_chat_selector", label="新对话")
+        platform._attempt_learned_selector_heal.assert_called_once_with("new_chat_selector", label="新对话")
 
 
 if __name__ == "__main__":

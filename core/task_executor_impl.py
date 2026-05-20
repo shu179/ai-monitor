@@ -18,10 +18,7 @@ from core.platform_sessions import (
 )
 from core.task_executor_api import _run_api_task
 from core.task_executor_browser import (
-    _apply_browser_runtime_config,
-    _create_browser_platform,
     _should_use_session_pool_for_query,
-    _sync_reused_platform_runtime_state,
 )
 from core.task_executor_dispatch import dispatch_task_queries
 from core.task_executor_finalization import (
@@ -519,11 +516,8 @@ def run_task_group(
 
 
 __all__ = [
-    "_apply_browser_runtime_config",
-    "_create_browser_platform",
     "_run_api_task",
     "_run_smart_browser_task",
     "_should_use_session_pool_for_query",
-    "_sync_reused_platform_runtime_state",
     "run_task_group",
 ]

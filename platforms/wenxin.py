@@ -161,7 +161,7 @@ class WenxinPlatform(BasePlatform):
             return False
         if not self._click_deep_think_menu_item(target_text):
             return False
-        self._cooperative_sleep(0.6)
+        self._cooperative_sleep_jittered(0.6, spread=0.2)
         state = self._get_deep_think_state()
         text = str(state.get("text") or "")
         if target_text == "关闭":
@@ -222,16 +222,13 @@ class WenxinPlatform(BasePlatform):
         if not self.new_chat_selector:
             if self._attempt_learned_selector_heal("new_chat_selector", label="新会话"):
                 print(f"[{self.name}] 已通过 learned selector 开启新会话")
-                return
-            if self._attempt_selector_agent_heal("new_chat_selector", label="新会话"):
-                print(f"[{self.name}] 已通过 selector_agent 开启新会话")
-                return
+            return
             return
         try:
             btn = self.page.locator(self.new_chat_selector).first
             self._wait_for_locator(btn, timeout_ms=5000)
             self._click_locator(btn, timeout_ms=5000)
-            if self._wait_and_confirm_new_chat(before, sleep_seconds=1.5):
+            if self._wait_and_confirm_new_chat(before, sleep_seconds=random.uniform(1.25, 1.75)):
                 print(f"[{self.name}] 已开启新对话")
                 return
             last_error = "已点击新会话按钮，但未确认切换到新会话"
@@ -240,9 +237,6 @@ class WenxinPlatform(BasePlatform):
             last_error = str(e) or last_error
         if self._attempt_learned_selector_heal("new_chat_selector", label="新会话"):
             print(f"[{self.name}] 已通过 learned selector 开启新会话")
-            return
-        if self._attempt_selector_agent_heal("new_chat_selector", label="新会话"):
-            print(f"[{self.name}] 已通过 selector_agent 开启新会话")
             return
         print(f"[{self.name}] 开启新对话失败，继续: {last_error}")
 
@@ -259,14 +253,14 @@ class WenxinPlatform(BasePlatform):
         except Exception as e:
             self._reraise_stop_requested(e)
             pass
-        self._cooperative_sleep(0.15)
+        self._cooperative_sleep_jittered(0.15, spread=0.35)
 
         # 先用真实快捷键清空，确保 Slate 内部状态同步更新。
         try:
             self.page.keyboard.press(select_all)
-            self._cooperative_sleep(0.1)
+            self._cooperative_sleep_jittered(0.1, spread=0.35)
             self.page.keyboard.press("Backspace")
-            self._cooperative_sleep(0.15)
+            self._cooperative_sleep_jittered(0.15, spread=0.35)
         except Exception as e:
             self._reraise_stop_requested(e)
             pass
@@ -274,9 +268,9 @@ class WenxinPlatform(BasePlatform):
         try:
             if (editor.inner_text(timeout=1000) or "").strip():
                 self.page.keyboard.press(select_all)
-                self._cooperative_sleep(0.1)
+                self._cooperative_sleep_jittered(0.1, spread=0.35)
                 self.page.keyboard.press("Delete")
-                self._cooperative_sleep(0.15)
+                self._cooperative_sleep_jittered(0.15, spread=0.35)
         except Exception as e:
             self._reraise_stop_requested(e)
             pass
@@ -408,20 +402,10 @@ class WenxinPlatform(BasePlatform):
     def _get_answer_text(self) -> str:
         try:
             self._raise_if_stop_requested()
+            self._consume_answer_read_scroll()
             return self.page.evaluate(
-                """({containerSel, resultSel, lastOnly, shouldScroll}) => {
+                """({containerSel, resultSel, lastOnly}) => {
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (shouldScroll && container) {
-                        const style = window.getComputedStyle(container);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                            container.scrollTop = container.scrollHeight;
-                        } else {
-                            window.scrollTo(0, document.body.scrollHeight);
-                        }
-                    } else if (shouldScroll) {
-                        window.scrollTo(0, document.body.scrollHeight);
-                    }
-
                     let blocks = Array.from(document.querySelectorAll(resultSel))
                         .map((el) => (el.innerText || '').trim())
                         .filter(Boolean);
@@ -435,7 +419,6 @@ class WenxinPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector,
                     "resultSel": self.result_selector,
                     "lastOnly": True,
-                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as e:
@@ -638,7 +621,7 @@ class WenxinPlatform(BasePlatform):
                 start_time = time.monotonic()
                 stable_count = 0
                 last_text = ""
-                self._cooperative_sleep(2)
+                self._cooperative_sleep_jittered(2.0, spread=0.16)
                 continue
 
             self._schedule_answer_poll_read()
@@ -646,18 +629,18 @@ class WenxinPlatform(BasePlatform):
             elapsed = time.monotonic() - start_time
             if elapsed < min_wait:
                 last_text = page_text
-                self._cooperative_sleep(1)
+                self._cooperative_sleep_jittered(1.0, spread=0.18)
                 continue
 
             if self._is_generating():
                 stable_count = 0
                 last_text = page_text
-                self._cooperative_sleep(1)
+                self._cooperative_sleep_jittered(1.0, spread=0.18)
                 continue
 
             if not self.has_usable_answer_text(page_text, keyword=keyword, brand=brand):
                 last_text = page_text
-                self._cooperative_sleep(1)
+                self._cooperative_sleep_jittered(1.0, spread=0.18)
                 continue
 
             if page_text == last_text:
@@ -668,7 +651,7 @@ class WenxinPlatform(BasePlatform):
 
             if stable_count >= 2:
                 print(f"[{self.name}] 文心回答已稳定，判定生成完成")
-                self._cooperative_sleep(0.8)
+                self._cooperative_sleep_jittered(0.8, spread=0.18)
                 self._schedule_answer_poll_read(force_scroll=True)
                 final_text = get_text() or ""
                 self.last_answer_text = final_text
@@ -691,7 +674,7 @@ class WenxinPlatform(BasePlatform):
                 )
                 return
 
-            self._cooperative_sleep(1)
+            self._cooperative_sleep_jittered(1.0, spread=0.18)
 
         print(f"[{self.name}] 等待生成超时（{timeout}s），尝试用当前内容解析排名")
         try:
@@ -770,7 +753,7 @@ class WenxinPlatform(BasePlatform):
                     if not has_rotate:
                         print(f"[{self.name}] 点击展开深度思考区域...")
                         think_header.click(timeout=3000)
-                        self._cooperative_sleep(1.5)
+                        self._cooperative_sleep_jittered(1.5, spread=0.16)
                     else:
                         print(f"[{self.name}] 深度思考区域已展开")
             except Exception as e:
@@ -792,7 +775,7 @@ class WenxinPlatform(BasePlatform):
             print(f"[{self.name}] 找到引用按钮: {btn_text}，点击展开...")
             try:
                 ref_btn.evaluate("el => el.click()")
-                self._cooperative_sleep(2.0)
+                self._cooperative_sleep_jittered(2.0, spread=0.16)
             except Exception as e:
                 self._reraise_stop_requested(e)
                 print(f"[{self.name}] 点击参考网页按钮失败: {e}")

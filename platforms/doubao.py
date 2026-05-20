@@ -25,9 +25,9 @@ class DoubaoPlatform(BasePlatform):
 
     target_url = "https://www.doubao.com/chat/"
     input_selector = 'textarea.semi-input-textarea.semi-input-textarea-autosize[placeholder="发消息..."]'
-    new_chat_selector = 'xpath=//div[contains(@class,"cursor-pointer") and .//div[normalize-space()="新对话"]]'
+    new_chat_selector = 'xpath=//div[contains(@class,"sidebar_nav_item") and contains(normalize-space(.),"新对话")]'
     chat_container_selector = '[class*="scrollable"]'
-    composer_status_selector = 'div[data-trigger-type="hover"][data-state]'
+    composer_status_selector = 'button#flow-end-msg-send, div[data-trigger-type="hover"][data-state]'
     result_selector = (
         '[data-testid*="message-content"], '
         '[data-testid*="message_content"], '
@@ -54,22 +54,16 @@ class DoubaoPlatform(BasePlatform):
     deep_think_menu_trigger_selector = 'button[aria-haspopup="menu"][data-slot="dropdown-menu-trigger"]:visible'
     deep_think_think_selector = 'xpath=//*[@role="menuitem" and contains(normalize-space(.), "思考")]'
     deep_think_quick_selector = 'xpath=//*[@role="menuitem" and contains(normalize-space(.), "快速")]'
-    send_button_selector = (
-        'xpath=//div[@data-trigger-type="hover" and contains(@class,"cursor-pointer") '
-        'and .//svg/path[contains(@d,"M10.6254 20.3752V6.69549")]]'
-    )
-    stop_generating_selector = (
-        'xpath=//div[@data-trigger-type="hover" and contains(@class,"cursor-pointer") '
-        'and .//svg/path[contains(@d,"M21.1504 12C21.1504 6.94659")]]'
-    )
+    send_button_selector = '#flow-end-msg-send'
+    stop_generating_selector = 'div[data-trigger-type="hover"][data-state]:has(svg path[d^="M12 0.5C18.3513 0.5"])'
     voice_button_selector = (
         'xpath=//div[@data-trigger-type="hover" and contains(@class,"cursor-pointer") '
         'and .//svg/path[contains(@d,"M19.8628 9.29346")]]'
     )
-    status_button_selector = 'div[data-trigger-type="hover"][data-state]'
+    status_button_selector = 'button#flow-end-msg-send, div[data-trigger-type="hover"][data-state]'
     _status_voice_path_prefix = "M19.8628 9.29346"
-    _status_send_path_prefix = "M10.6254 20.3752V6.69549"
-    _status_pause_path_prefix = "M21.1504 12C21.1504 6.94659"
+    _status_send_path_prefix = "M4.93934 10.2598"
+    _status_pause_path_prefix = "M12 0.5C18.3513 0.5"
 
     # 豆包页面上带 verify class 的正常布局元素，排除误报。
     # #captcha_container 不再加入白名单，否则真实拦截层会绕过 base._detect_overlay。
@@ -146,7 +140,7 @@ class DoubaoPlatform(BasePlatform):
         chat_input = self.page.locator(self.input_selector).first
         self._wait_for_locator(chat_input, timeout_ms=timeout_ms)
         composer = chat_input.locator(
-            "xpath=ancestor::div[.//div[@data-trigger-type='hover' and @data-state]][1]"
+            "xpath=ancestor::div[.//*[@id='flow-end-msg-send' or (@data-trigger-type='hover' and @data-state)]][1]"
         )
         self._wait_for_locator(composer, timeout_ms=timeout_ms)
         return composer
@@ -216,7 +210,7 @@ class DoubaoPlatform(BasePlatform):
                 or (pause_state and container_grew)
             ):
                 return True
-            self._cooperative_sleep(0.2)
+            self._cooperative_sleep_jittered(0.2, spread=0.32)
         debug_snapshot = self._composer_snapshot(keyword)
         print(
             f"[{self.name}] 提交确认未通过: "
@@ -235,9 +229,17 @@ class DoubaoPlatform(BasePlatform):
         self._raise_if_stop_requested()
         try:
             snapshot = self._get_status_button_snapshot()
-            state = self._classify_status_button_state(snapshot.get("paths"))
+            state = self._classify_status_button_state(
+                snapshot.get("paths"),
+                text=snapshot.get("text"),
+                data_state=snapshot.get("dataState"),
+                outer_html=snapshot.get("outerHTML"),
+            )
             if state != "unknown":
                 return state
+            guessed_state = str(snapshot.get("stateGuess") or "")
+            if guessed_state in {"pause", "send", "voice"}:
+                return guessed_state
             if self._is_selector_visible(self.stop_generating_selector):
                 return "pause"
             if self._is_selector_visible(self.send_button_selector):
@@ -248,7 +250,23 @@ class DoubaoPlatform(BasePlatform):
             self._reraise_stop_requested(e)
         return "unknown"
 
-    def _classify_status_button_state(self, paths: list[str] | None) -> str:
+    @staticmethod
+    def _selector_looks_xpath(selector: str) -> bool:
+        text = str(selector or "").strip()
+        return bool(text) and (
+            text.startswith("xpath=")
+            or text.startswith("//")
+            or text.startswith("(//")
+        )
+
+    def _classify_status_button_state(
+        self,
+        paths: list[str] | None,
+        *,
+        text: str = "",
+        data_state: str = "",
+        outer_html: str = "",
+    ) -> str:
         for path in paths or []:
             if not path:
                 continue
@@ -258,15 +276,70 @@ class DoubaoPlatform(BasePlatform):
                 return "send"
             if self._status_voice_path_prefix in path:
                 return "voice"
+        fallback_text = " ".join(
+            part for part in [
+                str(text or "").strip(),
+                str(data_state or "").strip(),
+                str(outer_html or "").strip(),
+            ]
+            if part
+        )
+        if fallback_text:
+            lowered = fallback_text.lower()
+            if (
+                "停止生成" in fallback_text
+                or "停止回答" in fallback_text
+                or "break-btn" in lowered
+            ):
+                return "pause"
+            if (
+                "发送消息" in fallback_text
+                or "发送" in fallback_text
+                or "flow-end-msg-send" in lowered
+                or "send-msg-btn" in lowered
+            ):
+                return "send"
+            if "语音输入" in fallback_text or "voice" in lowered:
+                return "voice"
         return "unknown"
+
+    def _resolve_status_button_locator(self, *, required_state: str = "", timeout_ms: int = 1500):
+        self._raise_if_stop_requested()
+        ordered = [
+            ("pause", self.stop_generating_selector),
+            ("send", self.send_button_selector),
+            ("voice", self.voice_button_selector),
+        ]
+        if required_state:
+            ordered = [item for item in ordered if item[0] == required_state]
+        wait_ms = max(300, int(timeout_ms or 300))
+        for state, selector in ordered:
+            if not selector:
+                continue
+            locator = self.page.locator(selector).first
+            try:
+                self._wait_for_locator(locator, timeout_ms=wait_ms)
+                return state, locator
+            except Exception:
+                continue
+        if required_state:
+            return "", None
+        try:
+            composer = self._get_composer_locator(timeout_ms=min(wait_ms, 1200))
+            locator = composer.locator(self.composer_status_selector).first
+            self._wait_for_locator(locator, timeout_ms=min(wait_ms, 1200))
+            return "", locator
+        except Exception:
+            return "", None
 
     def _get_status_button_snapshot(self) -> dict:
         try:
-            composer = self._get_composer_locator(timeout_ms=1500)
-            button = composer.locator(self.composer_status_selector).first
-            self._wait_for_locator(button, timeout_ms=1500)
+            state_guess, button = self._resolve_status_button_locator(timeout_ms=1500)
+            if button is None:
+                return {"found": False}
             return {
                 "found": True,
+                "stateGuess": state_guess,
                 "text": (button.text_content(timeout=300) or "").strip(),
                 "className": button.get_attribute("class") or "",
                 "outerHTML": button.evaluate("(el) => String(el.outerHTML || '')"),
@@ -303,6 +376,8 @@ class DoubaoPlatform(BasePlatform):
             self._raise_if_stop_requested()
             status_snapshot = self._get_status_button_snapshot()
             status_state = self._classify_status_button_state(status_snapshot.get("paths"))
+            if status_state == "unknown":
+                status_state = str(status_snapshot.get("stateGuess") or "")
             snapshot = self.page.evaluate(
                 """({resultSel, thinkSel, inputSel, stopSel, sendSel, voiceSel}) => {
                     const normalize = (value) => String(value || '')
@@ -389,10 +464,13 @@ class DoubaoPlatform(BasePlatform):
         try:
             snapshot = self._get_status_button_snapshot()
             state = self._classify_status_button_state(snapshot.get("paths"))
+            if state == "unknown":
+                state = str(snapshot.get("stateGuess") or "")
             if required_state and state != required_state:
                 return False
-            composer = self._get_composer_locator(timeout_ms=1500)
-            button = composer.locator(self.composer_status_selector).first
+            _, button = self._resolve_status_button_locator(required_state=required_state, timeout_ms=1500)
+            if button is None:
+                return False
             self._click_locator(button, timeout_ms=1500)
             return True
         except Exception as e:
@@ -579,7 +657,7 @@ class DoubaoPlatform(BasePlatform):
         return super()._wait_until_new_chat_ready(before, timeout=timeout)
 
     def start_new_chat(self) -> None:
-        """仅通过固定 selector 开启新对话，不再做 DOM 猜测。"""
+        """优先使用固定 selector，失效时再退回轻量 DOM 兜底。"""
         try:
             self._raise_if_stop_requested()
             self._disable_captcha_pointer_intercept()
@@ -591,11 +669,13 @@ class DoubaoPlatform(BasePlatform):
                     print(f"[{self.name}] 已开启新对话")
                     return
                 last_error = "已点击新对话按钮，但未确认切换到新会话"
+            if self._click_new_chat_via_dom():
+                if self._wait_and_confirm_new_chat(before, sleep_seconds=random.uniform(0.5, 1.0), timeout_ms=8000):
+                    print(f"[{self.name}] 已通过DOM开启新对话")
+                    return
+                last_error = "已通过DOM点击新对话按钮，但未确认切换到新会话"
             if self._attempt_learned_selector_heal("new_chat_selector", label="新对话"):
                 print(f"[{self.name}] 已通过 learned selector 开启新对话")
-                return
-            if self._attempt_selector_agent_heal("new_chat_selector", label="新对话"):
-                print(f"[{self.name}] 已通过 selector_agent 开启新对话")
                 return
             if self._open_fresh_chat_fallback():
                 print(f"[{self.name}] 新对话按钮不可用，已回到首页")
@@ -682,7 +762,7 @@ class DoubaoPlatform(BasePlatform):
                 el.scrollTo(0, target);
                 return el.scrollTop;
             }""", scroll_top)
-            self._cooperative_sleep(0.4)
+            self._cooperative_sleep_jittered(0.4, spread=0.2)
             actual_scroll = self.page.evaluate("""() => {
                 const el = document.querySelector('[class*="scrollable"]');
                 return el ? el.scrollTop : null;
@@ -802,7 +882,7 @@ class DoubaoPlatform(BasePlatform):
             current = self._normalize_compact_text(self._read_input_value())
             if current == expected or expected in current:
                 return True
-            self._cooperative_sleep(0.15)
+            self._cooperative_sleep_jittered(0.15, spread=0.35)
         return False
 
     def _composer_snapshot(self, keyword: str = "") -> dict:
@@ -815,6 +895,18 @@ class DoubaoPlatform(BasePlatform):
                         .replace(/\\n{3,}/g, '\\n\\n')
                         .replace(/[ \\t]{2,}/g, ' ')
                         .trim();
+                    const queryAllSafe = (selector) => {
+                        if (!selector) return [];
+                        const text = String(selector || '').trim();
+                        if (!text || text.startsWith('xpath=') || text.startsWith('//') || text.startsWith('(//')) {
+                            return [];
+                        }
+                        try {
+                            return Array.from(document.querySelectorAll(text));
+                        } catch (_) {
+                            return [];
+                        }
+                    };
                     const compact = (value) => normalize(value).replace(/[\\s\\W_]+/g, '').toLowerCase();
                     const isVisible = (el) => {
                         if (!el) return false;
@@ -838,7 +930,7 @@ class DoubaoPlatform(BasePlatform):
                         input ? (input.value || input.innerText || input.textContent || '') : ''
                     );
                     const resultTexts = resultSel
-                        ? Array.from(document.querySelectorAll(resultSel))
+                        ? queryAllSafe(resultSel)
                             .filter((el) => isVisible(el) && !(thinkSel && el.closest(thinkSel)))
                             .map((el) => cleanupText(el.innerText || el.textContent || ''))
                             .filter(Boolean)
@@ -847,7 +939,7 @@ class DoubaoPlatform(BasePlatform):
                     const containerText = cleanupText(
                         container ? (container.innerText || container.textContent || '') : ''
                     );
-                    const stopVisible = Array.from(document.querySelectorAll(stopSel || ''))
+                    const stopVisible = queryAllSafe(stopSel)
                         .some((el) => isVisible(el));
                     const keywordCompact = compact(keyword || '');
                     const containerCompact = compact(containerText);
@@ -902,7 +994,7 @@ class DoubaoPlatform(BasePlatform):
     def _click_send_button_via_dom(self) -> bool:
         try:
             result = self.page.evaluate(
-                """(inputSel) => {
+                """({inputSel, sendSel}) => {
                     const input = document.querySelector(inputSel);
                     if (!input) return { clicked: false, reason: 'no-input' };
                     const norm = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
@@ -924,6 +1016,12 @@ class DoubaoPlatform(BasePlatform):
                         const ariaDisabled = String(el.getAttribute('aria-disabled') || '').toLowerCase();
                         return disabled !== null || ariaDisabled === 'true';
                     };
+                    const clickNode = (el) => {
+                        if (!el || !isVisible(el) || isDisabled(el)) return false;
+                        try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+                        try { el.click(); } catch (_) {}
+                        return true;
+                    };
                     const getText = (el) => norm([
                         el.innerText,
                         el.textContent,
@@ -932,6 +1030,12 @@ class DoubaoPlatform(BasePlatform):
                         el.getAttribute('data-testid'),
                         el.getAttribute('data-dbx-name'),
                     ].filter(Boolean).join(' '));
+                    if (sendSel) {
+                        const direct = document.querySelector(sendSel);
+                        if (clickNode(direct)) {
+                            return { clicked: true, text: 'direct-send-selector', score: 999 };
+                        }
+                    }
                     const inputRect = input.getBoundingClientRect();
                     const inputCenterY = inputRect.top + inputRect.height / 2;
                     const selectors = 'button, [role="button"], div[role="button"]';
@@ -970,14 +1074,17 @@ class DoubaoPlatform(BasePlatform):
                             reason: best ? `low-score:${best.score}` : 'no-candidate',
                         };
                     }
-                    best.el.click();
+                    clickNode(best.el);
                     return {
                         clicked: true,
                         text: best.text,
                         score: best.score,
                     };
                 }""",
-                self.input_selector,
+                {
+                    "inputSel": self.input_selector,
+                    "sendSel": self.send_button_selector,
+                },
             ) or {}
             if result.get("clicked"):
                 print(f"[{self.name}] 已通过DOM点击发送按钮: {result.get('text') or 'icon-button'}")
@@ -1009,6 +1116,12 @@ class DoubaoPlatform(BasePlatform):
             if status_after == "pause":
                 print(f"[{self.name}] 状态按钮已切到暂停态（策略: {strategy_name}）")
                 return
+            after_input = self._normalize_compact_text(self._read_input_value())
+            if before_input and not after_input:
+                self._cooperative_sleep_jittered(0.8, spread=0.18)
+                if not self._normalize_compact_text(self._read_input_value()):
+                    print(f"[{self.name}] 输入框已清空，按已发送处理（策略: {strategy_name}; input-cleared）")
+                    return
             print(f"[{self.name}] Enter 提交未确认，尝试点击发送按钮兜底")
             if self._click_send_button_via_dom():
                 strategy_name = "dom_send_button"
@@ -1022,6 +1135,12 @@ class DoubaoPlatform(BasePlatform):
                 if status_after == "pause":
                     print(f"[{self.name}] 状态按钮已切到暂停态（策略: {strategy_name}）")
                     return
+                after_input = self._normalize_compact_text(self._read_input_value())
+                if before_input and not after_input:
+                    self._cooperative_sleep_jittered(0.8, spread=0.18)
+                    if not self._normalize_compact_text(self._read_input_value()):
+                        print(f"[{self.name}] 输入框已清空，按已发送处理（策略: {strategy_name}; input-cleared）")
+                        return
             raise RuntimeError(f"豆包未确认问题已发送，当前状态按钮={status_after}")
         except InterruptionDetected:
             raise
@@ -1031,20 +1150,10 @@ class DoubaoPlatform(BasePlatform):
 
     def _get_answer_text(self) -> str:
         try:
+            self._consume_answer_read_scroll()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel, inputSel, shouldScroll}) => {
+                """({containerSel, resultSel, thinkSel, inputSel}) => {
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (shouldScroll && container) {
-                        const style = window.getComputedStyle(container);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                            container.scrollTop = container.scrollHeight;
-                        } else {
-                            window.scrollTo(0, document.body.scrollHeight);
-                        }
-                    } else if (shouldScroll) {
-                        window.scrollTo(0, document.body.scrollHeight);
-                    }
-
                     const normalize = (value) => String(value || '')
                         .replace(/\\u00a0/g, ' ')
                         .replace(/[ \\t]+\\n/g, '\\n')
@@ -1210,7 +1319,6 @@ class DoubaoPlatform(BasePlatform):
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
                     "inputSel": self.input_selector or "",
-                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as e:
@@ -1230,6 +1338,18 @@ class DoubaoPlatform(BasePlatform):
                         .replace(/\\n{3,}/g, '\\n\\n')
                         .replace(/[ \\t]{2,}/g, ' ')
                         .trim();
+                    const queryAllSafe = (selector) => {
+                        if (!selector) return [];
+                        const text = String(selector || '').trim();
+                        if (!text || text.startsWith('xpath=') || text.startsWith('//') || text.startsWith('(//')) {
+                            return [];
+                        }
+                        try {
+                            return Array.from(document.querySelectorAll(text));
+                        } catch (_) {
+                            return [];
+                        }
+                    };
                     const isVisible = (el) => {
                         if (!el) return false;
                         const style = window.getComputedStyle(el);
@@ -1277,11 +1397,11 @@ class DoubaoPlatform(BasePlatform):
                         return /[\\u4e00-\\u9fffA-Za-z0-9]/.test(compact);
                     };
                     if (statusState === 'pause') return false;
-                    const hasStopButton = Array.from(document.querySelectorAll(stopSel || ''))
+                    const hasStopButton = queryAllSafe(stopSel)
                         .some((el) => isVisible(el));
                     if (hasStopButton) return false;
                     const resultNodes = resultSel
-                        ? Array.from(document.querySelectorAll(resultSel))
+                        ? queryAllSafe(resultSel)
                             .filter((el) => isVisible(el) && !(thinkSel && el.closest(thinkSel)))
                         : [];
                     return resultNodes.some((el) => looksLikeAnswer(el.innerText || el.textContent || ''));
@@ -1631,7 +1751,7 @@ class DoubaoPlatform(BasePlatform):
                     return false;
                 }"""):
                     return True
-                self._cooperative_sleep(0.15)
+                self._cooperative_sleep_jittered(0.15, spread=0.35)
             return False
         except Exception as e:
             self._reraise_stop_requested(e)
@@ -1789,6 +1909,23 @@ class DoubaoPlatform(BasePlatform):
             return candidates.slice(0, 12);
         }""")
 
+    @staticmethod
+    def _parse_reference_expected_count(text: str) -> int:
+        match = re.search(r"参考\s*(\d+)\s*篇资料", str(text or ""))
+        if not match:
+            return 0
+        try:
+            return max(0, int(match.group(1)))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _reference_wheel_max_passes(expected_count: int) -> int:
+        count = max(0, int(expected_count or 0))
+        if count <= 0:
+            return 8
+        return min(36, max(8, (count + 2) // 3 + 5))
+
     def extract_answer_references(self) -> list[dict]:
         """
         豆包平台抓取源提取：点击"参考X篇资料"按钮展开右侧面板，
@@ -1806,28 +1943,16 @@ class DoubaoPlatform(BasePlatform):
                     print(f"[{self.name}] 未找到参考资料按钮")
                     return []
                 button_text = ref_button.inner_text()
+                expected_count = self._parse_reference_expected_count(button_text)
                 print(f"[{self.name}] 找到参考按钮: {button_text}，点击展开...")
                 ref_button.click(timeout=3000)
-                self._cooperative_sleep(2.5)
+                self._cooperative_sleep_jittered(2.5, spread=0.15)
             except Exception as e:
                 self._reraise_stop_requested(e)
                 print(f"[{self.name}] 点击参考按钮失败: {e}")
                 return []
 
-            # 同步滚动右侧面板到底部，确保所有条目渲染到 DOM
-            self.page.evaluate("""() => {
-                const W = window.innerWidth;
-                const scrollable = Array.from(document.querySelectorAll('*')).find(el => {
-                    const rect = el.getBoundingClientRect();
-                    if (rect.left < W * 0.5 || rect.height < 200) return false;
-                    const style = window.getComputedStyle(el);
-                    return (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight;
-                });
-                if (scrollable) scrollable.scrollTop = scrollable.scrollHeight;
-            }""")
-            self._cooperative_sleep(1.5)
-
-            references = self.page.evaluate(r"""() => {
+            collect_script = r"""() => {
                 const results = [];
                 const seenUrls = new Set();
                 let index = 1;
@@ -1877,12 +2002,185 @@ class DoubaoPlatform(BasePlatform):
                 }
 
                 return results;
-            }""")
+            }"""
+            scroll_probe_script = """() => {
+                const W = window.innerWidth;
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return (
+                        rect.width > 0 &&
+                        rect.height > 0 &&
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.opacity !== '0'
+                    );
+                };
+                const isExternalReferenceLink = (a) => {
+                    try {
+                        const url = a.href || '';
+                        if (!url || url.startsWith('javascript:') || url === '#') return false;
+                        if (url.includes('doubao.com') || url.includes('bytedance.com')) return false;
+                        if (/\\.(jpg|jpeg|png|gif|webp|svg|ico|bmp)(\\?|$)/i.test(url)) return false;
+                        return true;
+                    } catch (_) {
+                        return false;
+                    }
+                };
+                const isReferenceScrollable = (el) => {
+                    if (!el || el === document.body || el === document.documentElement) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return (
+                        rect.height >= 180 &&
+                        rect.width >= 220 &&
+                        rect.left >= W * 0.25 &&
+                        rect.right >= W * 0.82 &&
+                        rect.width <= W * 0.78 &&
+                        (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+                        el.scrollHeight > el.clientHeight + 8
+                    );
+                };
+                const scoreCandidate = (el, linkHits) => {
+                    const rect = el.getBoundingClientRect();
+                    return linkHits * 10000 + rect.right * 3 - rect.left + Math.min(1800, el.scrollHeight - el.clientHeight);
+                };
 
-            if isinstance(references, list):
+                const candidateHits = new Map();
+                for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+                    if (!isExternalReferenceLink(a) || !isVisible(a)) continue;
+                    const linkRect = a.getBoundingClientRect();
+                    if (linkRect.right < W * 0.55) continue;
+                    let node = a.parentElement;
+                    while (node && node !== document.body && node !== document.documentElement) {
+                        if (isReferenceScrollable(node)) {
+                            candidateHits.set(node, (candidateHits.get(node) || 0) + 1);
+                            break;
+                        }
+                        node = node.parentElement;
+                    }
+                }
+
+                let scrollable = null;
+                let bestScore = -1;
+                for (const [el, hits] of candidateHits.entries()) {
+                    const score = scoreCandidate(el, hits);
+                    if (score > bestScore) {
+                        scrollable = el;
+                        bestScore = score;
+                    }
+                }
+
+                if (!scrollable) {
+                    for (const el of Array.from(document.querySelectorAll('*'))) {
+                        if (!isReferenceScrollable(el)) continue;
+                        const score = scoreCandidate(el, 0);
+                        if (score > bestScore) {
+                            scrollable = el;
+                            bestScore = score;
+                        }
+                    }
+                }
+                if (!scrollable) return null;
+                const rect = scrollable.getBoundingClientRect();
+                return {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    scrollTop: Number(scrollable.scrollTop || 0),
+                    scrollHeight: Number(scrollable.scrollHeight || 0),
+                    clientHeight: Number(scrollable.clientHeight || 0),
+                };
+            }"""
+
+            def collect_visible_references() -> list[dict]:
+                try:
+                    current = self.page.evaluate(collect_script)
+                except Exception as exc:
+                    self._reraise_stop_requested(exc)
+                    return []
+                return current if isinstance(current, list) else []
+
+            seen_by_url: dict[str, dict] = {}
+
+            def merge_references(items: list[dict]) -> None:
+                for item in items or []:
+                    if not isinstance(item, dict):
+                        continue
+                    url = str(item.get("url") or "").strip()
+                    if not url:
+                        continue
+                    if url in seen_by_url:
+                        continue
+                    seen_by_url[url] = {
+                        "index": 0,
+                        "title": str(item.get("title") or "").strip(),
+                        "url": url,
+                        "source": str(item.get("source") or "").strip(),
+                    }
+
+            merge_references(collect_visible_references())
+
+            stalled_passes = 0
+            for _ in range(self._reference_wheel_max_passes(expected_count)):
+                if expected_count > 0 and len(seen_by_url) >= expected_count:
+                    break
+                self._raise_if_stop_requested()
+                metrics = self.page.evaluate(scroll_probe_script) or {}
+                if not metrics:
+                    break
+                before_top = float(metrics.get("scrollTop", 0) or 0)
+                remaining = max(
+                    0.0,
+                    float(metrics.get("scrollHeight", 0) or 0)
+                    - float(metrics.get("clientHeight", 0) or 0)
+                    - before_top,
+                )
+                if remaining <= 10:
+                    break
+                if not self._perform_auxiliary_wheel_pass(
+                    box={
+                        "x": float(metrics.get("x", 0) or 0),
+                        "y": float(metrics.get("y", 0) or 0),
+                        "width": float(metrics.get("width", 0) or 0),
+                        "height": float(metrics.get("height", 0) or 0),
+                    },
+                    remaining=remaining,
+                    clamp_to_input=False,
+                    x_range=(0.48, 0.62),
+                    y_range=(0.36, 0.72),
+                ):
+                    break
+                self._cooperative_sleep_jittered(0.9, spread=0.24)
+                merge_references(collect_visible_references())
+
+                after_metrics = self.page.evaluate(scroll_probe_script) or {}
+                after_top = float(after_metrics.get("scrollTop", before_top) or 0)
+                after_remaining = max(
+                    0.0,
+                    float(after_metrics.get("scrollHeight", 0) or 0)
+                    - float(after_metrics.get("clientHeight", 0) or 0)
+                    - after_top,
+                )
+                if abs(after_top - before_top) <= 2:
+                    stalled_passes += 1
+                else:
+                    stalled_passes = 0
+                if after_remaining <= 10 or stalled_passes >= 2:
+                    break
+
+            merge_references(collect_visible_references())
+
+            references = list(seen_by_url.values())
+            for index, ref in enumerate(references, start=1):
+                ref["index"] = index
+            if expected_count > 0 and len(references) != expected_count:
+                print(f"[{self.name}] 参考资料期望 {expected_count} 条，当前提取 {len(references)} 条")
+            if references:
                 print(f"[{self.name}] 提取到 {len(references)} 条平台抓取源")
-                return references
-            return []
+            return references
 
         except Exception as exc:
             self._reraise_stop_requested(exc)

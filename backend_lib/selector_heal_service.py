@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 from collections.abc import Callable
 import json
 import time
@@ -12,13 +11,6 @@ from typing import Any
 
 from core.app_paths import resolve_app_path
 from core.browser_platform_factory import normalize_browser_platform_name
-from platforms.api_client import (
-    get_platform_api_key,
-    get_platform_last_error,
-    model_supports_image_input,
-    platform_has_configured_access,
-    send_platform_chat_messages,
-)
 from core.selector_heal.repair import diagnose_selector_field
 from core.selector_heal.registry import get_field_intent
 from core.selector_heal.verifier import verify_selector_candidates
@@ -90,12 +82,11 @@ class SelectorHealService:
                 "results": [],
             }
 
-        config = self._config_loader()
         platform_instance = None
         try:
             platform_instance = self._platform_factory(
                 platform,
-                config=config,
+                config=self._config_loader(),
                 inspect=True,
                 stop_checker=None,
             )
@@ -115,11 +106,6 @@ class SelectorHealService:
                     platform=platform,
                     field_name=field,
                     current_selector=current_selector,
-                )
-                diagnosis = self._maybe_enrich_with_selector_agent(
-                    platform_instance,
-                    diagnosis,
-                    config=config,
                 )
                 if verify:
                     diagnosis = verify_selector_candidates(platform_instance, diagnosis)
@@ -279,265 +265,6 @@ class SelectorHealService:
                     platform_instance.close()
                 except Exception:
                     pass
-
-    def _maybe_enrich_with_selector_agent(
-        self,
-        platform_instance: Any,
-        diagnosis: dict[str, Any],
-        *,
-        config: dict[str, Any],
-    ) -> dict[str, Any]:
-        updated = dict(diagnosis or {})
-        selector_agent_cfg = self._resolve_selector_agent_config(config)
-        if not selector_agent_cfg.get("enabled"):
-            updated.setdefault("selector_agent_used", False)
-            updated.setdefault("selector_agent_reason", "selector_agent 未启用")
-            return updated
-
-        if str(updated.get("current_status") or "").strip() == "healthy":
-            updated.setdefault("selector_agent_used", False)
-            updated.setdefault("selector_agent_reason", "当前 selector 仍可用，跳过模型辅助")
-            return updated
-
-        platform = str(selector_agent_cfg.get("platform") or "").strip()
-        model = str(selector_agent_cfg.get("model") or "").strip()
-        api_key = str(selector_agent_cfg.get("api_key") or "").strip()
-        if not platform or not model:
-            updated["selector_agent_used"] = False
-            updated["selector_agent_error"] = "selector_agent 未配置平台或模型"
-            return updated
-        if not selector_agent_cfg.get("available", False):
-            updated["selector_agent_used"] = False
-            updated["selector_agent_error"] = str(selector_agent_cfg.get("error") or "selector_agent 不可用")
-            return updated
-
-        page = getattr(platform_instance, "page", None)
-        if page is None:
-            updated["selector_agent_used"] = False
-            updated["selector_agent_error"] = "诊断浏览器页面未就绪"
-            return updated
-
-        screenshot_b64 = ""
-        screenshot_mime = ""
-        if bool(selector_agent_cfg.get("supports_image_input", False)):
-            screenshot_b64, screenshot_mime = self._capture_selector_agent_screenshot(page)
-
-        candidates = list(updated.get("candidates") or [])
-        prompt_payload = {
-            "platform": str(updated.get("platform") or "").strip(),
-            "field": str(updated.get("field") or "").strip(),
-            "intent": str(updated.get("intent") or "").strip(),
-            "current_selector": str(updated.get("current_selector") or "").strip(),
-            "current_status": str(updated.get("current_status") or "").strip(),
-            "page_url": self._safe_page_value(page, "url"),
-            "page_title": self._safe_page_title(page),
-            "candidates": candidates[:8],
-            "instructions": [
-                "优先从候选里挑最稳定的 selector。",
-                "如果候选都不合适，可以给出一个新的更稳定 selector。",
-                "只返回 JSON，不要输出多余解释。",
-            ],
-        }
-        target_label = str(updated.get("intent") or updated.get("field") or "目标").strip() or "目标"
-        system_prompt = (
-            "你是 selector 诊断助手。你的任务是基于页面截图和 DOM 候选，"
-            f"找出最可能稳定的 {target_label} selector。"
-            "请只输出 JSON，格式必须是 "
-            "{\"selected_selector\":\"...\",\"selected_index\":0,\"confidence\":0.0,"
-            "\"reason\":\"...\",\"candidate_order\":[\"...\"],\"needs_verification\":true}. "
-            "selected_selector 可以是候选里的 selector，也可以是你根据页面证据推断出的新 selector。"
-            "不要编造无法验证的内容。"
-        )
-        user_text = json.dumps(prompt_payload, ensure_ascii=False, indent=2)
-        user_content: Any = user_text
-        if screenshot_b64:
-            user_content = [
-                {"type": "text", "text": user_text},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"{screenshot_mime};base64,{screenshot_b64}"},
-                },
-            ]
-
-        try:
-            content = send_platform_chat_messages(
-                platform,
-                api_key,
-                model,
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-            )
-            if content is None:
-                updated["selector_agent_used"] = False
-                updated["selector_agent_error"] = get_platform_last_error(platform) or "selector_agent 调用失败"
-                return updated
-            agent_result = _extract_json_object(content)
-        except Exception as exc:
-            updated["selector_agent_used"] = False
-            updated["selector_agent_error"] = str(exc) or "selector_agent 调用失败"
-            return updated
-
-        selected_selector = str(
-            agent_result.get("selected_selector")
-            or agent_result.get("selector")
-            or ""
-        ).strip()
-        selected_index = _safe_int(agent_result.get("selected_index"), default=-1)
-        confidence = _safe_float(agent_result.get("confidence"), default=0.0)
-        reason = str(agent_result.get("reason") or agent_result.get("summary") or "").strip()
-        candidate_order = [
-            str(item or "").strip()
-            for item in (agent_result.get("candidate_order") or [])
-            if str(item or "").strip()
-        ]
-
-        updated["selector_agent_used"] = True
-        updated["selector_agent_platform"] = platform
-        updated["selector_agent_model"] = model
-        updated["selector_agent_confidence"] = confidence
-        updated["selector_agent_reason"] = reason
-        updated["selector_agent_error"] = ""
-        updated["selector_agent_image_used"] = bool(screenshot_b64)
-        updated["selector_agent_image_supported"] = bool(selector_agent_cfg.get("supports_image_input", False))
-        updated["selector_agent_raw"] = agent_result
-
-        if not selected_selector and 0 <= selected_index < len(candidates):
-            selected_selector = str((candidates[selected_index] or {}).get("selector") or "").strip()
-
-        if candidate_order:
-            ordered_candidates = self._reorder_candidates_by_selector_order(candidates, candidate_order)
-        else:
-            ordered_candidates = list(candidates)
-
-        if selected_selector:
-            ordered_candidates = self._promote_selector_candidate(
-                ordered_candidates,
-                selected_selector,
-                reason=reason or "selector_agent 建议",
-                confidence=max(confidence, 0.65),
-            )
-            updated["selector_agent_selected_selector"] = selected_selector
-
-        if ordered_candidates:
-            updated["candidates"] = ordered_candidates
-        return updated
-
-    def _resolve_selector_agent_config(self, config: dict[str, Any]) -> dict[str, Any]:
-        selector_agent_cfg = dict(config.get("selector_agent", {}) or {})
-        if not bool(selector_agent_cfg.get("enabled", False)):
-            return {"enabled": False}
-
-        assistant_cfg = dict(config.get("ai_assistant", {}) or {})
-        platform = str(selector_agent_cfg.get("platform") or assistant_cfg.get("platform") or "").strip()
-        model = str(selector_agent_cfg.get("model") or assistant_cfg.get("model") or "").strip()
-        if not platform or not model:
-            return {"enabled": True, "available": False, "error": "selector_agent 未配置平台或模型"}
-        if not platform_has_configured_access(config, platform):
-            return {
-                "enabled": True,
-                "available": False,
-                "platform": platform,
-                "model": model,
-                "error": f"{platform} 未配置可用 API Key",
-            }
-        return {
-            "enabled": True,
-            "available": True,
-            "platform": platform,
-            "model": model,
-            "api_key": get_platform_api_key(config, platform),
-            "supports_image_input": model_supports_image_input(platform, model),
-        }
-
-    @staticmethod
-    def _safe_page_value(page: Any, attr: str) -> str:
-        try:
-            return str(getattr(page, attr, "") or "").strip()
-        except Exception:
-            return ""
-
-    def _safe_page_title(self, page: Any) -> str:
-        try:
-            title = page.title()
-        except Exception:
-            title = ""
-        return str(title or "").strip()
-
-    @staticmethod
-    def _capture_selector_agent_screenshot(page: Any) -> tuple[str, str]:
-        try:
-            image_bytes = page.screenshot(type="jpeg", quality=82, full_page=False)
-        except Exception:
-            return "", ""
-        if not image_bytes:
-            return "", ""
-        return base64.b64encode(image_bytes).decode("utf-8"), "data:image/jpeg"
-
-    @staticmethod
-    def _reorder_candidates_by_selector_order(
-        candidates: list[dict[str, Any]],
-        selector_order: list[str],
-    ) -> list[dict[str, Any]]:
-        if not candidates:
-            return []
-        normalized_order = [str(item or "").strip() for item in selector_order if str(item or "").strip()]
-        if not normalized_order:
-            return list(candidates)
-        ordered: list[dict[str, Any]] = []
-        remaining = list(candidates)
-        for selector in normalized_order:
-            for candidate in list(remaining):
-                if str(candidate.get("selector") or "").strip() != selector:
-                    continue
-                ordered.append(candidate)
-                remaining.remove(candidate)
-                break
-        ordered.extend(remaining)
-        return ordered
-
-    @staticmethod
-    def _promote_selector_candidate(
-        candidates: list[dict[str, Any]],
-        selector: str,
-        *,
-        reason: str,
-        confidence: float,
-    ) -> list[dict[str, Any]]:
-        selector = str(selector or "").strip()
-        if not selector:
-            return list(candidates)
-        promoted: list[dict[str, Any]] = []
-        match_index = -1
-        for index, candidate in enumerate(candidates):
-            if str(candidate.get("selector") or "").strip() == selector:
-                match_index = index
-                break
-        if match_index >= 0:
-            match = dict(candidates[match_index])
-            match["score"] = max(float(match.get("score") or 0.0), float(confidence or 0.0), 0.65)
-            match["reason"] = reason or str(match.get("reason") or "")
-            match["selector_agent_selected"] = True
-            match["selector_agent_confidence"] = confidence
-            promoted.append(match)
-            for index, candidate in enumerate(candidates):
-                if index == match_index:
-                    continue
-                promoted.append(candidate)
-            return promoted
-        promoted.append(
-            {
-                "selector": selector,
-                "score": max(float(confidence or 0.0), 0.65),
-                "reason": reason or "selector_agent 建议",
-                "verified": False,
-                "selector_agent_selected": True,
-                "selector_agent_confidence": confidence,
-            }
-        )
-        promoted.extend(candidates)
-        return promoted
 
     def apply(self, payload: dict[str, Any] | None) -> dict[str, Any]:
         """Apply a selector only after a fresh headed-browser verification."""
@@ -754,58 +481,6 @@ def _bounded_float(value: Any, *, default: float, minimum: float, maximum: float
     except Exception:
         number = default
     return max(minimum, min(maximum, number))
-
-
-def _safe_float(value: Any, *, default: float) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return float(default)
-
-
-def _safe_int(value: Any, *, default: int) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return int(default)
-
-
-def _extract_json_object(text: str) -> dict[str, Any]:
-    raw = str(text or "").strip()
-    if not raw:
-        raise ValueError("AI 返回为空")
-
-    candidates = [raw]
-    if raw.startswith("```"):
-        lines = raw.splitlines()
-        if len(lines) >= 3:
-            candidates.append("\n".join(lines[1:-1]).strip())
-
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-
-    start = raw.find("{")
-    if start == -1:
-        raise ValueError("AI 返回里没有 JSON")
-    snippet = raw[start:]
-    try:
-        parsed = json.loads(snippet)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
-    end = snippet.rfind("}")
-    if end == -1:
-        raise ValueError("AI 返回 JSON 解析失败")
-    parsed = json.loads(snippet[: end + 1])
-    if not isinstance(parsed, dict):
-        raise ValueError("AI 返回 JSON 解析失败")
-    return parsed
 
 
 def _summarize_pause_state_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:

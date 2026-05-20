@@ -9,7 +9,6 @@ from typing import Callable
 from core.task_executor_api import _run_api_task
 from core.task_executor_browser import (
     _create_browser_platform,
-    _should_use_platform_serial_for_query,
     _should_use_session_pool_for_query,
     _sync_reused_platform_runtime_state,
 )
@@ -60,7 +59,6 @@ def execute_task_query(
     stop_message: str,
     record_diagnostic: Callable[..., str],
     complete_query_result: Callable[..., dict],
-    acquire_serial_platform: Callable[[str, object], object],
     run_api_task: Callable[..., dict] = _run_api_task,
     run_smart_browser_task: Callable[..., dict] = _run_smart_browser_task,
 ) -> dict | None:
@@ -127,7 +125,6 @@ def execute_task_query(
             progress_callback=progress_callback,
             record_diagnostic=record_diagnostic,
             complete_query_result=complete_query_result,
-            acquire_serial_platform=acquire_serial_platform,
             run_smart_browser_task=run_smart_browser_task,
         )
 
@@ -146,7 +143,6 @@ def execute_task_query(
         progress_callback=progress_callback,
         record_diagnostic=record_diagnostic,
         complete_query_result=complete_query_result,
-        acquire_serial_platform=acquire_serial_platform,
     )
 
 
@@ -239,12 +235,10 @@ def _execute_smart_query(
     progress_callback,
     record_diagnostic: Callable[..., str],
     complete_query_result: Callable[..., dict],
-    acquire_serial_platform: Callable[[str, object], object],
     run_smart_browser_task: Callable[..., dict],
 ) -> dict | None:
     try:
         use_session_pool = _should_use_session_pool_for_query("smart", task, platform_session_manager)
-        use_platform_serial = _should_use_platform_serial_for_query("smart", task, config, platform_session_manager)
         active_platform = None
         if use_session_pool:
             active_platform = platform_session_manager.get_or_create(
@@ -268,18 +262,6 @@ def _execute_smart_query(
             active_platform.progress_callback = progress_callback
             active_platform.stop_checker = stop_checker
             platform_session_manager.mark_query_started(platform_name)
-        elif use_platform_serial:
-            active_platform = acquire_serial_platform(platform_name, platform_class)
-            _sync_reused_platform_runtime_state(
-                platform_name,
-                active_platform,
-                task,
-                kw_entry,
-                config=config,
-                stop_checker=stop_checker,
-            )
-            active_platform.progress_callback = progress_callback
-            active_platform.stop_checker = stop_checker
 
         query_started_at = time.monotonic()
         smart_result = run_smart_browser_task(
@@ -382,10 +364,8 @@ def _execute_browser_query(
     progress_callback,
     record_diagnostic: Callable[..., str],
     complete_query_result: Callable[..., dict],
-    acquire_serial_platform: Callable[[str, object], object],
 ) -> dict | None:
     use_session_pool = _should_use_session_pool_for_query(mode, task, platform_session_manager)
-    use_platform_serial = _should_use_platform_serial_for_query(mode, task, config, platform_session_manager)
     pooled_platform = None
     query_started_at = time.monotonic()
     if use_session_pool:
@@ -413,21 +393,6 @@ def _execute_browser_query(
         pooled_platform.deep_think = kw_entry.get("deep_think", {}).get(platform_name, False)
         pooled_platform.extract_references_enabled = bool(task.get("extract_references_enabled", False))
         platform_session_manager.mark_query_started(platform_name)
-    elif use_platform_serial:
-        pooled_platform = acquire_serial_platform(platform_name, platform_class)
-        _sync_reused_platform_runtime_state(
-            platform_name,
-            pooled_platform,
-            task,
-            kw_entry,
-            config=config,
-            stop_checker=stop_checker,
-        )
-        pooled_platform.progress_callback = progress_callback
-        pooled_platform.stop_checker = stop_checker
-        pooled_platform.screenshot_on_mention = task.get("screenshot_on_mention", False)
-        pooled_platform.deep_think = kw_entry.get("deep_think", {}).get(platform_name, False)
-        pooled_platform.extract_references_enabled = bool(task.get("extract_references_enabled", False))
     else:
         pooled_platform = _create_browser_platform(
             platform_name,
@@ -483,7 +448,7 @@ def _execute_browser_query(
                     print(f"[Main] 复用会话结果记录失败 ({platform_name}): {session_error}")
             return complete_query_result(result)
 
-        if use_session_pool or use_platform_serial:
+        if use_session_pool:
             return _run_browser_query(pooled_platform)
         with pooled_platform:
             return _run_browser_query(pooled_platform)

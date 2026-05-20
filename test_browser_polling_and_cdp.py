@@ -94,6 +94,32 @@ class BrowserPollingAndCDPTests(unittest.TestCase):
             self.assertEqual(mouse.moves, [(120.0, 240.0)])
             self.assertEqual(mouse.wheels, [(0, 900)])
 
+    def test_auxiliary_wheel_profile_splits_large_scrolls_into_multiple_pulses(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            platform = FakePlatform(tmpdir)
+
+            with (
+                patch("platforms.base.random.uniform", side_effect=[0.3, 0.36, 0.5]),
+                patch("platforms.base.random.randint", return_value=360),
+                patch("platforms.base.random.random", return_value=0.7),
+            ):
+                deltas = platform._build_auxiliary_wheel_deltas(remaining=1800)
+
+        self.assertEqual(deltas, [130, 115, 115])
+
+    def test_auxiliary_wheel_profile_keeps_short_scrolls_small(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            platform = FakePlatform(tmpdir)
+
+            with (
+                patch("platforms.base.random.uniform", return_value=0.4),
+                patch("platforms.base.random.randint", return_value=220),
+                patch("platforms.base.random.random", return_value=0.95),
+            ):
+                deltas = platform._build_auxiliary_wheel_deltas(remaining=260)
+
+        self.assertEqual(deltas, [104])
+
     def test_overlay_scan_is_throttled_for_polling_checks(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             platform = FakePlatform(tmpdir)

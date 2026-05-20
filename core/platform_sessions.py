@@ -15,7 +15,7 @@ _SESSION_RANDOM = secrets.SystemRandom()
 
 DEFAULT_QUERY_EXECUTION_SETTINGS: dict[str, dict[str, Any]] = {
     "browser": {
-        "strategy": "platform_serial",
+        "strategy": "session_pool",
         "session_pool_dispatch": "platform_batch",
         "session_pool_platform_batch_size": 2,
         "session_ttl_minutes_min": 120,
@@ -31,7 +31,7 @@ DEFAULT_QUERY_EXECUTION_SETTINGS: dict[str, dict[str, Any]] = {
         "restart_after_structural_failures": 2,
     },
     "smart": {
-        "strategy": "platform_serial",
+        "strategy": "session_pool",
         "session_pool_dispatch": "platform_batch",
         "session_pool_platform_batch_size": 2,
         "session_ttl_minutes_min": 120,
@@ -51,7 +51,8 @@ DEFAULT_QUERY_EXECUTION_SETTINGS: dict[str, dict[str, Any]] = {
 SUPPORTED_STRATEGIES = {"single_query_isolated", "platform_serial", "session_pool"}
 SUPPORTED_SESSION_POOL_DISPATCHES = {"keyword_round_robin", "platform_batch"}
 LEGACY_STRATEGY_ALIASES = {
-    "single_query_isolated": "platform_serial",
+    "single_query_isolated": "session_pool",
+    "platform_serial": "session_pool",
 }
 
 
@@ -91,15 +92,11 @@ class QueryExecutionPolicy:
         return self.strategy == "session_pool"
 
     @property
-    def use_platform_serial(self) -> bool:
-        return self.strategy == "platform_serial"
-
-    @property
     def use_platform_batch_dispatch(self) -> bool:
         return self.use_session_pool and self.session_pool_dispatch == "platform_batch"
 
 
-def normalize_query_execution_strategy(value: Any, default: str = "platform_serial") -> str:
+def normalize_query_execution_strategy(value: Any, default: str = "session_pool") -> str:
     strategy = str(value or default).strip() or default
     strategy = LEGACY_STRATEGY_ALIASES.get(strategy, strategy)
     if strategy not in SUPPORTED_STRATEGIES:
@@ -122,12 +119,17 @@ def build_query_execution_policy(config: dict | None, mode: str) -> QueryExecuti
         if normalized_mode
         else {}
     )
+    force_mode_defaults = normalized_mode in {"browser", "smart"}
     strategy = normalize_query_execution_strategy(
-        raw.get("strategy", defaults.get("strategy", "platform_serial")),
-        default=str(defaults.get("strategy", "platform_serial") or "platform_serial"),
+        defaults.get("strategy", "session_pool") if force_mode_defaults else raw.get("strategy", defaults.get("strategy", "session_pool")),
+        default=str(defaults.get("strategy", "session_pool") or "session_pool"),
     )
     session_pool_dispatch = normalize_session_pool_dispatch(
-        raw.get("session_pool_dispatch", defaults.get("session_pool_dispatch", "platform_batch")),
+        (
+            defaults.get("session_pool_dispatch", "platform_batch")
+            if force_mode_defaults
+            else raw.get("session_pool_dispatch", defaults.get("session_pool_dispatch", "platform_batch"))
+        ),
         default=str(defaults.get("session_pool_dispatch", "platform_batch") or "platform_batch"),
     )
     session_pool_platform_batch_size = _safe_int(

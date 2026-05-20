@@ -3,32 +3,11 @@
 from __future__ import annotations
 
 from core.browser_platform_factory import (
-    apply_browser_runtime_config,
     create_browser_platform,
     resolve_browser_answer_screenshot_mode,
+    apply_browser_runtime_config,
 )
-from core.platform_sessions import PlatformSessionManager, build_query_execution_policy
-
-
-def _apply_browser_runtime_config(platform, platform_name: str, config: dict | None) -> None:
-    """把浏览器自动化的运行时配置注入到平台实例。"""
-    if not config:
-        return
-    browser_cfg = (config.get("browser_automation", {}) or {}).get(platform_name, {}) or {}
-    if hasattr(platform, "debug_poll_metrics") and "debug_poll_metrics" not in browser_cfg:
-        setattr(platform, "debug_poll_metrics", "")
-    for key, value in browser_cfg.items():
-        if not hasattr(platform, key):
-            continue
-        if key == "debug_poll_metrics" and isinstance(value, (bool, int, float)):
-            setattr(platform, key, value)
-            continue
-        if not isinstance(value, str):
-            continue
-        normalized = value.strip()
-        if not normalized:
-            continue
-        setattr(platform, key, normalized)
+from core.platform_sessions import PlatformSessionManager
 
 
 def _create_browser_platform(
@@ -53,27 +32,13 @@ def _should_use_session_pool_for_query(
     task: dict,
     platform_session_manager: PlatformSessionManager | None,
 ) -> bool:
+    del task
     normalized_mode = str(mode or "").strip()
     if platform_session_manager is None:
         return False
     if normalized_mode not in {"browser", "smart"}:
         return False
     return bool(platform_session_manager.policy.use_session_pool)
-
-
-def _should_use_platform_serial_for_query(
-    mode: str,
-    task: dict,
-    config: dict | None,
-    platform_session_manager: PlatformSessionManager | None,
-) -> bool:
-    normalized_mode = str(mode or "").strip()
-    if normalized_mode not in {"browser", "smart"}:
-        return False
-    if _should_use_session_pool_for_query(normalized_mode, task, platform_session_manager):
-        return False
-    policy = build_query_execution_policy(config or {}, normalized_mode)
-    return bool(policy.use_platform_serial)
 
 
 def _sync_reused_platform_runtime_state(
@@ -108,9 +73,7 @@ def _sync_reused_platform_runtime_state(
 
 
 __all__ = [
-    "_apply_browser_runtime_config",
     "_create_browser_platform",
-    "_should_use_platform_serial_for_query",
     "_should_use_session_pool_for_query",
     "_sync_reused_platform_runtime_state",
 ]

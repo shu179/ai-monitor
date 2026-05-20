@@ -31,6 +31,20 @@ class YuanbaoPlatform(BasePlatform):
     )
     prefer_last_result_block = True
     deep_think_selector = "button:has-text('Deep thinking'), div:has-text('Deep thinking'), span:has-text('Deep thinking'), button:has-text('深度思考'), div:has-text('深度思考')"
+    reference_open_selector = (
+        '#search-guide-tool[data-toolbar-type="citation"], '
+        '[data-toolbar-type="citation"], '
+        'div#search-guide-tool, '
+        '[class*="ToolbarSearchGuid_searchGuidTool"], '
+        '[class*="ToolbarSearchGuid_source"], '
+        '[class*="ToolbarSearchGuid"][role="button"], '
+        '[class*="ToolbarSearchGuid"], '
+        'button:has-text("来源"), [role="button"]:has-text("来源"), '
+        'button:has-text("引用"), [role="button"]:has-text("引用"), '
+        'button:has-text("参考"), [role="button"]:has-text("参考"), '
+        'button:has-text("网页"), [role="button"]:has-text("网页"), '
+        'button:has-text("源"), [role="button"]:has-text("源")'
+    )
     _overlay_detection_enabled = False
 
     @staticmethod
@@ -91,9 +105,6 @@ class YuanbaoPlatform(BasePlatform):
             if not clicked and self._attempt_learned_selector_heal("new_chat_selector", label="新对话"):
                 print(f"[{self.name}] 已通过 learned selector 开启新对话")
                 return
-            if not clicked and self._attempt_selector_agent_heal("new_chat_selector", label="新对话"):
-                print(f"[{self.name}] 已通过 selector_agent 开启新对话")
-                return
             if self._open_fresh_chat_fallback():
                 print(f"[{self.name}] 新对话按钮不可用，已回到首页")
                 return
@@ -106,11 +117,12 @@ class YuanbaoPlatform(BasePlatform):
         """元宝先滚到容器底部（最新回答在底部），再定位品牌词。"""
         try:
             self._raise_if_stop_requested()
-            self.page.evaluate("""() => {
-                const el = document.querySelector('.agent-chat__list__content-wrapper');
-                if (el) el.scrollTop = el.scrollHeight;
-            }""")
-            self._cooperative_sleep(0.5)
+            self._wheel_scroll_selector_to_end(
+                self.chat_container_selector or ".agent-chat__list__content-wrapper",
+                last=False,
+                max_passes=5,
+            )
+            self._cooperative_sleep_jittered(0.5, spread=0.2)
         except Exception as e:
             self._reraise_stop_requested(e)
             pass
@@ -120,20 +132,11 @@ class YuanbaoPlatform(BasePlatform):
         """元宝一轮回答经常被拆成多个 markdown 块，这里取最后一轮回答的全部正文。"""
         try:
             self._raise_if_stop_requested()
+            self._consume_answer_read_scroll()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel, shouldScroll}) => {
+                """({containerSel, resultSel, thinkSel}) => {
                     const normalize = (value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
                     const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (shouldScroll && container) {
-                        const style = window.getComputedStyle(container);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                            container.scrollTop = container.scrollHeight;
-                        } else {
-                            window.scrollTo(0, document.body.scrollHeight);
-                        }
-                    } else if (shouldScroll) {
-                        window.scrollTo(0, document.body.scrollHeight);
-                    }
 
                     const isExcluded = (el) => {
                         if (!el) return false;
@@ -253,7 +256,6 @@ class YuanbaoPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
-                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as e:
@@ -264,20 +266,9 @@ class YuanbaoPlatform(BasePlatform):
         """只采最后一轮 AI speech 下的 markdown 块，避免局部渲染时丢全文。"""
         try:
             self._raise_if_stop_requested()
+            self._consume_answer_read_scroll()
             return self.page.evaluate(
-                """({containerSel, resultSel, thinkSel, shouldScroll}) => {
-                    const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (shouldScroll && container) {
-                        const style = window.getComputedStyle(container);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                            container.scrollTop = container.scrollHeight;
-                        } else {
-                            window.scrollTo(0, document.body.scrollHeight);
-                        }
-                    } else if (shouldScroll) {
-                        window.scrollTo(0, document.body.scrollHeight);
-                    }
-
+                """({containerSel, resultSel, thinkSel}) => {
                     const normalize = (value) => String(value || '').trim();
                     const compact = (value) => normalize(value).replace(/[\\s\\W_]+/g, '').toLowerCase();
                     const isExcluded = (el) => {
@@ -491,7 +482,6 @@ class YuanbaoPlatform(BasePlatform):
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
                     "thinkSel": self.think_content_selector or "",
-                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or {"root_key": "", "blocks": [], "raw_text": "", "raw_html": ""}
         except Exception as e:
@@ -774,7 +764,7 @@ class YuanbaoPlatform(BasePlatform):
             current_compact = self._normalize_compact_text(self._read_input_value())
             if before_compact and current_compact != before_compact and not current_compact:
                 return True
-            self._cooperative_sleep(0.2)
+            self._cooperative_sleep_jittered(0.2, spread=0.32)
         return False
 
     def _click_send_button_via_dom(self) -> bool:
@@ -865,24 +855,31 @@ class YuanbaoPlatform(BasePlatform):
             except Exception as e:
                 self._reraise_stop_requested(e)
             strategies = [
-                ("input_enter", lambda: chat_input.press("Enter", timeout=3000)),
-                ("keyboard_enter", lambda: self.page.keyboard.press("Enter")),
+                ("input_enter", lambda: chat_input.press("Enter", timeout=3000), 3.0, 1.5),
+                ("keyboard_enter", lambda: self.page.keyboard.press("Enter"), 2.5, 1.5),
             ]
-            for strategy_name, submit_action in strategies:
+            for strategy_name, submit_action, started_timeout, signal_timeout in strategies:
                 submit_action()
-                if self._wait_for_submit_started(before_input, timeout=8.0):
+                if self._wait_for_submit_started(before_input, timeout=started_timeout):
                     print(f"[{self.name}] 已确认问题已发送（策略: {strategy_name}）")
                     return
-                if self._wait_for_submit_start_signal(timeout=4.0):
+                if self._wait_for_submit_start_signal(timeout=signal_timeout):
                     print(f"[{self.name}] 已确认问题已发送（策略: {strategy_name}; submit-signal）")
+                    return
+                current_input = self._normalize_compact_text(self._read_input_value())
+                if not current_input:
+                    print(f"[{self.name}] 输入框已清空，按已发送处理（策略: {strategy_name}; input-cleared）")
                     return
             print(f"[{self.name}] Enter 提交未确认，尝试点击发送按钮兜底")
             if self._click_send_button_via_dom():
-                if self._wait_for_submit_started(before_input, timeout=8.0):
+                if self._wait_for_submit_started(before_input, timeout=5.0):
                     print(f"[{self.name}] 已确认问题已发送（策略: dom_send_button）")
                     return
-                if self._wait_for_submit_start_signal(timeout=4.0):
+                if self._wait_for_submit_start_signal(timeout=2.0):
                     print(f"[{self.name}] 已确认问题已发送（策略: dom_send_button; submit-signal）")
+                    return
+                if not self._normalize_compact_text(self._read_input_value()):
+                    print(f"[{self.name}] 输入框已清空，按已发送处理（策略: dom_send_button; input-cleared）")
                     return
             debug_state = self._get_generation_debug_state() or {}
             raise RuntimeError(
@@ -1014,6 +1011,261 @@ class YuanbaoPlatform(BasePlatform):
         """元宝有常驻的下载提示条，不做遮罩检测避免误判"""
         return False
 
+    def _collect_reference_cards(self) -> list[dict]:
+        try:
+            self._raise_if_stop_requested()
+            references = self.page.evaluate("""() => {
+                const results = [];
+                const seenUrls = new Set();
+                let index = 1;
+
+                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return (
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.opacity !== '0' &&
+                        rect.width > 0 &&
+                        rect.height > 0
+                    );
+                };
+                const isReferenceUrl = (url) => {
+                    try {
+                        const parsed = new URL(url, location.href);
+                        if (!/^https?:$/.test(parsed.protocol)) return false;
+                        if (/\\.(jpg|jpeg|png|gif|webp|svg|ico|bmp)(\\?|$)/i.test(parsed.href)) return false;
+                        return true;
+                    } catch (_) {
+                        return false;
+                    }
+                };
+                const extractDomain = (url) => {
+                    try { return new URL(url, location.href).hostname.replace(/^www\\./, ''); } catch (_) { return ''; }
+                };
+                const absoluteUrl = (url) => {
+                    try { return new URL(url, location.href).href; } catch (_) { return String(url || ''); }
+                };
+                const cardFor = (node) => {
+                    let current = node;
+                    let best = node;
+                    for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
+                        if (!isVisible(current)) continue;
+                        const cls = String(current.className || '');
+                        const rect = current.getBoundingClientRect();
+                        const looksCardLike = (
+                            /ref[_-]?card|reference|citation|source|card|list/i.test(cls) ||
+                            current.hasAttribute('data-url') ||
+                            current.hasAttribute('data-idx') ||
+                            ['LI', 'ARTICLE'].includes(current.tagName)
+                        );
+                        if (looksCardLike && rect.width >= 120 && rect.height >= 24) {
+                            best = current;
+                        }
+                    }
+                    return best || node;
+                };
+                const isReferenceContext = (node, card) => {
+                    const marker = [
+                        node.className,
+                        card?.className,
+                        node.getAttribute?.('data-idx'),
+                        card?.getAttribute?.('data-idx'),
+                        node.getAttribute?.('data-web-site-name'),
+                        card?.getAttribute?.('data-web-site-name'),
+                    ].filter(Boolean).join(' ');
+                    return /ref[_-]?card|ref-list|reference|citation|source|site|web-site|ToolbarSearchGuid/i.test(String(marker || ''));
+                };
+                const textFrom = (root, selectors) => {
+                    for (const selector of selectors) {
+                        try {
+                            const el = root.querySelector(selector);
+                            const text = normalize(el?.innerText || el?.textContent || el?.getAttribute?.('title') || '');
+                            if (text) return text;
+                        } catch (_) {}
+                    }
+                    return '';
+                };
+
+                const nodes = Array.from(document.querySelectorAll('[data-url], [data-href], a[href]'));
+                for (const node of nodes) {
+                    const hasExplicitUrl = node.hasAttribute('data-url') || node.hasAttribute('data-href');
+                    const rawUrl = node.getAttribute('data-url') || node.getAttribute('data-href') || node.href || node.getAttribute('href') || '';
+                    const url = absoluteUrl(rawUrl);
+                    if (!isReferenceUrl(url) || seenUrls.has(url)) continue;
+                    const card = cardFor(node);
+                    if (!isVisible(card)) continue;
+                    if (!hasExplicitUrl && !isReferenceContext(node, card)) continue;
+                    if (!hasExplicitUrl) {
+                        try {
+                            const host = new URL(url, location.href).hostname;
+                            if (/yuanbao[.]tencent[.]com$/i.test(host)) continue;
+                        } catch (_) {}
+                    }
+                    seenUrls.add(url);
+                    const title = (
+                        textFrom(card, [
+                            '[class*="ref_card-title"]',
+                            '[class*="title"]',
+                            '[class*="Title"]',
+                            'h1',
+                            'h2',
+                            'h3',
+                            'h4',
+                            'a'
+                        ]) ||
+                        normalize(node.innerText || node.textContent || node.getAttribute('title') || '')
+                    ).slice(0, 100);
+                    const source = (
+                        textFrom(card, [
+                            '[class*="ref_card-foot__source_txt"]',
+                            '[class*="source"]',
+                            '[class*="Source"]',
+                            '[class*="site"]',
+                            '[class*="Site"]'
+                        ]) ||
+                        normalize(card.getAttribute('data-web-site-name') || node.getAttribute('data-web-site-name') || '') ||
+                        extractDomain(url)
+                    ).slice(0, 80);
+                    results.push({ index: index++, title: title || url, url, source });
+                }
+                return results;
+            }""")
+            return references if isinstance(references, list) else []
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return []
+
+    def _click_reference_open_button(self) -> bool:
+        try:
+            self._raise_if_stop_requested()
+            for selector in [
+                '#search-guide-tool[data-toolbar-type="citation"]',
+                '[data-toolbar-type="citation"]',
+                'div#search-guide-tool',
+                '[class*="ToolbarSearchGuid_searchGuidTool"]',
+                self.reference_open_selector,
+                '[class*="ToolbarSearchGuid_source"]',
+                '[class*="ToolbarSearchGuid"]',
+                'button:has-text("来源"), [role="button"]:has-text("来源")',
+                'button:has-text("引用"), [role="button"]:has-text("引用")',
+                'button:has-text("参考"), [role="button"]:has-text("参考")',
+                'button:has-text("网页"), [role="button"]:has-text("网页")',
+                'button:has-text("源"), [role="button"]:has-text("源")',
+            ]:
+                try:
+                    locator = self.page.locator(selector)
+                    if locator.count() <= 0:
+                        continue
+                    btn = locator.last
+                    btn.scroll_into_view_if_needed(timeout=2000)
+                    self._click_locator(btn, timeout_ms=2500, force=False)
+                    return True
+                except Exception as exc:
+                    self._reraise_stop_requested(exc)
+                    continue
+
+            result = self.page.evaluate("""() => {
+                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return (
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.opacity !== '0' &&
+                        style.pointerEvents !== 'none' &&
+                        rect.width > 0 &&
+                        rect.height > 0
+                    );
+                };
+                const isDisabled = (el) => (
+                    el.disabled ||
+                    el.getAttribute('disabled') !== null ||
+                    String(el.getAttribute('aria-disabled') || '').toLowerCase() === 'true'
+                );
+                const collectText = (el) => normalize([
+                    el.innerText,
+                    el.textContent,
+                    el.getAttribute && el.getAttribute('aria-label'),
+                    el.getAttribute && el.getAttribute('title'),
+                    el.getAttribute && el.getAttribute('data-testid'),
+                    el.getAttribute && el.getAttribute('data-role'),
+                    el.className,
+                ].filter(Boolean).join(' '));
+                const controlFor = (el) => (
+                    el.closest('#search-guide-tool, [data-toolbar-type="citation"], button, [role="button"], [class*="ToolbarSearchGuid_searchGuidTool"], [class*="ToolbarSearchGuid"]') ||
+                    el
+                );
+                const scoreCandidate = (el, text, rect) => {
+                    const cls = String(el.className || '');
+                    const toolbarType = String(el.getAttribute('data-toolbar-type') || '');
+                    let score = 0;
+                    if (el.id === 'search-guide-tool') score += 340;
+                    if (/citation/i.test(toolbarType)) score += 320;
+                    if (/ToolbarSearchGuid_searchGuidTool/i.test(cls)) score += 300;
+                    if (/ToolbarSearchGuid_source/i.test(cls)) score += 220;
+                    if (/ToolbarSearchGuid/i.test(cls)) score += 190;
+                    if (/source|reference|citation|ref-list/i.test(cls)) score += 90;
+                    if (/^源$/.test(text)) score += 180;
+                    if (/(来源|引用|参考|网页|资料)/.test(text)) score += 130;
+                    if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') score += 70;
+                    if (rect.width <= 160 && rect.height <= 72) score += 45;
+                    score += Math.min(45, Math.max(0, rect.top / Math.max(1, window.innerHeight)) * 45);
+                    if (rect.width >= window.innerWidth * 0.6) score -= 170;
+                    if (rect.height >= 180) score -= 120;
+                    if (text.length >= 80) score -= 180;
+                    if (/停止|发送|重新生成|复制|分享|点赞|点踩|新对话|下载|登录|设置/i.test(text)) score -= 260;
+                    return score;
+                };
+
+                const nodes = Array.from(document.querySelectorAll(
+                    '#search-guide-tool, [data-toolbar-type="citation"], button, [role="button"], [class*="ToolbarSearchGuid"], [class*="source"], [class*="Source"], [class*="reference"], [class*="citation"], [class*="ref-list"], span, div'
+                ));
+                const seen = new Set();
+                let best = null;
+                for (const node of nodes) {
+                    const control = controlFor(node);
+                    if (!control || seen.has(control) || !isVisible(control) || isDisabled(control)) continue;
+                    seen.add(control);
+                    const text = collectText(control) || collectText(node);
+                    const marker = [
+                        text,
+                        control.id,
+                        control.getAttribute && control.getAttribute('data-toolbar-type'),
+                        control.className,
+                    ].filter(Boolean).join(' ');
+                    if (!/(源|来源|引用|参考|网页|资料|search-guide-tool|ToolbarSearchGuid|source|reference|citation|ref-list)/i.test(marker)) continue;
+                    const rect = control.getBoundingClientRect();
+                    const score = scoreCandidate(control, marker, rect);
+                    if (!best || score > best.score) {
+                        best = { control, text: marker, score };
+                    }
+                }
+                if (!best || best.score < 130) {
+                    return {clicked: false, score: best ? best.score : 0, text: best ? best.text : ''};
+                }
+                const target = best.control;
+                try { target.scrollIntoView({block: 'center', inline: 'center'}); } catch (_) {}
+                for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                    try {
+                        target.dispatchEvent(new MouseEvent(eventName, {bubbles: true, cancelable: true, view: window}));
+                    } catch (_) {}
+                }
+                try { target.click(); } catch (_) {}
+                return {clicked: true, score: best.score, text: best.text};
+            }""") or {}
+            if result.get("clicked"):
+                print(f"[{self.name}] 已通过DOM点击源按钮: {str(result.get('text') or '')[:40]}")
+                return True
+            return False
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return False
+
     def extract_answer_references(self) -> list[dict]:
         """
         元宝平台抓取源：点击「源」按钮展开面板，从卡片 data-url 属性读取链接。
@@ -1022,79 +1274,33 @@ class YuanbaoPlatform(BasePlatform):
             self._raise_if_stop_requested()
 
             try:
-                self.page.evaluate("""(selector) => {
-                    const el = document.querySelector(selector);
-                    if (el) el.scrollTop = el.scrollHeight;
-                    else window.scrollTo(0, document.body.scrollHeight);
-                }""", self.chat_container_selector or "")
-                self._cooperative_sleep(0.6)
-                btn_locator = self.page.locator('[class*="ToolbarSearchGuid_source"]')
-                if btn_locator.count() == 0:
-                    print(f"[{self.name}] 未找到源按钮")
-                    return []
-                btn = btn_locator.last
-                print(f"[{self.name}] 找到源按钮，点击展开...")
-                try:
-                    btn.scroll_into_view_if_needed(timeout=2000)
-                except Exception:
-                    pass
-                clicked = False
-                try:
-                    self._click_locator(btn, timeout_ms=2500, force=True)
-                    clicked = True
-                except Exception:
-                    clicked = bool(self.page.evaluate("""() => {
-                        const candidates = Array.from(document.querySelectorAll('[class*="ToolbarSearchGuid_source"]'));
-                        const target = candidates.length > 0 ? candidates[candidates.length - 1] : null;
-                        if (!target) return false;
-                        const clickable = target.closest('button, [role="button"], span, div') || target;
-                        try {
-                            clickable.scrollIntoView({block: 'center', inline: 'center'});
-                        } catch (_) {}
-                        for (const node of [clickable, target]) {
-                            if (!node) continue;
-                            try {
-                                node.dispatchEvent(new MouseEvent('pointerdown', {bubbles: true, cancelable: true, view: window}));
-                                node.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
-                                node.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
-                                node.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
-                                node.click?.();
-                                return true;
-                            } catch (_) {}
-                        }
-                        return false;
-                    }"""))
+                self._wheel_scroll_selector_to_end(
+                    self.chat_container_selector or ".agent-chat__list__content-wrapper",
+                    last=False,
+                    max_passes=5,
+                )
+                self._cooperative_sleep_jittered(0.6, spread=0.2)
+                existing_references = self._collect_reference_cards()
+                if existing_references:
+                    print(f"[{self.name}] 引用面板已展开，直接读取 {len(existing_references)} 条")
+                    return existing_references
+
+                print(f"[{self.name}] 尝试点击源/引用按钮展开面板...")
+                clicked = self._click_reference_open_button()
                 if not clicked:
-                    print(f"[{self.name}] 源按钮点击未成功触发")
+                    fallback_references = self._collect_reference_cards()
+                    if fallback_references:
+                        print(f"[{self.name}] 未确认点击源按钮，但已读取 {len(fallback_references)} 条引用")
+                        return fallback_references
+                    print(f"[{self.name}] 未找到可用的源/引用按钮")
                     return []
-                self._cooperative_sleep(2.0)
+                self._cooperative_sleep_jittered(2.0, spread=0.16)
             except Exception as e:
                 self._reraise_stop_requested(e)
                 print(f"[{self.name}] 点击源按钮失败: {e}")
                 return []
 
-            references = self.page.evaluate("""() => {
-                const results = [];
-                const seenUrls = new Set();
-                let index = 1;
-
-                const extractDomain = (url) => {
-                    try { return new URL(url).hostname.replace(/^www\\./, ''); } catch { return ''; }
-                };
-
-                for (const card of document.querySelectorAll('[data-url]')) {
-                    const url = card.getAttribute('data-url') || '';
-                    if (!url || seenUrls.has(url)) continue;
-                    seenUrls.add(url);
-                    const titleEl = card.querySelector('[class*="ref_card-title"]');
-                    const title = (titleEl ? titleEl.innerText || titleEl.textContent : '').trim().slice(0, 80);
-                    const sourceEl = card.querySelector('[class*="ref_card-foot__source_txt"]');
-                    const source = (sourceEl ? sourceEl.innerText || sourceEl.textContent : '').trim()
-                        || extractDomain(url);
-                    results.push({ index: index++, title: title || url, url, source });
-                }
-                return results;
-            }""")
+            references = self._collect_reference_cards()
 
             if isinstance(references, list):
                 print(f"[{self.name}] 提取到 {len(references)} 条平台抓取源")

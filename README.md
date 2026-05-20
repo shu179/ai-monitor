@@ -131,7 +131,7 @@ browser_automation:
     page_stabilize_wait_min_ms: 1200
     page_stabilize_wait_max_ms: 2600
     failure_backoff_base_seconds: 3
-    failure_backoff_max_seconds: 20
+    failure_backoff_max_seconds: 12
 ```
 
 调度告警也支持单独控制连续失败提醒节奏：

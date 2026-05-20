@@ -99,9 +99,6 @@ class KimiPlatform(BasePlatform):
         if not clicked and self._attempt_learned_selector_heal("new_chat_selector", label="新对话"):
             print(f"[{self.name}] 已通过 learned selector 开启新对话")
             return
-        if not clicked and self._attempt_selector_agent_heal("new_chat_selector", label="新对话"):
-            print(f"[{self.name}] 已通过 selector_agent 开启新对话")
-            return
         print(f"[{self.name}] 开启新对话失败，继续: {last_error}")
 
     def type_like_human(self, text: str) -> None:
@@ -284,21 +281,10 @@ class KimiPlatform(BasePlatform):
         """Kimi 只采最后一轮 assistant markdown，排除提问区和搜索网页面板。"""
         try:
             self._raise_if_stop_requested()
+            self._consume_answer_read_scroll()
             return self.page.evaluate(
-                """({containerSel, resultSel, shouldScroll}) => {
+                """({containerSel, resultSel}) => {
                     const normalize = (value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
-                    const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (shouldScroll && container) {
-                        const style = window.getComputedStyle(container);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                            container.scrollTop = container.scrollHeight;
-                        } else {
-                            window.scrollTo(0, document.body.scrollHeight);
-                        }
-                    } else if (shouldScroll) {
-                        window.scrollTo(0, document.body.scrollHeight);
-                    }
-
                     const isVisible = (el) => {
                         if (!el) return false;
                         const style = window.getComputedStyle(el);
@@ -382,7 +368,6 @@ class KimiPlatform(BasePlatform):
                 {
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
-                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or ""
         except Exception as e:
@@ -393,20 +378,9 @@ class KimiPlatform(BasePlatform):
         """采集 Kimi 最后一轮 assistant markdown 的干净正文快照。"""
         try:
             self._raise_if_stop_requested()
+            self._consume_answer_read_scroll()
             return self.page.evaluate(
-                """({containerSel, resultSel, shouldScroll}) => {
-                    const container = containerSel ? document.querySelector(containerSel) : document.body;
-                    if (shouldScroll && container) {
-                        const style = window.getComputedStyle(container);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                            container.scrollTop = container.scrollHeight;
-                        } else {
-                            window.scrollTo(0, document.body.scrollHeight);
-                        }
-                    } else if (shouldScroll) {
-                        window.scrollTo(0, document.body.scrollHeight);
-                    }
-
+                """({containerSel, resultSel}) => {
                     const normalize = (value) => String(value || '').trim();
                     const isVisible = (el) => {
                         if (!el) return false;
@@ -567,7 +541,6 @@ class KimiPlatform(BasePlatform):
                 {
                     "containerSel": self.chat_container_selector or "",
                     "resultSel": self.result_selector or "",
-                    "shouldScroll": self._consume_answer_read_scroll(),
                 },
             ) or {"root_key": "", "blocks": [], "raw_text": "", "raw_html": ""}
         except Exception as e:
@@ -630,7 +603,7 @@ class KimiPlatform(BasePlatform):
                 btn_text = btn.inner_text()
                 print(f"[{self.name}] 找到引用按钮: {btn_text}，点击展开...")
                 btn.click(timeout=3000)
-                self._cooperative_sleep(2.0)
+                self._cooperative_sleep_jittered(2.0, spread=0.16)
             except Exception as e:
                 self._reraise_stop_requested(e)
                 print(f"[{self.name}] 点击引用按钮失败: {e}")

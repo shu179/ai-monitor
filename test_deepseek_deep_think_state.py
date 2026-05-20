@@ -38,6 +38,12 @@ class _DeepThinkProbe(DeepSeekPlatform):
 
 
 class DeepSeekDeepThinkStateTests(unittest.TestCase):
+    def test_deep_think_selector_targets_real_toggle_button(self) -> None:
+        selector = DeepSeekPlatform.deep_think_selector
+        self.assertIn("ds-toggle-button", selector)
+        self.assertIn("[role='button'][aria-pressed]", selector)
+        self.assertNotIn("div:has-text('深度思考')", selector)
+
     def test_enable_keeps_already_active_without_clicking(self) -> None:
         platform = _DeepThinkProbe(
             target_enabled=True,
