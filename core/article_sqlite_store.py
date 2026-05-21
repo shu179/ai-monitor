@@ -200,6 +200,38 @@ class ArticleSQLiteStore:
             ).fetchall()
         return [self._json_loads(row[0]) for row in rows]
 
+    def list_articles_by_normalized_urls(
+        self, normalized_urls: list[str] | tuple[str, ...] | set[str]
+    ) -> list[dict[str, Any]]:
+        """根据 normalized_url 列表批量精确查询 article。
+
+        走 articles.normalized_url 的 UNIQUE 索引，O(M log N)。
+        给抓取模式引用比对用，避免 list_articles() 全表加载 + Python O(N) 扫。
+        """
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for url in normalized_urls or []:
+            value = str(url or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                deduped.append(value)
+        if not deduped:
+            return []
+        self.initialize()
+        # SQLite 默认 SQLITE_MAX_VARIABLE_NUMBER=999，分片避免极端场景超限
+        chunk_size = 500
+        results: list[dict[str, Any]] = []
+        with self._connection() as conn:
+            for start in range(0, len(deduped), chunk_size):
+                chunk = deduped[start:start + chunk_size]
+                placeholders = ",".join(["?"] * len(chunk))
+                rows = conn.execute(
+                    f"SELECT raw_json FROM articles WHERE normalized_url IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                results.extend(self._json_loads(row[0]) for row in rows)
+        return results
+
     def get_article_page(
         self,
         *,

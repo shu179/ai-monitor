@@ -3215,7 +3215,10 @@ def _mark_articles_referenced_by_urls_sqlite(
     matched_articles = []
     updated_count = 0
     updated_articles: list[dict] = []
-    articles = _article_sqlite_store().list_articles()
+    # 走 normalized_url UNIQUE 索引精确查询，O(M log N)；避免 list_articles() 全表
+    # 加载 + Python O(N) 扫（在 articles 表上万条时差异显著）。下面仍保留
+    # article_url not in url_set 的 Python 端二次校验，防止 normalize 版本漂移导致误命中。
+    articles = _article_sqlite_store().list_articles_by_normalized_urls(list(url_set))
     for article in articles:
         article_url = normalize_article_url(article.get("url", ""))
         if not article_url or article_url not in url_set:

@@ -265,6 +265,42 @@ class ArticleSQLiteStoreTests(unittest.TestCase):
             self.assertEqual(refreshed["article-a"]["matched_tasks"], ["Brand A"])
             self.assertEqual(refreshed["article-a"]["ts"], "2026-05-08")
 
+    def test_list_articles_by_normalized_urls_returns_only_matches(self) -> None:
+        """走 normalized_url UNIQUE 索引精确查询，O(M log N)，避免全表扫。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(Path(tmpdir) / "article_store.sqlite3")
+            store.bulk_upsert_articles([
+                {"id": "a1", "url": "https://example.com/a", "title": "A", "matched_tasks": ["T"]},
+                {"id": "a2", "url": "https://example.com/b", "title": "B", "matched_tasks": ["T"]},
+                {"id": "a3", "url": "https://example.com/c", "title": "C", "matched_tasks": ["T"]},
+            ])
+
+            # 空 URL 列表
+            self.assertEqual(store.list_articles_by_normalized_urls([]), [])
+            self.assertEqual(store.list_articles_by_normalized_urls(["", "  "]), [])
+
+            # 全部不命中
+            self.assertEqual(
+                store.list_articles_by_normalized_urls(["https://nope.com/x"]),
+                [],
+            )
+
+            # 部分命中（仅返回命中的）
+            hits = store.list_articles_by_normalized_urls([
+                article_store.normalize_article_url("https://example.com/a"),
+                article_store.normalize_article_url("https://example.com/c"),
+                article_store.normalize_article_url("https://nope.com/x"),
+            ])
+            self.assertEqual({h["id"] for h in hits}, {"a1", "a3"})
+
+            # 重复 URL 应被去重，仍只返回 1 条命中
+            hits = store.list_articles_by_normalized_urls([
+                article_store.normalize_article_url("https://example.com/a"),
+                article_store.normalize_article_url("https://example.com/a"),
+            ])
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(hits[0]["id"], "a1")
+
 
 class ArticleStoreSQLiteParityTests(unittest.TestCase):
     def setUp(self) -> None:

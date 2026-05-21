@@ -348,6 +348,51 @@ def _execute_smart_query(
         return complete_query_result(result, error_message=str(e))
 
 
+def _mark_browser_extraction_references(
+    *,
+    task_name: str,
+    platform_name: str,
+    references: list,
+    body_references: list,
+) -> None:
+    """抓取模式抓到的引用 URL → 对比已录入文章，命中则标记为"已引用"。
+
+    复用识别模式的 mark_articles_referenced_by_urls 主流程；只做单次去重
+    + 单次 SQLite UPDATE，失败不致命。性能 < 10ms，无持久缓存。
+    """
+    if not task_name:
+        return
+    try:
+        seen: set[str] = set()
+        urls: list[str] = []
+        for ref in list(references or []) + list(body_references or []):
+            url = str((ref or {}).get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+        if not urls:
+            return
+        from core.article_store import mark_articles_referenced_by_urls
+
+        result = mark_articles_referenced_by_urls(
+            [task_name],
+            urls,
+            source="browser_extraction",
+            platform=platform_name or "",
+        )
+        matched = int((result or {}).get("matched_count", 0) or 0)
+        if matched > 0:
+            print(
+                f"[Main] 抓取引用已标记 {matched} 条已录入文章为已引用: "
+                f"task={task_name}, platform={platform_name}, candidates={len(urls)}"
+            )
+    except Exception as exc:
+        print(
+            f"[Main] 抓取引用→文章标记失败 ({platform_name}/{task_name}): {exc}"
+        )
+
+
 def _execute_browser_query(
     *,
     task: dict,
@@ -436,6 +481,14 @@ def _execute_browser_query(
                 references=getattr(active_platform, "last_references", []),
                 body_references=getattr(active_platform, "last_body_references", []),
             )
+            # 仅在开启引用抓取时做匹配，避免没抓引用却跑这一步
+            if bool(getattr(active_platform, "extract_references_enabled", False)):
+                _mark_browser_extraction_references(
+                    task_name=task_name,
+                    platform_name=platform_name,
+                    references=result.get("references") or [],
+                    body_references=result.get("body_references") or [],
+                )
             if use_session_pool:
                 try:
                     platform_session_manager.record_query_result(
