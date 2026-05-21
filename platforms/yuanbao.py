@@ -1443,7 +1443,7 @@ class YuanbaoPlatform(BasePlatform):
     def _click_reference_open_button(self) -> bool:
         try:
             self._raise_if_stop_requested()
-            result = self.page.evaluate("""() => {
+            marker = self.page.evaluate("""() => {
                 const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
                 const isVisible = (el) => {
                     if (!el) return false;
@@ -1531,42 +1531,71 @@ class YuanbaoPlatform(BasePlatform):
                         if (!control || seen.has(control) || !isVisible(control) || isDisabled(control)) return;
                         seen.add(control);
                         const text = collectText(control) || collectText(node);
-                        const marker = [
+                        const tag = [
                             text,
                             control.id,
                             control.getAttribute && control.getAttribute('data-toolbar-type'),
                             control.className,
                         ].filter(Boolean).join(' ');
-                        if (!/(源|来源|引用|参考|网页|资料|search-guide-tool|ToolbarSearchGuid|source|reference|citation)/i.test(marker)) return;
+                        if (!/(源|来源|引用|参考|网页|资料|search-guide-tool|ToolbarSearchGuid|source|reference|citation)/i.test(tag)) return;
                         const rect = control.getBoundingClientRect();
-                        const score = scoreCandidate(control, marker, rect, spec.score, index);
+                        const score = scoreCandidate(control, tag, rect, spec.score, index);
                         if (!best || score > best.score) {
-                            best = { control, text: marker, score };
+                            best = { control, text: tag, score };
                         }
                     });
                     if (best && spec.score >= 1400) break;
                 }
 
+                for (const el of document.querySelectorAll('[data-yb-source-click="1"]')) {
+                    try { el.removeAttribute('data-yb-source-click'); } catch (_) {}
+                }
                 if (!best || best.score < 300) {
-                    return {clicked: false, score: best ? best.score : 0, text: best ? best.text : ''};
+                    return {found: false, score: best ? best.score : 0, text: best ? best.text : ''};
                 }
-                const targets = [best.control];
-                const source = best.control.querySelector && best.control.querySelector('[class*="ToolbarSearchGuid_source"]');
-                if (source) targets.push(source);
-                for (const target of targets) {
-                    for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
-                        try {
-                            target.dispatchEvent(new MouseEvent(eventName, {bubbles: true, cancelable: true, view: window}));
-                        } catch (_) {}
-                    }
-                    try { target.click(); } catch (_) {}
-                }
-                return {clicked: true, score: best.score, text: best.text};
+                try { best.control.setAttribute('data-yb-source-click', '1'); } catch (_) {}
+                return {found: true, score: best.score, text: best.text};
             }""") or {}
-            if result.get("clicked"):
-                print(f"[{self.name}] 已通过DOM点击源按钮: {str(result.get('text') or '')[:40]}")
+
+            if not marker.get("found"):
+                return False
+
+            text_preview = str(marker.get("text") or "")[:40]
+            target_selector = '[data-yb-source-click="1"]'
+
+            try:
+                locator = self.page.locator(target_selector).first
+                self._click_locator(locator, timeout_ms=2500, force=False)
+                print(f"[{self.name}] 已通过 Playwright 点击源按钮: {text_preview}")
                 return True
-            return False
+            except Exception as exc:
+                self._reraise_stop_requested(exc)
+                print(f"[{self.name}] Playwright 点击源按钮失败，回退到 JS 合成事件: {exc}")
+
+            try:
+                dispatched = self.page.evaluate("""() => {
+                    const el = document.querySelector('[data-yb-source-click="1"]');
+                    if (!el) return false;
+                    const targets = [el];
+                    const source = el.querySelector && el.querySelector('[class*="ToolbarSearchGuid_source"]');
+                    if (source) targets.push(source);
+                    for (const target of targets) {
+                        for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                            try {
+                                target.dispatchEvent(new MouseEvent(eventName, {bubbles: true, cancelable: true, view: window}));
+                            } catch (_) {}
+                        }
+                        try { target.click(); } catch (_) {}
+                    }
+                    return true;
+                }""")
+                if dispatched:
+                    print(f"[{self.name}] 已通过 JS 合成事件点击源按钮: {text_preview}")
+                    return True
+                return False
+            except Exception as exc:
+                self._reraise_stop_requested(exc)
+                return False
         except Exception as exc:
             self._reraise_stop_requested(exc)
             return False

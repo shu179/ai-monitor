@@ -38,17 +38,51 @@ class _FakeReferencePanelPage:
         raise AssertionError(f"unexpected evaluate script: {script[:120]}")
 
 
+class _FakeReferenceClickLocator:
+    def __init__(self, *, click_raises: bool = False):
+        self.click_raises = click_raises
+        self.hover_calls = 0
+        self.click_calls = 0
+        self.last_click_kwargs: dict | None = None
+
+    @property
+    def first(self):
+        return self
+
+    def hover(self, timeout=None):
+        self.hover_calls += 1
+
+    def click(self, timeout=None, **kwargs):
+        self.click_calls += 1
+        self.last_click_kwargs = kwargs
+        if self.click_raises:
+            raise RuntimeError("simulated playwright click failure")
+
+
 class _FakeReferenceOpenPage:
-    def __init__(self):
-        self.clicked = False
+    def __init__(self, *, click_raises: bool = False):
+        self.marked = False
+        self.dispatched = False
+        self.locator_selector: str | None = None
+        self.last_locator: _FakeReferenceClickLocator | None = None
+        self._click_raises = click_raises
 
     def evaluate(self, script: str, arg=None):
-        if "scrollIntoView" in script or "window.scrollTo" in script:
-            raise AssertionError("reference open click path must not scroll the page")
-        if "search-guide-tool" in script:
-            self.clicked = True
-            return {"clicked": True, "score": 2400, "text": "源 search-guide-tool citation"}
+        if "data-yb-source-click" in script and "search-guide-tool" in script and "scoreCandidate" in script:
+            self.marked = True
+            return {"found": True, "score": 2400, "text": "源 search-guide-tool citation"}
+        if "data-yb-source-click" in script and "dispatchEvent" in script:
+            self.dispatched = True
+            return True
         raise AssertionError(f"unexpected evaluate script: {script[:120]}")
+
+    def locator(self, selector: str):
+        assert selector == '[data-yb-source-click="1"]', (
+            f"locator selector mismatch: {selector}"
+        )
+        self.locator_selector = selector
+        self.last_locator = _FakeReferenceClickLocator(click_raises=self._click_raises)
+        return self.last_locator
 
 
 class _FakeLatestToolbarScrollPage:
@@ -105,12 +139,40 @@ class YuanbaoPlatformTests(unittest.TestCase):
         ])
         self.assertEqual([item["index"] for item in references], [1, 2, 3])
 
-    def test_reference_open_fast_path_does_not_scroll_page(self):
+    def test_reference_open_prefers_playwright_real_click(self):
         platform = YuanbaoPlatform("/tmp/yuanbao-test")
         platform.page = _FakeReferenceOpenPage()
+        platform._cooperative_sleep = lambda *args, **kwargs: None
 
         self.assertTrue(platform._click_reference_open_button())
-        self.assertTrue(platform.page.clicked)
+        self.assertTrue(
+            platform.page.marked,
+            "JS scoring 必须给目标打 data-yb-source-click 标记",
+        )
+        self.assertIsNotNone(
+            platform.page.last_locator,
+            "必须用 Playwright locator 真实点击",
+        )
+        self.assertGreaterEqual(
+            platform.page.last_locator.click_calls,
+            1,
+            "Playwright click 必须被调用",
+        )
+        self.assertFalse(
+            platform.page.dispatched,
+            "Playwright 点击成功后不应回退到 JS dispatchEvent",
+        )
+
+    def test_reference_open_falls_back_to_js_when_playwright_fails(self):
+        platform = YuanbaoPlatform("/tmp/yuanbao-test")
+        platform.page = _FakeReferenceOpenPage(click_raises=True)
+        platform._cooperative_sleep = lambda *args, **kwargs: None
+
+        self.assertTrue(platform._click_reference_open_button())
+        self.assertTrue(
+            platform.page.dispatched,
+            "Playwright click 失败后必须回退到 JS dispatchEvent",
+        )
 
     def test_latest_toolbar_scroll_uses_chat_container_only(self):
         platform = YuanbaoPlatform("/tmp/yuanbao-test")
