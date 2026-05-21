@@ -2,6 +2,8 @@
 阿里通义千问 平台适配器
 """
 
+import base64
+import json as _json
 import re
 import time
 import random
@@ -9,6 +11,9 @@ from .base import BasePlatform
 
 
 class TongyiPlatform(BasePlatform):
+
+    # 通义千问对话 SSE 流的 endpoint 关键字（用于网络拦截定位 reference 数据）
+    _chat_endpoint_marker = "chat2.qianwen.com/api/v2/chat"
 
     use_external_chrome_cdp = True
     external_chrome_launch_target_url = True
@@ -48,6 +53,96 @@ class TongyiPlatform(BasePlatform):
     )
     prefer_last_result_block = True
     _overlay_detection_enabled = False
+
+    def __init__(self, user_data_dir: str):
+        super().__init__(user_data_dir)
+        # SSE 拦截缓存：最近一次对话流的完整 body（用于解析 reference）
+        self._chat_sse_body: str = ""
+        # in-flight request ids for chat endpoint，用于在 loadingFinished 时识别
+        self._chat_pending_request_ids: set = set()
+        # CDP session 引用：避免被 GC，page 重建时重新安装
+        self._chat_cdp_session = None
+        self._chat_cdp_installed_for_page = None
+
+    def _install_shared_js_helpers(self) -> None:
+        super()._install_shared_js_helpers()
+        # 在每次 page 创建/重建后同步装 CDP listener，跟着 page 的生命周期走
+        self._install_chat_response_capture()
+
+    def _install_chat_response_capture(self) -> None:
+        """订阅 chat2.qianwen.com/api/v2/chat 的 SSE 响应，缓存供 extract_answer_references 用。
+
+        失败不致命 —— extract_answer_references 会回退到点击展开 + 文本解析的旧路径。
+        """
+        page = getattr(self, "page", None)
+        context = getattr(self, "context", None)
+        if not page or not context:
+            return
+        if self._chat_cdp_installed_for_page is page:
+            return  # 已经装过当前 page
+
+        try:
+            client = context.new_cdp_session(page)
+            client.send("Network.enable")
+        except Exception as exc:
+            print(f"[{self.name}] CDP 网络订阅安装失败，引用抓取将回退到点击路径: {exc}")
+            self._chat_cdp_session = None
+            self._chat_cdp_installed_for_page = None
+            return
+
+        marker = self._chat_endpoint_marker
+        pending = self._chat_pending_request_ids
+
+        def on_response_received(params):
+            try:
+                url = (params.get("response") or {}).get("url", "")
+                if marker in url:
+                    pending.add(params.get("requestId", ""))
+            except Exception:
+                pass
+
+        def on_loading_finished(params):
+            try:
+                rid = params.get("requestId", "")
+                if rid not in pending:
+                    return
+                pending.discard(rid)
+                result = client.send("Network.getResponseBody", {"requestId": rid})
+                body = result.get("body") or ""
+                if result.get("base64Encoded"):
+                    try:
+                        body = base64.b64decode(body).decode("utf-8", errors="replace")
+                    except Exception:
+                        body = ""
+                if body:
+                    self._chat_sse_body = body
+            except Exception as exc:
+                # body 读失败不致命，下次拦截再试
+                print(f"[{self.name}] CDP 读取 chat SSE body 失败: {exc}")
+
+        def on_loading_failed(params):
+            try:
+                pending.discard(params.get("requestId", ""))
+            except Exception:
+                pass
+
+        try:
+            client.on("Network.responseReceived", on_response_received)
+            client.on("Network.loadingFinished", on_loading_finished)
+            client.on("Network.loadingFailed", on_loading_failed)
+            self._chat_cdp_session = client
+            self._chat_cdp_installed_for_page = page
+            print(f"[{self.name}] 已安装 chat SSE 响应拦截器（reference 直抓）")
+        except Exception as exc:
+            print(f"[{self.name}] CDP 事件订阅失败: {exc}")
+            self._chat_cdp_session = None
+            self._chat_cdp_installed_for_page = None
+
+    def start_new_chat(self) -> None:
+        # 新对话开始前清掉上一轮 SSE 缓存，避免读到旧引用
+        self._chat_sse_body = ""
+        self._chat_pending_request_ids.clear()
+        super().start_new_chat()
 
     def _get_answer_text(self) -> str:
         """Tongyi 只采最后一轮 assistant markdown，排除提问区、思考区和来源侧栏。"""
@@ -1198,8 +1293,126 @@ class TongyiPlatform(BasePlatform):
 
     def extract_answer_references(self) -> list[dict]:
         """
-        通义千问平台抓取源提取：点击"X篇来源"按钮展开右侧面板。
-        面板无 <a href>，从来源行文字（"来源名 domain.com"格式）提取域名作为 URL。
+        通义千问引用抓取（优先 SSE 拦截 + 点击兜底）。
+
+        主路径：从 chat2.qianwen.com/api/v2/chat 的 SSE 流里解析
+        data.messages[].mime_type=='multi_load/iframe' →
+        meta_data.multi_load[].type=='source_group_web' →
+        content.list[].type=='source' → content.list[]
+        每项含 title/url/name/ref_num，**无需任何点击**、**全部条数都有真实 URL**。
+
+        兜底路径：CDP 拦截失效或未触发搜索时，回退到旧的「点击展开 + 逐张拦截新页面」
+        实现（前 3 条真实 URL，第 4 条起只用 https://domain）。
+        """
+        try:
+            self._raise_if_stop_requested()
+            sse_body = str(self._chat_sse_body or "")
+            if sse_body:
+                references = self._parse_references_from_sse(sse_body)
+                if references:
+                    print(f"[{self.name}] 已通过 SSE 拦截提取 {len(references)} 条引用（无需点击）")
+                    return references
+                # 解析失败时打印关键计数，便于定位 endpoint 漂移 / 结构变化 / body 截断
+                self._log_sse_parse_diagnostics(sse_body)
+                print(f"[{self.name}] SSE 已缓存但未解析到引用，回退到点击路径")
+            else:
+                print(f"[{self.name}] 未捕获 SSE 响应（CDP 失效或未触发搜索），回退到点击路径")
+            return self._extract_answer_references_via_click()
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            print(f"[{self.name}] 平台抓取源提取失败: {exc}")
+            return []
+
+    def _log_sse_parse_diagnostics(self, body: str) -> None:
+        """SSE 解析失败时打印关键计数，让日志足以判断是哪种失败模式。"""
+        try:
+            print(
+                f"[{self.name}] SSE 诊断: 长度={len(body)}, "
+                f"含'data:'={body.count('data:')}, "
+                f"含'multi_load/iframe'={body.count('multi_load/iframe')}, "
+                f"含'source_group_web'={body.count('source_group_web')}, "
+                f"含'bar/progress'={body.count('bar/progress')}, "
+                f"含'\"web_source\"'={body.count(chr(34) + 'web_source' + chr(34))}, "
+                f"含'\"url\"'={body.count(chr(34) + 'url' + chr(34))}, "
+                f"含'http'={body.count('http')}"
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _parse_references_from_sse(body: str) -> list[dict]:
+        """从 SSE event-stream 文本里抽取引用列表。
+
+        通义千问对同一 URL 在不同模式下用了两种 mime_type / 嵌套结构：
+
+        - 深度思考模式：
+          mime_type='multi_load/iframe' → meta_data.multi_load[].type='source_group_web'
+          → content.list[].type='source' → content.list[]（嵌套 4 层）
+
+        - 非深度思考模式：
+          mime_type='bar/progress' → meta_data.list[]（type='web_source'，平铺）
+
+        两种结构的引用项字段名都一致（title / url / name），可共用提取逻辑。
+        按 url 去重、index 从 1 递增；流被截断/非 JSON 行（心跳、注释）跳过。
+        """
+        if not body:
+            return []
+        chunks = re.split(r'\n+data:', '\n' + body)
+        events: list[str] = []
+        for chunk in chunks:
+            text = chunk.strip()
+            if text.startswith('data:'):
+                text = text[5:].strip()
+            if text and text != '[DONE]':
+                events.append(text)
+
+        all_refs: list[dict] = []
+        seen_urls: set[str] = set()
+
+        def _add_ref(item: dict) -> None:
+            url = str((item or {}).get('url') or '').strip()
+            if not url or url in seen_urls:
+                return
+            seen_urls.add(url)
+            all_refs.append({
+                'index': len(all_refs) + 1,
+                'title': str(item.get('title') or '').strip(),
+                'url': url,
+                'source': str(item.get('name') or '').strip(),
+            })
+
+        for ev in events:
+            try:
+                obj = _json.loads(ev)
+            except Exception:
+                continue
+            messages = (obj.get('data') or {}).get('messages') or []
+            for msg in messages:
+                mime = msg.get('mime_type', '')
+                meta = msg.get('meta_data') or {}
+                if mime == 'multi_load/iframe':
+                    # 深度思考：嵌套结构
+                    for group in meta.get('multi_load') or []:
+                        if group.get('type') != 'source_group_web':
+                            continue
+                        for src_block in (group.get('content') or {}).get('list') or []:
+                            if src_block.get('type') != 'source':
+                                continue
+                            for item in (src_block.get('content') or {}).get('list') or []:
+                                _add_ref(item)
+                elif mime == 'bar/progress':
+                    # 非深度思考：平铺结构，type='web_source'
+                    for item in meta.get('list') or []:
+                        if str(item.get('type') or '') not in ('web_source', 'source'):
+                            continue
+                        _add_ref(item)
+        return all_refs
+
+    def _extract_answer_references_via_click(self) -> list[dict]:
+        """旧路径：点击「X篇来源」按钮展开面板 + 逐张点击拦截 URL（CDP 失效时兜底）。
+
+        面板无 <a href>，只能通过点击每张卡片捕获新标签页 URL；前 3 条真实 URL，
+        第 4 条起只用 https://domain 兜底。
         """
         try:
             self._raise_if_stop_requested()
