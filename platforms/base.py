@@ -1984,12 +1984,12 @@ class BasePlatform(ABC):
         if not getattr(self, "page", None):
             return
         try:
-            # 增强：随机选择行为模式（模拟不同用户习惯）
+            # 真人行为模式：去掉 idle_browse（贡献最长尾延迟但反检测收益低，
+            # 真用户不会闲逛 8-20s 再问问题）。剩 3 项 ~33% 等概率。
             behavior_pattern = random.choice([
-                "quick_scan",      # 快速浏览（30%）
-                "careful_read",    # 仔细阅读（40%）
-                "direct_action",   # 直接操作（20%）
-                "idle_browse",     # 闲逛浏览（10%）
+                "quick_scan",      # 快速浏览
+                "careful_read",    # 仔细阅读
+                "direct_action",   # 直接操作
             ])
 
             if behavior_pattern == "direct_action":
@@ -2005,13 +2005,11 @@ class BasePlatform(ABC):
                 return
 
             # 其他模式：正常行为模拟
-            # 增强：随机初始停顿（模拟真人打开页面后的观察时间）
+            # 真实用户从打开页面到开始打字一般 1-2s 足够，长停顿主要是早期反检测的过度补偿
             if behavior_pattern == "careful_read":
-                initial_pause = random.uniform(1.5, 3.0)  # 仔细阅读：停顿更久
-            elif behavior_pattern == "idle_browse":
-                initial_pause = random.uniform(2.0, 4.0)  # 闲逛：停顿最久
+                initial_pause = random.uniform(0.5, 1.5)
             else:
-                initial_pause = random.uniform(0.5, 1.5)  # 快速浏览：停顿较短
+                initial_pause = random.uniform(0.3, 1.0)  # 快速浏览：停顿较短
 
             self._cooperative_sleep(initial_pause)
 
@@ -2050,9 +2048,6 @@ class BasePlatform(ABC):
                 if behavior_pattern == "careful_read":
                     total_scroll = random.randint(300, 1000)  # 仔细阅读：滚动更多
                     scroll_steps = random.randint(4, 8)
-                elif behavior_pattern == "idle_browse":
-                    total_scroll = random.randint(400, 1200)  # 闲逛：滚动最多
-                    scroll_steps = random.randint(5, 10)
                 else:
                     total_scroll = random.randint(150, 600)  # 快速浏览：滚动较少
                     scroll_steps = random.randint(2, 5)
@@ -2067,8 +2062,6 @@ class BasePlatform(ABC):
                 # 3. 随机停顿（模拟真人阅读）- 更长的随机时间
                 if behavior_pattern == "careful_read":
                     reading_pause = random.uniform(1.0, 2.5)
-                elif behavior_pattern == "idle_browse":
-                    reading_pause = random.uniform(1.5, 3.0)
                 else:
                     reading_pause = random.uniform(0.3, 1.0)
                 self._cooperative_sleep(reading_pause)
@@ -4009,7 +4002,7 @@ class BasePlatform(ABC):
         """DOM-based completion check. ``start_time`` is a monotonic timestamp."""
         return False
 
-    def _poll_until_complete(self, brand: str, on_rank, get_text=None, timeout: int = 180, min_wait: int = 8, keyword: str = "") -> None:
+    def _poll_until_complete(self, brand: str, on_rank, get_text=None, timeout: int = 180, min_wait: int = 5, keyword: str = "") -> None:
         """Centralized polling loop. Waits for generation to complete, then calls on_rank once."""
         if get_text is None:
             def get_text():
