@@ -1056,13 +1056,14 @@ class YuanbaoPlatform(BasePlatform):
                         const cls = String(current.className || '');
                         const rect = current.getBoundingClientRect();
                         const looksCardLike = (
-                            /ref[_-]?card|reference|citation|source|card|list/i.test(cls) ||
+                            /ref[_-]?card|reference|citation|source|card|doc-container|doc/i.test(cls) ||
                             current.hasAttribute('data-url') ||
                             current.hasAttribute('data-idx') ||
                             ['LI', 'ARTICLE'].includes(current.tagName)
                         );
                         if (looksCardLike && rect.width >= 120 && rect.height >= 24) {
                             best = current;
+                            break;
                         }
                     }
                     return best || node;
@@ -1138,35 +1139,310 @@ class YuanbaoPlatform(BasePlatform):
             self._reraise_stop_requested(exc)
             return []
 
+    @staticmethod
+    def _merge_reference_cards(reference_groups: list[list[dict] | None]) -> list[dict]:
+        merged: list[dict] = []
+        seen_urls: set[str] = set()
+        for references in reference_groups:
+            for item in references or []:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or "").strip()
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                merged.append({
+                    "index": len(merged) + 1,
+                    "title": str(item.get("title") or url).strip() or url,
+                    "url": url,
+                    "source": str(item.get("source") or "").strip(),
+                })
+        return merged
+
+    def _reference_panel_scroll_metrics(self) -> dict | None:
+        try:
+            self._raise_if_stop_requested()
+            metrics = self.page.evaluate("""() => {
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return (
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.opacity !== '0' &&
+                        rect.width > 0 &&
+                        rect.height > 0
+                    );
+                };
+                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                const referenceNodes = Array.from(document.querySelectorAll(
+                    '[data-url], [data-href], a[href], [class*="ref_card"], [class*="ref-list"], [class*="reference"], [class*="citation"], [class*="source"]'
+                )).filter((el) => isVisible(el));
+                const candidates = [];
+                const pushCandidate = (el, seedScore = 0) => {
+                    if (!el || !isVisible(el)) return;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    const scrollHeight = Number(el.scrollHeight || 0);
+                    const clientHeight = Number(el.clientHeight || 0);
+                    if (scrollHeight <= clientHeight + 16 || clientHeight <= 24) return;
+                    const marker = [
+                        el.id,
+                        el.className,
+                        el.getAttribute && el.getAttribute('role'),
+                        el.getAttribute && el.getAttribute('data-testid'),
+                    ].filter(Boolean).join(' ');
+                    if (el === document.body || el === document.documentElement) return;
+                    if (/agent-dialogue__content|agent-chat__list__content-wrapper|agent-chat__list__content|chat-content/i.test(marker)) return;
+                    const text = normalize(el.innerText || el.textContent || '');
+                    let score = seedScore;
+                    if (/(t-popup|popup|popper|reference|citation|source|ref-list|ref_card|docs)/i.test(marker)) score += 260;
+                    if (/(来源|引用|参考|网页|资料|源)/.test(text)) score += 90;
+                    score += Math.min(240, el.querySelectorAll('[data-url], [data-href], a[href]').length * 24);
+                    if (rect.left >= window.innerWidth * 0.45) score += 70;
+                    if (rect.width >= 180 && rect.height >= 80) score += 40;
+                    if (/agent-chat__list__content-wrapper|chat-content/i.test(marker)) score -= 160;
+                    if (style.overflowY === 'auto' || style.overflowY === 'scroll') score += 35;
+                    candidates.push({el, score, rect, scrollHeight, clientHeight});
+                };
+
+                for (const node of referenceNodes) {
+                    let current = node;
+                    for (let depth = 0; current && depth < 10; depth += 1, current = current.parentElement) {
+                        pushCandidate(current, Math.max(0, 80 - depth * 8));
+                    }
+                }
+                for (const el of document.querySelectorAll('.t-popup, [class*="popup"], [class*="ref-list"], [class*="source"], [class*="reference"], [class*="citation"]')) {
+                    pushCandidate(el, 80);
+                }
+
+                candidates.sort((a, b) => b.score - a.score);
+                const best = candidates[0];
+                if (!best) return null;
+                for (const el of document.querySelectorAll('[data-yb-reference-scroll-root="1"]')) {
+                    try { el.removeAttribute('data-yb-reference-scroll-root'); } catch (_) {}
+                }
+                best.el.setAttribute('data-yb-reference-scroll-root', '1');
+                return {
+                    x: best.rect.left,
+                    y: best.rect.top,
+                    width: best.rect.width,
+                    height: best.rect.height,
+                    scrollTop: Number(best.el.scrollTop || 0),
+                    scrollHeight: best.scrollHeight,
+                    clientHeight: best.clientHeight,
+                    score: best.score,
+                };
+            }""")
+            return metrics if isinstance(metrics, dict) else None
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return None
+
+    def _scroll_reference_panel_once(self, metrics: dict | None = None) -> bool:
+        try:
+            self._raise_if_stop_requested()
+            payload = metrics if isinstance(metrics, dict) else {}
+            result = self.page.evaluate("""(metrics) => {
+                const el = document.querySelector('[data-yb-reference-scroll-root="1"]');
+                if (!el) return {ok: false};
+                const before = Number(el.scrollTop || 0);
+                const clientHeight = Number(el.clientHeight || metrics.clientHeight || 0);
+                const maxTop = Math.max(0, Number(el.scrollHeight || metrics.scrollHeight || 0) - clientHeight);
+                const step = Math.max(180, Math.round(clientHeight * 0.82));
+                el.scrollTop = Math.min(maxTop, before + step);
+                try { el.dispatchEvent(new Event('scroll', {bubbles: true})); } catch (_) {}
+                return {
+                    ok: Number(el.scrollTop || 0) > before + 2,
+                    before,
+                    after: Number(el.scrollTop || 0),
+                    maxTop,
+                };
+            }""", payload) or {}
+            return bool(result.get("ok"))
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return False
+
+    def _collect_reference_cards_with_scroll_sampling(
+        self,
+        initial_references: list[dict] | None = None,
+        *,
+        max_passes: int = 10,
+    ) -> list[dict]:
+        groups: list[list[dict] | None] = [initial_references if initial_references is not None else self._collect_reference_cards()]
+        merged = self._merge_reference_cards(groups)
+        stagnant_passes = 0
+        for _ in range(max(0, int(max_passes or 0))):
+            metrics = self._reference_panel_scroll_metrics()
+            if not metrics:
+                break
+            remaining = max(
+                0.0,
+                float(metrics.get("scrollHeight", 0) or 0)
+                - float(metrics.get("clientHeight", 0) or 0)
+                - float(metrics.get("scrollTop", 0) or 0),
+            )
+            if remaining <= 12:
+                break
+            if not self._scroll_reference_panel_once(metrics):
+                break
+            self._cooperative_sleep_jittered(0.22, spread=0.22)
+            before_count = len(merged)
+            groups.append(self._collect_reference_cards())
+            merged = self._merge_reference_cards(groups)
+            stagnant_passes = stagnant_passes + 1 if len(merged) == before_count else 0
+            if stagnant_passes >= 3:
+                break
+        return merged
+
+    def _wait_for_reference_cards(self, *, timeout_seconds: float = 1.4) -> list[dict]:
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds or 0.1))
+        last_references: list[dict] = []
+        while time.monotonic() < deadline:
+            self._raise_if_stop_requested()
+            last_references = self._collect_reference_cards()
+            if last_references:
+                return last_references
+            self._cooperative_sleep_jittered(0.18, spread=0.2)
+        return last_references
+
+    def _scroll_latest_answer_toolbar_into_view(self) -> bool:
+        try:
+            self._raise_if_stop_requested()
+            result = self.page.evaluate("""(containerSel) => {
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return (
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.opacity !== '0' &&
+                        rect.width > 0 &&
+                        rect.height > 0
+                    );
+                };
+                const isScrollable = (el) => {
+                    if (!el || !isVisible(el)) return false;
+                    return Number(el.scrollHeight || 0) > Number(el.clientHeight || 0) + 12;
+                };
+                const candidates = [];
+                const addCandidate = (el, score) => {
+                    if (!el || !isScrollable(el)) return;
+                    if (el === document.body || el === document.documentElement) return;
+                    if (candidates.some((item) => item.el === el)) return;
+                    candidates.push({el, score});
+                };
+
+                for (const selector of [
+                    containerSel,
+                    '.agent-chat__list__content-wrapper',
+                    '.agent-chat__list__content',
+                    '#chat-content'
+                ].filter(Boolean)) {
+                    try {
+                        const nodes = Array.from(document.querySelectorAll(selector));
+                        nodes.forEach((el, index) => addCandidate(el, 500 - index));
+                    } catch (_) {}
+                }
+
+                const latestAi = (
+                    document.querySelector('.agent-chat__list__item--ai.agent-chat__list__item--last') ||
+                    Array.from(document.querySelectorAll('.agent-chat__list__item--ai')).pop()
+                );
+                let current = latestAi;
+                for (let depth = 0; current && depth < 9; depth += 1, current = current.parentElement) {
+                    addCandidate(current, 420 - depth * 20);
+                }
+
+                candidates.sort((a, b) => b.score - a.score);
+                const target = candidates[0]?.el || null;
+                if (!target) return {found: false, scrolled: false};
+                const before = Number(target.scrollTop || 0);
+                const maxTop = Math.max(0, Number(target.scrollHeight || 0) - Number(target.clientHeight || 0));
+                target.scrollTop = maxTop;
+                try { target.dispatchEvent(new Event('scroll', {bubbles: true})); } catch (_) {}
+                const after = Number(target.scrollTop || 0);
+                return {
+                    found: true,
+                    scrolled: Math.abs(after - before) > 1,
+                    before,
+                    after,
+                    maxTop,
+                };
+            }""", self.chat_container_selector or "")
+            return bool(isinstance(result, dict) and result.get("found"))
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return False
+
+    def _latest_reference_button_is_open(self) -> bool:
+        try:
+            self._raise_if_stop_requested()
+            return bool(self.page.evaluate("""() => {
+                const candidateSelector = [
+                    '#search-guide-tool[data-toolbar-type="citation"]',
+                    '[data-toolbar-type="citation"]',
+                    'div#search-guide-tool',
+                    '[class*="ToolbarSearchGuid_searchGuidTool"]',
+                    '[class*="ToolbarSearchGuid_source"]'
+                ].join(',');
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return (
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.opacity !== '0' &&
+                        rect.width > 0 &&
+                        rect.height > 0
+                    );
+                };
+                const controlFor = (el) => (
+                    el.closest('#search-guide-tool, [data-toolbar-type="citation"], [class*="ToolbarSearchGuid_searchGuidTool"], button, [role="button"]') ||
+                    el
+                );
+                const latestAi = (
+                    document.querySelector('.agent-chat__list__item--ai.agent-chat__list__item--last') ||
+                    Array.from(document.querySelectorAll('.agent-chat__list__item--ai')).pop()
+                );
+                const roots = [];
+                if (latestAi) roots.push(latestAi);
+                roots.push(document);
+                const seen = new Set();
+                for (const root of roots) {
+                    let nodes = [];
+                    try { nodes = Array.from(root.querySelectorAll(candidateSelector)); } catch (_) {}
+                    for (const node of nodes.reverse()) {
+                        const control = controlFor(node);
+                        if (!control || seen.has(control) || !isVisible(control)) continue;
+                        seen.add(control);
+                        const marker = [
+                            control.id,
+                            control.className,
+                            control.getAttribute && control.getAttribute('data-toolbar-type'),
+                            control.getAttribute && control.getAttribute('data-state'),
+                            control.getAttribute && control.getAttribute('aria-expanded'),
+                        ].filter(Boolean).join(' ');
+                        if (!/(search-guide-tool|ToolbarSearchGuid|citation|源|source)/i.test(marker)) continue;
+                        return (
+                            /t-popup-open|open|expanded/i.test(marker) ||
+                            String(control.getAttribute('aria-expanded') || '').toLowerCase() === 'true'
+                        );
+                    }
+                }
+                return false;
+            }"""))
+        except Exception as exc:
+            self._reraise_stop_requested(exc)
+            return False
+
     def _click_reference_open_button(self) -> bool:
         try:
             self._raise_if_stop_requested()
-            for selector in [
-                '#search-guide-tool[data-toolbar-type="citation"]',
-                '[data-toolbar-type="citation"]',
-                'div#search-guide-tool',
-                '[class*="ToolbarSearchGuid_searchGuidTool"]',
-                self.reference_open_selector,
-                '[class*="ToolbarSearchGuid_source"]',
-                '[class*="ToolbarSearchGuid"]',
-                'button:has-text("来源"), [role="button"]:has-text("来源")',
-                'button:has-text("引用"), [role="button"]:has-text("引用")',
-                'button:has-text("参考"), [role="button"]:has-text("参考")',
-                'button:has-text("网页"), [role="button"]:has-text("网页")',
-                'button:has-text("源"), [role="button"]:has-text("源")',
-            ]:
-                try:
-                    locator = self.page.locator(selector)
-                    if locator.count() <= 0:
-                        continue
-                    btn = locator.last
-                    btn.scroll_into_view_if_needed(timeout=2000)
-                    self._click_locator(btn, timeout_ms=2500, force=False)
-                    return True
-                except Exception as exc:
-                    self._reraise_stop_requested(exc)
-                    continue
-
             result = self.page.evaluate("""() => {
                 const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
                 const isVisible = (el) => {
@@ -1197,13 +1473,13 @@ class YuanbaoPlatform(BasePlatform):
                     el.className,
                 ].filter(Boolean).join(' '));
                 const controlFor = (el) => (
-                    el.closest('#search-guide-tool, [data-toolbar-type="citation"], button, [role="button"], [class*="ToolbarSearchGuid_searchGuidTool"], [class*="ToolbarSearchGuid"]') ||
+                    el.closest('#search-guide-tool, [data-toolbar-type="citation"], [class*="ToolbarSearchGuid_searchGuidTool"], button, [role="button"]') ||
                     el
                 );
-                const scoreCandidate = (el, text, rect) => {
+                const scoreCandidate = (el, text, rect, rootScore, order) => {
                     const cls = String(el.className || '');
                     const toolbarType = String(el.getAttribute('data-toolbar-type') || '');
-                    let score = 0;
+                    let score = rootScore + order;
                     if (el.id === 'search-guide-tool') score += 340;
                     if (/citation/i.test(toolbarType)) score += 320;
                     if (/ToolbarSearchGuid_searchGuidTool/i.test(cls)) score += 300;
@@ -1214,48 +1490,77 @@ class YuanbaoPlatform(BasePlatform):
                     if (/(来源|引用|参考|网页|资料)/.test(text)) score += 130;
                     if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') score += 70;
                     if (rect.width <= 160 && rect.height <= 72) score += 45;
-                    score += Math.min(45, Math.max(0, rect.top / Math.max(1, window.innerHeight)) * 45);
                     if (rect.width >= window.innerWidth * 0.6) score -= 170;
                     if (rect.height >= 180) score -= 120;
                     if (text.length >= 80) score -= 180;
                     if (/停止|发送|重新生成|复制|分享|点赞|点踩|新对话|下载|登录|设置/i.test(text)) score -= 260;
                     return score;
                 };
+                const candidateSelector = [
+                    '#search-guide-tool[data-toolbar-type="citation"]',
+                    '[data-toolbar-type="citation"]',
+                    'div#search-guide-tool',
+                    '[class*="ToolbarSearchGuid_searchGuidTool"]',
+                    '[class*="ToolbarSearchGuid_source"]'
+                ].join(',');
+                const latestAi = (
+                    document.querySelector('.agent-chat__list__item--ai.agent-chat__list__item--last') ||
+                    Array.from(document.querySelectorAll('.agent-chat__list__item--ai')).pop()
+                );
+                const latestToolbars = latestAi
+                    ? Array.from(latestAi.querySelectorAll('.agent-chat__conv--ai__toolbar, .agent-chat__toolbar__right, .agent-chat__toolbar'))
+                    : [];
+                const allToolbars = Array.from(document.querySelectorAll('.agent-chat__conv--ai__toolbar, .agent-chat__toolbar__right, .agent-chat__toolbar'));
+                const rootSpecs = [];
+                if (latestToolbars.length > 0) rootSpecs.push({root: latestToolbars[latestToolbars.length - 1], score: 1800});
+                if (latestAi) rootSpecs.push({root: latestAi, score: 1400});
+                if (allToolbars.length > 0) rootSpecs.push({root: allToolbars[allToolbars.length - 1], score: 900});
+                rootSpecs.push({root: document, score: 0});
 
-                const nodes = Array.from(document.querySelectorAll(
-                    '#search-guide-tool, [data-toolbar-type="citation"], button, [role="button"], [class*="ToolbarSearchGuid"], [class*="source"], [class*="Source"], [class*="reference"], [class*="citation"], [class*="ref-list"], span, div'
-                ));
                 const seen = new Set();
                 let best = null;
-                for (const node of nodes) {
-                    const control = controlFor(node);
-                    if (!control || seen.has(control) || !isVisible(control) || isDisabled(control)) continue;
-                    seen.add(control);
-                    const text = collectText(control) || collectText(node);
-                    const marker = [
-                        text,
-                        control.id,
-                        control.getAttribute && control.getAttribute('data-toolbar-type'),
-                        control.className,
-                    ].filter(Boolean).join(' ');
-                    if (!/(源|来源|引用|参考|网页|资料|search-guide-tool|ToolbarSearchGuid|source|reference|citation|ref-list)/i.test(marker)) continue;
-                    const rect = control.getBoundingClientRect();
-                    const score = scoreCandidate(control, marker, rect);
-                    if (!best || score > best.score) {
-                        best = { control, text: marker, score };
+                for (const spec of rootSpecs) {
+                    let nodes = [];
+                    try {
+                        nodes = Array.from(spec.root.querySelectorAll(candidateSelector));
+                    } catch (_) {
+                        nodes = [];
                     }
+                    nodes.forEach((node, index) => {
+                        const control = controlFor(node);
+                        if (!control || seen.has(control) || !isVisible(control) || isDisabled(control)) return;
+                        seen.add(control);
+                        const text = collectText(control) || collectText(node);
+                        const marker = [
+                            text,
+                            control.id,
+                            control.getAttribute && control.getAttribute('data-toolbar-type'),
+                            control.className,
+                        ].filter(Boolean).join(' ');
+                        if (!/(源|来源|引用|参考|网页|资料|search-guide-tool|ToolbarSearchGuid|source|reference|citation)/i.test(marker)) return;
+                        const rect = control.getBoundingClientRect();
+                        const score = scoreCandidate(control, marker, rect, spec.score, index);
+                        if (!best || score > best.score) {
+                            best = { control, text: marker, score };
+                        }
+                    });
+                    if (best && spec.score >= 1400) break;
                 }
-                if (!best || best.score < 130) {
+
+                if (!best || best.score < 300) {
                     return {clicked: false, score: best ? best.score : 0, text: best ? best.text : ''};
                 }
-                const target = best.control;
-                try { target.scrollIntoView({block: 'center', inline: 'center'}); } catch (_) {}
-                for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
-                    try {
-                        target.dispatchEvent(new MouseEvent(eventName, {bubbles: true, cancelable: true, view: window}));
-                    } catch (_) {}
+                const targets = [best.control];
+                const source = best.control.querySelector && best.control.querySelector('[class*="ToolbarSearchGuid_source"]');
+                if (source) targets.push(source);
+                for (const target of targets) {
+                    for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                        try {
+                            target.dispatchEvent(new MouseEvent(eventName, {bubbles: true, cancelable: true, view: window}));
+                        } catch (_) {}
+                    }
+                    try { target.click(); } catch (_) {}
                 }
-                try { target.click(); } catch (_) {}
                 return {clicked: true, score: best.score, text: best.text};
             }""") or {}
             if result.get("clicked"):
@@ -1274,33 +1579,39 @@ class YuanbaoPlatform(BasePlatform):
             self._raise_if_stop_requested()
 
             try:
-                self._wheel_scroll_selector_to_end(
-                    self.chat_container_selector or ".agent-chat__list__content-wrapper",
-                    last=False,
-                    max_passes=5,
-                )
-                self._cooperative_sleep_jittered(0.6, spread=0.2)
-                existing_references = self._collect_reference_cards()
-                if existing_references:
-                    print(f"[{self.name}] 引用面板已展开，直接读取 {len(existing_references)} 条")
-                    return existing_references
+                self._scroll_latest_answer_toolbar_into_view()
+                self._cooperative_sleep_jittered(0.35, spread=0.2)
 
-                print(f"[{self.name}] 尝试点击源/引用按钮展开面板...")
-                clicked = self._click_reference_open_button()
-                if not clicked:
-                    fallback_references = self._collect_reference_cards()
-                    if fallback_references:
-                        print(f"[{self.name}] 未确认点击源按钮，但已读取 {len(fallback_references)} 条引用")
-                        return fallback_references
-                    print(f"[{self.name}] 未找到可用的源/引用按钮")
-                    return []
-                self._cooperative_sleep_jittered(2.0, spread=0.16)
+                latest_panel_open = self._latest_reference_button_is_open()
+                existing_references = self._collect_reference_cards() if latest_panel_open else []
+                if not latest_panel_open:
+                    print(f"[{self.name}] 尝试点击源/引用按钮展开面板...")
+                    clicked = self._click_reference_open_button()
+                    if not clicked:
+                        fallback_references = self._collect_reference_cards()
+                        if fallback_references:
+                            print(f"[{self.name}] 未确认点击源按钮，但已读取 {len(fallback_references)} 条引用")
+                            existing_references = self._merge_reference_cards([existing_references, fallback_references])
+                        else:
+                            print(f"[{self.name}] 未找到可用的源/引用按钮")
+                            return []
+                    loaded_references = self._wait_for_reference_cards(timeout_seconds=1.6)
+                    if loaded_references:
+                        existing_references = self._merge_reference_cards([existing_references, loaded_references])
+                else:
+                    if not existing_references:
+                        existing_references = self._wait_for_reference_cards(timeout_seconds=0.8)
+                    if existing_references:
+                        print(f"[{self.name}] 引用面板已展开，开始滚动采样 {len(existing_references)} 条")
+                    else:
+                        print(f"[{self.name}] 未找到可用的源/引用按钮")
+                        return []
             except Exception as e:
                 self._reraise_stop_requested(e)
                 print(f"[{self.name}] 点击源按钮失败: {e}")
                 return []
 
-            references = self._collect_reference_cards()
+            references = self._collect_reference_cards_with_scroll_sampling(existing_references, max_passes=10)
 
             if isinstance(references, list):
                 print(f"[{self.name}] 提取到 {len(references)} 条平台抓取源")
