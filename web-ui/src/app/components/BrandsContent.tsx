@@ -3,7 +3,7 @@ import { Search, Plus, ChevronDown, Zap, Edit2, Brain, X, Download, Calendar, La
 import { AreaChart, Area, ResponsiveContainer, YAxis } from "recharts";
 import { ConfirmModal } from "./ConfirmModal";
 import { AnimatedLoadingText } from "./AnimatedLoadingText";
-import { ARTICLE_DATA_CHANGED_EVENT, CLOUD_ADMIN_USERS_CHANGED_EVENT, TASK_DATA_CHANGED_EVENT, fetchDeletedTasks, fetchTasksFull, readTasksFullCache, deleteTask, startTestRunTask, fetchTestRunStatus, cancelTestRunTask, forceSendSuccessfulTaskResults, restoreDeletedTask, syncCloudAdminTask, updateTask, type CloudAdminTaskSnapshot, type CloudUserSnapshot, type DeletedTaskSnapshot, type TaskFull, type TestRunStatus } from "../lib/backend";
+import { ARTICLE_DATA_CHANGED_EVENT, CLOUD_ADMIN_USERS_CHANGED_EVENT, TASK_DATA_CHANGED_EVENT, TASK_DATA_CHANGED_SOURCE_BRANDS, fetchDeletedTasks, fetchTasksFull, readTasksFullCache, writeTasksFullCache, deleteTask, startTestRunTask, fetchTestRunStatus, cancelTestRunTask, forceSendSuccessfulTaskResults, restoreDeletedTask, syncCloudAdminTask, updateTask, type CloudAdminTaskSnapshot, type CloudUserSnapshot, type DeletedTaskSnapshot, type TaskFull, type TestRunStatus } from "../lib/backend";
 import {
   ensureCloudAdminTasks,
   ensureCloudAdminUsers,
@@ -46,10 +46,43 @@ const PLATFORM_ID_TO_NAME: Record<string, string> = {
 type ActiveTestRun = { runId: string; brandName: string; taskId: string };
 
 const ACTIVE_TEST_RUN_STORAGE_KEY = "surfaced-active-test-run";
-const TASK_EVENT_SOURCE = "brands-content";
+const TASK_EVENT_SOURCE = TASK_DATA_CHANGED_SOURCE_BRANDS;
 
 function emitTaskDataChanged() {
   window.dispatchEvent(new CustomEvent(TASK_DATA_CHANGED_EVENT, { detail: { source: TASK_EVENT_SOURCE } }));
+}
+
+function areTaskListsSame(left: TaskFull[], right: TaskFull[]) {
+  if (left === right) {
+    return true;
+  }
+  if (left.length !== right.length) {
+    return false;
+  }
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return false;
+  }
+}
+
+function upsertTask(tasks: TaskFull[], incoming: TaskFull) {
+  const incomingId = String(incoming.id || "").trim();
+  if (!incomingId) {
+    return tasks;
+  }
+  let found = false;
+  const next = tasks.map((task) => {
+    if (String(task.id || "").trim() !== incomingId) {
+      return task;
+    }
+    found = true;
+    return incoming;
+  });
+  if (!found) {
+    next.push(incoming);
+  }
+  return next;
 }
 
 function readStoredActiveTestRun(): ActiveTestRun | null {
@@ -220,6 +253,12 @@ export function BrandsContent({
 
   const dropdownRef = useRef<HTMLDivElement>(null);
   const loadTasksRequestRef = useRef(0);
+  const displayedTasksRef = useRef<TaskFull[]>(cachedTasksOnOpen ?? []);
+  const mutationVersionRef = useRef(0);
+
+  useEffect(() => {
+    displayedTasksRef.current = tasks;
+  }, [tasks]);
 
   // Fetch tasks on mount
   const loadTasks = useCallback(async (options: { showLoadingState?: boolean; force?: boolean } = {}) => {
@@ -231,16 +270,23 @@ export function BrandsContent({
       setLoading(true);
     }
     const result = await fetchTasksFull({ force });
-    if (requestId !== loadTasksRequestRef.current) {
+    if (requestId !== loadTasksRequestRef.current || requestId < mutationVersionRef.current) {
       return;
     }
-    setTasks(result);
+    setTasks((current) => (areTaskListsSame(current, result) ? current : result));
     setLoading(false);
   }, []);
 
   useEffect(() => {
     const hasCachedTasks = Boolean(readTasksFullCache()?.length);
-    void loadTasks({ showLoadingState: !hasCachedTasks, force: hasCachedTasks });
+    if (!hasCachedTasks) {
+      void loadTasks({ showLoadingState: true, force: false });
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void loadTasks({ showLoadingState: false, force: true });
+    }, 250);
+    return () => window.clearTimeout(timer);
   }, [loadTasks]);
 
   useEffect(() => {
@@ -1077,18 +1123,17 @@ export function BrandsContent({
                 setEditingBrand(null);
                 setIsCreatingBrand(false);
               }}
-              onSave={async (savedTask, savedCloudTask) => {
+              onSave={async (savedTask, savedCloudTask, options) => {
                 if (savedTask?.id) {
-                  setTasks((prev) => {
-                    const exists = prev.some((task) => task.id === savedTask.id);
-                    return exists
-                      ? prev.map((task) => (task.id === savedTask.id ? savedTask : task))
-                      : [...prev, savedTask];
-                  });
+                  mutationVersionRef.current = loadTasksRequestRef.current + 1;
+                  const nextTasks = upsertTask(displayedTasksRef.current, savedTask);
+                  displayedTasksRef.current = nextTasks;
+                  writeTasksFullCache(nextTasks);
+                  setTasks(nextTasks);
                   if (isCreatingBrand) {
                     setCurrentPage(1);
                   }
-                } else {
+                } else if (!savedCloudTask) {
                   await loadTasks({ showLoadingState: false, force: true });
                 }
                 if (savedCloudTask?.id) {
@@ -1100,7 +1145,9 @@ export function BrandsContent({
                   });
                 }
                 emitTaskDataChanged();
-                notifySaveSuccess(onSaveSuccess, "保存成功");
+                if (options?.notify !== false) {
+                  notifySaveSuccess(onSaveSuccess, options?.message || "保存成功");
+                }
               }}
             />
           </Suspense>

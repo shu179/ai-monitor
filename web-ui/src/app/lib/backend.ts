@@ -605,6 +605,7 @@ export type CloudArticleClassificationJobUpdateResponse = {
 
 export const ARTICLE_DATA_CHANGED_EVENT = "article-updated";
 export const TASK_DATA_CHANGED_EVENT = "task-updated";
+export const TASK_DATA_CHANGED_SOURCE_BRANDS = "brands-content";
 export const CLOUD_ADMIN_USERS_CHANGED_EVENT = "cloud-admin-users-updated";
 
 const BOOTSTRAP_CACHE_TTL_MS = 2500;
@@ -1062,10 +1063,87 @@ export function readTasksFullCache(): TaskFull[] | null {
   return tasksFullCache?.tasks ?? null;
 }
 
-export function invalidateTasksFullCache() {
-  tasksFullCache = null;
+function cancelTasksFullInFlight() {
   tasksFullInFlight = null;
   tasksFullCacheVersion += 1;
+}
+
+function hasTaskFullId(value: unknown): value is TaskFull {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  return Boolean(String((value as Record<string, unknown>).id || "").trim());
+}
+
+function upsertTaskFullList(
+  tasks: TaskFull[],
+  incoming: TaskFull,
+  options: {
+    allowInsert?: boolean;
+    merge?: (current: TaskFull | undefined, incoming: TaskFull) => TaskFull;
+  } = {},
+) {
+  const incomingId = String(incoming.id || "").trim();
+  if (!incomingId) {
+    return { tasks, changed: false };
+  }
+
+  let found = false;
+  const nextTasks = tasks.map((task) => {
+    if (String(task.id || "").trim() !== incomingId) {
+      return task;
+    }
+    found = true;
+    return options.merge ? options.merge(task, incoming) : incoming;
+  });
+
+  if (!found) {
+    if (!options.allowInsert) {
+      return { tasks, changed: false };
+    }
+    nextTasks.push(options.merge ? options.merge(undefined, incoming) : incoming);
+  }
+
+  return { tasks: nextTasks, changed: true };
+}
+
+function mergeTaskFullCloudFields(current: TaskFull | undefined, incoming: TaskFull): TaskFull {
+  const next = { ...(current || incoming) };
+  next.cloud_task_id = incoming.cloud_task_id;
+  next.cloud_task_key = incoming.cloud_task_key;
+  next.cloud_access_level = incoming.cloud_access_level;
+  next.cloud_config_version = incoming.cloud_config_version;
+  next.cloud_assigned_operator_user_id = incoming.cloud_assigned_operator_user_id;
+  next.cloud_assigned_operator_username = incoming.cloud_assigned_operator_username;
+  return next;
+}
+
+export function writeTasksFullCache(tasks: TaskFull[]) {
+  cancelTasksFullInFlight();
+  tasksFullCache = { tasks: [...tasks], updatedAt: Date.now() };
+}
+
+function updateTasksFullCacheTask(
+  task: unknown,
+  options: {
+    allowInsert?: boolean;
+    merge?: (current: TaskFull | undefined, incoming: TaskFull) => TaskFull;
+  } = {},
+) {
+  if (!hasTaskFullId(task) || !tasksFullCache) {
+    return false;
+  }
+  const result = upsertTaskFullList(tasksFullCache.tasks, task, options);
+  if (!result.changed) {
+    return false;
+  }
+  writeTasksFullCache(result.tasks);
+  return true;
+}
+
+export function invalidateTasksFullCache() {
+  tasksFullCache = null;
+  cancelTasksFullInFlight();
 }
 
 export function warmTasksFullCache() {
@@ -1681,14 +1759,21 @@ export async function syncCloudAdminTask(payload: {
     });
     const data = await response.json();
     const source = data && typeof data === "object" ? data as Record<string, unknown> : {};
-    if (source.ok) {
+    const localTask = source.local_task && typeof source.local_task === "object" ? source.local_task as TaskFull : undefined;
+    if (source.ok && localTask) {
+      updateTasksFullCacheTask(localTask, {
+        merge: mergeTaskFullCloudFields,
+      });
+      invalidateBootstrapCache();
+    } else if (source.ok) {
       invalidateTasksFullCache();
+      invalidateBootstrapCache();
     }
     return {
       ok: Boolean(source.ok && response.ok),
       message: String(source.message || ""),
       task: normalizeCloudAdminTask(source.task),
-      localTask: source.local_task && typeof source.local_task === "object" ? source.local_task as TaskFull : undefined,
+      localTask,
       cloud: source.cloud ? normalizeCloudStatus(source.cloud) : undefined,
     };
   } catch {
@@ -2365,14 +2450,23 @@ async function mutateTasksFullCache<T>(operation: () => Promise<T>): Promise<T> 
 
 export async function createTask(task: Record<string, unknown>): Promise<{ ok: boolean; task_id?: string; task?: TaskFull; message?: string }> {
   try {
-    return await mutateTasksFullCache(async () => {
-      const res = await apiFetch("/api/tasks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(task),
-      });
-      return await res.json();
+    const res = await apiFetch("/api/tasks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(task),
     });
+    const data = await res.json();
+    if (data?.ok && data.task) {
+      const cacheUpdated = updateTasksFullCacheTask(data.task, { allowInsert: true });
+      if (!cacheUpdated) {
+        invalidateTasksFullCache();
+      }
+      invalidateBootstrapCache();
+    } else if (data?.ok) {
+      invalidateTasksFullCache();
+      invalidateBootstrapCache();
+    }
+    return data;
   } catch {
     return { ok: false, message: "网络错误" };
   }
@@ -2406,14 +2500,23 @@ export async function generateQuickTodosDraft(instruction: string): Promise<{ ok
 
 export async function updateTask(taskId: string, task: Record<string, unknown>): Promise<{ ok: boolean; task?: TaskFull; message?: string }> {
   try {
-    return await mutateTasksFullCache(async () => {
-      const res = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(task),
-      });
-      return await res.json();
+    const res = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(task),
     });
+    const data = await res.json();
+    if (data?.ok && data.task) {
+      const cacheUpdated = updateTasksFullCacheTask(data.task);
+      if (!cacheUpdated) {
+        invalidateTasksFullCache();
+      }
+      invalidateBootstrapCache();
+    } else if (data?.ok) {
+      invalidateTasksFullCache();
+      invalidateBootstrapCache();
+    }
+    return data;
   } catch {
     return { ok: false, message: "网络错误" };
   }

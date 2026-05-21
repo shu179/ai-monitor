@@ -73,6 +73,11 @@ type ImportNotice = {
   message: string;
 };
 
+type SaveCallbackOptions = {
+  notify?: boolean;
+  message?: string;
+};
+
 export function BrandEditModal({
   brandName,
   brand,
@@ -97,7 +102,7 @@ export function BrandEditModal({
   deletedTasks?: DeletedTaskSnapshot[],
   currentDetectionMode?: "browser" | "recognition" | "api" | "smart",
   onClose: () => void,
-  onSave?: (task?: TaskFull, cloudTask?: CloudAdminTaskSnapshot) => void | Promise<void>,
+  onSave?: (task?: TaskFull, cloudTask?: CloudAdminTaskSnapshot, options?: SaveCallbackOptions) => void | Promise<void>,
   isNew?: boolean,
   initialInstruction?: string,
   cloudAdminEnabled?: boolean,
@@ -594,20 +599,28 @@ export function BrandEditModal({
         return;
       }
 
-      let savedTask = localResult.task;
-      let savedCloudTask: CloudAdminTaskSnapshot | undefined;
-      if (cloudAdminEnabled && onCloudSync && localTaskId) {
-        const cloudResult = await onCloudSync(localTaskId, cloudOperatorUserId || 0);
-        if (!cloudResult.ok) {
-          setSaveNotice({ tone: "error", message: cloudResult.message || "云端任务同步失败" });
-          return;
-        }
-        savedTask = cloudResult.localTask || savedTask;
-        savedCloudTask = cloudResult.task;
-      }
-
-      await onSave?.(savedTask, savedCloudTask);
+      const cloudSync = onCloudSync;
+      const shouldSyncCloud = Boolean(cloudAdminEnabled && cloudSync && localTaskId);
+      const savedTask = localResult.task;
+      await onSave?.(savedTask, undefined, {
+        message: shouldSyncCloud ? "本地保存成功，云端同步中" : "保存成功",
+      });
       onClose();
+      if (shouldSyncCloud && cloudSync) {
+        void (async () => {
+          const cloudResult = await cloudSync(localTaskId, cloudOperatorUserId || 0);
+          if (!cloudResult.ok) {
+            await onSave?.(undefined, undefined, {
+              message: cloudResult.message ? `本地已保存，云端同步失败：${cloudResult.message}` : "本地已保存，云端同步失败",
+            });
+            return;
+          }
+          await onSave?.(cloudResult.localTask || savedTask, cloudResult.task, {
+            notify: Boolean(cloudResult.message),
+            message: cloudResult.message || "云端同步完成",
+          });
+        })();
+      }
     } finally {
       setSaving(false);
     }

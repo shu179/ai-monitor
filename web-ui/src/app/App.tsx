@@ -16,6 +16,7 @@ import {
   ARTICLE_DATA_CHANGED_EVENT,
   FALLBACK_BOOTSTRAP,
   TASK_DATA_CHANGED_EVENT,
+  TASK_DATA_CHANGED_SOURCE_BRANDS,
   areArticlesEqual,
   areTodosEqual,
   cloudStatusIdentityKey,
@@ -157,6 +158,7 @@ function createSecureBootstrap(): BootstrapPayload {
 export default function App() {
   const saveToastTimerRef = useRef<number | null>(null);
   const runMessageTimerRef = useRef<number | null>(null);
+  const brandTaskRefreshTimerRef = useRef<number | null>(null);
   const bootstrapRequestSeqRef = useRef(0);
   const activeCloudIdentityRef = useRef("");
   const loginModalDragRef = useRef<{
@@ -400,7 +402,17 @@ export default function App() {
     if (!isAuthenticated) {
       return;
     }
-    const handleTaskDataChanged = () => {
+    const handleTaskDataChanged = (event: Event) => {
+      if (event instanceof CustomEvent && event.detail?.source === TASK_DATA_CHANGED_SOURCE_BRANDS) {
+        if (brandTaskRefreshTimerRef.current !== null) {
+          window.clearTimeout(brandTaskRefreshTimerRef.current);
+        }
+        brandTaskRefreshTimerRef.current = window.setTimeout(() => {
+          brandTaskRefreshTimerRef.current = null;
+          void refreshBootstrap();
+        }, 1200);
+        return;
+      }
       void refreshBootstrap({ force: true });
     };
     const handleArticleDataChanged = () => {
@@ -425,6 +437,10 @@ export default function App() {
       window.removeEventListener(TASK_DATA_CHANGED_EVENT, handleTaskDataChanged);
       window.removeEventListener("focus", handleWindowFocus);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
+      if (brandTaskRefreshTimerRef.current !== null) {
+        window.clearTimeout(brandTaskRefreshTimerRef.current);
+        brandTaskRefreshTimerRef.current = null;
+      }
     };
   }, [isAuthenticated, refreshBootstrap]);
 
