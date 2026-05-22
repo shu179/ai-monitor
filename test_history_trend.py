@@ -490,6 +490,134 @@ class HistoryTrendSeriesTests(unittest.TestCase):
         self.assertTrue(values)
         self.assertGreaterEqual(values[0], 80.0)
 
+    def test_task_id_records_keep_legacy_pre_id_success_without_mixing_other_same_name_tasks(self) -> None:
+        task_name = "共享任务趋势"
+        task_id = "task-current"
+        other_task_id = "task-other"
+        brand = "品牌Legacy"
+        today = date.today()
+
+        history._save(history._task_file(task_name), [
+            {
+                "id": "legacy-success",
+                "ts": f"{(today - timedelta(days=6)).isoformat()} 09:00",
+                "task_name": task_name,
+                "platform": "doubao",
+                "keyword": "关键词Legacy",
+                "brand": brand,
+                "rank": 1,
+                "success": True,
+                "review_status": "",
+                "execution_source": "auto",
+            },
+            {
+                "id": "other-task-success",
+                "ts": f"{(today - timedelta(days=4)).isoformat()} 09:00",
+                "task_id": other_task_id,
+                "task_name": task_name,
+                "platform": "doubao",
+                "keyword": "关键词Legacy",
+                "brand": brand,
+                "rank": 1,
+                "success": True,
+                "review_status": "",
+                "execution_source": "auto",
+            },
+        ])
+        history._save(history._task_file(task_id), [
+            {
+                "id": "current-failure",
+                "ts": f"{(today - timedelta(days=1)).isoformat()} 09:00",
+                "task_id": task_id,
+                "task_name": task_name,
+                "platform": "doubao",
+                "keyword": "关键词Legacy",
+                "brand": brand,
+                "rank": 99,
+                "success": False,
+                "review_status": "",
+                "error_message": "未识别到品牌名",
+                "execution_source": "auto",
+            },
+        ])
+
+        records = history.get_records(task_name, task_id=task_id)
+        self.assertEqual([record["id"] for record in records], ["current-failure"])
+
+        series = history.get_brand_trend_series(task_name, [brand], 7, task_id=task_id)
+        self.assertIsNotNone(series)
+        self.assertEqual(
+            series["recorded_dates"],
+            [
+                (today - timedelta(days=6)).isoformat(),
+                (today - timedelta(days=1)).isoformat(),
+            ],
+        )
+        values = {
+            day.isoformat(): value
+            for day, value in zip(series["dates"], series["actual"])
+            if value is not None
+        }
+        current_failure_value = values[(today - timedelta(days=1)).isoformat()]
+        today_value = values[today.isoformat()]
+        self.assertGreaterEqual(current_failure_value, 80.0)
+        self.assertLessEqual(current_failure_value, 100.0)
+        self.assertGreaterEqual(today_value, 80.0)
+        self.assertLessEqual(today_value, 100.0)
+
+    def test_trend_supplement_merges_legacy_pre_id_success_without_other_same_name_tasks(self) -> None:
+        task_name = "shared-task"
+        task_id = "task-current"
+        history._save(history._task_file(task_name), [
+            {
+                "id": "legacy-success",
+                "ts": "2026-01-01 09:00",
+                "task_name": task_name,
+                "platform": "doubao",
+                "keyword": "关键词S",
+                "brand": "品牌S",
+                "rank": 1,
+                "success": True,
+                "review_status": "",
+                "execution_source": "auto",
+            },
+            {
+                "id": "other-task-success",
+                "ts": "2026-01-02 09:00",
+                "task_id": "task-other",
+                "task_name": task_name,
+                "platform": "doubao",
+                "keyword": "关键词S",
+                "brand": "品牌S",
+                "rank": 1,
+                "success": True,
+                "review_status": "",
+                "execution_source": "auto",
+            },
+        ])
+        supplemented = history._supplement_trend_records_with_legacy_success(
+            task_name,
+            [
+                {
+                    "id": "current-failure",
+                    "ts": "2026-01-03 09:00",
+                    "task_id": task_id,
+                    "task_name": task_name,
+                    "platform": "doubao",
+                    "keyword": "关键词S",
+                    "brand": "品牌S",
+                    "rank": 99,
+                    "success": False,
+                    "review_status": "",
+                    "execution_source": "auto",
+                },
+            ],
+            task_id=task_id,
+            brands=["品牌S"],
+        )
+
+        self.assertEqual([record["id"] for record in supplemented], ["legacy-success", "current-failure"])
+
     def test_period_report_excludes_manual_test_failures(self) -> None:
         import core.reports as reports
 

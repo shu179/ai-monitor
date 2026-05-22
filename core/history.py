@@ -2521,6 +2521,12 @@ def get_brand_trend_series_from_records(
             record for record in records
             if str(record.get("brand", "")).strip() in allowed
         ]
+    records = _supplement_trend_records_with_legacy_success(
+        task_name,
+        records,
+        task_id=task_id,
+        brands=brand_names,
+    )
 
     today = local_today()
     days = max(7, int(days or 30))
@@ -2597,6 +2603,50 @@ def get_brand_trend_series_from_records(
             "average": round(sum(valid_values) / len(valid_values), 1),
         },
     }
+
+
+def _supplement_trend_records_with_legacy_success(
+    task_name: str,
+    records: list[dict] | None,
+    *,
+    task_id: str = "",
+    brands: list[str] | None = None,
+) -> list[dict]:
+    merged_records = [dict(record) for record in (records or []) if isinstance(record, dict)]
+    normalized_task_id = str(task_id or "").strip()
+    normalized_task_name = str(task_name or "").strip()
+    if not normalized_task_id or not normalized_task_name:
+        return merged_records
+    if any(is_success_record(record) for record in merged_records):
+        return merged_records
+
+    allowed_brands = set(_normalize_brand_names(brands))
+    seen_keys = {
+        _history_record_dedupe_key(record)
+        for record in merged_records
+        if isinstance(record, dict)
+    }
+    supplemented = list(merged_records)
+    for record in get_records(normalized_task_name):
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("task_id") or "").strip():
+            continue
+        record_task_name = str(record.get("task_name") or "").strip()
+        if record_task_name and record_task_name != normalized_task_name:
+            continue
+        record_brand = str(record.get("brand") or "").strip()
+        if allowed_brands and record_brand not in allowed_brands:
+            continue
+        if not is_success_record(record):
+            continue
+        dedupe_key = _history_record_dedupe_key(record)
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        supplemented.append(dict(record))
+    supplemented.sort(key=lambda item: str(item.get("ts") or ""))
+    return supplemented
 
 
 def get_pending_reviews(limit: int = 200) -> list[dict]:
