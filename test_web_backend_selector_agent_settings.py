@@ -82,6 +82,50 @@ def test_save_settings_preserves_guarded_storage_defaults_without_storage_payloa
     rebuild_mock.assert_called_once_with("settings_save")
 
 
+def test_save_settings_forces_managed_context_snapshot_defaults():
+    runtime = AppRuntime()
+    base_config = {
+        "scheduler": {},
+        "search": {},
+        "cloud_sync": {},
+        "query_execution": {},
+        "browser_automation": {},
+        "context_snapshots": {
+            "weather": {"enabled": False, "provider": "caiyun", "city": "旧城市", "token": "old"},
+            "calendar": {"enabled": False, "provider": "custom"},
+        },
+    }
+    saved_configs = []
+
+    runtime.load_config = Mock(return_value=deepcopy(base_config))
+    runtime.save_config = Mock(side_effect=lambda config: saved_configs.append(deepcopy(config)) or Path("/tmp/config.yaml"))
+    runtime._refresh_monitoring_runtime = Mock()
+    runtime._sync_recognition_mode = Mock()
+
+    with (
+        patch("web_backend.CloudSessionStore") as session_store_mock,
+        patch("web_backend.get_local_model_manager") as local_model_manager_mock,
+        patch("web_backend.configure_structured_history_storage"),
+        patch("web_backend.maybe_schedule_structured_history_auto_rebuild"),
+    ):
+        session_store_mock.return_value.load.return_value = {}
+        local_model_manager_mock.return_value = Mock(sync_config=Mock())
+        result = runtime.save_settings({
+            "context_snapshots": {
+                "weather": {"enabled": False, "provider": "caiyun", "city": "上海", "token": "legacy"},
+                "calendar": {"enabled": False},
+            },
+        })
+
+    assert result["ok"] is True
+    assert saved_configs[0]["context_snapshots"]["weather"]["enabled"] is True
+    assert saved_configs[0]["context_snapshots"]["weather"]["provider"] == "open-meteo"
+    assert saved_configs[0]["context_snapshots"]["weather"]["city"] == ""
+    assert "token" not in saved_configs[0]["context_snapshots"]["weather"]
+    assert saved_configs[0]["context_snapshots"]["calendar"]["enabled"] is True
+    assert saved_configs[0]["context_snapshots"]["calendar"]["provider"] == "timor"
+
+
 def test_save_settings_does_not_enable_storage_for_ordinary_cloud_session():
     runtime = AppRuntime()
     base_config = {
