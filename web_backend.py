@@ -218,7 +218,7 @@ from core.profile_assets import (
     store_profile_avatar,
 )
 from core.shutdown import install_shutdown_handlers, register_shutdown_callback, run_shutdown_callbacks
-from core.context_snapshots import DEFAULT_CONTEXT_SNAPSHOTS_CONFIG, ensure_context_snapshots
+from core.context_snapshots import DEFAULT_CONTEXT_SNAPSHOTS_CONFIG, ensure_context_snapshots, get_context_snapshots_config
 from core.cycle_state import (
     is_report_success,
     resolve_report_display_message,
@@ -9466,6 +9466,8 @@ return changedCount
                 if section in normalized_payload and isinstance(normalized_payload[section], dict):
                     existing = config.get(section, {}) or {}
                     config[section] = _deep_merge_dict(existing, normalized_payload[section])
+            if "context_snapshots" in normalized_payload:
+                config["context_snapshots"] = get_context_snapshots_config(config)
             recognition_cfg = dict(config.get("recognition", {}) or {})
             recognition_cfg["safe_mode_ocr_enabled"] = True
             for obsolete_key in ("ai_fallback_enabled", "platform", "model"):
