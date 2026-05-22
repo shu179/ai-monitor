@@ -38,9 +38,11 @@ type PlatformState = {
 export function APIContent({
   onSaved,
   onSaveSuccess,
+  embedded = false,
 }: {
   onSaved?: () => Promise<void> | void;
   onSaveSuccess?: (message?: string) => void;
+  embedded?: boolean;
 }) {
   const domestic = initialPlatforms.filter(p => p.region === "domestic");
   const international = initialPlatforms.filter(p => p.region === "international");
@@ -127,6 +129,65 @@ export function APIContent({
     }
     setSaving(false);
   };
+
+  const platformGroups = (
+    <>
+      <div className="mb-8">
+        <div className="flex items-center gap-2 mb-4">
+          <div className="w-1 h-3.5 bg-blue-600 rounded-full"></div>
+          <h3 className="text-[13px] font-bold text-gray-900 tracking-tight">国内大模型</h3>
+          <div className="h-px flex-1 bg-gray-100 ml-2"></div>
+        </div>
+        <div className="space-y-1">
+          {domestic.map(platform => (
+            <PlatformCard
+              key={platform.id}
+              platform={platform}
+              state={platformStates[platform.id]}
+              onUpdate={(patch) => updatePlatformState(platform.id, patch)}
+              onSetTestStatus={(s) => setTestStatus(platform.id, s)}
+            />
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <div className="flex items-center gap-2 mb-4">
+          <div className="w-1 h-3.5 bg-gray-900 rounded-full"></div>
+          <h3 className="text-[13px] font-bold text-gray-900 tracking-tight">国际大模型</h3>
+          <div className="h-px flex-1 bg-gray-100 ml-2"></div>
+        </div>
+        <div className="space-y-1">
+          {international.map(platform => (
+            <PlatformCard
+              key={platform.id}
+              platform={platform}
+              state={platformStates[platform.id]}
+              onUpdate={(patch) => updatePlatformState(platform.id, patch)}
+              onSetTestStatus={(s) => setTestStatus(platform.id, s)}
+            />
+          ))}
+        </div>
+      </div>
+    </>
+  );
+
+  if (embedded) {
+    return (
+      <div className="flex flex-col">
+        <div className="flex justify-end mb-4 -mt-1">
+          <button
+            onClick={handleSaveAll}
+            disabled={saving || dirtyCount === 0}
+            className="flex items-center gap-1.5 px-0 py-2 text-[12px] font-bold text-gray-900 transition-colors hover:text-black disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Save className="w-4 h-4" /> {saving ? "保存中..." : dirtyCount > 0 ? `保存 ${dirtyCount} 项修改` : "暂无修改"}
+          </button>
+        </div>
+        {platformGroups}
+      </div>
+    );
+  }
 
   return (
     <div className="flex-1 h-full overflow-hidden bg-transparent px-8 py-8 xl:px-10 flex flex-col">

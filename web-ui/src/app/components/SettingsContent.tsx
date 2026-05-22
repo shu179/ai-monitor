@@ -5,6 +5,7 @@ import { ConfirmModal } from "./ConfirmModal";
 import { browserAuthAction, checkAppUpdate, diagnoseSelectorHeal, diagnoseSelectorPauseState, fetchAccountCrawlExclusions, fetchBrowserAuth, fetchLocalModelStatus, fetchLocalUpdatePlan, fetchPlatformKeys, fetchSettings, pickDirectory, prepareAppUpdate, prepareLocalModel, readSettingsCache, restoreAccountCrawlExclusions, savePlatformConfig, saveSettings, saveProfile, startLocalUpdate, refreshContextSnapshots, testLocalModel, testSchedulerNotificationWebhook, type AppUpdateStatusSnapshot, type BrowserAuthPlatformSnapshot, type ExcludedArticleLinkSnapshot, type LocalModelStatus, type PlatformKeyInfo, type SelectorAgentSettingsSnapshot, type SelectorHealFieldResult, type SelectorPauseStateResponse } from "../lib/backend";
 import { notifySaveSuccess } from "../lib/saveToast";
 import { DatePickerField } from "./ui/date-picker-field";
+import { APIContent } from "./APIContent";
 
 type PlatformOption = {
   id: string;
@@ -2622,7 +2623,14 @@ export function SettingsContent({
       {/* Content Scroll Area */}
       <div className="flex-1 overflow-y-auto pr-3 -mr-3 scrollbar-thin scrollbar-thumb-gray-200 scrollbar-track-transparent pb-10">
         <div className="max-w-4xl space-y-6">
-          
+
+          <Section title="API 密钥与模型" collapsible defaultCollapsed>
+            <p className="text-[12px] text-gray-500 mb-4 leading-relaxed">
+              管理各 AI 平台的密钥与可用模型列表。仅在接口模式下需要配置。
+            </p>
+            <APIContent embedded onSaveSuccess={onSaveSuccess} />
+          </Section>
+
           {/* Section 1: Auto Query Time & Notification */}
           <Section title="自动查询时间及通知">
             <p className="text-[12px] text-gray-500 mb-4 leading-relaxed">

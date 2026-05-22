@@ -1,4 +1,4 @@
-import { LayoutDashboard, Hexagon, Bot, Webhook, Settings2, Moon, FileText, UserRound } from "lucide-react";
+import { LayoutDashboard, Hexagon, Bot, Settings2, Moon, FileText, UserRound } from "lucide-react";
 import { ImageWithFallback } from "./figma/ImageWithFallback";
 import surfacedWordmark from "../../assets/surfaced-wordmark.svg";
 
@@ -52,7 +52,6 @@ export function Sidebar({
           <NavItem icon={<Hexagon size={20} strokeWidth={2.5} />} label="品牌" active={activeTab === "品牌"} onClick={() => onTabChange?.("品牌")} onPreload={() => onTabPreload?.("品牌")} primary />
           <NavItem icon={<FileText size={20} strokeWidth={2.5} />} label="发稿" active={activeTab === "发稿"} onClick={() => onTabChange?.("发稿")} onPreload={() => onTabPreload?.("发稿")} primary trailingBadge={<BetaBadge />} />
           <NavItem icon={<Bot size={20} strokeWidth={2.5} />} label="搜搜" active={activeTab === "搜搜"} onClick={() => onTabChange?.("搜搜")} onPreload={() => onTabPreload?.("搜搜")} rightAction={<Badge label="⌘K" />} primary />
-          <NavItem icon={<Webhook size={20} strokeWidth={2.5} />} label="API配置" active={activeTab === "API配置"} onClick={() => onTabChange?.("API配置")} onPreload={() => onTabPreload?.("API配置")} primary />
         </div>
       </div>
       

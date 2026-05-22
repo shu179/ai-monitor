@@ -52,7 +52,6 @@ const loadCenterContent = () => import("./components/CenterContent").then((modul
 const loadBrandsContent = () => import("./components/BrandsContent").then((module) => ({ default: module.BrandsContent }));
 const loadOcrFloatingWindow = () => import("./components/OcrFloatingWindow").then((module) => ({ default: module.OcrFloatingWindow }));
 const loadSearchContent = () => import("./components/SearchContent").then((module) => ({ default: module.SearchContent }));
-const loadAPIContent = () => import("./components/APIContent").then((module) => ({ default: module.APIContent }));
 const loadSettingsContent = () => import("./components/SettingsContent").then((module) => ({ default: module.SettingsContent }));
 const preloadSettingsContent = () => {
   warmSettingsCache();
@@ -65,7 +64,6 @@ const CenterContent = lazy(loadCenterContent);
 const BrandsContent = lazy(loadBrandsContent);
 const OcrFloatingWindow = lazy(loadOcrFloatingWindow);
 const SearchContent = lazy(loadSearchContent);
-const APIContent = lazy(loadAPIContent);
 const SettingsContent = lazy(loadSettingsContent);
 const AccountContent = lazy(loadAccountContent);
 const ReleaseContent = lazy(loadReleaseContent);
@@ -75,7 +73,6 @@ const preloadPageByTab: Record<string, () => Promise<unknown>> = {
   品牌: loadBrandsContent,
   发稿: loadReleaseContent,
   搜搜: loadSearchContent,
-  API配置: loadAPIContent,
   账号: loadAccountContent,
   系统设置: preloadSettingsContent,
 };
@@ -335,7 +332,6 @@ export default function App() {
       warmTasksFullCache();
       void loadReleaseContent();
       void loadSearchContent();
-      void loadAPIContent();
       void preloadSettingsContent();
       void loadAccountContent();
     };
@@ -382,7 +378,7 @@ export default function App() {
     if (!isAuthenticated) {
       return;
     }
-    if (activeTab === "搜搜" || activeTab === "API配置" || activeTab === "发稿") {
+    if (activeTab === "搜搜" || activeTab === "发稿") {
       refreshBootstrap({ force: true });
     }
   }, [activeTab, isAuthenticated, refreshBootstrap]);
@@ -874,8 +870,6 @@ export default function App() {
               bootstrap={bootstrap}
               onDataChanged={refreshBootstrap}
             />
-          ) : activeTab === "API配置" ? (
-            <APIContent onSaved={refreshBootstrap} onSaveSuccess={showSaveSuccessToast} />
           ) : activeTab === "账号" ? (
             <AccountContent
               isAuthenticated={isAuthenticated}
