@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 import core.article_store as article_store
 from backend_lib.article_service import (
@@ -70,8 +71,15 @@ class ArticleTableImportTests(unittest.TestCase):
         article_store.DOMAIN_OVERRIDES_FILE = root / "logs" / "domain_overrides.json"
         article_store.DOMAIN_MEDIA_NAMES_FILE = root / "logs" / "domain_media_names.json"
         article_store.EXCLUDED_ARTICLE_URLS_FILE = root / "logs" / "excluded_article_urls.json"
+        self._import_batches_path = root / "logs" / "article_import_batches.json"
+        self._article_import_batches_path_patch = patch(
+            "backend_lib.article_service._article_import_batches_path",
+            return_value=self._import_batches_path,
+        )
+        self._article_import_batches_path_patch.start()
 
     def tearDown(self) -> None:
+        self._article_import_batches_path_patch.stop()
         article_store.ARTICLES_FILE = self._original_paths["ARTICLES_FILE"]
         article_store.DOMAIN_OVERRIDES_FILE = self._original_paths["DOMAIN_OVERRIDES_FILE"]
         article_store.DOMAIN_MEDIA_NAMES_FILE = self._original_paths["DOMAIN_MEDIA_NAMES_FILE"]
@@ -154,6 +162,10 @@ class ArticleTableImportTests(unittest.TestCase):
         loaded = _load_article_import_batches_file()
 
         self.assertEqual(set(loaded), {"existing", "new"})
+        self.assertEqual(
+            _article_import_batches_lock_file(),
+            self._import_batches_path.with_name(".article_import_batches.json.lock"),
+        )
         self.assertTrue(_article_import_batches_lock_file().exists())
 
     def test_import_media_type_keeps_self_media(self) -> None:
