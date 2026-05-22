@@ -83,7 +83,6 @@ from core.task_results import (
     load_today_success_only_query_results as _load_today_success_only_query_results,
     make_query_result_key as _make_query_result_key,
     record_result_history as _record_result_history,
-    render_api_screenshot_with_retries as _render_api_screenshot_with_retries,
     result_has_usable_screenshot as _result_has_usable_screenshot,
     screenshot_path_exists as _screenshot_path_exists,
     summarize_keyword_result as _summarize_keyword_result,
@@ -334,7 +333,7 @@ def main(argv: list[str] | None = None):
                 app._post(lambda root: app._start_recognition_mode())
             except Exception as exc:
                 print(f"[Main] 定时轮次启动识别监听失败: {exc}")
-        if mode in {"browser", "smart"}:
+        if mode == "browser":
             policy = build_query_execution_policy(current_config, mode)
             manager = PlatformSessionManager(
                 mode,

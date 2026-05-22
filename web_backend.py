@@ -289,10 +289,8 @@ from core.update_manager import (
 from core.version import APP_NAME, get_http_server_version, get_version_payload
 from platforms.api_client import (
     PLATFORM_API_CONFIG,
-    PLATFORM_API_MODE_MODEL_SPLITS,
     get_platform_api_key,
     get_platform_last_error,
-    get_platform_api_mode_model_split,
     platform_has_configured_access,
     platform_requires_api_key,
     send_platform_chat_messages,
@@ -1202,7 +1200,7 @@ _KEYWORD_ITEM_SCHEMA = {
         "brand": {"type": "string", "description": "关键词品牌，默认沿用任务品牌"},
         "mode": {
             "type": "string",
-            "enum": ["browser", "recognition", "api", "smart"],
+            "enum": ["browser", "recognition"],
             "description": "关键词运行模式",
         },
         "platforms": {
@@ -1433,7 +1431,7 @@ ASSISTANT_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "mode": {
                     "type": "string",
-                    "enum": ["browser", "recognition", "api", "smart"],
+                    "enum": ["browser", "recognition"],
                 },
             },
         },
@@ -1464,23 +1462,11 @@ ASSISTANT_TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "set_ai_assistant_model",
-        "修改智能模式使用的文本大模型。",
+        "修改 AI 助手使用的文本大模型。",
         {
             "type": "object",
             "required": ["platform", "model"],
             "properties": {
-                "platform": {"type": "string"},
-                "model": {"type": "string"},
-            },
-        },
-    ),
-    _tool(
-        "set_smart_vision_config",
-        "修改智能模式下的视觉能力配置。",
-        {
-            "type": "object",
-            "properties": {
-                "enabled": {"type": "boolean"},
                 "platform": {"type": "string"},
                 "model": {"type": "string"},
             },
@@ -1698,15 +1684,11 @@ ASSISTANT_TOOLS: list[dict[str, Any]] = [
 _MODE_TO_CARD_KEY = {
     "browser": "capture",
     "recognition": "ocr",
-    "api": "api",
-    "smart": "smart",
 }
 
 _CARD_DEFS = [
     {"key": "capture", "title": "抓取模式", "desc": "快速提取核心数据", "icon": "zap"},
     {"key": "ocr", "title": "识别模式", "desc": "OCR视觉解析", "icon": "eye"},
-    {"key": "api", "title": "接口模式", "desc": "API实时同步", "icon": "code"},
-    {"key": "smart", "title": "智能模式", "desc": "AI混合调度", "icon": "cpu"},
 ]
 
 
@@ -1730,15 +1712,11 @@ _PLATFORM_DISPLAY_NAMES: dict[str, str] = {
 _MODE_TITLE_TO_KEY: dict[str, str] = {
     "抓取模式": "browser",
     "识别模式": "recognition",
-    "接口模式": "api",
-    "智能模式": "smart",
 }
 
 _MODE_KEY_TO_TITLE: dict[str, str] = {
     "browser": "抓取模式",
     "recognition": "识别模式",
-    "api": "保险模式",
-    "smart": "智能模式",
 }
 
 
@@ -5424,7 +5402,7 @@ return changedCount
         source_label: str,
     ) -> PlatformSessionManager | None:
         normalized_mode = str(mode or "").strip()
-        if normalized_mode not in {"browser", "smart"}:
+        if normalized_mode != "browser":
             return None
         policy = build_query_execution_policy(config or {}, normalized_mode)
         if not policy.use_session_pool:
@@ -5456,7 +5434,7 @@ return changedCount
                         print("[WebBackend] 定时轮次开始，已启动识别监听")
                     except Exception as exc:
                         print(f"[WebBackend] 定时轮次启动识别监听失败: {exc}")
-        if mode in {"browser", "smart"}:
+        if mode == "browser":
             policy = build_query_execution_policy(config, mode)
             self._query_session_manager = PlatformSessionManager(
                 mode,
@@ -5536,7 +5514,7 @@ return changedCount
         if not query_tasks:
             current_mode = str(config.get("detection_mode", "browser") or "browser").strip()
             if current_mode == "recognition":
-                message = "识别模式不参与自动调度，请切回抓取/保险/智能模式后开启"
+                message = "识别模式不参与自动调度，请切回抓取模式后开启"
                 self._monitoring_status_message = message
                 return {"ok": False, "enabled": False, "message": message}
             else:
@@ -7176,110 +7154,109 @@ return changedCount
 
     # ── Platform API Key management ──────────────────────────────
 
+    @staticmethod
+    def _platform_key_aliases(platform_id: str) -> list[str]:
+        aliases: list[str] = []
+        legacy_alias = _PLATFORM_ID_REVERSE.get(platform_id)
+        if legacy_alias:
+            aliases.append(legacy_alias)
+        if platform_id == "tongyi":
+            aliases.append("qwen")
+        elif platform_id == "wenxin":
+            aliases.append("ernie")
+        return aliases
+
+    def _platform_key_info(self, config: dict[str, Any], platform_id: str, platform_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+        pcfg = platform_cfg if isinstance(platform_cfg, dict) else _get_platform_config_entry(config, platform_id)
+        raw_key = str(pcfg.get("api_key", "") or "").strip()
+        masked = ("*" * max(0, len(raw_key) - 4) + raw_key[-4:]) if len(raw_key) > 4 else ("*" * len(raw_key))
+        return {
+            "api_key_masked": masked,
+            "has_key": bool(raw_key),
+            "has_access": bool(raw_key) or platform_has_configured_access(config, platform_id),
+            "requires_api_key": platform_requires_api_key(platform_id),
+            "api_model": str(pcfg.get("api_model", "") or "").strip(),
+            "api_fast_model": str(pcfg.get("api_fast_model", "") or "").strip(),
+            "api_deep_model": str(pcfg.get("api_deep_model", "") or "").strip(),
+            "model_options": _normalize_model_options(pcfg.get("model_options", [])),
+            "api_test_status": _normalize_platform_test_status(pcfg.get("api_test_status")),
+            "default_model": str((PLATFORM_API_CONFIG.get(platform_id) or {}).get("default_model") or "").strip(),
+            "supports_split_models": False,
+            "fast_model_default": "",
+            "deep_model_default": "",
+            "split_model_note": "",
+        }
+
     def get_platform_keys(self) -> dict:
-        """返回各平台 API Key（脱敏）和 model 配置。"""
+        """返回各平台 API Key（脱敏）和模型配置，供搜搜等功能使用。"""
         config = self.load_config()
         platforms_cfg = config.get("platforms", {}) or {}
-        result = {}
+        result: dict[str, dict[str, Any]] = {}
+
         for raw_pid, raw_pcfg in platforms_cfg.items():
-            pid = _normalize_platform_id(raw_pid)
-            pcfg = raw_pcfg if isinstance(raw_pcfg, dict) else {}
-            raw_key = str(pcfg.get("api_key", "") or "").strip()
-            masked = ("*" * max(0, len(raw_key) - 4) + raw_key[-4:]) if len(raw_key) > 4 else ("*" * len(raw_key))
-            split_profile = get_platform_api_mode_model_split(pid) or {}
-            requires_api_key = platform_requires_api_key(pid)
-            has_access = platform_has_configured_access(config, pid)
-            entry = {
-                "api_key_masked": masked,
-                "has_key": bool(raw_key),
-                "has_access": has_access,
-                "requires_api_key": requires_api_key,
-                "api_model": str(pcfg.get("api_model", "") or "").strip(),
-                "api_fast_model": str(pcfg.get("api_fast_model", "") or "").strip(),
-                "api_deep_model": str(pcfg.get("api_deep_model", "") or "").strip(),
-                "model_options": list(pcfg.get("model_options", []) or []),
-                "api_test_status": _normalize_platform_test_status(pcfg.get("api_test_status")),
-                "default_model": (PLATFORM_API_CONFIG.get(pid) or {}).get("default_model", ""),
-                "supports_split_models": bool(split_profile),
-                "fast_model_default": str(split_profile.get("fast_model_default", "") or "").strip(),
-                "deep_model_default": str(split_profile.get("deep_model_default", "") or "").strip(),
-                "split_model_note": str(split_profile.get("note", "") or "").strip(),
-            }
+            pid = _normalize_platform_id(str(raw_pid or "").strip())
+            if not pid:
+                continue
+            entry = self._platform_key_info(config, pid, raw_pcfg if isinstance(raw_pcfg, dict) else {})
             result[pid] = entry
-            # 如果此平台有前端别名，也用别名 ID 返回一份
-            if pid in _PLATFORM_ID_REVERSE:
-                result[_PLATFORM_ID_REVERSE[pid]] = entry
-        # 补充 PLATFORM_API_CONFIG 中有但 config.yaml 中没有的平台
+            for alias in self._platform_key_aliases(pid):
+                result[alias] = entry
+
         for pid in PLATFORM_API_CONFIG:
-            if pid not in result:
-                split_profile = get_platform_api_mode_model_split(pid) or {}
-                requires_api_key = platform_requires_api_key(pid)
-                has_access = platform_has_configured_access(config, pid)
-                entry = {
-                    "api_key_masked": "",
-                    "has_key": False,
-                    "has_access": has_access,
-                    "requires_api_key": requires_api_key,
-                    "api_model": "",
-                    "api_fast_model": "",
-                    "api_deep_model": "",
-                    "model_options": [],
-                    "api_test_status": "idle",
-                    "default_model": (PLATFORM_API_CONFIG.get(pid) or {}).get("default_model", ""),
-                    "supports_split_models": bool(split_profile),
-                    "fast_model_default": str(split_profile.get("fast_model_default", "") or "").strip(),
-                    "deep_model_default": str(split_profile.get("deep_model_default", "") or "").strip(),
-                    "split_model_note": str(split_profile.get("note", "") or "").strip(),
-                }
-                result[pid] = entry
-                if pid in _PLATFORM_ID_REVERSE:
-                    result[_PLATFORM_ID_REVERSE[pid]] = entry
+            if pid in result:
+                continue
+            entry = self._platform_key_info(config, pid, {})
+            result[pid] = entry
+            for alias in self._platform_key_aliases(pid):
+                result[alias] = entry
+
         return {"platforms": result}
 
     def save_platform_config(self, payload: dict) -> dict:
-        """批量保存平台 API Key 和 model 设置。"""
+        """批量保存平台 API Key 和模型设置。"""
         with self._lock:
             config = self.load_config()
             platforms_cfg = config.get("platforms", {}) or {}
             updates = payload.get("platforms", {}) or {}
-            for pid, values in updates.items():
-                real_pid = _normalize_platform_id(pid)
-                if real_pid not in platforms_cfg:
+            if not isinstance(updates, dict):
+                return {"ok": False, "message": "platforms 必须是对象"}
+            for pid, raw_values in updates.items():
+                values = raw_values if isinstance(raw_values, dict) else {}
+                real_pid = _normalize_platform_id(str(pid or "").strip())
+                if not real_pid:
+                    continue
+                if real_pid not in platforms_cfg or not isinstance(platforms_cfg.get(real_pid), dict):
                     platforms_cfg[real_pid] = {}
                 if real_pid == "local_model":
                     platforms_cfg.pop("local_qwen", None)
+                platform_cfg = platforms_cfg[real_pid]
                 platform_changed = False
+
                 if "api_key" in values:
-                    raw_key = str(values["api_key"]).strip()
+                    raw_key = str(values.get("api_key", "") or "").strip()
                     if raw_key and not raw_key.startswith("*"):
-                        existing_key = str(platforms_cfg[real_pid].get("api_key", "") or "").strip()
-                        platforms_cfg[real_pid]["api_key"] = raw_key
+                        existing_key = str(platform_cfg.get("api_key", "") or "").strip()
+                        platform_cfg["api_key"] = raw_key
                         if raw_key != existing_key:
                             platform_changed = True
-                if "api_model" in values:
-                    next_model = str(values["api_model"]).strip()
-                    if next_model != str(platforms_cfg[real_pid].get("api_model", "") or "").strip():
+
+                for field in ("api_model", "api_fast_model", "api_deep_model"):
+                    if field not in values:
+                        continue
+                    next_model = str(values.get(field, "") or "").strip()
+                    if next_model != str(platform_cfg.get(field, "") or "").strip():
                         platform_changed = True
-                    platforms_cfg[real_pid]["api_model"] = next_model
-                if "api_fast_model" in values:
-                    next_fast_model = str(values["api_fast_model"]).strip()
-                    if next_fast_model != str(platforms_cfg[real_pid].get("api_fast_model", "") or "").strip():
-                        platform_changed = True
-                    platforms_cfg[real_pid]["api_fast_model"] = next_fast_model
-                if "api_deep_model" in values:
-                    next_deep_model = str(values["api_deep_model"]).strip()
-                    if next_deep_model != str(platforms_cfg[real_pid].get("api_deep_model", "") or "").strip():
-                        platform_changed = True
-                    platforms_cfg[real_pid]["api_deep_model"] = next_deep_model
+                    platform_cfg[field] = next_model
+
                 if "model_options" in values:
-                    opts = values["model_options"]
-                    if isinstance(opts, list):
-                        next_options = [str(o).strip() for o in opts if str(o).strip()]
-                        if next_options != list(platforms_cfg[real_pid].get("model_options", []) or []):
-                            platform_changed = True
-                        platforms_cfg[real_pid]["model_options"] = next_options
+                    next_options = _normalize_model_options(values.get("model_options", []))
+                    if next_options != _normalize_model_options(platform_cfg.get("model_options", [])):
+                        platform_changed = True
+                    platform_cfg["model_options"] = next_options
+
                 if platform_changed:
-                    platforms_cfg[real_pid]["api_test_status"] = "idle"
+                    platform_cfg["api_test_status"] = "idle"
+
             config["platforms"] = platforms_cfg
             self.save_config(config)
         self._refresh_monitoring_runtime(restart_scheduler=False)
@@ -7293,63 +7270,64 @@ return changedCount
         config = self.load_config()
         api_key = str(payload.get("api_key", "") or "").strip()
         model = str(payload.get("model", "") or "").strip()
-        # WebUI 重新进入 API 配置页后会展示掩码后的 key（如 ********abcd）。
-        # 测试连通性时如果直接把掩码传回来，这里需要回退到配置里保存的真实 key，
-        # 否则会误把掩码当成 token 去请求，表现为“刚保存能测通，重进页面后反复失败”。
         if not api_key or api_key.startswith("*"):
             api_key = get_platform_api_key(config, platform_id)
         if not model:
             pcfg = _get_platform_config_entry(config, platform_id)
             model = str(pcfg.get("api_model", "") or "").strip()
         if not model:
-            model = (PLATFORM_API_CONFIG.get(platform_id) or {}).get("default_model", "")
+            model = str((PLATFORM_API_CONFIG.get(platform_id) or {}).get("default_model") or "").strip()
         if platform_requires_api_key(platform_id) and not api_key:
             return {"ok": False, "message": "请先填写 API Key"}
         if not model:
             return {"ok": False, "message": "请先填写模型名"}
+
         t0 = _time.monotonic()
         try:
             text = send_platform_chat_messages(
-                platform_id, api_key, model,
+                platform_id,
+                api_key,
+                model,
                 [
                     {"role": "system", "content": '你只需要回复"测试成功"。'},
                     {"role": "user", "content": '这是一条接口连通性测试。请只回复"测试成功"。'},
                 ],
             )
             latency = int((_time.monotonic() - t0) * 1000)
-            platforms_cfg = config.get("platforms", {}) or {}
-            platform_cfg = platforms_cfg.get(platform_id, {})
-            if not isinstance(platform_cfg, dict):
-                platform_cfg = {}
-                platforms_cfg[platform_id] = platform_cfg
-            if platform_id == "local_model":
-                platforms_cfg.pop("local_qwen", None)
-            if not text:
-                platform_cfg["api_test_status"] = "error"
+            with self._lock:
+                config = self.load_config()
+                platforms_cfg = config.get("platforms", {}) or {}
+                platform_cfg = platforms_cfg.get(platform_id, {})
+                if not isinstance(platform_cfg, dict):
+                    platform_cfg = {}
+                    platforms_cfg[platform_id] = platform_cfg
+                if platform_id == "local_model":
+                    platforms_cfg.pop("local_qwen", None)
+                platform_cfg["api_test_status"] = "success" if text else "error"
                 config["platforms"] = platforms_cfg
                 self.save_config(config)
+            if not text:
                 return {
                     "ok": False,
                     "message": get_platform_last_error(platform_id) or "接口已连通，但没有返回内容",
                     "latency_ms": latency,
                 }
-            platform_cfg["api_test_status"] = "success"
-            config["platforms"] = platforms_cfg
-            self.save_config(config)
             return {"ok": True, "message": str(text).strip(), "latency_ms": latency}
         except Exception as exc:
             from ui.api_config import _classify_test_exception
             latency = int((_time.monotonic() - t0) * 1000)
-            platforms_cfg = config.get("platforms", {}) or {}
-            platform_cfg = platforms_cfg.get(platform_id, {})
-            if not isinstance(platform_cfg, dict):
-                platform_cfg = {}
-                platforms_cfg[platform_id] = platform_cfg
-            if platform_id == "local_model":
-                platforms_cfg.pop("local_qwen", None)
-            platform_cfg["api_test_status"] = "error"
-            config["platforms"] = platforms_cfg
-            self.save_config(config)
+            with self._lock:
+                config = self.load_config()
+                platforms_cfg = config.get("platforms", {}) or {}
+                platform_cfg = platforms_cfg.get(platform_id, {})
+                if not isinstance(platform_cfg, dict):
+                    platform_cfg = {}
+                    platforms_cfg[platform_id] = platform_cfg
+                if platform_id == "local_model":
+                    platforms_cfg.pop("local_qwen", None)
+                platform_cfg["api_test_status"] = "error"
+                config["platforms"] = platforms_cfg
+                self.save_config(config)
             return {"ok": False, "message": _classify_test_exception(platform_id, exc), "latency_ms": latency}
 
     # ── Task CRUD ────────────────────────────────────────────────
@@ -8550,8 +8528,10 @@ return changedCount
                     "keyword": str(kw_raw.get("keyword", "")).strip(),
                     "brand": str(kw_raw.get("brand", "")).strip(),
                     "platforms": [_normalize_platform_id(p) for p in kw_raw.get("platforms", [])],
-                    "mode": str(kw_raw.get("mode", "api")).strip(),
+                    "mode": str(kw_raw.get("mode", "browser")).strip(),
                 }
+                if kw["mode"] not in {"browser", "recognition"}:
+                    kw["mode"] = "browser"
                 if "deep_think" in kw_raw and isinstance(kw_raw["deep_think"], dict):
                     # 前端用显示名（"豆包"、"DeepSeek"等）作为 key，需要转换为平台 ID
                     kw["deep_think"] = {
@@ -8685,7 +8665,7 @@ return changedCount
                 if platform in keyword_platforms
             ]
             mode = str(raw_keyword.get("mode", "") or "browser").strip()
-            if mode not in {"browser", "recognition", "api", "smart"}:
+            if mode not in {"browser", "recognition"}:
                 mode = "browser"
             keywords.append(
                 {
@@ -8792,7 +8772,7 @@ return changedCount
             '  "missing_info": ["还需要用户补充的信息"]\n'
             "}\n\n"
             "规则补充：\n"
-            "- mode 只能是 browser / recognition / api / smart。\n"
+            "- mode 只能是 browser / recognition。\n"
             "- 如果用户没指定运行日，默认给全周。\n"
             "- 如果用户只明确提到品牌词，就只保留品牌词；不要擅自补充更多关键词。\n"
             "- platforms 和 deep_think_platforms 都使用平台 ID，不要用中文显示名。\n"
@@ -9459,7 +9439,7 @@ return changedCount
 
             allowed_sections = [
                 "scheduler", "ai_assistant", "local_model", "recognition",
-                "search", "smart_vision", "profile", "cloud_sync",
+                "search", "profile", "cloud_sync",
                 "default_notification",
                 "context_snapshots",
                 "query_execution",
@@ -9470,7 +9450,7 @@ return changedCount
             ]
             query_execution_payload = normalized_payload.get("query_execution")
             if isinstance(query_execution_payload, dict):
-                for mode in ("browser", "smart"):
+                for mode in ("browser",):
                     mode_cfg = query_execution_payload.get(mode)
                     if not isinstance(mode_cfg, dict):
                         continue
@@ -9496,7 +9476,7 @@ return changedCount
                     config.get("browser_automation", {}) or {},
                     normalized_payload["browser_automation"],
                 )
-            for section in ("ai_assistant", "recognition", "smart_vision"):
+            for section in ("ai_assistant", "recognition"):
                 section_cfg = config.get(section, {}) or {}
                 if isinstance(section_cfg, dict) and section_cfg.get("platform"):
                     section_cfg["platform"] = _normalize_platform_id(str(section_cfg.get("platform", "") or "").strip())
@@ -9506,20 +9486,6 @@ return changedCount
                 if "api_key" in normalized_payload["tavily"]:
                     search_cfg["tavily_api_key"] = str(normalized_payload["tavily"].get("api_key", "") or "").strip()
                 config["search"] = search_cfg
-            if "platforms" in normalized_payload and isinstance(normalized_payload["platforms"], dict):
-                platforms_cfg = dict(config.get("platforms", {}) or {})
-                for pid, platform_patch in normalized_payload["platforms"].items():
-                    if not isinstance(platform_patch, dict):
-                        continue
-                    real_pid = _normalize_platform_id(str(pid or "").strip())
-                    if not real_pid:
-                        continue
-                    current_platform_cfg = dict(platforms_cfg.get(real_pid, {}) or {})
-                    for field in ("api_model", "api_fast_model", "api_deep_model"):
-                        if field in platform_patch:
-                            current_platform_cfg[field] = str(platform_patch.get(field, "") or "").strip()
-                    platforms_cfg[real_pid] = current_platform_cfg
-                config["platforms"] = platforms_cfg
             if "screenshot_template" in normalized_payload and isinstance(normalized_payload["screenshot_template"], dict):
                 screenshot_cfg = dict(config.get("screenshot", {}) or {})
                 screenshot_cfg["decoration"] = get_default_decoration_theme()
@@ -10419,8 +10385,7 @@ return changedCount
 
     def _update_single_platform_config(self, platform: str, patch: dict[str, Any], message: str) -> dict:
         real_platform = _normalize_platform_id(platform)
-        payload = {"platforms": {real_platform: patch}}
-        result = self.save_platform_config(payload)
+        result = self.save_platform_config({"platforms": {real_platform: patch}})
         if result.get("ok"):
             result["message"] = message
         return result
@@ -10451,30 +10416,26 @@ return changedCount
         model = str(payload.get("model", "") or "").strip()
         if not platform or not model:
             return {"ok": False, "message": "缺少 platform 或 model"}
-        with self._lock:
-            config = self.load_config()
-            current_cfg = _get_platform_config_entry(config, platform)
-            options = _normalize_model_options(current_cfg.get("model_options", []))
-            if model not in options:
-                options.append(model)
-            patch: dict[str, Any] = {"model_options": options}
-            if bool(payload.get("make_primary", False)):
-                patch["api_model"] = model
-            return self._update_single_platform_config(platform, patch, f"已给平台 {_pid_to_display(platform)} 添加模型 {model}")
+        current_cfg = _get_platform_config_entry(self.load_config(), platform)
+        options = _normalize_model_options(current_cfg.get("model_options", []))
+        if model not in options:
+            options.append(model)
+        patch: dict[str, Any] = {"model_options": options}
+        if bool(payload.get("make_primary", False)):
+            patch["api_model"] = model
+        return self._update_single_platform_config(platform, patch, f"已给平台 {_pid_to_display(platform)} 添加模型 {model}")
 
     def remove_platform_model_option(self, payload: dict[str, Any]) -> dict:
         platform = _normalize_platform_id(str(payload.get("platform", "") or "").strip())
         model = str(payload.get("model", "") or "").strip()
         if not platform or not model:
             return {"ok": False, "message": "缺少 platform 或 model"}
-        with self._lock:
-            config = self.load_config()
-            current_cfg = _get_platform_config_entry(config, platform)
-            options = [item for item in _normalize_model_options(current_cfg.get("model_options", [])) if item != model]
-            patch: dict[str, Any] = {"model_options": options}
-            if str(current_cfg.get("api_model", "") or "").strip() == model:
-                patch["api_model"] = options[0] if options else ""
-            return self._update_single_platform_config(platform, patch, f"已从平台 {_pid_to_display(platform)} 移除模型 {model}")
+        current_cfg = _get_platform_config_entry(self.load_config(), platform)
+        options = [item for item in _normalize_model_options(current_cfg.get("model_options", [])) if item != model]
+        patch: dict[str, Any] = {"model_options": options}
+        if str(current_cfg.get("api_model", "") or "").strip() == model:
+            patch["api_model"] = options[0] if options else ""
+        return self._update_single_platform_config(platform, patch, f"已从平台 {_pid_to_display(platform)} 移除模型 {model}")
 
     def replace_platform_model_options(self, payload: dict[str, Any]) -> dict:
         platform = _normalize_platform_id(str(payload.get("platform", "") or "").strip())
@@ -10505,8 +10466,8 @@ return changedCount
 
     def set_detection_mode(self, payload: dict[str, Any]) -> dict:
         mode = str(payload.get("mode", "") or "").strip()
-        if mode not in {"browser", "recognition", "api", "smart"}:
-            return {"ok": False, "message": "mode 必须是 browser/recognition/api/smart"}
+        if mode not in {"browser", "recognition"}:
+            return {"ok": False, "message": "mode 必须是 browser/recognition"}
         result = self.save_settings({"detection_mode": mode})
         result["message"] = f"已切换全局检测模式为 {mode}"
         return result
@@ -10565,21 +10526,7 @@ return changedCount
         if not platform or not model:
             return {"ok": False, "message": "缺少 platform 或 model"}
         result = self.save_settings({"ai_assistant": {"platform": _normalize_platform_id(platform), "model": model}})
-        result["message"] = "已更新智能模式文本模型"
-        return result
-
-    def set_smart_vision_config(self, payload: dict[str, Any]) -> dict:
-        patch: dict[str, Any] = {}
-        if "enabled" in payload:
-            patch["enabled"] = bool(payload["enabled"])
-        if "platform" in payload:
-            patch["platform"] = _normalize_platform_id(str(payload.get("platform", "") or "").strip())
-        if "model" in payload:
-            patch["model"] = str(payload.get("model", "") or "").strip()
-        if not patch:
-            return {"ok": False, "message": "未提供 smart_vision 字段"}
-        result = self.save_settings({"smart_vision": patch})
-        result["message"] = "已更新智能模式视觉能力配置"
+        result["message"] = "已更新 AI 助手文本模型"
         return result
 
     def set_recognition_local_ocr(self, payload: dict[str, Any]) -> dict:
@@ -10742,8 +10689,6 @@ return changedCount
                 result = self.set_monitoring_enabled(params)
             elif action == "set_ai_assistant_model":
                 result = self.set_ai_assistant_model(params)
-            elif action == "set_smart_vision_config":
-                result = self.set_smart_vision_config(params)
             elif action == "set_recognition_local_ocr":
                 result = self.set_recognition_local_ocr(params)
             elif action == "set_recognition_ai_fallback":
@@ -10815,10 +10760,10 @@ return changedCount
                 result = self.save_profile(params.get("payload") or params)
             elif action == "save_settings":
                 result = self.save_settings(params.get("payload") or params)
-            elif action == "refresh_context_snapshots":
-                result = self.refresh_context_snapshots(params.get("payload") or params)
             elif action == "save_platform_config":
                 result = self.save_platform_config(params.get("payload") or params)
+            elif action == "refresh_context_snapshots":
+                result = self.refresh_context_snapshots(params.get("payload") or params)
             elif action == "recognition_action":
                 result = self.recognition_action({"action": str(params.get("action", "") or "").strip()})
             elif action == "sync_todos":

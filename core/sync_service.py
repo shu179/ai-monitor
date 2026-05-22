@@ -19,7 +19,6 @@ _SYNC_SETTINGS_SECTIONS = (
     "ai_assistant",
     "recognition",
     "search",
-    "smart_vision",
     "default_notification",
     "query_execution",
     "screenshot",
@@ -30,8 +29,6 @@ _SYNC_SETTINGS_SECTIONS = (
 _SYNC_PLATFORM_FIELDS = (
     "enabled",
     "api_model",
-    "api_fast_model",
-    "api_deep_model",
     "model_options",
 )
 

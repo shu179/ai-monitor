@@ -3,7 +3,7 @@
 
 设计目标：
 - 按全局每周时间表唤醒
-- 按模式分轮执行：保险(api) -> 抓取(browser) -> 智能(smart)
+- 按抓取模式执行自动任务
 - 每轮内部按任务规模、平均耗时和历史失败惩罚排序
 - 展示层状态和调度层状态解耦
 - 识别模式不进入主动调度队列
@@ -25,11 +25,9 @@ from .time_utils import local_now
 
 
 WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-MODE_ORDER = ["api", "browser", "smart"]
+MODE_ORDER = ["browser"]
 MODE_LABELS = {
-    "api": "保险模式",
     "browser": "抓取模式",
-    "smart": "智能模式",
 }
 PROCESSED_ROUND_STATUSES = {"success", "skipped", "partial", "failed", "pending", "query_failed", "send_failed"}
 DEFAULT_WEEKLY_TIMES = {
@@ -175,8 +173,6 @@ def _count_queries(task: dict) -> int:
 
 
 def _mode_weight(mode: str) -> int:
-    if mode == "smart":
-        return 5
     if mode == "browser":
         return 3
     return 1

@@ -42,14 +42,14 @@ class HomeCopyTests(unittest.TestCase):
                     }
                 ]
             },
-            mode_key="api",
+            mode_key="browser",
             monitoring_running=False,
             enabled_task_count=1,
             now=datetime(2026, 1, 2, 9, 0, 0),
         )
 
         self.assertIn("品牌A", result["headline"])
-        self.assertNotIn("保险模式走平台 API", result["headline"])
+        self.assertNotIn("抓取模式适合", result["headline"])
 
     def test_greeting_boundaries(self) -> None:
         cases = [

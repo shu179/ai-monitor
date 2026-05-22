@@ -2,7 +2,6 @@
 本地 OCR 运行时
 
 识别模式默认走本地 OCR，不上传图片。
-仅当显式开启 AI fallback 时，才交给视觉模型兜底。
 """
 
 from __future__ import annotations
@@ -527,15 +526,13 @@ def build_match_summary(text: str, brands: list[str]) -> str:
 
 
 def is_ai_fallback_enabled(config: dict) -> bool:
-    recognition_cfg = (config or {}).get("recognition", {})
-    return bool(recognition_cfg.get("ai_fallback_enabled", False))
+    return False
 
 
 def dump_provider_status(config: dict) -> str:
     return json.dumps(
         {
             "providers": _preferred_providers(config),
-            "ai_fallback_enabled": is_ai_fallback_enabled(config),
         },
         ensure_ascii=False,
     )

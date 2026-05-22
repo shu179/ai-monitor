@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 from datetime import timedelta
 from pathlib import Path
 import tempfile
@@ -13,6 +14,7 @@ from web_backend import (
     _validate_browser_target_url,
 )
 from core.app_paths import resolve_app_path
+import core.daily_task_state as dts
 from core.time_utils import local_now
 
 
@@ -89,6 +91,21 @@ class FakeManualPlatformManager:
 
 
 class WebBackendRecognitionTestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._original_state_path = dts.STATE_PATH
+        self._original_data_dir = os.environ.get("AIBRANDMONITOR_DATA_DIR")
+        os.environ["AIBRANDMONITOR_DATA_DIR"] = self._tmpdir.name
+        dts.STATE_PATH = Path(self._tmpdir.name) / "daily_task_status.json"
+
+    def tearDown(self) -> None:
+        dts.STATE_PATH = self._original_state_path
+        if self._original_data_dir is None:
+            os.environ.pop("AIBRANDMONITOR_DATA_DIR", None)
+        else:
+            os.environ["AIBRANDMONITOR_DATA_DIR"] = self._original_data_dir
+        self._tmpdir.cleanup()
+
     def test_sensitive_get_exact_paths_require_session_token(self):
         self.assertIn("/api/debug/paths", GET_EXACT_SESSION_TOKEN_REQUIRED_PATHS)
         self.assertIn("/api/browser-auth", GET_EXACT_SESSION_TOKEN_REQUIRED_PATHS)
@@ -229,7 +246,7 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
         runtime._recognition_manager = FakeRecognitionManager(running=False, has_tasks=True)
         runtime.load_config = Mock(return_value={"detection_mode": "recognition", "tasks": []})
 
-        with patch("web_backend.build_query_execution_policy", return_value=Mock(use_session_pool=False, use_platform_serial=False)):
+        with patch("web_backend.build_query_execution_policy", return_value=Mock(use_session_pool=True)):
             runtime.begin_mode_round("recognition", [], None, {})
 
         self.assertTrue(runtime._recognition_manager.started)
@@ -433,6 +450,51 @@ class WebBackendRecognitionTestTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         prime_mock.assert_called_once()
+        runtime._stop_recognition_test_session(restore_previous=False)
+
+    def test_start_recognition_test_session_clears_previous_test_pool_but_keeps_day_success(self):
+        runtime = AppRuntime()
+        runtime.load_config = Mock(return_value={"recognition": {}})
+        task = {
+            "task_id": "task-3b",
+            "name": "品牌任务",
+            "brand": "品牌任务",
+            "recognition_batch_size": 2,
+            "_daily_state_source": "manual_test",
+            "keywords": [{"keyword": "品牌词", "brand": "品牌任务", "platforms": ["doubao"], "mode": "recognition"}],
+        }
+
+        screenshot_dir = Path(self._tmpdir.name) / "screenshots"
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        screenshot_path = screenshot_dir / "first_round.jpg"
+        screenshot_path.write_bytes(b"img")
+
+        dts.apply_task_keyword_updates(
+            task,
+            [
+                {
+                    "keyword": "品牌词",
+                    "brand": "品牌任务",
+                    "run_success": True,
+                    "screenshot_saved": True,
+                    "failure_reason": "",
+                    "platform": "doubao",
+                    "image_path": str(screenshot_path),
+                }
+            ],
+            source_mode="test",
+        )
+        dts.mark_task_sent(task, source_mode="test", message="first round sent")
+
+        with patch("core.recognition.ClipboardRecognitionManager", FakeRecognitionManager):
+            result = runtime._start_recognition_test_session(task)
+
+        self.assertTrue(result["ok"])
+        status = dts.get_task_day_status(task)
+        self.assertEqual(status["brand_status"], "sent")
+        self.assertEqual(status["test_status"], "running")
+        self.assertEqual(status["test_actual_screenshot_count"], 0)
+        self.assertEqual(status["test_completed_keywords"], [])
         runtime._stop_recognition_test_session(restore_previous=False)
 
     def test_get_active_recognition_manager_reaps_finished_test_session(self):

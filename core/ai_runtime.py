@@ -1,7 +1,7 @@
 """
 AI 运行时能力
 
-提供给智能模式和搜搜复用的轻量能力：
+提供给搜搜和 AI 辅助流程复用的轻量能力：
 - 选择 AI 后端
 - 通过模型判断品牌是否被提及
 - 通过模型识别截图中的品牌
@@ -109,7 +109,7 @@ def judge_brand_mention(config: dict, platform_name: str, keyword: str, brand: s
     backend_cfg = PLATFORM_API_CONFIG.get(platform_code, {})
     base_url = backend_cfg.get("base_url")
     if not base_url:
-        raise ValueError(f"{platform_code} 暂不支持智能模式 AI 判断")
+        raise ValueError(f"{platform_code} 暂不支持 AI 判断")
 
     system_prompt = (
         "你负责判断 AI 回答内容里是否明确提到了目标品牌。"

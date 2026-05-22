@@ -204,6 +204,8 @@ def _dispatch_default_keyword_queries(
         platforms = kw_entry.get("platforms", [])
         task_name = task.get("name", default_brand)
         mode = runtime_mode or str(kw_entry.get("mode", "browser") or "browser").strip()
+        if mode not in {"browser", "recognition"}:
+            mode = "browser"
 
         if not keyword or not platforms:
             continue

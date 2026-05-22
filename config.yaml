@@ -127,9 +127,6 @@ ai_assistant:
   model: doubao-seed-2-0-pro-260215
 recognition:
   safe_mode_ocr_enabled: true
-  ai_fallback_enabled: false
-  platform: doubao
-  model: doubao-seed-2-0-pro-260215
   dom_render_mode: true
   dom_render_min_length: 500
   dom_render_max_length: 5000
@@ -156,14 +153,6 @@ search:
   model_pool:
   - sonar-pro
   - sonar
-smart_vision:
-  enabled: false
-  platform: doubao
-  model: doubao-seed-2-0-pro-260215
-selector_agent:
-  enabled: false
-  platform: doubao
-  model: doubao-seed-2-0-pro-260215
 browser_automation:
   doubao:
     debug_poll_metrics: true

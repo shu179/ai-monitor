@@ -160,5 +160,4 @@ python test_batch_feature.py
 - [ ] 支持导出报告为 Excel/PDF
 - [ ] 支持历史报告查看
 - [ ] 支持自定义查询间隔
-- [ ] 支持 API 模式批量测试
 - [ ] 支持批量测试模板保存

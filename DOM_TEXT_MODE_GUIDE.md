@@ -27,9 +27,6 @@ DOM文本渲染模式是识别模式的增强版本，将监听目标从**剪贴
 ```yaml
 recognition:
   safe_mode_ocr_enabled: true
-  ai_fallback_enabled: false
-  platform: doubao
-  model: doubao-seed-2-0-pro-260215
   
   # DOM文本渲染模式配置
   dom_render_mode: true                    # 启用文本监听模式（而非截图监听）

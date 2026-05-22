@@ -1822,7 +1822,7 @@ export function SearchContent({ availableModels, bootstrap, onDataChanged }: Sea
             <div className="px-3 pt-3 flex min-h-9 items-center relative border-b border-gray-50 pb-2 mb-1">
               {models.length === 0 ? (
                 <span className="inline-flex items-center px-2 py-1 text-[11px] font-bold leading-none text-amber-500 uppercase tracking-wider">
-                  请先在 API 配置页面配置大模型
+                  请先在系统设置的 API 密钥与模型里配置大模型
                 </span>
               ) : (
                 <button

@@ -211,12 +211,12 @@ function taskToBrand(task: TaskFull, idx: number) {
 }
 
 export function BrandsContent({
-  currentDetectionMode = "smart",
+  currentDetectionMode = "browser",
   cloudRole = "",
   onSaveSuccess,
   onRecognitionTestStart,
 }: {
-  currentDetectionMode?: "browser" | "recognition" | "api" | "smart";
+  currentDetectionMode?: "browser" | "recognition";
   cloudRole?: string;
   onSaveSuccess?: (message?: string) => void;
   onRecognitionTestStart?: (payload: { taskId: string; taskName: string }) => void;

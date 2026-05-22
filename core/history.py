@@ -90,7 +90,7 @@ _STRUCTURAL_ERROR_PATTERNS = (
     "未配置 api_key",
     "未配置 api_model",
     "未配置有效 webhook",
-    "当前仅支持 api 模式或尚未接入浏览器适配",
+    "当前平台尚未接入浏览器适配",
     "不支持的平台",
     "未登录",
     "登录失效",

@@ -78,12 +78,8 @@ def get_home_messages(context: dict) -> list[str]:
 
     if mode == "抓取模式":
         messages.append("🧭 抓取模式适合固定脚本跑浏览器、抓页面内容和规则判断。")
-    elif mode == "保险模式":
-        messages.append("🛡️ 保险模式走平台 API，默认联网搜索，更适合结构容易变化时做稳定兜底。")
     elif mode == "识别模式":
         messages.append("🖼️ 识别模式会低负载监听新截图，按批次确认后再排队发送。主界面右上角可直接点“仅启动识别”。")
-    elif mode == "智能模式":
-        messages.append("🤖 智能模式由 AI 接管浏览器流程，适合更灵活但更重的任务。")
 
     seen = set()
     deduped = []

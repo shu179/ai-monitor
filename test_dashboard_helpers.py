@@ -1,6 +1,8 @@
 import unittest
 from collections import Counter
 from datetime import date, timedelta
+from pathlib import Path
+import tempfile
 
 import backend_lib.dashboard_trends as dashboard_trends
 from backend_lib.dashboard import (
@@ -121,7 +123,7 @@ class DashboardHelperTests(unittest.TestCase):
             day_status_loader=lambda _task, _target_date=None: status,
             scheduler_state_loader=lambda unit_id: {
                 "last_auto_run_date": "2026-01-05",
-                "last_round_status": "failed" if unit_id.endswith("::api") else "success",
+                "last_round_status": "failed" if unit_id.endswith("::browser") else "success",
                 "last_auto_fail_at": "2026-01-05 10:01:00",
                 "last_failure_kind": "query",
             },
@@ -131,7 +133,7 @@ class DashboardHelperTests(unittest.TestCase):
 
         self.assertEqual(len(failed), 1)
         item = failed[0]
-        self.assertEqual(item["failedModes"], ["保险模式"])
+        self.assertEqual(item["failedModes"], ["抓取模式"])
         self.assertEqual(item["issueType"], "query")
         self.assertEqual(item["failedQueries"][0]["platform"], "豆包")
         self.assertEqual(item["failedQueries"][0]["error_message"], "关键词执行失败")
@@ -227,6 +229,39 @@ class DashboardHelperTests(unittest.TestCase):
             },
         )
         self.assertEqual(quota_payload["completedKeywords"], [])
+
+    def test_collect_today_successful_task_payload_reads_screenshot_paths_from_failure_progress(self) -> None:
+        task = {"task_id": "task-1", "name": "任务一", "brand": "品牌A"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            screenshot_path = Path(tmpdir) / "retained.png"
+            screenshot_path.write_bytes(b"fake")
+            status = {
+                "status": "send_failed",
+                "brand_status": "send_failed",
+                "extra": {
+                    "completed_keywords": ["关键词1"],
+                    "detected_platforms": ["doubao"],
+                    "screenshot_paths": [str(screenshot_path)],
+                    "actual_screenshot_count": 1,
+                },
+                "official_extra": {
+                    "completed_keywords": ["关键词1"],
+                    "detected_platforms": ["doubao"],
+                    "screenshot_paths": [str(screenshot_path)],
+                    "actual_screenshot_count": 1,
+                },
+                "keyword_states": {},
+            }
+
+            payload = _collect_today_successful_task_payload(
+                task,
+                day_status_loader=lambda _task, _target_date=None: status,
+            )
+
+        self.assertEqual(payload["completedKeywords"], ["关键词1"])
+        self.assertEqual(payload["detectedPlatforms"], ["doubao"])
+        self.assertEqual(payload["screenshotPaths"], [str(screenshot_path)])
+        self.assertEqual(payload["actualScreenshotCount"], 1)
 
     def test_compute_fixed_screenshot_target_respects_flag_count_and_platform_floor(self) -> None:
         self.assertEqual(

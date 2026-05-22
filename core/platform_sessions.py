@@ -30,22 +30,6 @@ DEFAULT_QUERY_EXECUTION_SETTINGS: dict[str, dict[str, Any]] = {
         "restart_after_manual_recovery": True,
         "restart_after_structural_failures": 2,
     },
-    "smart": {
-        "strategy": "session_pool",
-        "session_pool_dispatch": "platform_batch",
-        "session_pool_platform_batch_size": 2,
-        "session_ttl_minutes_min": 120,
-        "session_ttl_minutes_max": 150,
-        "session_max_queries_min": 110,
-        "session_max_queries_max": 140,
-        "min_queries_window_minutes": 30,
-        "min_queries_per_window": 10,
-        "single_query_timeout_minutes": 12,
-        "no_progress_timeout_minutes": 30,
-        "min_restart_cooldown_minutes": 10,
-        "restart_after_manual_recovery": True,
-        "restart_after_structural_failures": 2,
-    },
 }
 
 SUPPORTED_STRATEGIES = {"single_query_isolated", "platform_serial", "session_pool"}
@@ -119,7 +103,7 @@ def build_query_execution_policy(config: dict | None, mode: str) -> QueryExecuti
         if normalized_mode
         else {}
     )
-    force_mode_defaults = normalized_mode in {"browser", "smart"}
+    force_mode_defaults = normalized_mode == "browser"
     strategy = normalize_query_execution_strategy(
         defaults.get("strategy", "session_pool") if force_mode_defaults else raw.get("strategy", defaults.get("strategy", "session_pool")),
         default=str(defaults.get("strategy", "session_pool") or "session_pool"),

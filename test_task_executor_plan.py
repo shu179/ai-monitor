@@ -3,7 +3,7 @@ from pathlib import Path
 from core.task_executor_plan import build_task_execution_plan, historical_query_result
 
 
-def test_build_task_execution_plan_applies_runtime_mode_to_all_keywords(tmp_path):
+def test_build_task_execution_plan_normalizes_legacy_runtime_mode_to_browser(tmp_path):
     keywords = [
         {
             "keyword": "品牌A 评测",
@@ -23,13 +23,13 @@ def test_build_task_execution_plan_applies_runtime_mode_to_all_keywords(tmp_path
         task={"fixed_screenshot_enabled": True, "fixed_screenshot_count": 1},
         keywords=keywords,
         default_brand="品牌A",
-        runtime_mode="api",
+        runtime_mode="old_global_runner",
         historical_success_map={},
         manual_test_replay_completed_keywords=False,
     )
 
     assert [entry["keyword"] for entry in plan.executable_entries] == ["品牌A 评测", "品牌A 识别"]
-    assert [entry["mode"] for entry in plan.executable_entries] == ["api", "api"]
+    assert [entry["mode"] for entry in plan.executable_entries] == ["browser", "browser"]
     assert plan.ordered_platforms == ["doubao", "deepseek", "kimi"]
     assert plan.total_queries == 3
     assert plan.expected_query_count == 3

@@ -140,12 +140,8 @@ def get_default_decoration_theme() -> dict:
 
 
 def get_decoration_theme(config: dict | None = None) -> dict:
-    """从配置中读取截图装饰主题，并与默认值合并。"""
-    theme = get_default_decoration_theme()
-    user_theme = ((config or {}).get("screenshot") or {}).get("decoration") or {}
-    if isinstance(user_theme, dict):
-        theme = _deep_merge(theme, user_theme)
-    return theme
+    """返回固定启用的默认截图装饰主题。"""
+    return get_default_decoration_theme()
 
 
 def decorate_screenshot(

@@ -31,8 +31,6 @@ DEFAULT_TASK_PLATFORM_LABELS: dict[str, str] = {
 DEFAULT_TASK_MODE_TITLES: dict[str, str] = {
     "browser": "抓取模式",
     "recognition": "识别模式",
-    "api": "保险模式",
-    "smart": "智能模式",
 }
 
 
@@ -69,7 +67,7 @@ def _collect_failed_modes_today(
     latest_failed_at = ""
     latest_failure_kind = ""
 
-    for mode in ("api", "browser", "smart"):
+    for mode in ("browser",):
         entry = load_scheduler_state(f"{task_id}::{mode}")
         if str(entry.get("last_auto_run_date") or "").strip() != current_today_text:
             continue
@@ -353,7 +351,16 @@ def _collect_today_successful_task_payload(
         for item in (status_extra.get("detected_platforms") or [])
         if str(item).strip()
     ]
-    screenshot_paths = _collect_successful_screenshot_paths(keyword_states)
+    status_screenshot_paths = [
+        str(item).strip()
+        for item in (
+            status_extra.get("screenshot_paths")
+            or official_extra.get("screenshot_paths")
+            or []
+        )
+        if screenshot_path_exists(str(item).strip())
+    ]
+    screenshot_paths = normalize_values(status_screenshot_paths + _collect_successful_screenshot_paths(keyword_states))
     history_results = _load_today_successful_query_results(task_name, task_id)
     if history_results:
         completed_keywords = normalize_values(

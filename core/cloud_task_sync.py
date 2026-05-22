@@ -1408,14 +1408,14 @@ def _normalize_keywords(
     if not isinstance(raw_keywords, list):
         return []
     normalized: list[dict[str, Any]] = []
-    safe_mode = fallback_mode if fallback_mode in {"browser", "recognition", "api", "smart"} else "browser"
+    safe_mode = fallback_mode if fallback_mode in {"browser", "recognition"} else "browser"
     for item in raw_keywords:
         if isinstance(item, dict):
             keyword = str(item.get("keyword") or item.get("name") or "").strip()
             keyword_brand = str(item.get("brand") or brand or "").strip()
             platforms = _normalize_platform_list(item.get("platforms")) or list(fallback_platforms)
             mode = str(item.get("mode") or safe_mode).strip()
-            if mode not in {"browser", "recognition", "api", "smart"}:
+            if mode not in {"browser", "recognition"}:
                 mode = safe_mode
             deep_think = _normalize_deep_think(item.get("deep_think"), platforms)
             if not deep_think:

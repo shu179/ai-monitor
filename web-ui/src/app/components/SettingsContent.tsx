@@ -2,16 +2,10 @@ import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { Settings2, Save, RefreshCw, CalendarDays, Clock, X, Edit2, ChevronDown, Upload, Download, Send, ListFilter, RotateCcw, Wrench } from "lucide-react";
 import { ImageWithFallback } from "./figma/ImageWithFallback";
 import { ConfirmModal } from "./ConfirmModal";
-import { browserAuthAction, checkAppUpdate, diagnoseSelectorHeal, diagnoseSelectorPauseState, fetchAccountCrawlExclusions, fetchBrowserAuth, fetchLocalModelStatus, fetchLocalUpdatePlan, fetchPlatformKeys, fetchSettings, pickDirectory, prepareAppUpdate, prepareLocalModel, readSettingsCache, restoreAccountCrawlExclusions, savePlatformConfig, saveSettings, saveProfile, startLocalUpdate, refreshContextSnapshots, testLocalModel, testSchedulerNotificationWebhook, type AppUpdateStatusSnapshot, type BrowserAuthPlatformSnapshot, type ExcludedArticleLinkSnapshot, type LocalModelStatus, type PlatformKeyInfo, type SelectorAgentSettingsSnapshot, type SelectorHealFieldResult, type SelectorPauseStateResponse } from "../lib/backend";
+import { browserAuthAction, checkAppUpdate, diagnoseSelectorHeal, diagnoseSelectorPauseState, fetchAccountCrawlExclusions, fetchBrowserAuth, fetchLocalModelStatus, fetchLocalUpdatePlan, fetchSettings, pickDirectory, prepareAppUpdate, prepareLocalModel, readSettingsCache, restoreAccountCrawlExclusions, saveSettings, saveProfile, startLocalUpdate, testLocalModel, testSchedulerNotificationWebhook, type AppUpdateStatusSnapshot, type BrowserAuthPlatformSnapshot, type ExcludedArticleLinkSnapshot, type LocalModelStatus, type SelectorHealFieldResult, type SelectorPauseStateResponse } from "../lib/backend";
 import { notifySaveSuccess } from "../lib/saveToast";
 import { DatePickerField } from "./ui/date-picker-field";
 import { APIContent } from "./APIContent";
-
-type PlatformOption = {
-  id: string;
-  name: string;
-  models: string[];
-};
 
 function getExcludedArticleUrl(link: ExcludedArticleLinkSnapshot): string {
   return String(link.url || "").trim();
@@ -107,7 +101,7 @@ const BROWSER_AUTOMATION_RUNTIME_FIELDS: BrowserAutomationField[] = [
   {
     key: "failure_backoff_max_seconds",
     label: "失败退避上限秒数 :",
-    placeholder: "20",
+    placeholder: "12",
     advanced: true,
   },
 ];
@@ -149,28 +143,6 @@ function hasConfiguredAdvancedBrowserFields(
     return Boolean(String(values?.[field.key] || "").trim());
   });
 }
-
-type ApiModeModelState = {
-  fastModel: string;
-  deepModel: string;
-};
-
-type QueryExecutionModeSettings = {
-  strategy: string;
-  sessionPoolDispatch: string;
-  sessionPoolPlatformBatchSize: string;
-  sessionTtlMinutesMin: string;
-  sessionTtlMinutesMax: string;
-  sessionMaxQueriesMin: string;
-  sessionMaxQueriesMax: string;
-  minQueriesWindowMinutes: string;
-  minQueriesPerWindow: string;
-  singleQueryTimeoutMinutes: string;
-  noProgressTimeoutMinutes: string;
-  minRestartCooldownMinutes: string;
-  restartAfterManualRecovery: boolean;
-  restartAfterStructuralFailures: string;
-};
 
 type LocalModelFormState = {
   defaultModel: string;
@@ -217,12 +189,6 @@ const SCHEDULER_DAYS = [0, 1, 2, 3, 4, 5, 6] as const;
 type BrowserAutomationPlatformId = (typeof BROWSER_AUTOMATION_PLATFORM_IDS)[number];
 type SchedulerDay = (typeof SCHEDULER_DAYS)[number];
 type ActiveDaysState = Record<SchedulerDay, boolean>;
-const API_MODE_SPLIT_PLATFORM_IDS = ["deepseek", "tongyi", "yuanbao"] as const;
-const QUERY_EXECUTION_MODE_IDS = ["browser", "smart"] as const;
-const QUERY_EXECUTION_STRATEGY_OPTIONS = [
-  { value: "platform_serial", label: "按平台分组串行" },
-  { value: "session_pool", label: "平台会话池（实验中）" },
-];
 const BROWSER_ANSWER_MODE_OPTIONS = [
   { value: "page", label: "页面原始截图" },
   { value: "dom", label: "DOM 文本生成" },
@@ -231,49 +197,10 @@ const RECOGNITION_MODE_OPTIONS = [
   { value: "screenshot", label: "截图 OCR 识别" },
   { value: "dom", label: "DOM 文本识别" },
 ];
-const SESSION_POOL_DISPATCH_OPTIONS = [
-  { value: "platform_batch", label: "按平台小批次轮转" },
-  { value: "keyword_round_robin", label: "按关键词轮转平台" },
-];
 const UPDATE_CHANNEL_OPTIONS = [
   { value: "stable", label: "稳定版" },
   { value: "beta", label: "Beta 预览" },
 ];
-const QUERY_EXECUTION_DEFAULTS: Record<(typeof QUERY_EXECUTION_MODE_IDS)[number], QueryExecutionModeSettings> = {
-  browser: {
-    strategy: "platform_serial",
-    sessionPoolDispatch: "platform_batch",
-    sessionPoolPlatformBatchSize: "2",
-    sessionTtlMinutesMin: "120",
-    sessionTtlMinutesMax: "150",
-    sessionMaxQueriesMin: "110",
-    sessionMaxQueriesMax: "140",
-    minQueriesWindowMinutes: "30",
-    minQueriesPerWindow: "10",
-    singleQueryTimeoutMinutes: "12",
-    noProgressTimeoutMinutes: "30",
-    minRestartCooldownMinutes: "10",
-    restartAfterManualRecovery: true,
-    restartAfterStructuralFailures: "2",
-  },
-  smart: {
-    strategy: "platform_serial",
-    sessionPoolDispatch: "platform_batch",
-    sessionPoolPlatformBatchSize: "2",
-    sessionTtlMinutesMin: "120",
-    sessionTtlMinutesMax: "150",
-    sessionMaxQueriesMin: "110",
-    sessionMaxQueriesMax: "140",
-    minQueriesWindowMinutes: "30",
-    minQueriesPerWindow: "10",
-    singleQueryTimeoutMinutes: "12",
-    noProgressTimeoutMinutes: "30",
-    minRestartCooldownMinutes: "10",
-    restartAfterManualRecovery: true,
-    restartAfterStructuralFailures: "2",
-  },
-};
-
 const BROWSER_AUTOMATION_CONFIGS: Record<(typeof BROWSER_AUTOMATION_PLATFORM_IDS)[number], BrowserAutomationPlatformConfig> = {
   doubao: {
     summary: "模式切换与新对话",
@@ -455,71 +382,8 @@ function buildBrowserAutomationPayload(
   );
 }
 
-function buildQueryExecutionState(): Record<string, QueryExecutionModeSettings> {
-  return Object.fromEntries(
-    QUERY_EXECUTION_MODE_IDS.map((mode) => [mode, { ...QUERY_EXECUTION_DEFAULTS[mode] }]),
-  ) as Record<string, QueryExecutionModeSettings>;
-}
-
-function normalizeQueryExecutionStrategy(value: unknown): string {
-  const normalized = String(value || "").trim();
-  if (normalized === "single_query_isolated") {
-    return "platform_serial";
-  }
-  return QUERY_EXECUTION_STRATEGY_OPTIONS.some((option) => option.value === normalized)
-    ? normalized
-    : "platform_serial";
-}
-
-function normalizeSessionPoolDispatch(value: unknown): string {
-  const normalized = String(value || "").trim();
-  return SESSION_POOL_DISPATCH_OPTIONS.some((option) => option.value === normalized)
-    ? normalized
-    : "platform_batch";
-}
-
-function buildQueryExecutionPayload(
-  settings: Record<string, QueryExecutionModeSettings>,
-): Record<string, Record<string, string | number | boolean>> {
-  return Object.fromEntries(
-    QUERY_EXECUTION_MODE_IDS.map((mode) => {
-      const current = settings[mode] || QUERY_EXECUTION_DEFAULTS[mode];
-      return [mode, {
-        strategy: normalizeQueryExecutionStrategy(current.strategy || QUERY_EXECUTION_DEFAULTS[mode].strategy),
-        session_pool_dispatch: normalizeSessionPoolDispatch(current.sessionPoolDispatch || QUERY_EXECUTION_DEFAULTS[mode].sessionPoolDispatch),
-        session_pool_platform_batch_size: parseInt(current.sessionPoolPlatformBatchSize, 10) || parseInt(QUERY_EXECUTION_DEFAULTS[mode].sessionPoolPlatformBatchSize, 10),
-        session_ttl_minutes_min: parseInt(current.sessionTtlMinutesMin, 10) || parseInt(QUERY_EXECUTION_DEFAULTS[mode].sessionTtlMinutesMin, 10),
-        session_ttl_minutes_max: parseInt(current.sessionTtlMinutesMax, 10) || parseInt(QUERY_EXECUTION_DEFAULTS[mode].sessionTtlMinutesMax, 10),
-        session_max_queries_min: parseInt(current.sessionMaxQueriesMin, 10) || parseInt(QUERY_EXECUTION_DEFAULTS[mode].sessionMaxQueriesMin, 10),
-        session_max_queries_max: parseInt(current.sessionMaxQueriesMax, 10) || parseInt(QUERY_EXECUTION_DEFAULTS[mode].sessionMaxQueriesMax, 10),
-        min_queries_window_minutes: parseInt(current.minQueriesWindowMinutes, 10) || parseInt(QUERY_EXECUTION_DEFAULTS[mode].minQueriesWindowMinutes, 10),
-        min_queries_per_window: parseInt(current.minQueriesPerWindow, 10) || parseInt(QUERY_EXECUTION_DEFAULTS[mode].minQueriesPerWindow, 10),
-        single_query_timeout_minutes: parseInt(current.singleQueryTimeoutMinutes, 10) || parseInt(QUERY_EXECUTION_DEFAULTS[mode].singleQueryTimeoutMinutes, 10),
-        no_progress_timeout_minutes: parseInt(current.noProgressTimeoutMinutes, 10) || parseInt(QUERY_EXECUTION_DEFAULTS[mode].noProgressTimeoutMinutes, 10),
-        min_restart_cooldown_minutes: parseInt(current.minRestartCooldownMinutes, 10) || parseInt(QUERY_EXECUTION_DEFAULTS[mode].minRestartCooldownMinutes, 10),
-        restart_after_manual_recovery: current.restartAfterManualRecovery,
-        restart_after_structural_failures: parseInt(current.restartAfterStructuralFailures, 10) || parseInt(QUERY_EXECUTION_DEFAULTS[mode].restartAfterStructuralFailures, 10),
-      }];
-    }),
-  );
-}
-
-const VISION_MODEL_HINTS: Record<string, string[]> = {
-  deepseek: ["vision", "vl", "janus", "image", "multi"],
-};
-
 function uniqStrings(values: string[]): string[] {
   return values.filter((value, index) => value && values.indexOf(value) === index);
-}
-
-function modelSupportsImageInput(platformId: string, model: string): boolean {
-  const normalizedPlatform = String(platformId || "").trim().toLowerCase();
-  const normalizedModel = String(model || "").trim().toLowerCase();
-  const hints = VISION_MODEL_HINTS[normalizedPlatform];
-  if (!hints || !normalizedModel) {
-    return true;
-  }
-  return hints.some((hint) => normalizedModel.includes(hint));
 }
 
 function readFileAsDataUrl(file: File): Promise<string> {
@@ -606,77 +470,6 @@ async function renderAvatarFromCrop(draft: AvatarCropDraft): Promise<string> {
   return canvas.toDataURL("image/jpeg", 0.9);
 }
 
-function buildPlatformOptions(
-  platformKeys: Record<string, PlatformKeyInfo>,
-  {
-    visionOnly = false,
-    currentPlatform = "",
-    currentModel = "",
-  }: { visionOnly?: boolean; currentPlatform?: string; currentModel?: string } = {},
-): PlatformOption[] {
-  const options = Object.entries(platformKeys)
-    .filter(([id, info]) => id === id.toLowerCase() && ((info.has_access ?? info.has_key) || id === "local_model"))
-    .map(([id, info]) => {
-      const baseModels = uniqStrings([
-        String(info.api_model || "").trim(),
-        String(info.api_fast_model || "").trim(),
-        String(info.api_deep_model || "").trim(),
-        ...((info.model_options || []).map((item) => String(item || "").trim())),
-        String(info.fast_model_default || "").trim(),
-        String(info.deep_model_default || "").trim(),
-        String(info.default_model || "").trim(),
-      ].filter(Boolean));
-      const models = visionOnly
-        ? baseModels.filter((model) => modelSupportsImageInput(id, model))
-        : baseModels;
-      return {
-        id,
-        name: PLATFORM_LABELS[id] || id,
-        models,
-      };
-    })
-    .filter((item) => item.models.length > 0)
-    .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
-
-  if (currentPlatform && currentModel) {
-    const existing = options.find((item) => item.id === currentPlatform);
-    if (existing) {
-      existing.models = withCurrentModel(existing.models, currentModel);
-    }
-  }
-
-  return options;
-}
-
-function buildApiModeModelState(platformKeys: Record<string, PlatformKeyInfo> = {}): Record<string, ApiModeModelState> {
-  return Object.fromEntries(
-    API_MODE_SPLIT_PLATFORM_IDS
-      .filter((id) => !!platformKeys[id]?.supports_split_models)
-      .map((id) => [
-        id,
-        {
-          fastModel: String(platformKeys[id]?.api_fast_model || "").trim(),
-          deepModel: String(platformKeys[id]?.api_deep_model || "").trim(),
-        },
-      ]),
-  );
-}
-
-const SCREENSHOT_TEMPLATE_DEFAULTS = {
-  title: "{platform}",
-  subtitle: "{brand}",
-  footer: "MONITOR SNAPSHOT",
-  accentColor: "#14C7F3",
-  backgroundStart: "#FCFDFF",
-  backgroundEnd: "#F7FAFF",
-  headerStart: "#173A43",
-  headerEnd: "#14C7F3",
-  outerPadding: "28",
-  headerHeight: "152",
-  radius: "28",
-  imageRadius: "22",
-};
-
 const DEFAULT_LOCAL_MODEL_CONFIG: LocalModelFormState = {
   defaultModel: "gemma4:e2b",
   binaryPath: "",
@@ -733,50 +526,6 @@ const LOCAL_MODEL_STATUS_META: Record<string, { label: string; className: string
   },
 };
 
-function withCurrentModel(models: string[], current: string): string[] {
-  if (!current) return models;
-  return models.includes(current) ? models : [current, ...models];
-}
-
-function formatSnapshotTime(value: unknown): string {
-  const text = String(value || "").trim();
-  if (!text) return "";
-  const date = new Date(text);
-  if (Number.isNaN(date.getTime())) return text;
-  return date.toLocaleString("zh-CN", { hour12: false });
-}
-
-function formatWeatherSnapshotLine(snapshot: Record<string, unknown> | undefined): string {
-  if (!snapshot) return "";
-  const summary = String(snapshot.summary || "").trim();
-  const city = String(snapshot.city || "").trim();
-  if (city && summary) return `${city} · ${summary}`;
-  return city || summary;
-}
-
-function formatCalendarSnapshotLine(snapshot: Record<string, unknown> | undefined): string {
-  if (!snapshot) return "";
-  const holidayName = String(snapshot.holiday_name || "").trim();
-  const isHoliday = Boolean(snapshot.is_holiday);
-  const isMakeupWorkday = Boolean(snapshot.is_makeup_workday);
-  const daysUntilRaw = snapshot.days_until;
-  const daysUntil = typeof daysUntilRaw === "number" ? daysUntilRaw : Number(daysUntilRaw);
-
-  if (!holidayName) {
-    return "";
-  }
-  if (isMakeupWorkday) {
-    return `${holidayName} 调休上班`;
-  }
-  if (isHoliday) {
-    return `${holidayName} 假期中`;
-  }
-  if (!Number.isNaN(daysUntil)) {
-    return `${holidayName} 还有 ${daysUntil} 天`;
-  }
-  return holidayName;
-}
-
 function normalizeLocalModelStatus(value: unknown): LocalModelStatus {
   const source = (value && typeof value === "object") ? value as Partial<LocalModelStatus> : {};
   return {
@@ -822,13 +571,9 @@ function normalizeLocalModelConfig(configValue: unknown, statusValue?: unknown):
 }
 
 export function SettingsContent({
-  localOCR,
-  setLocalOCR,
   onSaveSuccess,
   onLogout,
 }: {
-  localOCR?: boolean,
-  setLocalOCR?: (val: boolean) => void,
   onSaveSuccess?: (message?: string) => void,
   onLogout?: () => void | Promise<void>,
 }) {
@@ -836,7 +581,6 @@ export function SettingsContent({
     const mode = String(value || "page").trim().toLowerCase();
     return mode === "dom" ? "dom" : "page";
   }, []);
-  const [platformKeys, setPlatformKeys] = useState<Record<string, PlatformKeyInfo>>({});
   const [activeDays, setActiveDays] = useState<ActiveDaysState>({
     0: true, 1: true, 2: true, 3: true, 4: true, 5: false, 6: false
   });
@@ -850,15 +594,8 @@ export function SettingsContent({
   const [failureAlertCooldownMinutes, setFailureAlertCooldownMinutes] = useState("5");
   const [schedulerWebhookTesting, setSchedulerWebhookTesting] = useState(false);
   const [schedulerWebhookTestMessage, setSchedulerWebhookTestMessage] = useState("");
-  const [internalLocalOCR, setInternalLocalOCR] = useState(true);
-  
-  // Use passed prop or fallback to internal state
-  const isLocalOCREnabled = localOCR !== undefined ? localOCR : internalLocalOCR;
-  
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
-  const setLocalOCRHandler = setLocalOCR || setInternalLocalOCR;
 
-  const [aiAssist, setAiAssist] = useState(false);
   const [tavilyKey, setTavilyKey] = useState("");
   const [localModelConfig, setLocalModelConfig] = useState<LocalModelFormState>(DEFAULT_LOCAL_MODEL_CONFIG);
   const [localModelStatus, setLocalModelStatus] = useState<LocalModelStatus>(EMPTY_LOCAL_MODEL_STATUS);
@@ -868,37 +605,6 @@ export function SettingsContent({
   const [localModelTesting, setLocalModelTesting] = useState(false);
   const [localModelTestReply, setLocalModelTestReply] = useState("");
   const [browserAnswerMode, setBrowserAnswerMode] = useState("page");
-  
-  const [screenshotEnabled, setScreenshotEnabled] = useState(true);
-  const [showTime, setShowTime] = useState(true);
-  const [showFooter, setShowFooter] = useState(true);
-  const [showHighlight, setShowHighlight] = useState(true);
-  const [screenshotTitle, setScreenshotTitle] = useState(SCREENSHOT_TEMPLATE_DEFAULTS.title);
-  const [screenshotSubtitle, setScreenshotSubtitle] = useState(SCREENSHOT_TEMPLATE_DEFAULTS.subtitle);
-  const [screenshotFooter, setScreenshotFooter] = useState(SCREENSHOT_TEMPLATE_DEFAULTS.footer);
-  const [accentColor, setAccentColor] = useState(SCREENSHOT_TEMPLATE_DEFAULTS.accentColor);
-  const [backgroundStart, setBackgroundStart] = useState(SCREENSHOT_TEMPLATE_DEFAULTS.backgroundStart);
-  const [backgroundEnd, setBackgroundEnd] = useState(SCREENSHOT_TEMPLATE_DEFAULTS.backgroundEnd);
-  const [headerStart, setHeaderStart] = useState(SCREENSHOT_TEMPLATE_DEFAULTS.headerStart);
-  const [headerEnd, setHeaderEnd] = useState(SCREENSHOT_TEMPLATE_DEFAULTS.headerEnd);
-  const [outerPadding, setOuterPadding] = useState(SCREENSHOT_TEMPLATE_DEFAULTS.outerPadding);
-  const [headerHeight, setHeaderHeight] = useState(SCREENSHOT_TEMPLATE_DEFAULTS.headerHeight);
-  const [radius, setRadius] = useState(SCREENSHOT_TEMPLATE_DEFAULTS.radius);
-  const [imageRadius, setImageRadius] = useState(SCREENSHOT_TEMPLATE_DEFAULTS.imageRadius);
-  const [weatherReminderEnabled, setWeatherReminderEnabled] = useState(true);
-  const [weatherCity, setWeatherCity] = useState("");
-  const [weatherToken, setWeatherToken] = useState("");
-  const [weatherRefreshMinutes, setWeatherRefreshMinutes] = useState("180");
-  const [calendarReminderEnabled, setCalendarReminderEnabled] = useState(true);
-  const [calendarRefreshMinutes, setCalendarRefreshMinutes] = useState("720");
-  const [weatherSnapshotLine, setWeatherSnapshotLine] = useState("");
-  const [weatherSnapshotTime, setWeatherSnapshotTime] = useState("");
-  const [weatherSnapshotError, setWeatherSnapshotError] = useState("");
-  const [calendarSnapshotLine, setCalendarSnapshotLine] = useState("");
-  const [calendarSnapshotTime, setCalendarSnapshotTime] = useState("");
-  const [calendarSnapshotError, setCalendarSnapshotError] = useState("");
-  const [contextRefreshMessage, setContextRefreshMessage] = useState("");
-  const [refreshingContext, setRefreshingContext] = useState(false);
   const [appVersionLabel, setAppVersionLabel] = useState("v2026.04.12");
   const [updateChannel, setUpdateChannel] = useState("stable");
   const [updateManifestUrl, setUpdateManifestUrl] = useState("");
@@ -920,35 +626,12 @@ export function SettingsContent({
   const [localUpdatePlanMessage, setLocalUpdatePlanMessage] = useState("");
   const [localUpdatePlanSummary, setLocalUpdatePlanSummary] = useState("");
   const [localUpdatePending, setLocalUpdatePending] = useState(false);
-  // New states for models
-  const [smartPlatform, setSmartPlatform] = useState("");
-  const [smartModel, setSmartModel] = useState("");
-
-  const [smartVisionEnabled, setSmartVisionEnabled] = useState(false);
-  const [smartVisionPlatform, setSmartVisionPlatform] = useState("");
-  const [smartVisionModel, setSmartVisionModel] = useState("");
-
-  const [selectorAgentEnabled, setSelectorAgentEnabled] = useState(false);
-  const [selectorAgentPlatform, setSelectorAgentPlatform] = useState("");
-  const [selectorAgentModel, setSelectorAgentModel] = useState("");
-
-  const [ocrPlatform, setOcrPlatform] = useState("");
-  const [ocrModel, setOcrModel] = useState("");
   const [recognitionMode, setRecognitionMode] = useState("screenshot");
   const [floatingWindowResidentEnabled, setFloatingWindowResidentEnabled] = useState(false);
-  const [queryExecutionSettings, setQueryExecutionSettings] = useState<Record<string, QueryExecutionModeSettings>>(
-    () => buildQueryExecutionState(),
-  );
 
   const [searchModels, setSearchModels] = useState<string[]>(["sonar-pro", "sonar"]);
   const [newSearchModel, setNewSearchModel] = useState("");
-  const [apiModeModels, setApiModeModels] = useState<Record<string, ApiModeModelState>>(() => buildApiModeModelState());
   const [browserSelectors, setBrowserSelectors] = useState<Record<string, Record<string, string>>>(() => buildBrowserSelectorState());
-  const [apiModePanelsOpen, setApiModePanelsOpen] = useState<Record<string, boolean>>({
-    deepseek: false,
-    tongyi: false,
-    yuanbao: false,
-  });
   const [browserPanelsOpen, setBrowserPanelsOpen] = useState<Record<string, boolean>>({
     doubao: false,
     deepseek: false,
@@ -989,10 +672,6 @@ export function SettingsContent({
     setSearchModels(searchModels.filter(m => m !== modelToRemove));
   };
 
-  const toggleApiModePanel = useCallback((platformId: string) => {
-    setApiModePanelsOpen((prev) => ({ ...prev, [platformId]: !prev[platformId] }));
-  }, []);
-
   const toggleBrowserPanel = useCallback((platformId: string) => {
     setBrowserPanelsOpen((prev) => ({ ...prev, [platformId]: !prev[platformId] }));
   }, []);
@@ -1009,57 +688,6 @@ export function SettingsContent({
         [field]: value,
       },
     }));
-  }, []);
-
-  const updateApiModeModel = useCallback((platformId: string, mode: keyof ApiModeModelState, value: string) => {
-    setApiModeModels((prev) => ({
-      ...prev,
-      [platformId]: {
-        fastModel: prev[platformId]?.fastModel || "",
-        deepModel: prev[platformId]?.deepModel || "",
-        [mode]: value,
-      },
-    }));
-  }, []);
-
-  const updateQueryExecutionSetting = useCallback((
-    mode: string,
-    key: keyof QueryExecutionModeSettings,
-    value: string | boolean,
-  ) => {
-    setQueryExecutionSettings((prev) => ({
-      ...prev,
-      [mode]: {
-        ...(prev[mode] || QUERY_EXECUTION_DEFAULTS[mode as keyof typeof QUERY_EXECUTION_DEFAULTS]),
-        [key]: value,
-      },
-    }));
-  }, []);
-
-  const applyContextSnapshotPayload = useCallback((data: Record<string, unknown>) => {
-    const contextSnapshots = (data.context_snapshots as Record<string, unknown> | undefined) || {};
-    const weatherSettings = (contextSnapshots.weather as Record<string, unknown> | undefined) || {};
-    const calendarSettings = (contextSnapshots.calendar as Record<string, unknown> | undefined) || {};
-    const weatherSnapshot = (data.weather_snapshot as Record<string, unknown> | undefined) || {};
-    const calendarSnapshot = (data.calendar_snapshot as Record<string, unknown> | undefined) || {};
-
-    setWeatherReminderEnabled(weatherSettings.enabled !== false);
-    setWeatherCity(String(weatherSettings.city || "").trim());
-    setWeatherToken(String(weatherSettings.token || "").trim());
-    if (weatherSettings.ttl_minutes !== undefined) {
-      setWeatherRefreshMinutes(String(weatherSettings.ttl_minutes || 180));
-    }
-    setCalendarReminderEnabled(calendarSettings.enabled !== false);
-    if (calendarSettings.ttl_minutes !== undefined) {
-      setCalendarRefreshMinutes(String(calendarSettings.ttl_minutes || 720));
-    }
-
-    setWeatherSnapshotLine(formatWeatherSnapshotLine(weatherSnapshot));
-    setWeatherSnapshotTime(formatSnapshotTime(weatherSnapshot.updated_at));
-    setWeatherSnapshotError(String(weatherSettings.last_error || "").trim());
-    setCalendarSnapshotLine(formatCalendarSnapshotLine(calendarSnapshot));
-    setCalendarSnapshotTime(formatSnapshotTime(calendarSnapshot.updated_at));
-    setCalendarSnapshotError(String(calendarSettings.last_error || "").trim());
   }, []);
 
   const applyBrowserAuthPayload = useCallback((payload?: Record<string, BrowserAuthPlatformSnapshot> | null) => {
@@ -1117,6 +745,7 @@ export function SettingsContent({
   const [accountExclusionRestoring, setAccountExclusionRestoring] = useState(false);
   const [accountExclusionMessage, setAccountExclusionMessage] = useState("");
   const [savingScope, setSavingScope] = useState<string | null>(null);
+  const [saveFailureMessage, setSaveFailureMessage] = useState("");
   const [settingsReady, setSettingsReady] = useState(false);
   const lastSavedSettingsRef = useRef<Record<string, string>>({});
   const settingsSnapshotInitializedRef = useRef(false);
@@ -1145,14 +774,9 @@ export function SettingsContent({
 
   const applySettingsPayload = useCallback((
     data: Record<string, unknown>,
-    platformKeyData?: Record<string, PlatformKeyInfo>,
     browserAuthData?: { platforms: Record<string, BrowserAuthPlatformSnapshot> },
   ) => {
       settingsSnapshotInitializedRef.current = false;
-      if (platformKeyData && Object.keys(platformKeyData).length > 0) {
-        setPlatformKeys(platformKeyData);
-        setApiModeModels(buildApiModeModelState(platformKeyData));
-      }
       if (browserAuthData?.platforms) {
         applyBrowserAuthPayload(browserAuthData.platforms);
       }
@@ -1231,34 +855,8 @@ export function SettingsContent({
         setArticleExportShowSelfMediaAccount(Boolean(articleExport.show_selfmedia_account ?? true));
       }
 
-      // ai_assistant -> smartPlatform, smartModel
-      const ai = data.ai_assistant as Record<string, unknown> | undefined;
-      if (ai) {
-        if (ai.platform) setSmartPlatform(String(ai.platform));
-        if (ai.model) setSmartModel(String(ai.model));
-      }
-
-      const smartVision = data.smart_vision as Record<string, unknown> | undefined;
-      if (smartVision) {
-        if (typeof smartVision.enabled === "boolean") setSmartVisionEnabled(smartVision.enabled);
-        if (smartVision.platform) setSmartVisionPlatform(String(smartVision.platform));
-        if (smartVision.model) setSmartVisionModel(String(smartVision.model));
-      }
-
-      const selectorAgent = data.selector_agent as SelectorAgentSettingsSnapshot | Record<string, unknown> | undefined;
-      if (selectorAgent) {
-        if (typeof selectorAgent.enabled === "boolean") setSelectorAgentEnabled(selectorAgent.enabled);
-        if (selectorAgent.platform) setSelectorAgentPlatform(String(selectorAgent.platform));
-        if (selectorAgent.model) setSelectorAgentModel(String(selectorAgent.model));
-      }
-
-      // recognition -> ocrPlatform, ocrModel
       const rec = data.recognition as Record<string, unknown> | undefined;
       if (rec) {
-        if (typeof rec.safe_mode_ocr_enabled === "boolean") setLocalOCRHandler(rec.safe_mode_ocr_enabled);
-        if (typeof rec.ai_fallback_enabled === "boolean") setAiAssist(rec.ai_fallback_enabled);
-        if (rec.platform) setOcrPlatform(String(rec.platform));
-        if (rec.model) setOcrModel(String(rec.model));
         if (typeof rec.floating_window_resident_enabled === "boolean") {
           setFloatingWindowResidentEnabled(rec.floating_window_resident_enabled);
         }
@@ -1330,60 +928,8 @@ export function SettingsContent({
         applyBrowserAuthPayload(browserAuth);
       }
 
-      const queryExecution = data.query_execution as Record<string, Record<string, unknown>> | undefined;
-      if (queryExecution) {
-        setQueryExecutionSettings(() => {
-          const next = buildQueryExecutionState();
-          for (const mode of QUERY_EXECUTION_MODE_IDS) {
-            const current = (queryExecution[mode] as Record<string, unknown> | undefined) || {};
-            next[mode] = {
-              strategy: normalizeQueryExecutionStrategy(current.strategy || next[mode].strategy),
-              sessionPoolDispatch: normalizeSessionPoolDispatch(current.session_pool_dispatch || next[mode].sessionPoolDispatch),
-              sessionPoolPlatformBatchSize: String(current.session_pool_platform_batch_size ?? next[mode].sessionPoolPlatformBatchSize),
-              sessionTtlMinutesMin: String(current.session_ttl_minutes_min ?? next[mode].sessionTtlMinutesMin),
-              sessionTtlMinutesMax: String(current.session_ttl_minutes_max ?? next[mode].sessionTtlMinutesMax),
-              sessionMaxQueriesMin: String(current.session_max_queries_min ?? next[mode].sessionMaxQueriesMin),
-              sessionMaxQueriesMax: String(current.session_max_queries_max ?? next[mode].sessionMaxQueriesMax),
-              minQueriesWindowMinutes: String(current.min_queries_window_minutes ?? next[mode].minQueriesWindowMinutes),
-              minQueriesPerWindow: String(current.min_queries_per_window ?? next[mode].minQueriesPerWindow),
-              singleQueryTimeoutMinutes: String(current.single_query_timeout_minutes ?? next[mode].singleQueryTimeoutMinutes),
-              noProgressTimeoutMinutes: String(current.no_progress_timeout_minutes ?? next[mode].noProgressTimeoutMinutes),
-              minRestartCooldownMinutes: String(current.min_restart_cooldown_minutes ?? next[mode].minRestartCooldownMinutes),
-              restartAfterManualRecovery: current.restart_after_manual_recovery === undefined
-                ? next[mode].restartAfterManualRecovery
-                : Boolean(current.restart_after_manual_recovery),
-              restartAfterStructuralFailures: String(current.restart_after_structural_failures ?? next[mode].restartAfterStructuralFailures),
-            };
-          }
-          return next;
-        });
-      }
-
-      applyContextSnapshotPayload(data as Record<string, unknown>);
-
       const screenshotConfig = data.screenshot as Record<string, unknown> | undefined;
       setBrowserAnswerMode(normalizeBrowserAnswerMode(screenshotConfig?.browser_answer_mode));
-
-      // screenshot_template -> screenshotEnabled, showTime, showFooter, showHighlight
-      const ss = data.screenshot_template as Record<string, unknown> | undefined;
-      if (ss) {
-        if (typeof ss.enabled === "boolean") setScreenshotEnabled(ss.enabled);
-        if (typeof ss.show_time === "boolean") setShowTime(ss.show_time);
-        if (typeof ss.show_footer === "boolean") setShowFooter(ss.show_footer);
-        if (typeof ss.show_highlight === "boolean") setShowHighlight(ss.show_highlight);
-        if (ss.title) setScreenshotTitle(String(ss.title));
-        if (ss.subtitle) setScreenshotSubtitle(String(ss.subtitle));
-        if (ss.footer) setScreenshotFooter(String(ss.footer));
-        if (ss.accent_color) setAccentColor(String(ss.accent_color));
-        if (ss.background_start) setBackgroundStart(String(ss.background_start));
-        if (ss.background_end) setBackgroundEnd(String(ss.background_end));
-        if (ss.header_start) setHeaderStart(String(ss.header_start));
-        if (ss.header_end) setHeaderEnd(String(ss.header_end));
-        if (ss.outer_padding !== undefined) setOuterPadding(String(ss.outer_padding));
-        if (ss.header_height !== undefined) setHeaderHeight(String(ss.header_height));
-        if (ss.radius !== undefined) setRadius(String(ss.radius));
-        if (ss.image_radius !== undefined) setImageRadius(String(ss.image_radius));
-      }
 
       // profile -> profile state
       const prof = data.profile as Record<string, string> | undefined;
@@ -1401,7 +947,7 @@ export function SettingsContent({
         });
       }
       setSettingsReady(true);
-    }, [applyBrowserAuthPayload, applyContextSnapshotPayload, applyUpdateStatusPayload, normalizeBrowserAnswerMode, setLocalOCRHandler]);
+  }, [applyBrowserAuthPayload, applyUpdateStatusPayload, normalizeBrowserAnswerMode]);
 
   // Load settings from backend on mount. Use the last real settings payload immediately,
   // then refresh in the background so re-entering the page does not flash defaults.
@@ -1416,13 +962,12 @@ export function SettingsContent({
 
     Promise.all([
       fetchSettings({ force: hasCachedSettings }),
-      fetchPlatformKeys(),
       fetchBrowserAuth(),
-    ]).then(([data, platformKeyData, browserAuthData]) => {
+    ]).then(([data, browserAuthData]) => {
       if (cancelled) {
         return;
       }
-      applySettingsPayload(data, platformKeyData, browserAuthData);
+      applySettingsPayload(data, browserAuthData);
     });
 
     return () => {
@@ -1495,109 +1040,6 @@ export function SettingsContent({
     return () => window.clearInterval(timer);
   }, [refreshLocalModelRuntimeStatus]);
 
-  const aiPlatforms = useMemo(
-    () => buildPlatformOptions(platformKeys, { currentPlatform: smartPlatform, currentModel: smartModel }),
-    [platformKeys, smartPlatform, smartModel],
-  );
-  const apiModePlatforms = useMemo(
-    () => API_MODE_SPLIT_PLATFORM_IDS
-      .filter((id) => !!platformKeys[id]?.supports_split_models)
-      .map((id) => {
-        const info = platformKeys[id]!;
-        return ({
-        id,
-        name: PLATFORM_LABELS[id] || id,
-        hasKey: !!info.has_key,
-        note: String(info.split_model_note || "").trim(),
-        fastDefault: String(info.fast_model_default || "").trim() || String(info.default_model || "").trim(),
-        deepDefault: String(info.deep_model_default || "").trim() || String(info.default_model || "").trim(),
-        models: uniqStrings([
-          String(info.api_fast_model || "").trim(),
-          String(info.api_deep_model || "").trim(),
-          String(info.api_model || "").trim(),
-          ...((info.model_options || []).map((item) => String(item || "").trim())),
-          String(info.fast_model_default || "").trim(),
-          String(info.deep_model_default || "").trim(),
-          String(info.default_model || "").trim(),
-        ].filter(Boolean)),
-      });
-      })
-      .sort((a, b) => a.name.localeCompare(b.name, "zh-CN")),
-    [platformKeys],
-  );
-  const visionPlatforms = useMemo(
-    () => buildPlatformOptions(platformKeys, { visionOnly: true, currentPlatform: smartVisionPlatform, currentModel: smartVisionModel }),
-    [platformKeys, smartVisionPlatform, smartVisionModel],
-  );
-  const selectorAgentPlatforms = useMemo(
-    () => buildPlatformOptions(platformKeys, { currentPlatform: selectorAgentPlatform, currentModel: selectorAgentModel }),
-    [platformKeys, selectorAgentPlatform, selectorAgentModel],
-  );
-  const recognitionVisionPlatforms = useMemo(
-    () => buildPlatformOptions(platformKeys, { visionOnly: true, currentPlatform: ocrPlatform, currentModel: ocrModel }),
-    [platformKeys, ocrPlatform, ocrModel],
-  );
-
-  useEffect(() => {
-    if (!smartPlatform && aiPlatforms[0]) {
-      setSmartPlatform(aiPlatforms[0].id);
-      setSmartModel(aiPlatforms[0].models[0] || "");
-      return;
-    }
-    const current = aiPlatforms.find((item) => item.id === smartPlatform);
-    if (!current && aiPlatforms[0]) {
-      setSmartPlatform(aiPlatforms[0].id);
-      setSmartModel(aiPlatforms[0].models[0] || "");
-    } else if (current && !current.models.includes(smartModel)) {
-      setSmartModel(current.models[0] || "");
-    }
-  }, [aiPlatforms, smartPlatform, smartModel]);
-
-  useEffect(() => {
-    if (!smartVisionPlatform && visionPlatforms[0]) {
-      setSmartVisionPlatform(visionPlatforms[0].id);
-      setSmartVisionModel(visionPlatforms[0].models[0] || "");
-      return;
-    }
-    const current = visionPlatforms.find((item) => item.id === smartVisionPlatform);
-    if (!current && visionPlatforms[0]) {
-      setSmartVisionPlatform(visionPlatforms[0].id);
-      setSmartVisionModel(visionPlatforms[0].models[0] || "");
-    } else if (current && !current.models.includes(smartVisionModel)) {
-      setSmartVisionModel(current.models[0] || "");
-    }
-  }, [visionPlatforms, smartVisionPlatform, smartVisionModel]);
-
-  useEffect(() => {
-    if (!ocrPlatform && recognitionVisionPlatforms[0]) {
-      setOcrPlatform(recognitionVisionPlatforms[0].id);
-      setOcrModel(recognitionVisionPlatforms[0].models[0] || "");
-      return;
-    }
-    const current = recognitionVisionPlatforms.find((item) => item.id === ocrPlatform);
-    if (!current && recognitionVisionPlatforms[0]) {
-      setOcrPlatform(recognitionVisionPlatforms[0].id);
-      setOcrModel(recognitionVisionPlatforms[0].models[0] || "");
-    } else if (current && !current.models.includes(ocrModel)) {
-      setOcrModel(current.models[0] || "");
-    }
-  }, [recognitionVisionPlatforms, ocrPlatform, ocrModel]);
-
-  useEffect(() => {
-    if (!selectorAgentPlatform && selectorAgentPlatforms[0]) {
-      setSelectorAgentPlatform(selectorAgentPlatforms[0].id);
-      setSelectorAgentModel(selectorAgentPlatforms[0].models[0] || "");
-      return;
-    }
-    const current = selectorAgentPlatforms.find((item) => item.id === selectorAgentPlatform);
-    if (!current && selectorAgentPlatforms[0]) {
-      setSelectorAgentPlatform(selectorAgentPlatforms[0].id);
-      setSelectorAgentModel(selectorAgentPlatforms[0].models[0] || "");
-    } else if (current && !current.models.includes(selectorAgentModel)) {
-      setSelectorAgentModel(current.models[0] || "");
-    }
-  }, [selectorAgentPlatforms, selectorAgentPlatform, selectorAgentModel]);
-
   const buildSchedulerSettingsPayload = useCallback(() => {
     const weekly_times: Record<string, string | null> = {};
     for (const day of [0, 1, 2, 3, 4, 5, 6]) {
@@ -1657,46 +1099,20 @@ export function SettingsContent({
 
   const buildRecognitionSettingsPayload = useCallback(() => ({
     recognition: {
-      safe_mode_ocr_enabled: isLocalOCREnabled,
-      ai_fallback_enabled: aiAssist,
-      platform: ocrPlatform,
-      model: ocrModel,
+      safe_mode_ocr_enabled: true,
       dom_render_mode: recognitionMode === "dom",
       floating_window_resident_enabled: floatingWindowResidentEnabled,
     },
-  }), [aiAssist, floatingWindowResidentEnabled, isLocalOCREnabled, ocrModel, ocrPlatform, recognitionMode]);
+  }), [floatingWindowResidentEnabled, recognitionMode]);
 
   const buildBrowserModeSettingsPayload = useCallback(() => ({
     screenshot: {
       browser_answer_mode: browserAnswerMode,
     },
-    query_execution: {
-      browser: buildQueryExecutionPayload({ browser: queryExecutionSettings.browser } as Record<string, QueryExecutionModeSettings>).browser,
-    },
     browser_automation: Object.fromEntries(
       Object.entries(buildBrowserAutomationPayload(browserSelectors)),
     ),
-  }), [browserAnswerMode, browserSelectors, queryExecutionSettings]);
-
-  const buildSmartModeSettingsPayload = useCallback(() => ({
-    ai_assistant: { platform: smartPlatform, model: smartModel },
-    smart_vision: {
-      enabled: smartVisionEnabled,
-      platform: smartVisionPlatform,
-      model: smartVisionModel,
-    },
-    query_execution: {
-      smart: buildQueryExecutionPayload({ smart: queryExecutionSettings.smart } as Record<string, QueryExecutionModeSettings>).smart,
-    },
-  }), [queryExecutionSettings, smartModel, smartPlatform, smartVisionEnabled, smartVisionModel, smartVisionPlatform]);
-
-  const buildSelectorAgentSettingsPayload = useCallback(() => ({
-    selector_agent: {
-      enabled: selectorAgentEnabled,
-      platform: selectorAgentPlatform.trim(),
-      model: selectorAgentModel.trim(),
-    },
-  }), [selectorAgentEnabled, selectorAgentModel, selectorAgentPlatform]);
+  }), [browserAnswerMode, browserSelectors]);
 
   const buildSearchSettingsPayload = useCallback(() => ({
     search: {
@@ -1717,28 +1133,6 @@ export function SettingsContent({
     },
   }), [localModelConfig]);
 
-  const buildContextSnapshotSettingsPayload = useCallback(() => ({
-    context_snapshots: {
-      weather: {
-        enabled: weatherReminderEnabled,
-        city: weatherCity.trim(),
-        token: weatherToken.trim(),
-        ttl_minutes: parseInt(weatherRefreshMinutes, 10) || 180,
-      },
-      calendar: {
-        enabled: calendarReminderEnabled,
-        ttl_minutes: parseInt(calendarRefreshMinutes, 10) || 720,
-      },
-    },
-  }), [
-    calendarRefreshMinutes,
-    calendarReminderEnabled,
-    weatherCity,
-    weatherRefreshMinutes,
-    weatherReminderEnabled,
-    weatherToken,
-  ]);
-
   const buildAppUpdateSettingsPayload = useCallback(() => ({
     app_update: {
       channel: updateChannel,
@@ -1748,84 +1142,24 @@ export function SettingsContent({
     },
   }), [updateAutoCheckEnabled, updateChannel, updateDownloadPageUrl, updateManifestUrl]);
 
-  const buildScreenshotTemplatePayload = useCallback(() => ({
-    screenshot_template: {
-      enabled: screenshotEnabled,
-      title: screenshotTitle,
-      subtitle: screenshotSubtitle,
-      footer: screenshotFooter,
-      show_time: showTime,
-      show_footer: showFooter,
-      show_highlight: showHighlight,
-      accent_color: accentColor,
-      background_start: backgroundStart,
-      background_end: backgroundEnd,
-      header_start: headerStart,
-      header_end: headerEnd,
-      outer_padding: parseInt(outerPadding, 10) || 0,
-      header_height: parseInt(headerHeight, 10) || 0,
-      radius: parseInt(radius, 10) || 0,
-      image_radius: parseInt(imageRadius, 10) || 0,
-    },
-  }), [
-    accentColor,
-    backgroundEnd,
-    backgroundStart,
-    headerEnd,
-    headerHeight,
-    headerStart,
-    imageRadius,
-    outerPadding,
-    radius,
-    screenshotEnabled,
-    screenshotFooter,
-    screenshotSubtitle,
-    screenshotTitle,
-    showFooter,
-    showHighlight,
-    showTime,
-  ]);
-
-  const buildApiModePayload = useCallback(() => (
-    Object.fromEntries(
-      apiModePlatforms.map((platform) => [
-        platform.id,
-        {
-          api_fast_model: apiModeModels[platform.id]?.fastModel || "",
-          api_deep_model: apiModeModels[platform.id]?.deepModel || "",
-        },
-      ]),
-    )
-  ), [apiModeModels, apiModePlatforms]);
-
   const captureCurrentSettingsSnapshot = useCallback((): Record<string, string> => ({
     scheduler: JSON.stringify(buildSchedulerSettingsPayload()),
     account_crawling: JSON.stringify(buildAccountCrawlingSettingsPayload()),
     article_export: JSON.stringify(buildArticleExportSettingsPayload()),
     browser: JSON.stringify(buildBrowserModeSettingsPayload()),
     recognition: JSON.stringify(buildRecognitionSettingsPayload()),
-    api_mode: JSON.stringify(buildApiModePayload()),
-    smart: JSON.stringify(buildSmartModeSettingsPayload()),
-    selector_agent: JSON.stringify(buildSelectorAgentSettingsPayload()),
     search: JSON.stringify(buildSearchSettingsPayload()),
     local_model: JSON.stringify(buildLocalModelSettingsPayload()),
-    context: JSON.stringify(buildContextSnapshotSettingsPayload()),
     app_update: JSON.stringify(buildAppUpdateSettingsPayload()),
-    screenshot: JSON.stringify(buildScreenshotTemplatePayload()),
   }), [
     buildAccountCrawlingSettingsPayload,
     buildArticleExportSettingsPayload,
     buildAppUpdateSettingsPayload,
-    buildApiModePayload,
     buildBrowserModeSettingsPayload,
-    buildContextSnapshotSettingsPayload,
     buildLocalModelSettingsPayload,
     buildRecognitionSettingsPayload,
     buildSchedulerSettingsPayload,
-    buildScreenshotTemplatePayload,
     buildSearchSettingsPayload,
-    buildSmartModeSettingsPayload,
-    buildSelectorAgentSettingsPayload,
   ]);
 
   useEffect(() => {
@@ -1894,9 +1228,6 @@ export function SettingsContent({
           screenshot: {
             browser_answer_mode: browserAnswerMode,
           },
-          query_execution: {
-            browser: buildQueryExecutionPayload({ browser: queryExecutionSettings.browser } as Record<string, QueryExecutionModeSettings>).browser,
-          },
           browser_automation: Object.fromEntries(
             Object.entries(buildBrowserAutomationPayload(nextSelectors)),
           ),
@@ -1904,7 +1235,7 @@ export function SettingsContent({
       };
       return nextSelectors;
     });
-  }, [browserAnswerMode, queryExecutionSettings.browser]);
+  }, [browserAnswerMode]);
 
   const handleDiagnoseDeepSeekNewChatSelector = useCallback(async () => {
     if (selectorHealDiagnosing || selectorPauseStateDiagnosing) {
@@ -2007,51 +1338,35 @@ export function SettingsContent({
     if (changedSections.includes("recognition")) {
       Object.assign(mergedSettingsPayload, buildRecognitionSettingsPayload());
     }
-    if (changedSections.includes("smart")) {
-      Object.assign(mergedSettingsPayload, buildSmartModeSettingsPayload());
-    }
-    if (changedSections.includes("selector_agent")) {
-      Object.assign(mergedSettingsPayload, buildSelectorAgentSettingsPayload());
-    }
     if (changedSections.includes("search")) {
       Object.assign(mergedSettingsPayload, buildSearchSettingsPayload());
     }
     if (changedSections.includes("local_model")) {
       Object.assign(mergedSettingsPayload, buildLocalModelSettingsPayload());
     }
-    if (changedSections.includes("context")) {
-      Object.assign(mergedSettingsPayload, buildContextSnapshotSettingsPayload());
-    }
     if (changedSections.includes("app_update")) {
       Object.assign(mergedSettingsPayload, buildAppUpdateSettingsPayload());
     }
-    if (changedSections.includes("screenshot")) {
-      Object.assign(mergedSettingsPayload, buildScreenshotTemplatePayload());
-    }
 
     setSavingScope("all");
+    setSaveFailureMessage("");
     try {
       const saveJobs: Promise<unknown>[] = [];
       if (Object.keys(mergedSettingsPayload).length > 0) {
         saveJobs.push(saveSettings(mergedSettingsPayload));
       }
-      if (changedSections.includes("api_mode")) {
-        saveJobs.push(savePlatformConfig(buildApiModePayload()));
+      const saveResults = await Promise.all(saveJobs);
+      const failedResult = saveResults.find((result) => (
+        result
+        && typeof result === "object"
+        && "ok" in result
+        && !(result as { ok?: boolean }).ok
+      )) as { message?: string } | undefined;
+      if (failedResult) {
+        setSaveFailureMessage(failedResult.message || "保存失败，请稍后重试");
+        return;
       }
-      await Promise.all(saveJobs);
       lastSavedSettingsRef.current = currentSnapshot;
-
-      if (changedSections.includes("context")) {
-        setContextRefreshMessage("设置已保存，天气与节日提醒正在后台刷新...");
-        void refreshContextSnapshots(true)
-          .then((refreshResult) => {
-            applyContextSnapshotPayload(refreshResult);
-            setContextRefreshMessage(String(refreshResult.message || "设置已保存"));
-          })
-          .catch(() => {
-            setContextRefreshMessage("设置已保存，天气与节日提醒后台刷新失败");
-          });
-      }
 
       notifySaveSuccess(
         onSaveSuccess,
@@ -2061,20 +1376,14 @@ export function SettingsContent({
       setSavingScope(null);
     }
   }, [
-    applyContextSnapshotPayload,
     buildAccountCrawlingSettingsPayload,
     buildArticleExportSettingsPayload,
-    buildApiModePayload,
     buildAppUpdateSettingsPayload,
     buildBrowserModeSettingsPayload,
-    buildContextSnapshotSettingsPayload,
     buildLocalModelSettingsPayload,
     buildRecognitionSettingsPayload,
     buildSchedulerSettingsPayload,
-    buildScreenshotTemplatePayload,
     buildSearchSettingsPayload,
-    buildSmartModeSettingsPayload,
-    buildSelectorAgentSettingsPayload,
     captureCurrentSettingsSnapshot,
     onSaveSuccess,
     savingScope,
@@ -2092,18 +1401,6 @@ export function SettingsContent({
       setSchedulerWebhookTesting(false);
     }
   }, [schedulerNotificationWebhook]);
-
-  const handleRefreshContext = useCallback(async () => {
-    setRefreshingContext(true);
-    setContextRefreshMessage("");
-    try {
-      const result = await refreshContextSnapshots(true);
-      applyContextSnapshotPayload(result);
-      setContextRefreshMessage(String(result.message || "天气与节日提醒已刷新"));
-    } finally {
-      setRefreshingContext(false);
-    }
-  }, [applyContextSnapshotPayload]);
 
   const handleCheckAppUpdate = useCallback(async () => {
     setUpdateCheckPending(true);
@@ -2298,25 +1595,6 @@ export function SettingsContent({
     onSaveSuccess,
   ]);
 
-  const handleResetScreenshotTemplate = useCallback(() => {
-    setScreenshotEnabled(true);
-    setShowTime(true);
-    setShowFooter(true);
-    setShowHighlight(true);
-    setScreenshotTitle(SCREENSHOT_TEMPLATE_DEFAULTS.title);
-    setScreenshotSubtitle(SCREENSHOT_TEMPLATE_DEFAULTS.subtitle);
-    setScreenshotFooter(SCREENSHOT_TEMPLATE_DEFAULTS.footer);
-    setAccentColor(SCREENSHOT_TEMPLATE_DEFAULTS.accentColor);
-    setBackgroundStart(SCREENSHOT_TEMPLATE_DEFAULTS.backgroundStart);
-    setBackgroundEnd(SCREENSHOT_TEMPLATE_DEFAULTS.backgroundEnd);
-    setHeaderStart(SCREENSHOT_TEMPLATE_DEFAULTS.headerStart);
-    setHeaderEnd(SCREENSHOT_TEMPLATE_DEFAULTS.headerEnd);
-    setOuterPadding(SCREENSHOT_TEMPLATE_DEFAULTS.outerPadding);
-    setHeaderHeight(SCREENSHOT_TEMPLATE_DEFAULTS.headerHeight);
-    setRadius(SCREENSHOT_TEMPLATE_DEFAULTS.radius);
-    setImageRadius(SCREENSHOT_TEMPLATE_DEFAULTS.imageRadius);
-  }, []);
-
   // Save profile to backend
   const handleSaveProfile = useCallback(async () => {
     let nextProfile = editProfile;
@@ -2334,13 +1612,17 @@ export function SettingsContent({
     setIsEditingProfile(false);
     setAvatarCropDraft(null);
     setAvatarUploadMessage("");
-    await saveProfile({
+    const result = await saveProfile({
       name: nextProfile.name,
       role: nextProfile.role,
       avatar: nextProfile.avatar,
       birthday: nextProfile.birthday,
       hire_date: nextProfile.hireDate,
     });
+    if (!result.ok) {
+      setAvatarUploadMessage(result.message || "资料保存失败，请稍后重试");
+      return;
+    }
     notifySaveSuccess(onSaveSuccess, "保存成功");
   }, [avatarCropDraft, editProfile, onSaveSuccess]);
 
@@ -2433,22 +1715,6 @@ export function SettingsContent({
     return Math.ceil(diffTime / (1000 * 60 * 60 * 24));
   }, [profile.hireDate]);
 
-  const smartModelOptions = withCurrentModel(
-    aiPlatforms.find((p) => p.id === smartPlatform)?.models || [],
-    smartModel,
-  );
-  const smartVisionModelOptions = withCurrentModel(
-    visionPlatforms.find((p) => p.id === smartVisionPlatform)?.models || [],
-    smartVisionModel,
-  );
-  const selectorAgentModelOptions = withCurrentModel(
-    selectorAgentPlatforms.find((p) => p.id === selectorAgentPlatform)?.models || [],
-    selectorAgentModel,
-  );
-  const ocrModelOptions = withCurrentModel(
-    recognitionVisionPlatforms.find((p) => p.id === ocrPlatform)?.models || [],
-    ocrModel,
-  );
   const localModelStatusMeta = LOCAL_MODEL_STATUS_META[localModelStatus.status] || LOCAL_MODEL_STATUS_META.idle;
   const localDownloadedModels = useMemo(
     () => uniqStrings([
@@ -2484,7 +1750,7 @@ export function SettingsContent({
       return {
         tone: "text-emerald-800 border-emerald-300",
         title: "自检结论：可直接使用",
-        detail: `本地服务已连通，默认模型 ${localTargetModel} 已就绪。识别、智能模式和搜搜都可以直接选用本地模型。`,
+        detail: `本地服务已连通，默认模型 ${localTargetModel} 已就绪。识别模式和搜搜都可以直接选用本地模型。`,
         action: `现在可以直接测试，或在功能里切到本地模型（${localTargetModel}）。`,
       };
     }
@@ -2610,6 +1876,11 @@ export function SettingsContent({
           <span className="text-[12px] font-medium text-gray-500 tracking-wide">配置全局运行参数与系统行为</span>
         </div>
         <div className="flex items-center gap-3">
+          {saveFailureMessage ? (
+            <span className="max-w-[260px] truncate text-[12px] font-medium text-rose-600">
+              {saveFailureMessage}
+            </span>
+          ) : null}
           <button
             onClick={handleSaveSettings}
             disabled={saving || dirtySectionCount === 0}
@@ -2625,8 +1896,8 @@ export function SettingsContent({
         <div className="max-w-4xl space-y-6">
 
           <Section title="API 密钥与模型" collapsible defaultCollapsed>
-            <p className="text-[12px] text-gray-500 mb-4 leading-relaxed">
-              管理各 AI 平台的密钥与可用模型列表。仅在接口模式下需要配置。
+            <p className="mb-4 text-[12px] leading-relaxed text-gray-500">
+              管理各 AI 平台的密钥与可用模型列表，供搜搜、草稿生成和 AI 助手调用。
             </p>
             <APIContent embedded onSaveSuccess={onSaveSuccess} />
           </Section>
@@ -2888,13 +2159,6 @@ export function SettingsContent({
                 页面原始截图会继续走下方的页面截图装饰模板；DOM 文本生成会直接提取回答 DOM，并固定使用 Surfaced 模版重排，表格等结构也会尽量保留。
               </p>
             </div>
-
-            <QueryExecutionSettingsCard
-              title="抓取模式查询规格"
-              description="默认按平台分组串行执行，同一平台的查询会尽量连着跑完后再切下一个；实验中的平台会话池策略暂时不要当作稳定能力使用。"
-              settings={queryExecutionSettings.browser}
-              onChange={(key, value) => updateQueryExecutionSetting("browser", key, value)}
-            />
 
             <div className="space-y-3">
               {BROWSER_AUTOMATION_PLATFORM_IDS.map((platformId) => {
@@ -3321,7 +2585,7 @@ export function SettingsContent({
           {/* Section 4: Recognition Mode */}
           <Section title="识别模式">
             <p className="text-[12px] text-gray-500 mb-4 leading-relaxed">
-              这里控制识别模式是否优先使用本地 OCR，以及本地 OCR 未命中时是否启用 AI 辅助复核。
+              这里控制识别模式是否优先使用本地 OCR，以及识别结果的监听方式。
             </p>
 
             <div className="mb-6 border-b border-gray-200/80 pb-5">
@@ -3337,8 +2601,6 @@ export function SettingsContent({
             </div>
 
             <div className="space-y-3 mb-6">
-              <CheckboxRow checked={isLocalOCREnabled} onChange={setLocalOCRHandler} label="启用本地 OCR 自动识别" />
-              <CheckboxRow checked={aiAssist} onChange={setAiAssist} label="本地 OCR 未命中时启用 AI 识别辅助" />
               <CheckboxRow
                 checked={floatingWindowResidentEnabled}
                 onChange={setFloatingWindowResidentEnabled}
@@ -3346,224 +2608,10 @@ export function SettingsContent({
                 subtext="开启后，识别任务未运行时悬浮窗会保留为文章录入与快捷工具；识别任务启动后自动切回关键词引导。"
               />
             </div>
-            
-            <div className={`transition-opacity duration-300 ${!aiAssist ? 'opacity-50 pointer-events-none' : ''}`}>
-              <div className="flex items-center gap-2 mb-3">
-                <label className="text-[12px] font-bold text-gray-900">大模型配置</label>
-                <span className="text-[11px] text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded font-medium">必须支持视觉能力</span>
-              </div>
-              <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
-                <SelectInput 
-                  label="AI 平台 :" 
-                  value={ocrPlatform} 
-                  onChange={(val) => {
-                    setOcrPlatform(val);
-                    const platform = recognitionVisionPlatforms.find(p => p.id === val);
-                    if (platform) setOcrModel(platform.models[0]);
-                  }}
-                  options={recognitionVisionPlatforms.map(p => ({ value: p.id, label: p.name }))}
-                />
-                <SelectInput 
-                  label="调用模型 :" 
-                  value={ocrModel} 
-                  onChange={setOcrModel}
-                  options={ocrModelOptions.map(m => ({ value: m, label: m }))}
-                />
-              </div>
-            </div>
 
             <p className="text-[11px] text-gray-400 mt-5 leading-relaxed border-l-2 border-gray-200 pl-3">
-              关闭本地 OCR 后，识别模式会进入人工推进；开启 AI 辅助后，会在 OCR 未识别到目标品牌时再调用 AI 复核。
+              识别模式会固定启用本地 OCR；命中品牌后会直接进入后续发送流程。
             </p>
-          </Section>
-
-          <Section title="接口模式">
-            <p className="text-[12px] text-gray-500 mb-4 leading-relaxed">
-              这里只展示已确认“快速模式”和“深度思考”分别对应不同模型的平台。任务在接口模式下运行时，会根据关键词里的深度思考开关自动选择下方对应模型。
-            </p>
-            <p className="text-[11px] text-gray-400 mb-4 leading-relaxed border-l-2 border-gray-200 pl-3">
-              如果某一项留空，系统会继续回退到 API 配置页里的主模型；只有同时填了快速模型和深度思考模型，才会完全按双模型切换。
-            </p>
-
-            {apiModePlatforms.length === 0 ? (
-              <div className="text-[12px] text-gray-500 border-l-2 border-gray-200 pl-3 py-1">
-                当前没有需要单独区分快速模型与深度思考模型的平台。
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {apiModePlatforms.map((platform) => {
-                  const currentModels = apiModeModels[platform.id] || { fastModel: "", deepModel: "" };
-                  const isOpen = !!apiModePanelsOpen[platform.id];
-                  return (
-                    <div key={platform.id} className="border-b border-gray-200/80 overflow-hidden">
-                      <button
-                        type="button"
-                        onClick={() => toggleApiModePanel(platform.id)}
-                        className="w-full grid grid-cols-[minmax(0,1fr)_24px] md:grid-cols-[150px_minmax(0,1fr)_24px] gap-4 px-0 py-4 text-left hover:bg-transparent transition-colors"
-                      >
-                        <span className="text-[12px] font-bold text-gray-900 pt-0.5">{platform.name}</span>
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <span className="text-[10px] font-bold text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full">
-                              双模型
-                            </span>
-                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${platform.hasKey ? "text-emerald-600 bg-emerald-50" : "text-gray-500 bg-gray-100"}`}>
-                              {platform.hasKey ? "已配置 Key" : "未配置 Key"}
-                            </span>
-                          </div>
-                          <p className="mt-2 text-[11px] text-gray-500 leading-relaxed">
-                            {platform.note || "该平台会按快速模式和深度思考分别调用不同模型。"}
-                          </p>
-                        </div>
-                        <ChevronDown className={`w-4 h-4 shrink-0 text-gray-400 mt-0.5 transition-transform ${isOpen ? "rotate-180" : ""}`} />
-                      </button>
-
-                      {isOpen && (
-                        <div className="grid grid-cols-1 md:grid-cols-[150px_minmax(0,1fr)] gap-4 border-t border-gray-200/80 pt-4 pb-4">
-                          <div className="hidden md:block" />
-                          <div>
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                              <ControlledTextInput
-                                label="快速模式模型 :"
-                                value={currentModels.fastModel}
-                                onChange={(value) => updateApiModeModel(platform.id, "fastModel", value)}
-                                placeholder={platform.fastDefault || "填写快速模式模型名"}
-                              />
-                              <ControlledTextInput
-                                label="深度思考模型 :"
-                                value={currentModels.deepModel}
-                                onChange={(value) => updateApiModeModel(platform.id, "deepModel", value)}
-                                placeholder={platform.deepDefault || "填写深度思考模型名"}
-                              />
-                            </div>
-
-                            {platform.models.length > 0 && (
-                              <div className="mt-4 border-l-2 border-gray-200 pl-3 py-1">
-                                <p className="text-[11px] text-gray-400 mb-2">可参考的已登记模型</p>
-                                <div className="flex flex-wrap gap-1.5">
-                                  {platform.models.map((model) => (
-                                    <span key={`${platform.id}-${model}`} className="bg-gray-50 text-gray-700 px-2 py-1 rounded-md text-[11px] font-mono">
-                                      {model}
-                                    </span>
-                                  ))}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </Section>
-
-          {/* Section 3: Smart Mode Configuration */}
-          <Section title="智能模式">
-            <p className="text-[12px] text-gray-500 mb-4 leading-relaxed">
-              智能模式下，系统会根据这里配置的大模型，自动处理非特定结构化的问答与查询请求。
-            </p>
-            <QueryExecutionSettingsCard
-              title="智能模式查询规格"
-              description="默认按平台分组串行执行，单个平台会在当前批次里持续复用到切换平台时再关闭；实验中的平台会话池策略暂时不要当作稳定能力使用。"
-              settings={queryExecutionSettings.smart}
-              onChange={(key, value) => updateQueryExecutionSetting("smart", key, value)}
-            />
-            <div className="flex flex-col gap-5">
-              <div className="flex flex-col gap-3">
-                <div className="flex items-center gap-2">
-                  <label className="text-[12px] font-bold text-gray-900">文本大模型</label>
-                </div>
-                <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
-                  <SelectInput 
-                    label="AI 平台 :" 
-                      value={smartPlatform} 
-                      onChange={(val) => {
-                        setSmartPlatform(val);
-                        const platform = aiPlatforms.find(p => p.id === val);
-                        if (platform) setSmartModel(platform.models[0]);
-                      }}
-                      options={aiPlatforms.map(p => ({ value: p.id, label: p.name }))}
-                    />
-                  <SelectInput 
-                    label="调用模型 :" 
-                    value={smartModel} 
-                    onChange={setSmartModel}
-                    options={smartModelOptions.map(m => ({ value: m, label: m }))}
-                  />
-                </div>
-              </div>
-
-              <div className="flex flex-col gap-3 pt-4 border-t border-gray-100">
-                <CheckboxRow checked={smartVisionEnabled} onChange={setSmartVisionEnabled} label="启用视觉能力（多模态增强）" subtext="开启后，在智能模式下如果传入了图片或截屏，将自动调用下方配置的视觉模型进行处理。" />
-                <div className={`transition-opacity duration-300 ${!smartVisionEnabled ? 'opacity-50 pointer-events-none' : ''}`}>
-                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4 ml-6">
-                    <SelectInput 
-                      label="AI 平台 :" 
-                      value={smartVisionPlatform} 
-                      onChange={(val) => {
-                        setSmartVisionPlatform(val);
-                        const platform = visionPlatforms.find(p => p.id === val);
-                        if (platform) setSmartVisionModel(platform.models[0]);
-                      }}
-                      options={visionPlatforms.map(p => ({ value: p.id, label: p.name }))}
-                    />
-                    <SelectInput 
-                      label="调用模型 :" 
-                      value={smartVisionModel} 
-                      onChange={setSmartVisionModel}
-                      options={smartVisionModelOptions.map(m => ({ value: m, label: m }))}
-                    />
-                  </div>
-                </div>
-              </div>
-            </div>
-          </Section>
-
-          <Section title="Selector Agent">
-            <p className="text-[12px] text-gray-500 mb-4 leading-relaxed">
-              这里单独配置浏览器自动抓取用的大模型，不占用智能模式或识别模式的账号。后续 selector 自动诊断、抽取和写回都会优先读这组配置。
-            </p>
-
-            <div className="space-y-3 mb-6">
-              <CheckboxRow
-                checked={selectorAgentEnabled}
-                onChange={setSelectorAgentEnabled}
-                label="启用 selector agent 自动抓取"
-                subtext="关闭后只保留配置，不参与自动诊断或自动写入。"
-              />
-            </div>
-
-            {selectorAgentPlatforms.length === 0 ? (
-              <div className="text-[12px] text-gray-500 border-l-2 border-gray-200 pl-3 py-1">
-                当前没有可用的平台模型，请先在 API 配置里补充至少一个可调用的模型。
-              </div>
-            ) : (
-              <div className="space-y-4">
-                <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
-                  <SelectInput
-                    label="AI 平台 :"
-                    value={selectorAgentPlatform}
-                    onChange={(val) => {
-                      setSelectorAgentPlatform(val);
-                      const platform = selectorAgentPlatforms.find((item) => item.id === val);
-                      if (platform) setSelectorAgentModel(platform.models[0] || "");
-                    }}
-                    options={selectorAgentPlatforms.map((item) => ({ value: item.id, label: item.name }))}
-                  />
-                  <SelectInput
-                    label="调用模型 :"
-                    value={selectorAgentModel}
-                    onChange={setSelectorAgentModel}
-                    options={selectorAgentModelOptions.map((model) => ({ value: model, label: model }))}
-                  />
-                </div>
-                <p className="text-[11px] text-gray-400 leading-relaxed border-l-2 border-gray-200 pl-3">
-                  这组配置只负责 selector 诊断和自动抓取时的模型选择，和智能模式、识别模式彼此独立。
-                </p>
-              </div>
-            )}
           </Section>
 
           {/* Section 6: Search Plugin */}
@@ -3606,124 +2654,6 @@ export function SettingsContent({
                 className="w-full bg-transparent border-0 border-b border-gray-200 rounded-none text-[12px] px-0 py-2 outline-none focus:border-gray-900 transition-colors font-mono text-gray-800"
               />
               <span className="text-[11px] text-gray-400 mt-1">未填写时，会自动回退到内置公开搜索桥接。</span>
-            </div>
-          </Section>
-
-          {/* Section 7: Decoration Template */}
-          <Section title="页面原始截图装饰模板">
-            <p className="text-[12px] text-gray-500 mb-4 leading-relaxed">
-              这里只作用于“页面原始截图”。DOM 文本生成会固定走 Surfaced 模版，不会套用这里的旧装饰样式。
-            </p>
-            
-            <div className="mb-6">
-              <CheckboxRow checked={screenshotEnabled} onChange={setScreenshotEnabled} label="启用页面截图装饰模板" />
-            </div>
-
-            <div className={`transition-opacity duration-300 space-y-6 ${!screenshotEnabled ? 'opacity-50 pointer-events-none' : ''}`}>
-              
-              {/* Text Inputs */}
-              <div className="space-y-4">
-                <TextInput label="标题 (支持 {brand} / {platform} / {keyword} / {time}) :" value={screenshotTitle} onChange={setScreenshotTitle} />
-                <TextInput label="副标题 :" value={screenshotSubtitle} onChange={setScreenshotSubtitle} />
-                <TextInput label="页脚文案 :" value={screenshotFooter} onChange={setScreenshotFooter} />
-              </div>
-
-              {/* Toggles */}
-              <div className="flex items-center gap-6">
-                <Checkbox checked={showTime} onChange={setShowTime} label="显示时间" />
-                <Checkbox checked={showFooter} onChange={setShowFooter} label="显示页脚" />
-                <Checkbox checked={showHighlight} onChange={setShowHighlight} label="绘制高亮框" />
-              </div>
-
-              {/* Colors & Dimensions Grid */}
-              <div className="grid grid-cols-2 gap-x-10 gap-y-4 pt-4 border-t border-gray-100">
-                <ColorInput label="强调色 :" value={accentColor} onChange={setAccentColor} />
-                <ColorInput label="背景起始 :" value={backgroundStart} onChange={setBackgroundStart} />
-                <ColorInput label="背景结束 :" value={backgroundEnd} onChange={setBackgroundEnd} />
-                <ColorInput label="头部起始 :" value={headerStart} onChange={setHeaderStart} />
-                <ColorInput label="头部结束 :" value={headerEnd} onChange={setHeaderEnd} />
-              </div>
-
-              <div className="grid grid-cols-2 gap-x-10 gap-y-4 pt-4 border-t border-gray-100">
-                <DimensionInput label="外边距 :" value={outerPadding} onChange={setOuterPadding} />
-                <DimensionInput label="头部高度 :" value={headerHeight} onChange={setHeaderHeight} />
-                <DimensionInput label="卡片圆角 :" value={radius} onChange={setRadius} />
-                <DimensionInput label="图片圆角 :" value={imageRadius} onChange={setImageRadius} />
-              </div>
-
-              {/* Reset Action */}
-              <div className="flex items-center gap-3 pt-6">
-                <button onClick={handleResetScreenshotTemplate} className="flex items-center gap-1.5 px-0 py-2 text-[12px] font-bold text-gray-700 hover:text-gray-900 transition-colors bg-transparent">
-                  <RefreshCw className="w-3.5 h-3.5" /> 恢复默认装饰
-                </button>
-                <span className="text-[11px] text-gray-400">改完保存后，后续截图会默认使用新样式。</span>
-              </div>
-            </div>
-          </Section>
-
-          <Section
-            title="天气与节日"
-            action={(
-              <button
-                type="button"
-                onClick={handleRefreshContext}
-                disabled={refreshingContext}
-                className="flex items-center gap-1.5 text-[12px] font-bold text-gray-600 hover:text-gray-900 transition-colors px-0 py-1.5 disabled:opacity-50"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${refreshingContext ? "animate-spin" : ""}`} />
-                {refreshingContext ? "刷新中..." : "立即刷新"}
-              </button>
-            )}
-          >
-            <div className="space-y-5">
-              <div className="border-b border-gray-200/80 pb-5 space-y-4">
-                <CheckboxRow
-                  checked={weatherReminderEnabled}
-                  onChange={setWeatherReminderEnabled}
-                  label="启用天气提醒"
-                  subtext="关闭后首页不会再显示天气文案。"
-                />
-                <ControlledTextInput
-                  label="天气城市 :"
-                  value={weatherCity}
-                  onChange={setWeatherCity}
-                  placeholder="例如：武汉 / 上海 / Beijing"
-                />
-                <ControlledTextInput
-                  label="彩云 Token :"
-                  value={weatherToken}
-                  onChange={setWeatherToken}
-                  placeholder="填写彩云天气开放平台 Token"
-                />
-                <div className="flex items-center gap-3 text-[12px]">
-                  <span className="w-24 font-bold text-gray-700">刷新间隔 :</span>
-                  <NumberInput
-                    value={weatherRefreshMinutes}
-                    onChange={setWeatherRefreshMinutes}
-                    min={15}
-                    max={1440}
-                  />
-                  <span className="text-gray-500 font-medium">分钟</span>
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-[120px_minmax(0,1fr)] gap-3 pt-2">
-                  <div className="text-[11px] font-bold tracking-wide text-gray-400">天气快照</div>
-                  <div>
-                    <div className="text-[12px] text-gray-700 leading-relaxed">
-                      {weatherSnapshotLine || "暂未获取天气快照"}
-                    </div>
-                    {weatherSnapshotTime ? (
-                      <div className="mt-1 text-[11px] text-gray-400">更新时间：{weatherSnapshotTime}</div>
-                    ) : null}
-                    {weatherSnapshotError ? (
-                      <div className="mt-1 text-[11px] text-amber-600">接口状态：{weatherSnapshotError}</div>
-                    ) : null}
-                  </div>
-                </div>
-              </div>
-
-              {contextRefreshMessage ? (
-                <div className="text-[12px] font-medium text-blue-600">{contextRefreshMessage}</div>
-              ) : null}
             </div>
           </Section>
 
@@ -3953,178 +2883,6 @@ export function SettingsContent({
 
 // --- Subcomponents ---
 
-function QueryExecutionSettingsCard({
-  title,
-  description,
-  settings,
-  onChange,
-}: {
-  title: string,
-  description: string,
-  settings: QueryExecutionModeSettings,
-  onChange: (key: keyof QueryExecutionModeSettings, value: string | boolean) => void,
-}) {
-  const experimentalPool = settings.strategy === "session_pool";
-
-  return (
-    <div className="mb-6 border-b border-gray-200/80 pb-5 space-y-4">
-      <div className="flex flex-col gap-1">
-        <span className="text-[12px] font-bold text-gray-900">{title}</span>
-        <span className="text-[11px] text-gray-500 leading-relaxed">{description}</span>
-      </div>
-
-      <SelectInput
-        label="执行策略 :"
-        value={settings.strategy}
-        onChange={(value) => onChange("strategy", value)}
-        options={QUERY_EXECUTION_STRATEGY_OPTIONS}
-      />
-
-      {!experimentalPool ? (
-        <div className="border-l-2 border-emerald-300 pl-3 text-[11px] text-emerald-800 leading-relaxed">
-          当前稳定策略会按平台分组串行执行，同一平台尽量连续完成后再切换，不再按单条查询反复重启浏览器。
-        </div>
-      ) : (
-        <div className="border-l-2 border-amber-300 pl-3 text-[11px] text-amber-900 leading-relaxed">
-          平台会话池仍处于实验阶段，适合单独验证，不建议当作日常稳定策略长期开启。
-        </div>
-      )}
-
-      <div className={`space-y-4 transition-opacity duration-200 ${experimentalPool ? "opacity-100" : "opacity-50 pointer-events-none"}`}>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <SelectInput
-            label="池内调度方式 :"
-            value={settings.sessionPoolDispatch}
-            onChange={(value) => onChange("sessionPoolDispatch", value)}
-            options={SESSION_POOL_DISPATCH_OPTIONS}
-          />
-          <LabeledNumberInput
-            label="平台批次大小 :"
-            value={settings.sessionPoolPlatformBatchSize}
-            onChange={(value) => onChange("sessionPoolPlatformBatchSize", value)}
-            suffix="条"
-            min={1}
-            max={20}
-          />
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <LabeledNumberInput
-            label="会话寿命最小值 :"
-            value={settings.sessionTtlMinutesMin}
-            onChange={(value) => onChange("sessionTtlMinutesMin", value)}
-            suffix="分钟"
-            min={10}
-            max={600}
-          />
-          <LabeledNumberInput
-            label="会话寿命最大值 :"
-            value={settings.sessionTtlMinutesMax}
-            onChange={(value) => onChange("sessionTtlMinutesMax", value)}
-            suffix="分钟"
-            min={10}
-            max={600}
-          />
-          <LabeledNumberInput
-            label="最大查询数最小值 :"
-            value={settings.sessionMaxQueriesMin}
-            onChange={(value) => onChange("sessionMaxQueriesMin", value)}
-            suffix="次"
-            min={1}
-            max={500}
-          />
-          <LabeledNumberInput
-            label="最大查询数最大值 :"
-            value={settings.sessionMaxQueriesMax}
-            onChange={(value) => onChange("sessionMaxQueriesMax", value)}
-            suffix="次"
-            min={1}
-            max={500}
-          />
-          <LabeledNumberInput
-            label="最少查询统计窗口 :"
-            value={settings.minQueriesWindowMinutes}
-            onChange={(value) => onChange("minQueriesWindowMinutes", value)}
-            suffix="分钟"
-            min={1}
-            max={180}
-          />
-          <LabeledNumberInput
-            label="窗口内最少查询数 :"
-            value={settings.minQueriesPerWindow}
-            onChange={(value) => onChange("minQueriesPerWindow", value)}
-            suffix="次"
-            min={1}
-            max={100}
-          />
-          <LabeledNumberInput
-            label="单次查询超时阈值 :"
-            value={settings.singleQueryTimeoutMinutes}
-            onChange={(value) => onChange("singleQueryTimeoutMinutes", value)}
-            suffix="分钟"
-            min={1}
-            max={180}
-          />
-          <LabeledNumberInput
-            label="无进展重启阈值 :"
-            value={settings.noProgressTimeoutMinutes}
-            onChange={(value) => onChange("noProgressTimeoutMinutes", value)}
-            suffix="分钟"
-            min={1}
-            max={180}
-          />
-          <LabeledNumberInput
-            label="重启冷却时间 :"
-            value={settings.minRestartCooldownMinutes}
-            onChange={(value) => onChange("minRestartCooldownMinutes", value)}
-            suffix="分钟"
-            min={0}
-            max={180}
-          />
-          <LabeledNumberInput
-            label="结构性异常重启阈值 :"
-            value={settings.restartAfterStructuralFailures}
-            onChange={(value) => onChange("restartAfterStructuralFailures", value)}
-            suffix="次"
-            min={1}
-            max={20}
-          />
-        </div>
-
-        <CheckboxRow
-          checked={settings.restartAfterManualRecovery}
-          onChange={(value) => onChange("restartAfterManualRecovery", value)}
-          label="人工恢复后优先轮换平台会话"
-          subtext="命中验证码或人工接管后，本次查询结束会优先重启该平台会话。"
-        />
-      </div>
-    </div>
-  );
-}
-
-function LabeledNumberInput({
-  label,
-  value,
-  onChange,
-  min,
-  max,
-  suffix,
-}: {
-  label: string,
-  value: string,
-  onChange: (val: string) => void,
-  min: number,
-  max: number,
-  suffix: string,
-}) {
-  return (
-    <div className="flex items-center gap-3 text-[12px]">
-      <span className="w-36 shrink-0 font-bold text-gray-700">{label}</span>
-      <NumberInput value={value} onChange={onChange} min={min} max={max} />
-      <span className="text-gray-500 font-medium">{suffix}</span>
-    </div>
-  );
-}
-
 function Section({
   title,
   action,
@@ -4298,13 +3056,6 @@ function SelectorHealResultPanel({
         : currentStatus
           ? `当前状态：${currentStatus}`
           : "";
-  const selectorAgentLabel = result?.selector_agent_used
-    ? `模型辅助：${result.selector_agent_platform || "unknown"}${result.selector_agent_model ? ` / ${result.selector_agent_model}` : ""}${result.selector_agent_confidence ? `（${Math.round(result.selector_agent_confidence * 100)}%）` : ""}`
-    : result?.selector_agent_error
-      ? `模型辅助失败：${result.selector_agent_error}`
-      : result?.selector_agent_reason
-        ? `模型辅助跳过：${result.selector_agent_reason}`
-      : "";
   const verifiedSelector = String(
     result?.selector
     || result?.verified_selector
@@ -4326,9 +3077,6 @@ function SelectorHealResultPanel({
             <span className={result.saved ? "text-emerald-700" : result.save_error ? "text-rose-700" : result.verify_status === "passed" ? "text-emerald-700" : "text-gray-400"}>
               {result.saved ? "已自动保存" : result.save_error ? "保存失败" : result.verify_status === "passed" ? "已验证待保存" : "仅诊断"}
             </span>
-            {selectorAgentLabel ? (
-              <span className={result.selector_agent_used ? "text-sky-700" : "text-amber-700"}>{selectorAgentLabel}</span>
-            ) : null}
           </div>
           {verifiedSelector ? (
             <div className="border-t border-gray-100 pt-2">
@@ -4447,32 +3195,6 @@ function TextInput({ label, value, onChange }: { label: string, value: string, o
         onChange={(e) => onChange(e.target.value)}
         className="w-full bg-transparent border-0 border-b border-gray-200 rounded-none text-[12px] px-0 py-2 outline-none focus:border-gray-900 transition-colors text-gray-800"
       />
-    </div>
-  );
-}
-
-function ColorInput({ label, value, onChange }: { label: string, value: string, onChange: (val: string) => void }) {
-  return (
-    <div className="flex items-center justify-between">
-      <label className="text-[12px] font-bold text-gray-500">{label}</label>
-      <div className="flex items-center gap-2">
-        <input 
-          type="text" 
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className="w-20 bg-transparent border-0 border-b border-gray-200 rounded-none text-[12px] px-0 py-1 outline-none focus:border-gray-900 transition-colors text-gray-800 font-mono uppercase text-right"
-        />
-        <div className="w-5 h-5 rounded border border-gray-200/50 shrink-0" style={{ backgroundColor: value }}></div>
-      </div>
-    </div>
-  );
-}
-
-function DimensionInput({ label, value, onChange }: { label: string, value: string, onChange: (val: string) => void }) {
-  return (
-    <div className="flex items-center justify-between">
-      <label className="text-[12px] font-bold text-gray-500">{label}</label>
-      <NumberInput value={value} onChange={onChange} min={0} max={500} />
     </div>
   );
 }

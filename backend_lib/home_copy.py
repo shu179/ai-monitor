@@ -12,8 +12,6 @@ from core.time_utils import local_now
 DEFAULT_MODE_KEY_TO_TITLE: dict[str, str] = {
     "browser": "抓取模式",
     "recognition": "识别模式",
-    "api": "保险模式",
-    "smart": "智能模式",
 }
 
 _HOME_COPY_SKIP_TOKENS = (
@@ -27,9 +25,7 @@ _HOME_COPY_SKIP_TOKENS = (
     "主页提醒会跟随模式状态自动变化",
     "启动监控后会自动刷新互动提醒",
     "抓取模式适合",
-    "保险模式走平台 API",
     "识别模式会低负载监听",
-    "智能模式由 AI 接管",
 )
 
 

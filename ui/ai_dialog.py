@@ -35,7 +35,6 @@ from platforms.api_client import (
     send_platform_chat_messages,
 )
 from platforms.base import BasePlatform
-from ui.api_config import get_config_model_options
 from ui.tk_compat import install_global_tk_behaviors
 
 
@@ -64,16 +63,40 @@ MODE_ALIASES = {
     "browser": "browser",
     "抓取模式": "browser",
     "抓取": "browser",
-    "api": "api",
-    "保险模式": "api",
-    "保险": "api",
     "recognition": "recognition",
     "识别模式": "recognition",
     "识别": "recognition",
-    "smart": "smart",
-    "智能模式": "smart",
-    "智能": "smart",
 }
+
+
+def _normalize_model_options(*values):
+    options = []
+    for value in values:
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                model = str(item or "").strip()
+                if model and model not in options:
+                    options.append(model)
+            continue
+
+        model = str(value or "").strip()
+        if model and model not in options:
+            options.append(model)
+    return options
+
+
+def _get_config_model_options(config, code, *extra_models):
+    config = config or {}
+    platforms_cfg = config.get("platforms", {}) or {}
+    platform_cfg = platforms_cfg.get(code, {}) or {}
+    if code == "local_model" and not platform_cfg:
+        platform_cfg = platforms_cfg.get("local_qwen", {}) or {}
+    return _normalize_model_options(
+        platform_cfg.get("model_options", []),
+        platform_cfg.get("api_model", ""),
+        str((PLATFORM_API_CONFIG.get(code) or {}).get("default_model") or "").strip(),
+        *extra_models,
+    )
 
 
 def _preview_debug_text(value, limit=120):
@@ -469,7 +492,7 @@ class AIAssistantDialog:
             return
 
         current_model = self.model_var.get().strip()
-        values = get_config_model_options(self.config, code, self._get_preferred_model(code), current_model)
+        values = _get_config_model_options(self.config, code, self._get_preferred_model(code), current_model)
         self.model_combo["values"] = values
 
         if force_model or not current_model:
@@ -882,8 +905,8 @@ class AIAssistantDialog:
             "只返回 JSON，不要输出解释。"
             "字段结构必须是 {\"tasks\": [...]}。"
             "支持的平台代码只有 doubao, deepseek, ark_deepseek, kimi, yuanbao, tongyi, wenxin。"
-            "每个关键词项的 mode 只允许 browser, api, recognition, smart 四种。"
-            "它们分别对应抓取模式、保险模式、识别模式、智能模式。"
+            "每个关键词项的 mode 只允许 browser, recognition 两种。"
+            "它们分别对应抓取模式、识别模式。"
             "weekdays 用 0-6 表示周一到周日。"
             "任务里不要包含 schedule 或 interval。"
             "每天的自动执行时刻由全局 weekly_times 单独配置。"

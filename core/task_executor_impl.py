@@ -16,7 +16,6 @@ from core.platform_sessions import (
     build_query_execution_policy,
     build_round_query_plan,
 )
-from core.task_executor_api import _run_api_task
 from core.task_executor_browser import (
     _should_use_session_pool_for_query,
 )
@@ -31,7 +30,6 @@ from core.task_executor_plan import (
     historical_query_result as _planned_historical_query_result,
 )
 from core.task_executor_query import execute_task_query
-from core.task_executor_smart import _run_smart_browser_task
 from core.task_notifications import (
     record_diagnostic as _record_diagnostic,
     send_task_notifications as _send_task_notifications,
@@ -80,12 +78,12 @@ def run_task_group(
         return ([], report) if return_report else []
 
     runtime_mode = str((config or {}).get('detection_mode') or '').strip()
-    if runtime_mode not in {'browser', 'api', 'smart', 'recognition'}:
+    if runtime_mode not in {'browser', 'recognition'}:
         runtime_mode = str(task.get('_scheduler_mode') or '').strip()
-    if runtime_mode not in {'browser', 'api', 'smart', 'recognition'}:
+    if runtime_mode not in {'browser', 'recognition'}:
         runtime_mode = ''
     owns_session_manager = False
-    if platform_session_manager is None and runtime_mode in {"browser", "smart"}:
+    if platform_session_manager is None and runtime_mode == "browser":
         policy = build_query_execution_policy(config or {}, runtime_mode)
         if policy.use_session_pool:
             platform_session_manager = PlatformSessionManager(
@@ -427,8 +425,6 @@ def run_task_group(
             stop_message=stop_message,
             record_diagnostic=_record_diagnostic,
             complete_query_result=_complete_query_result,
-            run_api_task=_run_api_task,
-            run_smart_browser_task=_run_smart_browser_task,
         )
 
     try:
@@ -516,8 +512,6 @@ def run_task_group(
 
 
 __all__ = [
-    "_run_api_task",
-    "_run_smart_browser_task",
     "_should_use_session_pool_for_query",
     "run_task_group",
 ]

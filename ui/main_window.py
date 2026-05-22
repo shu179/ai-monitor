@@ -22,7 +22,7 @@ from core.notifier import send_scheduler_test_message
 from core.quick_todos import normalize_quick_todos
 from core.runtime_state import should_auto_resume_monitoring, set_auto_resume_monitoring
 from core.scheduler import describe_task_schedule, normalize_weekly_times
-from core.screenshot_tools import get_decoration_theme, get_default_decoration_theme
+from core.screenshot_tools import get_default_decoration_theme
 from ui.config_runtime import persist_config, persist_config_with_feedback
 from ui.article_window import ArticleWindow
 from ui.home_copy import build_home_copy_context, get_home_messages, pick_home_message
@@ -80,9 +80,7 @@ _BROWSER_ANSWER_MODE_OPTIONS = {
 
 FORMAL_MODES = [
     ("抓取模式", "固定脚本操作浏览器、抓页面内容、规则判断、截图发送"),
-    ("保险模式", "直接走平台 API，默认联网搜索，适合稳定兜底"),
     ("识别模式", "自动读取剪切板截图，识别品牌并归类统计后确认发送"),
-    ("智能模式", "AI 在后台接管浏览器操作，完成输入、判断、截图和发送"),
 ]
 
 
@@ -545,7 +543,6 @@ class MainWindow:
         self._build_tasks_tab()
         self._build_status_tab()
         self._build_settings_tab()
-        self._build_api_tab()
 
         if getattr(self, "_should_restore_monitoring_on_launch", False) and should_auto_resume_monitoring():
             self._status_pill.config(text="状态: 正在恢复", fg=_TEXT_SEC, bg=_BG)
@@ -894,9 +891,7 @@ class MainWindow:
             return
         code_to_label = {
             "browser": "抓取模式",
-            "api": "保险模式",
             "recognition": "识别模式",
-            "smart": "智能模式",
         }
         actions = []
         for mode in pending_modes:
@@ -930,14 +925,12 @@ class MainWindow:
     def _get_default_mode(self) -> str:
         scheduler_cfg = self.config.get("scheduler", {}) or {}
         mode = str(scheduler_cfg.get("default_mode") or "browser").strip()
-        return mode if mode in {"browser", "api", "recognition", "smart"} else "browser"
+        return mode if mode in {"browser", "recognition"} else "browser"
 
     def _set_default_mode(self, mode_label: str):
         label_to_code = {
             "抓取模式": "browser",
-            "保险模式": "api",
             "识别模式": "recognition",
-            "智能模式": "smart",
         }
         mode_code = label_to_code.get(mode_label)
         if not mode_code:
@@ -955,9 +948,7 @@ class MainWindow:
     def _refresh_mode_cards(self):
         code_to_label = {
             "browser": "抓取模式",
-            "api": "保险模式",
             "recognition": "识别模式",
-            "smart": "智能模式",
         }
         selected_label = code_to_label.get(self._get_default_mode(), "抓取模式")
         for label, card in self._mode_cards.items():
@@ -3223,11 +3214,9 @@ class MainWindow:
         self._scheduler_extra_vars = {}
         self._settings_search_vars = {}
         self._settings_browser_vars = {}
-        self._settings_decoration_vars = {}
         recognition_cfg = self.config.get('recognition', {}) or {}
         scheduler_cfg = self.config.get('scheduler', {}) or {}
         search_cfg = self.config.get('search', {}) or {}
-        decoration_theme = get_decoration_theme(self.config)
         weekly_times = normalize_weekly_times(scheduler_cfg)
 
         def add_entry_row(parent, row, column, label, variable):
@@ -3420,7 +3409,7 @@ class MainWindow:
                  font=(_FONT, 11, "bold")).pack(anchor=tk.W)
         tk.Label(
             recognition_pad,
-            text="这里控制识别模式是否优先使用本地 OCR，以及本地 OCR 未命中时是否启用 AI 辅助复核。",
+            text="识别模式会固定启用本地 OCR，这里只保留识别方式相关设置。",
             bg=_SURFACE,
             fg=_TEXT_TER,
             font=(_FONT, 9),
@@ -3428,35 +3417,9 @@ class MainWindow:
             justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(8, 0))
 
-        safe_mode_ocr_var = tk.BooleanVar(value=bool(recognition_cfg.get('safe_mode_ocr_enabled', True)))
-        tk.Checkbutton(
-            recognition_pad,
-            text="启用本地 OCR 自动识别",
-            variable=safe_mode_ocr_var,
-            bg=_SURFACE,
-            fg=_TEXT_PRI,
-            activebackground=_SURFACE,
-            activeforeground=_TEXT_PRI,
-            selectcolor=_SURFACE,
-        ).pack(anchor=tk.W, pady=(10, 0))
-        self._recognition_api_vars['safe_mode_ocr_enabled'] = safe_mode_ocr_var
-
-        ai_fallback_var = tk.BooleanVar(value=bool(recognition_cfg.get('ai_fallback_enabled', False)))
-        tk.Checkbutton(
-            recognition_pad,
-            text="本地 OCR 未命中时启用 AI 识别辅助",
-            variable=ai_fallback_var,
-            bg=_SURFACE,
-            fg=_TEXT_PRI,
-            activebackground=_SURFACE,
-            activeforeground=_TEXT_PRI,
-            selectcolor=_SURFACE,
-        ).pack(anchor=tk.W, pady=(8, 0))
-        self._recognition_api_vars['ai_fallback_enabled'] = ai_fallback_var
-
         tk.Label(
             recognition_pad,
-            text="关闭本地 OCR 后，识别模式会进入人工推进；开启 AI 辅助后，会在 OCR 未识别到目标品牌时再调用 AI 复核。",
+            text="命中品牌后会直接进入后续发送流程。",
             bg=_SURFACE,
             fg=_TEXT_TER,
             font=(_FONT, 8),
@@ -3527,7 +3490,7 @@ class MainWindow:
                  font=(_FONT, 11, "bold")).pack(anchor=tk.W)
         tk.Label(
             search_pad,
-            text="联网搜索桥接优先走 Tavily；填写后，搜搜和保险模式的搜索兜底都会优先使用它。",
+            text="联网搜索桥接优先走 Tavily；填写后，搜搜会优先使用它。",
             bg=_SURFACE,
             fg=_TEXT_TER,
             font=(_FONT, 9),
@@ -3573,171 +3536,6 @@ class MainWindow:
             'tavily_api_key': tavily_key_var,
         }
 
-        decoration_card = tk.Frame(inner, bg=_SURFACE,
-                                   highlightbackground=_BORDER, highlightthickness=1)
-        decoration_card.pack(fill=tk.X, pady=(0, 8))
-        decoration_pad = tk.Frame(decoration_card, bg=_SURFACE, padx=18, pady=14)
-        decoration_pad.pack(fill=tk.X)
-
-        tk.Label(decoration_pad, text="页面原始截图装饰模板", bg=_SURFACE, fg=_TEXT_PRI,
-                 font=(_FONT, 11, "bold")).pack(anchor=tk.W)
-        tk.Label(
-            decoration_pad,
-            text="这里只作用于“页面原始截图”。DOM 文本生成会固定走 Surfaced 模版，不会套用这里的旧装饰样式。",
-            bg=_SURFACE,
-            fg=_TEXT_TER,
-            font=(_FONT, 9),
-            wraplength=560,
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W, pady=(8, 0))
-
-        self._settings_decoration_vars = {
-            'enabled': tk.BooleanVar(value=bool(decoration_theme.get('enabled', True))),
-            'title': tk.StringVar(value=str(decoration_theme.get('title', ''))),
-            'subtitle': tk.StringVar(value=str(decoration_theme.get('subtitle', ''))),
-            'footer': tk.StringVar(value=str(decoration_theme.get('footer', ''))),
-            'show_timestamp': tk.BooleanVar(value=bool(decoration_theme.get('show_timestamp', True))),
-            'show_footer': tk.BooleanVar(value=bool(decoration_theme.get('show_footer', True))),
-            'draw_highlight_boxes': tk.BooleanVar(value=bool(decoration_theme.get('draw_highlight_boxes', True))),
-            'accent_color': tk.StringVar(value=str(decoration_theme.get('accent_color', '#14C7F3'))),
-            'background_start': tk.StringVar(value=str((decoration_theme.get('background', {}) or {}).get('start', '#FCFDFF'))),
-            'background_end': tk.StringVar(value=str((decoration_theme.get('background', {}) or {}).get('end', '#F7FAFF'))),
-            'header_start': tk.StringVar(value=str((decoration_theme.get('header', {}) or {}).get('start', '#173A43'))),
-            'header_end': tk.StringVar(value=str((decoration_theme.get('header', {}) or {}).get('end', '#14C7F3'))),
-            'outer_padding': tk.IntVar(value=int((decoration_theme.get('layout', {}) or {}).get('outer_padding', 28))),
-            'header_height': tk.IntVar(value=int((decoration_theme.get('layout', {}) or {}).get('header_height', 136))),
-            'radius': tk.IntVar(value=int((decoration_theme.get('layout', {}) or {}).get('radius', 28))),
-            'image_radius': tk.IntVar(value=int((decoration_theme.get('layout', {}) or {}).get('image_radius', 22))),
-        }
-
-        tk.Checkbutton(
-            decoration_pad,
-            text="启用页面截图装饰模板",
-            variable=self._settings_decoration_vars['enabled'],
-            bg=_SURFACE,
-            fg=_TEXT_PRI,
-            activebackground=_SURFACE,
-            activeforeground=_TEXT_PRI,
-            selectcolor=_SURFACE,
-        ).pack(anchor=tk.W, pady=(10, 0))
-
-        tk.Label(decoration_pad, text="标题  ·  支持 {brand} / {platform} / {keyword} / {time}",
-                 bg=_SURFACE, fg=_TEXT_TER, font=(_FONT, 8)).pack(anchor=tk.W, pady=(8, 3))
-        title_entry = tk.Entry(
-            decoration_pad,
-            textvariable=self._settings_decoration_vars['title'],
-            font=(_FONT, 10),
-            bg=_SURFACE2, fg=_TEXT_PRI,
-            relief=tk.FLAT, highlightbackground=_BORDER2, highlightthickness=1,
-            insertbackground=_TEXT_PRI,
-        )
-        title_entry.pack(fill=tk.X, ipady=6)
-        title_entry.bind("<MouseWheel>", lambda e: scroll_canvas_on_mousewheel(canvas, e))
-
-        tk.Label(decoration_pad, text="副标题", bg=_SURFACE, fg=_TEXT_TER, font=(_FONT, 8)).pack(anchor=tk.W, pady=(8, 3))
-        subtitle_entry = tk.Entry(
-            decoration_pad,
-            textvariable=self._settings_decoration_vars['subtitle'],
-            font=(_FONT, 10),
-            bg=_SURFACE2, fg=_TEXT_PRI,
-            relief=tk.FLAT, highlightbackground=_BORDER2, highlightthickness=1,
-            insertbackground=_TEXT_PRI,
-        )
-        subtitle_entry.pack(fill=tk.X, ipady=6)
-        subtitle_entry.bind("<MouseWheel>", lambda e: scroll_canvas_on_mousewheel(canvas, e))
-
-        tk.Label(decoration_pad, text="页脚文案", bg=_SURFACE, fg=_TEXT_TER, font=(_FONT, 8)).pack(anchor=tk.W, pady=(8, 3))
-        footer_entry = tk.Entry(
-            decoration_pad,
-            textvariable=self._settings_decoration_vars['footer'],
-            font=(_FONT, 10),
-            bg=_SURFACE2, fg=_TEXT_PRI,
-            relief=tk.FLAT, highlightbackground=_BORDER2, highlightthickness=1,
-            insertbackground=_TEXT_PRI,
-        )
-        footer_entry.pack(fill=tk.X, ipady=6)
-        footer_entry.bind("<MouseWheel>", lambda e: scroll_canvas_on_mousewheel(canvas, e))
-
-        toggles = tk.Frame(decoration_pad, bg=_SURFACE)
-        toggles.pack(fill=tk.X, pady=(10, 8))
-        for label, key in (
-            ("显示时间", 'show_timestamp'),
-            ("显示页脚", 'show_footer'),
-            ("绘制高亮框", 'draw_highlight_boxes'),
-        ):
-            tk.Checkbutton(
-                toggles,
-                text=label,
-                variable=self._settings_decoration_vars[key],
-                bg=_SURFACE,
-                fg=_TEXT_PRI,
-                activebackground=_SURFACE,
-                activeforeground=_TEXT_PRI,
-                selectcolor=_SURFACE,
-            ).pack(side=tk.LEFT, padx=(0, 12))
-
-        color_grid = tk.Frame(decoration_pad, bg=_SURFACE)
-        color_grid.pack(fill=tk.X, pady=(0, 6))
-        add_entry_row(color_grid, 0, 0, "强调色", self._settings_decoration_vars['accent_color'])
-        add_entry_row(color_grid, 0, 2, "背景起始", self._settings_decoration_vars['background_start'])
-        add_entry_row(color_grid, 1, 0, "背景结束", self._settings_decoration_vars['background_end'])
-        add_entry_row(color_grid, 1, 2, "头部起始", self._settings_decoration_vars['header_start'])
-        add_entry_row(color_grid, 2, 0, "头部结束", self._settings_decoration_vars['header_end'])
-
-        layout_grid = tk.Frame(decoration_pad, bg=_SURFACE)
-        layout_grid.pack(fill=tk.X, pady=(2, 0))
-        add_spinbox_row(layout_grid, 0, 0, "外边距", self._settings_decoration_vars['outer_padding'], 12, 80)
-        add_spinbox_row(layout_grid, 0, 2, "头部高度", self._settings_decoration_vars['header_height'], 88, 240)
-        add_spinbox_row(layout_grid, 1, 0, "卡片圆角", self._settings_decoration_vars['radius'], 12, 48)
-        add_spinbox_row(layout_grid, 1, 2, "图片圆角", self._settings_decoration_vars['image_radius'], 8, 36)
-
-        def reset_decoration_defaults():
-            theme = get_default_decoration_theme()
-            layout = (theme.get('layout', {}) or {})
-            background = (theme.get('background', {}) or {})
-            header = (theme.get('header', {}) or {})
-            values = {
-                'enabled': bool(theme.get('enabled', True)),
-                'title': str(theme.get('title', '')),
-                'subtitle': str(theme.get('subtitle', '')),
-                'footer': str(theme.get('footer', '')),
-                'show_timestamp': bool(theme.get('show_timestamp', True)),
-                'show_footer': bool(theme.get('show_footer', True)),
-                'draw_highlight_boxes': bool(theme.get('draw_highlight_boxes', True)),
-                'accent_color': str(theme.get('accent_color', '#14C7F3')),
-                'background_start': str(background.get('start', '#FCFDFF')),
-                'background_end': str(background.get('end', '#F7FAFF')),
-                'header_start': str(header.get('start', '#173A43')),
-                'header_end': str(header.get('end', '#14C7F3')),
-                'outer_padding': int(layout.get('outer_padding', 28)),
-                'header_height': int(layout.get('header_height', 136)),
-                'radius': int(layout.get('radius', 28)),
-                'image_radius': int(layout.get('image_radius', 22)),
-            }
-            for key, value in values.items():
-                self._settings_decoration_vars[key].set(value)
-
-        decoration_actions = tk.Frame(decoration_pad, bg=_SURFACE)
-        decoration_actions.pack(fill=tk.X, pady=(10, 0))
-        tk.Button(
-            decoration_actions,
-            text="恢复默认模板",
-            command=reset_decoration_defaults,
-            bg=_SURFACE2,
-            fg=_TEXT_PRI,
-            relief=tk.FLAT,
-            padx=12,
-            pady=6,
-            cursor="hand2",
-        ).pack(side=tk.LEFT)
-        tk.Label(
-            decoration_actions,
-            text="保存后，后续“页面原始截图”会默认使用这里的样式。",
-            bg=_SURFACE,
-            fg=_TEXT_TER,
-            font=(_FONT, 8),
-        ).pack(side=tk.LEFT, padx=(10, 0))
-
         btn_frame = tk.Frame(inner, bg=_BG)
         btn_frame.pack(fill=tk.X, pady=(20, 0))
         tk.Button(btn_frame, text="保存设置",
@@ -3749,234 +3547,6 @@ class MainWindow:
                   activebackground="#3558d4",
                   activeforeground=_TEXT_PRI).pack(side=tk.RIGHT)
         bind_mousewheel_recursive(inner, lambda e: scroll_canvas_on_mousewheel(canvas, e))
-
-    def _build_api_tab(self):
-        frame = tk.Frame(self.notebook, bg=_BG)
-        self.notebook.add(frame, text="  API  ")
-
-        from ui.api_config import (
-            iter_platform_groups,
-            PLATFORM_LABELS,
-            get_config_model_options,
-            normalize_model_options,
-            run_platform_api_test,
-        )
-
-        canvas = tk.Canvas(frame, bg=_BG, highlightthickness=0)
-        sb = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        inner = tk.Frame(canvas, bg=_BG, padx=24, pady=20)
-
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        win = canvas.create_window((0,0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
-        canvas.bind("<MouseWheel>", lambda e: scroll_canvas_on_mousewheel(canvas, e))
-        canvas.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-
-        tk.Label(inner, text="API KEY 配置", bg=_BG, fg=_TEXT_PRI,
-                 font=(_FONT, 16, "bold")).pack(anchor=tk.W, pady=(0, 4))
-        tk.Label(inner, text="这里只负责各平台 API Key 与模型。搜索插件、OCR 和调度时间请到“设置”里配置。",
-                 bg=_BG, fg=_TEXT_TER, font=(_FONT, 9)).pack(anchor=tk.W, pady=(0, 20))
-
-        self._api_vars = {}
-        platforms_cfg = self.config.get('platforms', {})
-
-        def on_scroll(e):
-            return scroll_canvas_on_mousewheel(canvas, e)
-
-        for section_title, section_items in iter_platform_groups():
-            section = tk.Frame(inner, bg=_BG)
-            section.pack(fill=tk.X, pady=(0, 10))
-
-            tk.Label(
-                section,
-                text=section_title,
-                bg=_BG,
-                fg=_TEXT_PRI,
-                font=(_FONT, 12, "bold"),
-            ).pack(anchor=tk.W, pady=(4, 6))
-
-            for code, name, hint, has_api in section_items:
-                card = tk.Frame(section, bg=_SURFACE,
-                                highlightbackground=_BORDER, highlightthickness=1)
-                card.pack(fill=tk.X, pady=(0, 8))
-                card.bind("<MouseWheel>", on_scroll)
-
-                pad = tk.Frame(card, bg=_SURFACE, padx=18, pady=14)
-                pad.pack(fill=tk.X)
-
-                # 平台名（大字重）
-                tk.Label(pad, text=name, bg=_SURFACE, fg=_TEXT_PRI,
-                         font=(_FONT, 11, "bold")).pack(anchor=tk.W)
-
-                if not has_api:
-                    tk.Label(pad, text=hint, bg=_SURFACE, fg=_TEXT_TER,
-                             font=(_FONT, 9)).pack(anchor=tk.W, pady=(6, 0))
-                    self._api_vars[code] = {
-                        'api_key': tk.StringVar(),
-                        'api_model': tk.StringVar(),
-                        'model_options': [],
-                        'test_status': tk.StringVar(value=''),
-                    }
-                    continue
-
-                tk.Label(pad, text=f"API KEY  ·  {hint}", bg=_SURFACE, fg=_TEXT_TER,
-                         font=(_FONT, 8)).pack(anchor=tk.W, pady=(8, 3))
-                key_var = tk.StringVar(value=platforms_cfg.get(code, {}).get('api_key', ''))
-                key_entry = tk.Entry(pad, textvariable=key_var, show="•",
-                                     font=(_FONT_MONO, 10),
-                                     bg=_SURFACE2, fg=_TEXT_PRI,
-                                     relief=tk.FLAT,
-                                     highlightbackground=_BORDER2, highlightthickness=1,
-                                     insertbackground=_TEXT_PRI)
-                key_entry.pack(fill=tk.X, ipady=7)
-                key_entry.bind("<MouseWheel>", on_scroll)
-
-                def _ctx(event, e=key_entry):
-                    m = tk.Menu(frame, tearoff=0, bg=_SURFACE2, fg=_TEXT_PRI,
-                                activebackground=_ACCENT, activeforeground=_TEXT_PRI)
-                    m.add_command(label="复制", command=lambda: e.event_generate("<<CopyCompat>>"))
-                    m.add_command(label="剪切", command=lambda: e.event_generate("<<CutCompat>>"))
-                    m.add_command(label="粘贴", command=lambda: e.event_generate("<<PasteCompat>>"))
-                    m.add_command(label="全选", command=lambda: e.event_generate("<<SelectAllCompat>>"))
-                    m.post(event.x_root, event.y_root)
-                key_entry.bind("<Button-3>", _ctx)
-                key_entry.bind("<Button-2>", _ctx)
-
-                model_var = tk.StringVar(value=platforms_cfg.get(code, {}).get('api_model', ''))
-                model_options = get_config_model_options(self.config, code, model_var.get().strip())
-                model_row = tk.Frame(pad, bg=_SURFACE)
-                model_row.pack(fill=tk.X, pady=(10, 0))
-                if code == 'ark_deepseek':
-                    model_text = "推理接入点 ID / 模型标识（建议填 Endpoint ID，如 ep-xxxx，不要填页面展示名）"
-                else:
-                    model_text = "模型  （手填或从自定义列表中选，建议显式填写）"
-                tk.Label(model_row, text=model_text,
-                         bg=_SURFACE, fg=_TEXT_TER, font=(_FONT, 8)).pack(side=tk.LEFT)
-                model_combo = ttk.Combobox(
-                    model_row,
-                    textvariable=model_var,
-                    values=model_options,
-                    width=28,
-                    state="normal",
-                )
-                model_combo.pack(side=tk.LEFT, padx=(10, 0), ipady=5)
-
-                def _model_ctx(event, e=model_combo):
-                    m = tk.Menu(frame, tearoff=0, bg=_SURFACE2, fg=_TEXT_PRI,
-                                activebackground=_ACCENT, activeforeground=_TEXT_PRI)
-                    m.add_command(label="复制", command=lambda: e.event_generate("<<CopyCompat>>"))
-                    m.add_command(label="剪切", command=lambda: e.event_generate("<<CutCompat>>"))
-                    m.add_command(label="粘贴", command=lambda: e.event_generate("<<PasteCompat>>"))
-                    m.add_command(label="全选", command=lambda: e.event_generate("<<SelectAllCompat>>"))
-                    m.post(event.x_root, event.y_root)
-                model_combo.bind("<Button-3>", _model_ctx)
-                model_combo.bind("<Button-2>", _model_ctx)
-
-                model_btn_row = tk.Frame(pad, bg=_SURFACE)
-                model_btn_row.pack(fill=tk.X, pady=(6, 0))
-                ttk.Button(
-                    model_btn_row,
-                    text="新增模型名",
-                    command=lambda c=code: self._add_api_model_option(c),
-                ).pack(side=tk.LEFT)
-                ttk.Button(
-                    model_btn_row,
-                    text="删除当前模型名",
-                    command=lambda c=code: self._remove_api_model_option(c),
-                ).pack(side=tk.LEFT, padx=(8, 0))
-                test_btn = ttk.Button(
-                    model_btn_row,
-                    text="测试",
-                    command=lambda c=code: self._test_api_platform(c),
-                )
-                test_btn.pack(side=tk.LEFT, padx=(8, 0))
-                test_status = tk.StringVar(value="")
-                tk.Label(
-                    model_btn_row,
-                    text="列表由你维护，程序不再内置固定候选。",
-                    bg=_SURFACE,
-                    fg=_TEXT_TER,
-                    font=(_FONT, 8),
-                ).pack(side=tk.LEFT, padx=(10, 0))
-                tk.Label(
-                    model_btn_row,
-                    textvariable=test_status,
-                    bg=_SURFACE,
-                    fg=_TEXT_TER,
-                    font=(_FONT, 8),
-                ).pack(side=tk.RIGHT)
-
-                tk.Label(
-                    pad,
-                    text="联网搜索默认启用：优先走原生搜索，失败时自动兜底。",
-                    bg=_SURFACE,
-                    fg=_TEXT_TER,
-                    font=(_FONT, 9),
-                ).pack(anchor=tk.W, pady=(10, 0))
-
-                if code == 'wenxin':
-                    tk.Label(
-                        pad,
-                        text="提示：文心使用 Bearer Token 时优先走原生搜索；旧 ACCESS_KEY|SECRET_KEY 会自动退回兼容模式。",
-                        bg=_SURFACE,
-                        fg=_TEXT_TER,
-                        font=(_FONT, 8),
-                        wraplength=560,
-                        justify=tk.LEFT,
-                    ).pack(anchor=tk.W, pady=(6, 0))
-                elif code == 'ark_deepseek':
-                    tk.Label(
-                        pad,
-                        text="提示：方舟 DeepSeek 可以直接复用豆包的 API Key，模型单独填 Endpoint ID（通常形如 ep-xxxx）即可；联网搜索会优先走火山方舟原生 web_search。",
-                        bg=_SURFACE,
-                        fg=_TEXT_TER,
-                        font=(_FONT, 8),
-                        wraplength=560,
-                        justify=tk.LEFT,
-                    ).pack(anchor=tk.W, pady=(6, 0))
-
-                self._api_vars[code] = {
-                    'api_key': key_var,
-                    'api_model': model_var,
-                    'model_options': model_options,
-                    'model_combo': model_combo,
-                    'test_button': test_btn,
-                    'test_status': test_status,
-                    'platform_label': PLATFORM_LABELS.get(code, code),
-                }
-
-        btn_frame = tk.Frame(inner, bg=_BG)
-        btn_frame.pack(fill=tk.X, pady=(20, 0))
-        tk.Button(btn_frame, text="保存 API 配置",
-                  command=self._save_api,
-                  bg=_ACCENT, fg=_TEXT_PRI,
-                  font=(_FONT, 10, "bold"),
-                  relief=tk.FLAT, padx=22, pady=9,
-                  cursor="hand2",
-                  activebackground="#3558d4",
-                  activeforeground=_TEXT_PRI).pack(side=tk.RIGHT)
-        bind_mousewheel_recursive(inner, on_scroll)
-
-    def _save_api(self):
-        from ui.api_config import normalize_model_options
-        if 'platforms' not in self.config:
-            self.config['platforms'] = {}
-        for code, d in self._api_vars.items():
-            self.config['platforms'].setdefault(code, {})
-            self.config['platforms'][code]['api_key'] = d['api_key'].get().strip()
-            model = d['api_model'].get().strip()
-            if model:
-                self.config['platforms'][code]['api_model'] = model
-            elif 'api_model' in self.config['platforms'].get(code, {}):
-                del self.config['platforms'][code]['api_model']
-            model_options = normalize_model_options(d.get('model_options', []))
-            if model_options:
-                self.config['platforms'][code]['model_options'] = model_options
-            elif 'model_options' in self.config['platforms'].get(code, {}):
-                del self.config['platforms'][code]['model_options']
-        self._persist_runtime_config("API Key 已保存")
 
     def _save_settings(self):
         self.config.setdefault('scheduler', {})
@@ -4002,12 +3572,7 @@ class MainWindow:
             tk.StringVar(value=''),
         ).get().strip()
         self.config.setdefault('recognition', {})
-        self.config['recognition']['safe_mode_ocr_enabled'] = bool(
-            self._recognition_api_vars.get('safe_mode_ocr_enabled', tk.BooleanVar(value=True)).get()
-        )
-        self.config['recognition']['ai_fallback_enabled'] = bool(
-            self._recognition_api_vars.get('ai_fallback_enabled', tk.BooleanVar(value=False)).get()
-        )
+        self.config['recognition']['safe_mode_ocr_enabled'] = True
         self.config.setdefault('search', {})
         self.config['search']['provider'] = self._settings_search_vars.get(
             'provider', tk.StringVar(value='tavily')
@@ -4020,30 +3585,7 @@ class MainWindow:
             str(self._settings_browser_vars.get('answer_mode', tk.StringVar(value='页面原始截图')).get() or '').strip(),
             'page',
         )
-        self.config['screenshot']['decoration'] = {
-            'enabled': bool(self._settings_decoration_vars.get('enabled', tk.BooleanVar(value=True)).get()),
-            'title': self._settings_decoration_vars.get('title', tk.StringVar(value='')).get().strip(),
-            'subtitle': self._settings_decoration_vars.get('subtitle', tk.StringVar(value='')).get().strip(),
-            'footer': self._settings_decoration_vars.get('footer', tk.StringVar(value='')).get().strip(),
-            'show_timestamp': bool(self._settings_decoration_vars.get('show_timestamp', tk.BooleanVar(value=True)).get()),
-            'show_footer': bool(self._settings_decoration_vars.get('show_footer', tk.BooleanVar(value=True)).get()),
-            'draw_highlight_boxes': bool(self._settings_decoration_vars.get('draw_highlight_boxes', tk.BooleanVar(value=True)).get()),
-            'accent_color': self._settings_decoration_vars.get('accent_color', tk.StringVar(value='#14C7F3')).get().strip(),
-            'background': {
-                'start': self._settings_decoration_vars.get('background_start', tk.StringVar(value='#FCFDFF')).get().strip(),
-                'end': self._settings_decoration_vars.get('background_end', tk.StringVar(value='#F7FAFF')).get().strip(),
-            },
-            'header': {
-                'start': self._settings_decoration_vars.get('header_start', tk.StringVar(value='#173A43')).get().strip(),
-                'end': self._settings_decoration_vars.get('header_end', tk.StringVar(value='#14C7F3')).get().strip(),
-            },
-            'layout': {
-                'outer_padding': int(self._settings_decoration_vars.get('outer_padding', tk.IntVar(value=28)).get()),
-                'header_height': int(self._settings_decoration_vars.get('header_height', tk.IntVar(value=136)).get()),
-                'radius': int(self._settings_decoration_vars.get('radius', tk.IntVar(value=28)).get()),
-                'image_radius': int(self._settings_decoration_vars.get('image_radius', tk.IntVar(value=22)).get()),
-            },
-        }
+        self.config['screenshot']['decoration'] = get_default_decoration_theme()
         self._persist_runtime_config("设置已保存")
 
     def _send_scheduler_test_message(self):
@@ -4057,90 +3599,6 @@ class MainWindow:
             messagebox.showinfo("发送成功", "测试消息已发送，请到企业微信里确认是否收到。")
             return
         messagebox.showerror("发送失败", error or "测试消息发送失败")
-
-    def _refresh_api_model_combo(self, code):
-        from ui.api_config import normalize_model_options
-
-        data = self._api_vars.get(code)
-        if not data:
-            return
-        combo = data.get('model_combo')
-        if combo is not None:
-            combo['values'] = normalize_model_options(data.get('model_options', []), data['api_model'].get().strip())
-
-    def _add_api_model_option(self, code):
-        from ui.api_config import normalize_model_options
-
-        data = self._api_vars.get(code)
-        if not data:
-            return
-        model = data['api_model'].get().strip()
-        if not model:
-            messagebox.showwarning("提示", "请先输入模型名")
-            return
-        data['model_options'] = normalize_model_options(data.get('model_options', []), model)
-        self._refresh_api_model_combo(code)
-
-    def _remove_api_model_option(self, code):
-        data = self._api_vars.get(code)
-        if not data:
-            return
-        model = data['api_model'].get().strip()
-        if not model:
-            messagebox.showwarning("提示", "请先输入或选中要删除的模型名")
-            return
-        options = [item for item in data.get('model_options', []) if item != model]
-        if len(options) == len(data.get('model_options', [])):
-            messagebox.showinfo("提示", "当前模型名不在自定义列表里")
-            return
-        data['model_options'] = options
-        self._refresh_api_model_combo(code)
-
-    def _set_api_test_ui_state(self, code, status_text="", busy=False):
-        data = self._api_vars.get(code)
-        if not data:
-            return
-        status_var = data.get('test_status')
-        if status_var is not None:
-            status_var.set(status_text)
-        button = data.get('test_button')
-        if button is not None:
-            button.config(state=(tk.DISABLED if busy else tk.NORMAL))
-
-    def _test_api_platform(self, code):
-        from ui.api_config import run_platform_api_test
-
-        data = self._api_vars.get(code)
-        if not data:
-            return
-
-        api_key = data['api_key'].get().strip()
-        model = data['api_model'].get().strip()
-        platform_label = data.get('platform_label', code)
-        self._set_api_test_ui_state(code, "测试中...", busy=True)
-
-        def worker():
-            try:
-                result = run_platform_api_test(code, api_key, model, config=self.config)
-                preview = result if len(result) <= 120 else result[:120] + "..."
-                self.root.after(0, lambda: (
-                    self._set_api_test_ui_state(code, "测试成功", busy=False),
-                    messagebox.showinfo(
-                        "测试成功",
-                        f"{platform_label} 接口可用。\n\n返回内容：\n{preview}",
-                    ),
-                ))
-            except Exception as e:
-                error_text = str(e).strip() or e.__class__.__name__
-                self.root.after(0, lambda: (
-                    self._set_api_test_ui_state(code, "测试失败", busy=False),
-                    messagebox.showerror(
-                        "测试失败",
-                        f"{platform_label} 测试失败：{error_text}",
-                    ),
-                ))
-
-        threading.Thread(target=worker, daemon=True).start()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Tab 5: 日志

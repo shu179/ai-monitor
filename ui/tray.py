@@ -348,7 +348,6 @@ class TrayApp:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("程序设置", self.open_settings),
-            pystray.MenuItem("API Key 配置", self.open_api_config),
             pystray.MenuItem("搜搜", self.open_ai_assistant),
             pystray.MenuItem("文章录入管理", self.open_article_manager),
             pystray.MenuItem("查看日志", self.view_logs),
@@ -806,17 +805,6 @@ class TrayApp:
                 on_config_change=lambda new_config: self.apply_config(new_config, reload_runtime=True),
             )
             app.run()
-
-        self._post(build)
-
-    def open_api_config(self):
-        def build(root):
-            from ui.api_config import ApiConfigDialog
-            ApiConfigDialog(
-                root,
-                config_path="config.yaml",
-                on_config_change=lambda new_config: self.apply_config(new_config, reload_runtime=True),
-            )
 
         self._post(build)
 

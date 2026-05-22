@@ -17,6 +17,14 @@ def test_settings_service_projects_masked_settings(monkeypatch):
         "scheduler": {"notification_webhook_url": "scheduler-secret"},
         "search": {"tavily_api_key": "tavily-secret"},
         "cloud_sync": {"api_token": "cloud-secret"},
+        "recognition": {
+            "safe_mode_ocr_enabled": True,
+            "ai_fallback_enabled": True,
+            "platform": "doubao",
+            "model": "doubao-seed",
+            "dom_render_mode": True,
+            "floating_window_resident_enabled": True,
+        },
         "query_execution": {
             "browser": {"strategy": "bad-value", "session_pool_dispatch": "bad-value"},
         },
@@ -34,7 +42,6 @@ def test_settings_service_projects_masked_settings(monkeypatch):
             },
         },
         "article_export": {"show_keyword_category": True, "show_selfmedia_account": False},
-        "selector_agent": {"enabled": True, "platform": "deepseek", "model": "deepseek-chat"},
         "storage": {"history_read_backend": "auto", "history_shadow_writes_enabled": True},
     }
 
@@ -63,45 +70,21 @@ def test_settings_service_projects_masked_settings(monkeypatch):
         "show_keyword_category": True,
         "show_selfmedia_account": False,
     }
+    assert result["recognition"] == {
+        "safe_mode_ocr_enabled": True,
+        "dom_render_mode": True,
+        "floating_window_resident_enabled": True,
+    }
     assert result["storage"] == {
         "history_read_backend": "auto",
         "history_shadow_writes_enabled": True,
     }
-    assert result["selector_agent"] == {"enabled": True, "platform": "deepseek", "model": "deepseek-chat"}
-    assert result["query_execution"]["browser"]["strategy"] == "platform_serial"
+    assert "context_snapshots" not in result
+    assert "weather_snapshot" not in result
+    assert "calendar_snapshot" not in result
+    assert result["query_execution"]["browser"]["strategy"] == "session_pool"
     assert result["query_execution"]["browser"]["session_pool_dispatch"] == "platform_batch"
-    assert result["screenshot_template"]["title"] == "标题"
-    assert result["screenshot_template"]["show_time"] is False
-    assert result["screenshot_template"]["background_start"] == "#111111"
+    assert result["screenshot_template"]["title"] == "{platform}"
+    assert result["screenshot_template"]["show_time"] is True
+    assert result["screenshot_template"]["background_start"] == "#FCFDFF"
     assert result["screenshot"]["browser_answer_mode"] == "dom"
-
-
-def test_settings_service_provides_selector_agent_fallback_from_ai_assistant(monkeypatch):
-    monkeypatch.setattr(settings_module, "get_version_payload", lambda: {"version": "test"})
-    monkeypatch.setattr(settings_module, "get_local_model_manager", lambda: _FakeLocalModelManager())
-    monkeypatch.setattr(settings_module, "build_update_status", lambda config, include_check=False: {"ok": True})
-    monkeypatch.setattr(settings_module, "get_app_update_settings", lambda config: {"channel": "stable"})
-
-    config = {
-        "ai_assistant": {"platform": "deepseek", "model": "deepseek-chat"},
-    }
-
-    service = SettingsService(
-        context_snapshot_loader=lambda: (config, {}),
-        browser_auth_loader=lambda: {"platforms": {}},
-        public_profile_builder=lambda current_config: {"name": "AI 运营"},
-        cloud_sync_status_getter=lambda: {"connected": False},
-        secret_masker=lambda value: value if str(value or "").startswith("MASK(") else (f"MASK({value})" if value else ""),
-    )
-
-    result = service.get_settings()
-
-    assert result["selector_agent"] == {
-        "enabled": False,
-        "platform": "deepseek",
-        "model": "deepseek-chat",
-    }
-    assert result["storage"] == {
-        "history_read_backend": "auto",
-        "history_shadow_writes_enabled": True,
-    }

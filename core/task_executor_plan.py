@@ -50,6 +50,8 @@ def build_task_execution_plan(
         keyword = str(kw_entry.get("keyword", "") or "").strip()
         brand = str(kw_entry.get("brand", "") or "").strip() or default_brand
         mode = runtime_mode or str(kw_entry.get("mode", "browser") or "browser").strip()
+        if mode not in {"browser", "recognition"}:
+            mode = "browser"
         platforms = [str(p).strip() for p in (kw_entry.get("platforms", []) or []) if str(p).strip()]
         if not keyword or not platforms or mode == "recognition":
             continue

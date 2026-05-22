@@ -8,21 +8,15 @@ importer.
 
 from __future__ import annotations
 
-# Compatibility exports: `main.py` historically exposed these private helpers.
-# Keep them here while downstream imports migrate to the concrete modules.
-from .task_executor_api import _run_api_task
 from .task_executor_browser import (
     _create_browser_platform,
     _should_use_session_pool_for_query,
     _sync_reused_platform_runtime_state,
 )
 from .task_executor_impl import run_task_group
-from .task_executor_smart import _run_smart_browser_task
 
 __all__ = [
     "_create_browser_platform",
-    "_run_api_task",
-    "_run_smart_browser_task",
     "_should_use_session_pool_for_query",
     "_sync_reused_platform_runtime_state",
     "run_task_group",

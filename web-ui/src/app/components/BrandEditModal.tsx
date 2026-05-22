@@ -63,7 +63,7 @@ const INDUSTRY_OPTIONS = [
 type Keyword = {
   id: string;
   text: string;
-  mode: "browser" | "recognition" | "api" | "smart";
+  mode: "browser" | "recognition";
   customConfig: boolean;
   platforms: PlatformState[];
 };
@@ -83,7 +83,7 @@ export function BrandEditModal({
   brand,
   existingTasks = [],
   deletedTasks = [],
-  currentDetectionMode = "smart",
+  currentDetectionMode = "browser",
   onClose,
   onSave,
   isNew = false,
@@ -100,7 +100,7 @@ export function BrandEditModal({
   brand?: TaskFull,
   existingTasks?: TaskFull[],
   deletedTasks?: DeletedTaskSnapshot[],
-  currentDetectionMode?: "browser" | "recognition" | "api" | "smart",
+  currentDetectionMode?: "browser" | "recognition",
   onClose: () => void,
   onSave?: (task?: TaskFull, cloudTask?: CloudAdminTaskSnapshot, options?: SaveCallbackOptions) => void | Promise<void>,
   isNew?: boolean,
@@ -280,8 +280,6 @@ export function BrandEditModal({
   const MODE_LABELS: Record<Keyword["mode"], string> = {
     browser: "抓取模式",
     recognition: "识别模式",
-    api: "接口模式",
-    smart: "智能模式",
   };
   const globalModeLabel = MODE_LABELS[currentDetectionMode];
   const initPlatforms = (() => {
@@ -321,7 +319,7 @@ export function BrandEditModal({
         return {
           id: String(idx + 1),
           text: kw.keyword,
-          mode: (kw.mode as Keyword["mode"]) || "browser",
+          mode: kw.mode === "recognition" ? "recognition" : "browser",
           customConfig: hasCustomPlatforms,
           platforms: hasCustomPlatforms
             ? DEFAULT_PLATFORMS.map(p => ({

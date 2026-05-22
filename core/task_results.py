@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -94,42 +93,6 @@ def collect_unique_screenshot_paths(results: list[dict] | None) -> list[str]:
         seen.add(path)
         paths.append(path)
     return paths
-
-
-def render_api_screenshot_with_retries(
-    render_func,
-    *,
-    text: str,
-    platform_name: str,
-    brand: str,
-    keyword: str,
-    max_retries: int = 3,
-) -> str | None:
-    """API 模式命中后，固定走 HTML 模版渲染，截图真实生成才算成功。"""
-    started_at = time.perf_counter()
-    for attempt in range(1, max_retries + 1):
-        attempt_started = time.perf_counter()
-        screenshot = render_func(text, platform_name, keyword=keyword, brand=brand)
-        if screenshot_path_exists(screenshot):
-            print(
-                f"[API] 截图重试完成: platform={platform_name}, attempts={attempt}, "
-                f"attempt_elapsed={time.perf_counter() - attempt_started:.2f}s, "
-                f"total={time.perf_counter() - started_at:.2f}s"
-            )
-            return str(screenshot)
-
-        print(
-            f"[API] 第 {attempt}/{max_retries} 次截图生成失败: "
-            f"{str(screenshot or '').strip() or '未返回有效文件路径'}; "
-            f"attempt_elapsed={time.perf_counter() - attempt_started:.2f}s"
-        )
-        if attempt < max_retries:
-            time.sleep(min(0.6 * attempt, 1.2))
-    print(
-        f"[API] 截图重试失败: platform={platform_name}, attempts={max_retries}, "
-        f"total={time.perf_counter() - started_at:.2f}s"
-    )
-    return None
 
 
 def load_today_success_only_query_results(
@@ -394,7 +357,7 @@ STRUCTURAL_ERROR_PATTERNS = (
     '未配置 api_key',
     '未配置 api_model',
     '未配置有效 webhook',
-    '当前仅支持 api 模式或尚未接入浏览器适配',
+    '当前平台尚未接入浏览器适配',
     '不支持的平台',
     '未登录',
     '登录失效',
@@ -635,7 +598,6 @@ _make_query_result_key = make_query_result_key
 _result_has_usable_screenshot = result_has_usable_screenshot
 _screenshot_path_exists = screenshot_path_exists
 _collect_unique_screenshot_paths = collect_unique_screenshot_paths
-_render_api_screenshot_with_retries = render_api_screenshot_with_retries
 _load_today_success_only_query_results = load_today_success_only_query_results
 _group_keyword_results_by_platform = group_keyword_results_by_platform
 _keyword_result_key = keyword_result_key
@@ -677,7 +639,6 @@ __all__ = [
     "load_today_success_only_query_results",
     "make_query_result_key",
     "record_result_history",
-    "render_api_screenshot_with_retries",
     "result_has_usable_screenshot",
     "screenshot_path_exists",
     "summarize_keyword_result",

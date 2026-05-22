@@ -2,9 +2,9 @@
 各 AI 平台官方 API 调用。
 
 设计目标：
-1. API 模式尽量贴近各平台网页端的“联网搜索”表现。
+1. 平台模型调用尽量贴近各平台网页端的“联网搜索”表现。
 2. 原生联网搜索优先；没有公开搜索参数时，退化为“搜索摘要桥接 + 模型总结”。
-3. 保持现有调用入口不变，供 main.py 直接复用。
+3. 保持现有调用入口不变，供搜搜、草稿生成和 AI 助手复用。
 """
 
 from __future__ import annotations
@@ -231,24 +231,6 @@ PLATFORM_API_CONFIG = {
     },
 }
 
-PLATFORM_API_MODE_MODEL_SPLITS = {
-    "deepseek": {
-        "fast_model_default": "deepseek-chat",
-        "deep_model_default": "deepseek-reasoner",
-        "note": "DeepSeek 的快速回答与深度思考已确认属于不同模型。",
-    },
-    "tongyi": {
-        "fast_model_default": "qwen-plus",
-        "deep_model_default": "qwq-plus",
-        "note": "通义千问的快速模式与深度思考按两套模型配置更稳妥。",
-    },
-    "yuanbao": {
-        "fast_model_default": "hunyuan-turbos-latest",
-        "deep_model_default": "hunyuan-t1-latest",
-        "note": "元宝 / 混元的快速回答与深度思考已确认属于不同模型。",
-    },
-}
-
 PLATFORM_API_KEY_ALIASES = {
     "ark_deepseek": "doubao",
 }
@@ -386,59 +368,6 @@ def query_platform_api(
 
     print(f"[API] 未实现的平台: {platform}")
     return None
-
-
-def get_platform_api_mode_model_split(platform: str) -> dict[str, str] | None:
-    """返回需要区分快速/深度思考双模型的平台配置。"""
-    normalized = str(platform or "").strip().lower()
-    profile = PLATFORM_API_MODE_MODEL_SPLITS.get(normalized)
-    if not profile:
-        return None
-    return dict(profile)
-
-
-def resolve_platform_api_model(platform: str, platform_cfg: dict | None, deep_think: bool) -> str:
-    """
-    根据平台配置和深度思考开关，解析本次 API 实际应调用的模型。
-
-    规则：
-    1. 对已确认“快速模式/深度思考属于不同模型”的平台，优先读取专用模型字段。
-    2. 若未填写专用字段，则回退到原有 api_model。
-    3. 若 api_model 也为空，则回退到平台默认模型。
-    """
-    normalized = str(platform or "").strip().lower()
-    cfg = platform_cfg or {}
-    if normalized in PLATFORM_API_MODE_MODEL_SPLITS:
-        preferred_keys = ("api_deep_model", "deep_think_api_model") if deep_think else ("api_fast_model", "fast_api_model")
-        for key in preferred_keys:
-            selected = str(cfg.get(key, "") or "").strip()
-            if selected:
-                return selected
-    selected = str(cfg.get("api_model", "") or "").strip()
-    if selected:
-        return selected
-    return str((PLATFORM_API_CONFIG.get(normalized) or {}).get("default_model", "") or "").strip()
-
-
-def should_use_platform_deep_think_param(platform: str, platform_cfg: dict | None, deep_think: bool) -> bool:
-    """
-    是否继续向平台 API 传递深度思考开关参数。
-
-    当某个平台已经明确配置了“快速模型 + 深度思考模型”两套模型时，
-    优先通过切模型实现模式切换，避免额外的 thinking / enable_thinking
-    参数与专用模型语义冲突。
-    """
-    if not deep_think:
-        return False
-
-    normalized = str(platform or "").strip().lower()
-    if normalized not in PLATFORM_API_MODE_MODEL_SPLITS:
-        return True
-
-    cfg = platform_cfg or {}
-    fast_model = str(cfg.get("api_fast_model", "") or cfg.get("fast_api_model", "") or "").strip()
-    deep_model = str(cfg.get("api_deep_model", "") or cfg.get("deep_think_api_model", "") or "").strip()
-    return not (fast_model and deep_model)
 
 
 def _openai_content_to_text(content) -> str:

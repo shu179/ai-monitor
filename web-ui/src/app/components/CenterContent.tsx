@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Zap, Eye, Code2, Cpu, ArrowUpRight, Map, Globe } from "lucide-react";
+import { Zap, Eye, ArrowUpRight, Map, Globe } from "lucide-react";
 import { ChartArea } from "./Charts";
 import { OcrFloatingWindow } from "./OcrFloatingWindow";
 import { FailedTasksModal } from "./FailedTasksModal";
@@ -36,9 +36,34 @@ function buildCompactCalendar(now: Date) {
 const _MODE_TITLE_TO_KEY: Record<string, string> = {
   "抓取模式": "browser",
   "识别模式": "recognition",
-  "接口模式": "api",
-  "智能模式": "smart",
 };
+
+const DASHBOARD_MODE_CARD_DEFS: DashboardSnapshot["taskCards"] = [
+  { key: "capture", title: "抓取模式", desc: "快速提取核心数据", icon: "zap", active: true },
+  { key: "ocr", title: "识别模式", desc: "OCR视觉解析", icon: "eye", active: false },
+];
+
+function normalizeDashboardModeCardKey(card: Partial<DashboardSnapshot["taskCards"][number]> | null | undefined) {
+  const key = String(card?.key || "").trim().toLowerCase();
+  const title = String(card?.title || "").trim();
+  if (key === "capture" || key === "browser" || title === "抓取模式") {
+    return "capture";
+  }
+  if (key === "ocr" || key === "recognition" || title === "识别模式") {
+    return "ocr";
+  }
+  return "";
+}
+
+function sanitizeDashboardModeCards(cards: DashboardSnapshot["taskCards"] | undefined) {
+  const activeKey = (cards || [])
+    .map((card) => ({ key: normalizeDashboardModeCardKey(card), active: Boolean(card?.active) }))
+    .find((item) => item.key && item.active)?.key || "capture";
+  return DASHBOARD_MODE_CARD_DEFS.map((card) => ({
+    ...card,
+    active: card.key === activeKey,
+  }));
+}
 
 const DASHBOARD_DEEP = "#2F5A67";
 const DASHBOARD_TEAL = "#1E7F95";
@@ -123,7 +148,8 @@ export function CenterContent({
   const compactCalendar = buildCompactCalendar(now);
 
   // 从后端 taskCards 中找到 active 的卡片作为初始模式
-  const initialMode = dashboard?.taskCards?.find(c => c.active)?.title || '智能模式';
+  const initialModeCards = sanitizeDashboardModeCards(dashboard?.taskCards);
+  const initialMode = initialModeCards.find(c => c.active)?.title || '抓取模式';
   const [activeMode, setActiveMode] = useState<string>(initialMode);
   const [showOcrWindow, setShowOcrWindow] = useState(false);
   const headerDate = dashboard?.dateLabel || formatHeaderDate(now);
@@ -134,20 +160,20 @@ export function CenterContent({
   const completedCount = dashboard?.completedCount ?? 38;
   const runningCount = dashboard?.runningCount ?? 4;
   const sourceBreakdown = dashboard?.sourceBreakdown || [];
-  const modeCards = dashboard?.taskCards || [];
+  const modeCards = useMemo(() => sanitizeDashboardModeCards(dashboard?.taskCards), [dashboard?.taskCards]);
   const mediaStats = dashboard?.mediaStats || [];
   const failedTasks = dashboard?.failedTasks || [];
   const failedTaskCount = dashboard?.failedTaskCount ?? failedTasks.length;
   const [showFailedTasksModal, setShowFailedTasksModal] = useState(false);
 
   useEffect(() => {
-    const nextMode = dashboard?.taskCards?.find(c => c.active)?.title;
+    const nextMode = modeCards.find(c => c.active)?.title;
     if (nextMode) {
       setActiveMode(nextMode);
     }
-  }, [dashboard?.taskCards]);
+  }, [modeCards]);
 
-  const handleModeSelect = async (mode: { key: string; title: string; desc: string; icon: "zap" | "eye" | "code" | "cpu"; active: boolean }) => {
+  const handleModeSelect = async (mode: { key: string; title: string; desc: string; icon: "zap" | "eye"; active: boolean }) => {
     setActiveMode(mode.title);
     const modeKey = _MODE_TITLE_TO_KEY[mode.title] || mode.key;
     await saveSettings({ detection_mode: modeKey });
@@ -186,9 +212,9 @@ export function CenterContent({
   };
 
   return (
-    <div className="flex-1 min-w-0 min-h-0 overflow-y-auto bg-transparent px-6 py-6 xl:px-10 xl:py-8 flex flex-col custom-scrollbar">
+    <div className="flex-1 min-w-0 min-h-0 overflow-x-hidden overflow-y-auto bg-transparent px-6 py-4 xl:px-8 xl:py-5 flex flex-col custom-scrollbar">
       {/* 1. Header & Calendar */}
-      <div className="flex flex-col gap-4 border-b border-gray-200/70 pb-6 mb-6 shrink-0 xl:flex-row xl:items-center xl:justify-between">
+      <div className="flex flex-col gap-3 border-b border-gray-200/70 pb-4 mb-4 shrink-0 xl:flex-row xl:items-center xl:justify-between">
         <div className="flex flex-1 flex-col gap-1">
           <p className="text-[10px] text-slate-500 font-semibold tracking-[0.18em] uppercase mb-1">{headerDate}</p>
           <h1 className="app-display-heading text-[26px] font-semibold text-[#0f1835] tracking-[-0.035em]">
@@ -199,7 +225,7 @@ export function CenterContent({
           </p>
         </div>
 
-        <div className="flex flex-col gap-3 xl:items-end xl:pl-6">
+        <div className="flex flex-col gap-2 xl:items-end xl:pl-4">
           {runMessage && (
             <div className="hidden shrink-0 md:flex items-start gap-2 text-right">
               <span className="mt-[6px] h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: DASHBOARD_CYAN }} />
@@ -222,9 +248,9 @@ export function CenterContent({
         </div>
       </div>
 
-      <div className="flex flex-col gap-4 min-h-max">
+      <div className="flex flex-col gap-3 min-h-max">
         {/* Row 1: Tasks & Modes */}
-        <div className="grid grid-cols-1 xl:grid-cols-12 gap-8 shrink-0">
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 shrink-0">
           {/* Today's Tasks */}
           <div className="xl:col-span-4 flex flex-col justify-start">
             <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase mb-3">今日检测任务</h3>
@@ -257,21 +283,14 @@ export function CenterContent({
           {/* Detection Modes */}
           <div className="xl:col-span-8 flex flex-col">
             <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase mb-3">检测模式</h3>
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 h-full">
-              {(modeCards.length ? modeCards : [
-                { key: "capture", title: "抓取模式", desc: "快速提取核心数据", icon: "zap", active: activeMode === "抓取模式" },
-                { key: "ocr", title: "识别模式", desc: "OCR视觉解析", icon: "eye", active: activeMode === "识别模式" },
-                { key: "api", title: "接口模式", desc: "API实时同步", icon: "code", active: activeMode === "接口模式" },
-                { key: "smart", title: "智能模式", desc: "AI混合调度", icon: "cpu", active: activeMode === "智能模式" },
-              ] as typeof modeCards).map((mode) => (
+            <div className="grid grid-cols-2 gap-4 h-full">
+              {modeCards.map((mode) => (
                 <ModeItem
                   key={mode.key}
                   onClick={() => { void handleModeSelect(mode); }}
                   icon={
                     mode.icon === "zap" ? <Zap className="w-3.5 h-3.5" /> :
-                    mode.icon === "eye" ? <Eye className="w-3.5 h-3.5" /> :
-                    mode.icon === "code" ? <Code2 className="w-3.5 h-3.5" /> :
-                    <Cpu className="w-3.5 h-3.5" />
+                    <Eye className="w-3.5 h-3.5" />
                   }
                   title={mode.title}
                   desc={mode.desc}
@@ -283,7 +302,7 @@ export function CenterContent({
         </div>
 
         {/* Row 2: Trend & Pie Chart */}
-        <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 border-t border-gray-200/70 pt-6 -mb-1 shrink-0 items-start">
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 border-t border-gray-200/70 pt-4 shrink-0 items-start">
           {/* AI Trend */}
           <AITrendSection initialTrend={dashboard?.trend} />
 
@@ -297,7 +316,7 @@ export function CenterContent({
         </div>
 
         {/* Row 3: Bar & Map */}
-        <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 border-t border-gray-200/70 pt-3 shrink-0 items-start">
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 border-t border-gray-200/70 pt-3 shrink-0 items-start">
           {/* Media Bar */}
           <div className="xl:col-span-6 flex flex-col">
             <MediaBarChart data={mediaStats} />
@@ -425,7 +444,7 @@ function AITrendSection({
             </div>
         </div>
       </div>
-      <div className="w-full h-[118px] relative">
+      <div className="w-full h-[106px] relative">
         <ChartArea data={currentData.length ? currentData : [{ name: '', value: 0, predict: 0 }]} />
       </div>
     </div>
@@ -497,7 +516,7 @@ function MediaBarChart({ data }: { data?: DashboardSnapshot["mediaStats"] }) {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const chartData = data && data.length ? data : FALLBACK_MEDIA_STATS;
   const displayData = chartData;
-  const chartMinWidth = Math.max(600, displayData.length * 38 + 56);
+  const chartMinWidth = Math.max(520, displayData.length * 34 + 48);
   const labeledData = useMemo(
     () => displayData.map((item, index) => ({
       ...item,
@@ -556,10 +575,10 @@ function MediaBarChart({ data }: { data?: DashboardSnapshot["mediaStats"] }) {
         </div>
       </div>
 
-      <div className="w-full -ml-3 overflow-hidden">
+      <div className="w-full overflow-hidden">
         <div className="flex w-full">
           <div className="w-[40px] shrink-0">
-            <div className="flex h-[144px] flex-col justify-between pt-[10px] pr-2 pb-0 text-right text-[10px] font-medium leading-none text-gray-400">
+            <div className="flex h-[132px] flex-col justify-between pt-[8px] pr-2 pb-0 text-right text-[10px] font-medium leading-none text-gray-400">
               {[...yTicks].reverse().map((tick, index) => (
                 <div key={`${tick}-${index}`} className="tabular-nums">
                   {tick}
@@ -571,7 +590,7 @@ function MediaBarChart({ data }: { data?: DashboardSnapshot["mediaStats"] }) {
 
           <div ref={scrollContainerRef} className="flex-1 overflow-x-auto overflow-y-hidden custom-scrollbar">
             <div className="h-full" style={{ minWidth: chartMinWidth }}>
-              <div className="h-[144px]">
+              <div className="h-[132px]">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={displayData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }} barCategoryGap="10%" barGap={2}>
                     <CartesianGrid key="grid" strokeDasharray="3 3" vertical={false} stroke="#f3f4f6" />
@@ -591,7 +610,7 @@ function MediaBarChart({ data }: { data?: DashboardSnapshot["mediaStats"] }) {
                 </ResponsiveContainer>
               </div>
               <div
-                className="grid h-[24px] items-start pr-[10px]"
+                className="grid h-[22px] items-start pr-[10px]"
                 style={{ gridTemplateColumns: `repeat(${displayData.length || 1}, minmax(0, 1fr))` }}
               >
                 {labeledData.map((item, index) => (
@@ -689,7 +708,7 @@ function OptimizationMap({ activeRegions = [] }: { activeRegions?: string[] }) {
         </div>
       </div>
 
-      <div className="w-full bg-gray-50/50 rounded-2xl relative border border-gray-100/50 overflow-hidden" style={{ height: '164px' }}>
+      <div className="w-full bg-gray-50/50 rounded-2xl relative border border-gray-100/50 overflow-hidden" style={{ height: '152px' }}>
         {/* Grid Background to simulate tech map */}
         <div className="absolute inset-0 opacity-[0.03]" style={{ backgroundImage: 'linear-gradient(#000 1px, transparent 1px), linear-gradient(90deg, #000 1px, transparent 1px)', backgroundSize: '16px 16px' }}></div>
         

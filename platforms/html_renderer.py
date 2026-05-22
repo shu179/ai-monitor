@@ -366,11 +366,18 @@ def _render_text_to_screenshot_with_satori(
         "scale": _resolve_satori_render_scale(),
     }
 
+    started_at = time.perf_counter()
+    worker_elapsed = 0.0
+    convert_elapsed = 0.0
     try:
+        worker_started = time.perf_counter()
         _get_satori_renderer().render_text(payload)
+        worker_elapsed = time.perf_counter() - worker_started
         if not tmp_png.exists():
             raise RuntimeError("Satori renderer completed but no PNG was generated.")
+        convert_started = time.perf_counter()
         _convert_satori_png_to_jpeg(tmp_png, output)
+        convert_elapsed = time.perf_counter() - convert_started
     except Exception as exc:
         _log_satori_renderer_unavailable(f"Satori 快速渲染失败，回退 Playwright: {exc}")
         return ""
@@ -381,7 +388,11 @@ def _render_text_to_screenshot_with_satori(
             pass
 
     if output.exists():
-        print(f"[html_renderer] Satori截图已保存: {output}")
+        print(
+            f"[html_renderer] Satori截图已保存: {output}; "
+            f"worker={worker_elapsed:.2f}s; convert={convert_elapsed:.2f}s; "
+            f"total={time.perf_counter() - started_at:.2f}s"
+        )
         return str(output)
     return ""
 

@@ -36,7 +36,7 @@ def _should_use_session_pool_for_query(
     normalized_mode = str(mode or "").strip()
     if platform_session_manager is None:
         return False
-    if normalized_mode not in {"browser", "smart"}:
+    if normalized_mode != "browser":
         return False
     return bool(platform_session_manager.policy.use_session_pool)
 

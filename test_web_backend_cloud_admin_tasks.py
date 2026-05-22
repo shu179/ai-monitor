@@ -159,6 +159,19 @@ class FakeLoginClient:
             },
         }
 
+    def verify_email(self, *, email: str, code: str, device_id: str, app_version: str) -> dict:
+        return {
+            "access_token": "verified-access-token",
+            "refresh_token": "verified-refresh-token",
+            "token_type": "bearer",
+            "user": {
+                "id": 3,
+                "workspace_id": 1,
+                "username": email,
+                "role": "operator",
+            },
+        }
+
 
 class WebBackendCloudAdminTaskTests(unittest.TestCase):
     def _install_light_snapshot_runtime(self, runtime: AppRuntime, config_store: dict, base_snapshot: dict) -> None:
@@ -250,6 +263,46 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         self.assertEqual(task["total_records"], 12)
         self.assertEqual(task["completed_keywords_today"], ["新词"])
         runtime.task_overview_service.get_tasks_full.assert_not_called()
+
+    def test_update_task_blank_webhook_preserves_existing_secret(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        holder = {
+            "config": {
+                "tasks": [
+                    {
+                        "task_id": "task-1",
+                        "name": "旧品牌",
+                        "brand": "旧品牌",
+                        "enabled": True,
+                        "webhook_url": "https://example.com/hook-secret",
+                        "keywords": [{"keyword": "旧词", "brand": "旧品牌", "platforms": ["doubao"], "mode": "browser"}],
+                    }
+                ]
+            }
+        }
+
+        runtime._lock = threading.RLock()
+        runtime.load_config = Mock(side_effect=lambda: copy.deepcopy(holder["config"]))  # type: ignore[method-assign]
+        runtime.save_config = Mock(side_effect=lambda config: holder.update(config=copy.deepcopy(config)))  # type: ignore[method-assign]
+        runtime._invalidate_tasks_full_cache = Mock()  # type: ignore[method-assign]
+        runtime._invalidate_article_cache = Mock()  # type: ignore[method-assign]
+        runtime._refresh_monitoring_runtime = Mock()  # type: ignore[method-assign]
+        runtime._get_cached_task_snapshot = Mock(return_value={})  # type: ignore[method-assign]
+        runtime._get_light_task_snapshot = Mock(return_value={"id": "task-1"})  # type: ignore[method-assign]
+
+        result = runtime.update_task(
+            "task-1",
+            {
+                "name": "新品牌",
+                "brand": "新品牌",
+                "webhook_url": "",
+                "keywords": [{"keyword": "新词", "brand": "新品牌", "platforms": ["doubao"], "mode": "browser"}],
+            },
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(holder["config"]["tasks"][0]["webhook_url"], "https://example.com/hook-secret")
+        self.assertEqual(holder["config"]["tasks"][0]["name"], "新品牌")
 
     def test_sync_cloud_admin_task_returns_light_local_snapshot_without_rebuilding_tasks_full(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
@@ -478,13 +531,18 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
 
         self.assertEqual([item["title"] for item in result], ["已归类", "未归类"])
 
-    def test_cloud_login_uses_incremental_pull_after_auth(self) -> None:
+    def test_cloud_login_returns_success_without_blocking_incremental_pull(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
-        runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]
+        runtime._lock = threading.RLock()
+        runtime._cloud_status_validation_lock = threading.RLock()
+        runtime._cloud_status_validation_error = ""  # type: ignore[attr-defined]
+        runtime._cloud_platform_auto_sync = Mock()
+        runtime._cloud_platform_auto_sync.get_status.return_value = {}
         runtime._login_cloud_account_space = Mock(return_value={  # type: ignore[method-assign]
             "base_url": "https://api.surfacedlab.com",
             "access_token": "access-token",
             "refresh_token": "refresh-token",
+            "saved_at": "2026-05-15T10:00:00",
             "user": {"id": 2, "workspace_id": 1, "role": "operator"},
         })
         runtime.pull_cloud_tasks = Mock(return_value={"ok": True, "message": "云端任务无变化"})  # type: ignore[method-assign]
@@ -497,7 +555,65 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
             })
 
         self.assertTrue(result["ok"])
-        runtime.pull_cloud_tasks.assert_called_once_with({"force": False})
+        self.assertEqual(result["message"], "云端登录成功")
+        self.assertTrue(result["cloud"]["loggedIn"])
+        runtime.pull_cloud_tasks.assert_not_called()
+
+    def test_cloud_login_returns_immediately_after_auth_without_blocking_pull(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._lock = threading.RLock()
+        runtime._cloud_status_validation_lock = threading.RLock()
+        runtime._cloud_status_validation_error = ""  # type: ignore[attr-defined]
+        runtime._cloud_platform_auto_sync = Mock()
+        runtime._cloud_platform_auto_sync.get_status.return_value = {}
+        runtime._login_cloud_account_space = Mock(return_value={
+            "base_url": "https://api.surfacedlab.com",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "saved_at": "2026-05-15T10:00:00",
+            "user": {"id": 2, "workspace_id": 1, "username": "operator001", "role": "operator"},
+        })  # type: ignore[method-assign]
+        runtime.pull_cloud_tasks = Mock(return_value={"ok": True, "message": "云端任务无变化"})  # type: ignore[method-assign]
+
+        with patch("web_backend.SurfacedCloudClient", FakeLoginClient):
+            result = runtime.login_cloud({
+                "base_url": "https://api.surfacedlab.com",
+                "username": "operator001",
+                "password": "Operator123456",
+            })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["message"], "云端登录成功")
+        self.assertTrue(result["cloud"]["loggedIn"])
+        runtime.pull_cloud_tasks.assert_not_called()
+
+    def test_verify_cloud_email_returns_immediately_after_auth_without_blocking_pull(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._lock = threading.RLock()
+        runtime._cloud_status_validation_lock = threading.RLock()
+        runtime._cloud_status_validation_error = ""  # type: ignore[attr-defined]
+        runtime._cloud_platform_auto_sync = Mock()
+        runtime._cloud_platform_auto_sync.get_status.return_value = {}
+        runtime._login_cloud_account_space = Mock(return_value={
+            "base_url": "https://api.surfacedlab.com",
+            "access_token": "verified-access-token",
+            "refresh_token": "verified-refresh-token",
+            "saved_at": "2026-05-15T10:00:00",
+            "user": {"id": 3, "workspace_id": 1, "username": "admin@example.com", "role": "operator"},
+        })  # type: ignore[method-assign]
+        runtime.pull_cloud_tasks = Mock(return_value={"ok": True, "message": "云端任务无变化"})  # type: ignore[method-assign]
+
+        with patch("web_backend.SurfacedCloudClient", FakeLoginClient):
+            result = runtime.verify_cloud_email({
+                "base_url": "https://api.surfacedlab.com",
+                "email": "admin@example.com",
+                "code": "123456",
+            })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["message"], "邮箱验证成功")
+        self.assertTrue(result["cloud"]["loggedIn"])
+        runtime.pull_cloud_tasks.assert_not_called()
 
     def test_operator_article_upload_snapshot_keeps_unmatched_candidates(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)

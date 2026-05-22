@@ -27,6 +27,12 @@ class _FakePlatform:
     def start(self):
         return self
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
     def close(self) -> None:
         return None
 
@@ -39,52 +45,6 @@ class _FakePlatform:
         screenshot_path.write_bytes(b"fake-image")
         self.last_answer_text = f"{brand} mention on {self.platform_name}"
         return 1, str(screenshot_path)
-
-
-class _FakeSmartPlatform(_FakePlatform):
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        return None
-
-    def ensure_logged_in(self, timeout=15) -> None:
-        del timeout
-        return None
-
-    def start_new_chat(self) -> None:
-        return None
-
-    def enable_deep_think(self) -> None:
-        return None
-
-    def _get_answer_text(self) -> str:
-        return self.last_answer_text
-
-    def type_like_human(self, keyword: str) -> None:
-        self._last_keyword = keyword
-
-    def submit_prompt(self) -> None:
-        return None
-
-    def _poll_until_complete(self, brand: str, on_complete, **_kwargs) -> None:
-        self.last_answer_text = f"{brand} appears in smart answer"
-        on_complete(None, self.last_answer_text)
-
-    def has_usable_answer_text(self, final_text: str, **_kwargs) -> bool:
-        return bool(final_text)
-
-    def _has_new_answer_content(self, final_text: str, **_kwargs) -> bool:
-        return bool(final_text)
-
-    def detect_brand_mention(self, final_text: str, brand: str, **_kwargs):
-        return brand in final_text, brand, {"normalized_excerpt": brand}
-
-    def _take_long_screenshot_with_retries(self, brand: str = "") -> str:
-        screenshot_path = self._screenshot_dir / f"smart_{brand}_{self.platform_name}.jpg"
-        screenshot_path.write_bytes(b"smart-image")
-        self.last_screenshot_meta = {"highlight_count": 2}
-        return str(screenshot_path)
 
 
 class RunTaskGroupPlatformExecutionTests(unittest.TestCase):
@@ -123,12 +83,6 @@ class RunTaskGroupPlatformExecutionTests(unittest.TestCase):
     def _create_platform(self, platform_name: str, *, config=None, inspect=False, stop_checker=None):
         del config, inspect
         platform = _FakePlatform(platform_name, self._screenshot_dir, self.calls)
-        platform.stop_checker = stop_checker
-        return platform
-
-    def _create_smart_platform(self, platform_name: str, *, config=None, inspect=False, stop_checker=None):
-        del config, inspect
-        platform = _FakeSmartPlatform(platform_name, self._screenshot_dir, self.calls)
         platform.stop_checker = stop_checker
         return platform
 
@@ -274,85 +228,83 @@ class RunTaskGroupPlatformExecutionTests(unittest.TestCase):
                     "keyword": "云端关键词",
                     "brand": "云端品牌",
                     "platforms": ["kimi"],
-                    "mode": "api",
+                    "mode": "browser",
                 }
             ],
         }
 
-        with patch("core.task_executor_impl._load_today_success_only_query_results", return_value={}):
-            with patch("core.task_executor_impl._record_result_history", return_value=None) as record_history:
-                with patch(
-                    "core.task_executor_impl._send_task_notifications",
-                    return_value={"attempted": False, "success": False, "found_results": 0, "error_message": ""},
-                ):
-                    results, report = main.run_task_group(
-                        task,
-                        {},
-                        {"detection_mode": "api", "platforms": {"kimi": {"api_key": ""}}},
-                        return_report=True,
-                    )
+        with patch("core.task_executor_browser.create_browser_platform", side_effect=self._create_platform):
+            with patch("core.task_executor_impl._load_today_success_only_query_results", return_value={}):
+                with patch("core.task_executor_impl._record_result_history", return_value=None) as record_history:
+                    with patch(
+                        "core.task_executor_impl._send_task_notifications",
+                        return_value={"attempted": False, "success": False, "found_results": 0, "error_message": ""},
+                    ):
+                        results, report = main.run_task_group(
+                            task,
+                            {},
+                            {"detection_mode": "browser"},
+                            return_report=True,
+                        )
 
         self.assertEqual(len(results), 1)
         self.assertEqual(report["attempted_queries"], 1)
         self.assertTrue(record_history.called)
         self.assertEqual(record_history.call_args.kwargs.get("cloud_task_id"), 42)
 
-    def test_api_mode_success_uses_api_text_and_rendered_screenshot(self) -> None:
+    def test_legacy_keyword_modes_fall_back_to_browser_runner(self) -> None:
         task = {
-            "name": "API 成功任务",
-            "task_id": "api_success_task",
+            "name": "旧模式兼容任务",
+            "task_id": "legacy_modes_fallback_task",
             "keywords": [
                 {
-                    "keyword": "API 关键词",
-                    "brand": "品牌API",
+                    "keyword": "旧模式关键词一",
+                    "brand": "品牌A",
                     "platforms": ["kimi"],
-                    "mode": "api",
+                    "mode": "old_runner_a",
+                },
+                {
+                    "keyword": "旧模式关键词二",
+                    "brand": "品牌B",
+                    "platforms": ["doubao"],
+                    "mode": "old_runner_b",
                 }
             ],
         }
 
-        with patch("platforms.api_client.resolve_platform_api_model", return_value="kimi-test-model"):
-            with patch("platforms.api_client.should_use_platform_deep_think_param", return_value=False):
-                with patch("platforms.api_client.query_platform_api", return_value="这里提到了品牌API"):
-                    with patch("core.task_executor_impl._load_today_success_only_query_results", return_value={}):
-                        with patch("core.task_executor_impl._record_result_history", return_value=None):
-                            with patch(
-                                "core.task_executor_impl._send_task_notifications",
-                                return_value={
-                                    "attempted": True,
-                                    "success": True,
-                                    "found_results": 1,
-                                    "error_message": "",
-                                },
-                            ):
-                                results, report = task_executor_impl.run_task_group(
-                                    task,
-                                    {},
-                                    {"detection_mode": "api", "platforms": {"kimi": {"api_key": "key"}}},
-                                    return_report=True,
-                                )
+        with patch("core.task_executor_browser.create_browser_platform", side_effect=self._create_platform):
+            with patch("core.task_executor_impl._load_today_success_only_query_results", return_value={}):
+                with patch("core.task_executor_impl._record_result_history", return_value=None):
+                    with patch(
+                        "core.task_executor_impl._send_task_notifications",
+                        return_value={"attempted": True, "success": True, "found_results": 2, "error_message": ""},
+                    ):
+                        results, report = task_executor_impl.run_task_group(
+                            task,
+                            {},
+                            {"detection_mode": "browser"},
+                            return_report=True,
+                        )
 
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["mode"], "api")
-        self.assertEqual(results[0]["rank"], 1)
-        self.assertTrue(Path(results[0]["screenshot"]).exists())
-        self.assertEqual(report["success_queries"], 1)
+        self.assertEqual(self.calls, ["kimi", "doubao"])
+        self.assertEqual([item["mode"] for item in results], ["browser", "browser"])
+        self.assertEqual(report["success_queries"], 2)
 
-    def test_smart_mode_success_uses_smart_browser_runner(self) -> None:
+    def test_legacy_runtime_mode_falls_back_to_browser_runner(self) -> None:
         task = {
-            "name": "Smart 成功任务",
-            "task_id": "smart_success_task",
+            "name": "旧全局模式兼容任务",
+            "task_id": "legacy_runtime_mode_fallback_task",
             "keywords": [
                 {
-                    "keyword": "Smart 关键词",
-                    "brand": "品牌Smart",
-                    "platforms": ["doubao"],
-                    "mode": "smart",
+                    "keyword": "旧全局关键词",
+                    "brand": "品牌A",
+                    "platforms": ["kimi"],
+                    "mode": "browser",
                 }
             ],
         }
 
-        with patch("core.task_executor_browser.create_browser_platform", side_effect=self._create_smart_platform):
+        with patch("core.task_executor_browser.create_browser_platform", side_effect=self._create_platform):
             with patch("core.task_executor_impl._load_today_success_only_query_results", return_value={}):
                 with patch("core.task_executor_impl._record_result_history", return_value=None):
                     with patch(
@@ -362,15 +314,13 @@ class RunTaskGroupPlatformExecutionTests(unittest.TestCase):
                         results, report = task_executor_impl.run_task_group(
                             task,
                             {},
-                            {"detection_mode": "smart"},
+                            {"detection_mode": "old_global_runner"},
                             return_report=True,
                         )
 
         self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["mode"], "smart")
+        self.assertEqual(results[0]["mode"], "browser")
         self.assertEqual(results[0]["rank"], 1)
-        self.assertTrue(Path(results[0]["screenshot"]).exists())
-        self.assertEqual(results[0]["highlight_count"], 2)
         self.assertEqual(report["success_queries"], 1)
 
     def test_stop_checker_cancels_browser_round_without_recording_failed_query(self) -> None:

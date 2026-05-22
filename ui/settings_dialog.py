@@ -10,7 +10,7 @@ from core.app_paths import resolve_app_path
 from core.config_watcher import load_config as load_yaml_config
 from core.notifier import send_scheduler_test_message
 from core.scheduler import normalize_weekly_times
-from core.screenshot_tools import get_decoration_theme, get_default_decoration_theme
+from core.screenshot_tools import get_default_decoration_theme
 from ui.config_runtime import persist_config_with_feedback
 from ui.tk_compat import (
     bind_mousewheel_recursive,
@@ -46,7 +46,6 @@ class SettingsDialog:
         self._browser_vars = {}
         self._recognition_vars = {}
         self._search_vars = {}
-        self._decoration_vars = {}
         self._build_ui()
 
     def _load(self):
@@ -83,7 +82,6 @@ class SettingsDialog:
         self._build_browser_section(inner)
         self._build_recognition_section(inner)
         self._build_search_section(inner)
-        self._build_screenshot_decoration_section(inner)
 
         btn_frame = ttk.Frame(inner)
         btn_frame.pack(fill=tk.X, pady=(16, 0))
@@ -202,30 +200,14 @@ class SettingsDialog:
         frame.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(
             frame,
-            text="这里控制识别模式是否优先使用本地 OCR，以及本地 OCR 未命中时是否启用 AI 辅助复核。",
+            text="识别模式会固定启用本地 OCR，这里只保留识别方式相关设置。",
             foreground="gray",
             wraplength=520,
         ).pack(anchor=tk.W)
 
-        safe_mode_ocr_var = tk.BooleanVar(value=bool(recognition_cfg.get("safe_mode_ocr_enabled", True)))
-        ttk.Checkbutton(
-            frame,
-            text="启用本地 OCR 自动识别",
-            variable=safe_mode_ocr_var,
-        ).pack(anchor=tk.W, pady=(10, 0))
-        self._recognition_vars["safe_mode_ocr_enabled"] = safe_mode_ocr_var
-
-        ai_fallback_var = tk.BooleanVar(value=bool(recognition_cfg.get("ai_fallback_enabled", False)))
-        ttk.Checkbutton(
-            frame,
-            text="本地 OCR 未命中时启用 AI 识别辅助",
-            variable=ai_fallback_var,
-        ).pack(anchor=tk.W, pady=(8, 0))
-        self._recognition_vars["ai_fallback_enabled"] = ai_fallback_var
-
         ttk.Label(
             frame,
-            text="关闭本地 OCR 后，识别模式会进入人工推进；开启 AI 辅助后，会在 OCR 未识别到目标品牌时再调用 AI 复核。",
+            text="命中品牌后会直接进入后续发送流程。",
             foreground="gray",
             wraplength=520,
         ).pack(anchor=tk.W, pady=(8, 0))
@@ -270,7 +252,7 @@ class SettingsDialog:
         frame.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(
             frame,
-            text="联网搜索桥接优先走 Tavily；填写后，搜搜和保险模式的搜索兜底都会优先使用它。",
+            text="联网搜索桥接优先走 Tavily；填写后，搜搜会优先使用它。",
             foreground="gray",
             wraplength=520,
         ).pack(anchor=tk.W)
@@ -302,123 +284,6 @@ class SettingsDialog:
             "provider": tk.StringVar(value=search_cfg.get("provider", "tavily") or "tavily"),
             "tavily_api_key": tavily_key_var,
         }
-
-    def _build_screenshot_decoration_section(self, parent):
-        theme = get_decoration_theme(self.config)
-
-        frame = ttk.LabelFrame(parent, text="页面原始截图装饰模板", padding=10)
-        frame.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(
-            frame,
-            text="这里只作用于“页面原始截图”。DOM 文本生成会固定走 Surfaced 模版，不会套用这里的旧装饰样式。",
-            foreground="gray",
-            wraplength=520,
-        ).pack(anchor=tk.W)
-
-        self._decoration_vars = {
-            "enabled": tk.BooleanVar(value=bool(theme.get("enabled", True))),
-            "title": tk.StringVar(value=str(theme.get("title", ""))),
-            "subtitle": tk.StringVar(value=str(theme.get("subtitle", ""))),
-            "footer": tk.StringVar(value=str(theme.get("footer", ""))),
-            "show_timestamp": tk.BooleanVar(value=bool(theme.get("show_timestamp", True))),
-            "show_footer": tk.BooleanVar(value=bool(theme.get("show_footer", True))),
-            "draw_highlight_boxes": tk.BooleanVar(value=bool(theme.get("draw_highlight_boxes", True))),
-            "accent_color": tk.StringVar(value=str(theme.get("accent_color", "#14C7F3"))),
-            "background_start": tk.StringVar(value=str((theme.get("background", {}) or {}).get("start", "#FCFDFF"))),
-            "background_end": tk.StringVar(value=str((theme.get("background", {}) or {}).get("end", "#F7FAFF"))),
-            "header_start": tk.StringVar(value=str((theme.get("header", {}) or {}).get("start", "#173A43"))),
-            "header_end": tk.StringVar(value=str((theme.get("header", {}) or {}).get("end", "#14C7F3"))),
-            "outer_padding": tk.IntVar(value=int((theme.get("layout", {}) or {}).get("outer_padding", 28))),
-            "header_height": tk.IntVar(value=int((theme.get("layout", {}) or {}).get("header_height", 136))),
-            "radius": tk.IntVar(value=int((theme.get("layout", {}) or {}).get("radius", 28))),
-            "image_radius": tk.IntVar(value=int((theme.get("layout", {}) or {}).get("image_radius", 22))),
-        }
-
-        ttk.Checkbutton(
-            frame,
-            text="启用页面截图装饰模板",
-            variable=self._decoration_vars["enabled"],
-        ).pack(anchor=tk.W, pady=(10, 0))
-
-        ttk.Label(frame, text="标题（支持 {brand} / {platform} / {keyword} / {time}）:").pack(anchor=tk.W, pady=(10, 0))
-        ttk.Entry(frame, textvariable=self._decoration_vars["title"], width=60).pack(fill=tk.X, pady=(2, 6))
-
-        ttk.Label(frame, text="副标题:").pack(anchor=tk.W)
-        ttk.Entry(frame, textvariable=self._decoration_vars["subtitle"], width=60).pack(fill=tk.X, pady=(2, 6))
-
-        ttk.Label(frame, text="页脚文案:").pack(anchor=tk.W)
-        ttk.Entry(frame, textvariable=self._decoration_vars["footer"], width=60).pack(fill=tk.X, pady=(2, 10))
-
-        toggles = ttk.Frame(frame)
-        toggles.pack(fill=tk.X, pady=(0, 10))
-        ttk.Checkbutton(toggles, text="显示时间", variable=self._decoration_vars["show_timestamp"]).pack(side=tk.LEFT)
-        ttk.Checkbutton(toggles, text="显示页脚", variable=self._decoration_vars["show_footer"]).pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Checkbutton(toggles, text="绘制高亮框", variable=self._decoration_vars["draw_highlight_boxes"]).pack(side=tk.LEFT, padx=(12, 0))
-
-        colors = ttk.Frame(frame)
-        colors.pack(fill=tk.X, pady=(0, 8))
-        self._add_labeled_entry(colors, "强调色", self._decoration_vars["accent_color"], 0, 0)
-        self._add_labeled_entry(colors, "背景起始", self._decoration_vars["background_start"], 0, 2)
-        self._add_labeled_entry(colors, "背景结束", self._decoration_vars["background_end"], 1, 0)
-        self._add_labeled_entry(colors, "头部起始", self._decoration_vars["header_start"], 1, 2)
-        self._add_labeled_entry(colors, "头部结束", self._decoration_vars["header_end"], 2, 0)
-
-        layout = ttk.Frame(frame)
-        layout.pack(fill=tk.X, pady=(2, 8))
-        self._add_labeled_spinbox(layout, "外边距", self._decoration_vars["outer_padding"], 0, 0, 12, 80)
-        self._add_labeled_spinbox(layout, "头部高度", self._decoration_vars["header_height"], 0, 2, 88, 240)
-        self._add_labeled_spinbox(layout, "卡片圆角", self._decoration_vars["radius"], 1, 0, 12, 48)
-        self._add_labeled_spinbox(layout, "图片圆角", self._decoration_vars["image_radius"], 1, 2, 8, 36)
-
-        actions = ttk.Frame(frame)
-        actions.pack(fill=tk.X, pady=(4, 0))
-        ttk.Button(actions, text="恢复默认模板", command=self._reset_decoration_defaults).pack(side=tk.LEFT)
-        ttk.Label(
-            actions,
-            text="改完保存后，后续“页面原始截图”会默认使用这里的样式。",
-            foreground="gray",
-        ).pack(side=tk.LEFT, padx=(10, 0))
-
-    def _add_labeled_entry(self, parent, label, variable, row, column):
-        ttk.Label(parent, text=f"{label}:").grid(row=row, column=column, sticky="w", pady=(0, 4))
-        ttk.Entry(parent, textvariable=variable, width=18).grid(row=row, column=column + 1, sticky="ew", padx=(6, 14), pady=(0, 4))
-        parent.grid_columnconfigure(column + 1, weight=1)
-
-    def _add_labeled_spinbox(self, parent, label, variable, row, column, min_value, max_value):
-        ttk.Label(parent, text=f"{label}:").grid(row=row, column=column, sticky="w", pady=(0, 4))
-        tk.Spinbox(parent, from_=min_value, to=max_value, width=6, textvariable=variable).grid(
-            row=row, column=column + 1, sticky="w", padx=(6, 14), pady=(0, 4)
-        )
-
-    def _reset_decoration_defaults(self):
-        self._apply_decoration_theme(get_default_decoration_theme())
-
-    def _apply_decoration_theme(self, theme):
-        layout = (theme.get("layout", {}) or {})
-        background = (theme.get("background", {}) or {})
-        header = (theme.get("header", {}) or {})
-        mapping = {
-            "enabled": bool(theme.get("enabled", True)),
-            "title": str(theme.get("title", "")),
-            "subtitle": str(theme.get("subtitle", "")),
-            "footer": str(theme.get("footer", "")),
-            "show_timestamp": bool(theme.get("show_timestamp", True)),
-            "show_footer": bool(theme.get("show_footer", True)),
-            "draw_highlight_boxes": bool(theme.get("draw_highlight_boxes", True)),
-            "accent_color": str(theme.get("accent_color", "#14C7F3")),
-            "background_start": str(background.get("start", "#FCFDFF")),
-            "background_end": str(background.get("end", "#F7FAFF")),
-            "header_start": str(header.get("start", "#173A43")),
-            "header_end": str(header.get("end", "#14C7F3")),
-            "outer_padding": int(layout.get("outer_padding", 28)),
-            "header_height": int(layout.get("header_height", 136)),
-            "radius": int(layout.get("radius", 28)),
-            "image_radius": int(layout.get("image_radius", 22)),
-        }
-        for key, value in mapping.items():
-            var = self._decoration_vars.get(key)
-            if var is not None:
-                var.set(value)
 
     def _send_scheduler_test_message(self):
         webhook_url = self._scheduler_extra_vars.get(
@@ -457,12 +322,7 @@ class SettingsDialog:
         ).get().strip()
 
         self.config.setdefault("recognition", {})
-        self.config["recognition"]["safe_mode_ocr_enabled"] = bool(
-            self._recognition_vars.get("safe_mode_ocr_enabled", tk.BooleanVar(value=True)).get()
-        )
-        self.config["recognition"]["ai_fallback_enabled"] = bool(
-            self._recognition_vars.get("ai_fallback_enabled", tk.BooleanVar(value=False)).get()
-        )
+        self.config["recognition"]["safe_mode_ocr_enabled"] = True
 
         self.config.setdefault("search", {})
         self.config["search"]["provider"] = self._search_vars["provider"].get().strip() or "tavily"
@@ -473,30 +333,7 @@ class SettingsDialog:
             str(self._browser_vars.get("answer_mode", tk.StringVar(value="页面原始截图")).get() or "").strip(),
             "page",
         )
-        self.config["screenshot"]["decoration"] = {
-            "enabled": bool(self._decoration_vars["enabled"].get()),
-            "title": self._decoration_vars["title"].get().strip(),
-            "subtitle": self._decoration_vars["subtitle"].get().strip(),
-            "footer": self._decoration_vars["footer"].get().strip(),
-            "show_timestamp": bool(self._decoration_vars["show_timestamp"].get()),
-            "show_footer": bool(self._decoration_vars["show_footer"].get()),
-            "draw_highlight_boxes": bool(self._decoration_vars["draw_highlight_boxes"].get()),
-            "accent_color": self._decoration_vars["accent_color"].get().strip(),
-            "background": {
-                "start": self._decoration_vars["background_start"].get().strip(),
-                "end": self._decoration_vars["background_end"].get().strip(),
-            },
-            "header": {
-                "start": self._decoration_vars["header_start"].get().strip(),
-                "end": self._decoration_vars["header_end"].get().strip(),
-            },
-            "layout": {
-                "outer_padding": int(self._decoration_vars["outer_padding"].get()),
-                "header_height": int(self._decoration_vars["header_height"].get()),
-                "radius": int(self._decoration_vars["radius"].get()),
-                "image_radius": int(self._decoration_vars["image_radius"].get()),
-            },
-        }
+        self.config["screenshot"]["decoration"] = get_default_decoration_theme()
 
         persist_config_with_feedback(
             self.config,

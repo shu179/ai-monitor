@@ -17,9 +17,36 @@ export type ModeCard = {
   key: string;
   title: string;
   desc: string;
-  icon: "zap" | "eye" | "code" | "cpu";
+  icon: "zap" | "eye";
   active: boolean;
 };
+
+const DASHBOARD_MODE_CARD_DEFS: ModeCard[] = [
+  { key: "capture", title: "抓取模式", desc: "快速提取核心数据", icon: "zap", active: true },
+  { key: "ocr", title: "识别模式", desc: "OCR视觉解析", icon: "eye", active: false },
+];
+
+function normalizeDashboardModeCardKey(card: Partial<ModeCard> | null | undefined): "capture" | "ocr" | "" {
+  const key = String(card?.key || "").trim().toLowerCase();
+  const title = String(card?.title || "").trim();
+  if (key === "capture" || key === "browser" || title === "抓取模式") {
+    return "capture";
+  }
+  if (key === "ocr" || key === "recognition" || title === "识别模式") {
+    return "ocr";
+  }
+  return "";
+}
+
+function sanitizeDashboardModeCards(cards: ModeCard[] | undefined): ModeCard[] {
+  const activeKey = (cards || [])
+    .map((card) => ({ key: normalizeDashboardModeCardKey(card), active: Boolean(card?.active) }))
+    .find((item) => item.key && item.active)?.key || "capture";
+  return DASHBOARD_MODE_CARD_DEFS.map((card) => ({
+    ...card,
+    active: card.key === activeKey,
+  }));
+}
 
 export type DashboardSnapshot = {
   dateLabel: string;
@@ -251,15 +278,6 @@ export type SelectorHealFieldResult = {
   saved?: boolean;
   save_error?: string;
   candidates?: SelectorHealCandidate[];
-  selector_agent_used?: boolean;
-  selector_agent_platform?: string;
-  selector_agent_model?: string;
-  selector_agent_confidence?: number;
-  selector_agent_reason?: string;
-  selector_agent_error?: string;
-  selector_agent_selected_selector?: string;
-  selector_agent_image_used?: boolean;
-  selector_agent_image_supported?: boolean;
 };
 
 export type SelectorHealResponse = {
@@ -312,12 +330,6 @@ export type SelectorPauseStateResponse = {
     first_generating_sample?: Record<string, unknown> | null;
     last_sample?: Record<string, unknown> | null;
   };
-};
-
-export type SelectorAgentSettingsSnapshot = {
-  enabled: boolean;
-  platform: string;
-  model: string;
 };
 
 export type ArticleTableImportResult = {
@@ -613,8 +625,11 @@ const TASKS_FULL_CACHE_TTL_MS = 5000;
 const SETTINGS_CACHE_TTL_MS = 30000;
 const SESSION_REQUEST_TIMEOUT_MS = 2500;
 const BOOTSTRAP_REQUEST_TIMEOUT_MS = 6500;
+const SETTINGS_REQUEST_TIMEOUT_MS = 8000;
+const MUTATION_REQUEST_TIMEOUT_MS = 15000;
 
 let bootstrapCache: { data: BootstrapPayload; updatedAt: number } | null = null;
+let bootstrapLastGoodData: BootstrapPayload | null = null;
 let bootstrapInFlight: Promise<BootstrapPayload> | null = null;
 let bootstrapCacheVersion = 0;
 let sessionInFlight: Promise<string> | null = null;
@@ -768,12 +783,7 @@ export const FALLBACK_BOOTSTRAP: BootstrapPayload = {
       { name: "金融医疗", value: 20 },
       { name: "汽车制造", value: 10 },
     ],
-    taskCards: [
-      { key: "capture", title: "抓取模式", desc: "快速提取核心数据", icon: "zap", active: false },
-      { key: "ocr", title: "识别模式", desc: "OCR视觉解析", icon: "eye", active: false },
-      { key: "api", title: "接口模式", desc: "API实时同步", icon: "code", active: false },
-      { key: "smart", title: "智能模式", desc: "AI混合调度", icon: "cpu", active: true },
-    ],
+    taskCards: DASHBOARD_MODE_CARD_DEFS,
     mediaStats: [
       { name: "1日", auth: 0, self: 0 },
       { name: "2日", auth: 0, self: 0 },
@@ -967,7 +977,7 @@ type BootstrapFetchOptions = {
 };
 
 function fallbackBootstrap(options?: BootstrapFetchOptions): BootstrapPayload {
-  return options?.fallback || bootstrapCache?.data || FALLBACK_BOOTSTRAP;
+  return mergeBootstrap(options?.fallback || bootstrapCache?.data || bootstrapLastGoodData || FALLBACK_BOOTSTRAP);
 }
 
 async function fetchWithTimeout(
@@ -1029,6 +1039,7 @@ export async function fetchBootstrap(options?: BootstrapFetchOptions): Promise<B
       const data = (await response.json()) as Partial<BootstrapPayload>;
       storeSessionToken(data.session);
       const merged = mergeBootstrap(data);
+      bootstrapLastGoodData = merged;
       if (requestVersion === bootstrapCacheVersion) {
         bootstrapCache = { data: merged, updatedAt: Date.now() };
       }
@@ -1043,10 +1054,13 @@ export async function fetchBootstrap(options?: BootstrapFetchOptions): Promise<B
   return bootstrapInFlight;
 }
 
-export function invalidateBootstrapCache() {
+export function invalidateBootstrapCache(options: { clearFallback?: boolean } = {}) {
   bootstrapCache = null;
   bootstrapInFlight = null;
   bootstrapCacheVersion += 1;
+  if (options.clearFallback) {
+    bootstrapLastGoodData = null;
+  }
 }
 
 export function warmBootstrapCache() {
@@ -1054,7 +1068,7 @@ export function warmBootstrapCache() {
 }
 
 export function invalidateAccountScopedCaches() {
-  invalidateBootstrapCache();
+  invalidateBootstrapCache({ clearFallback: true });
   invalidateTasksFullCache();
   invalidateSettingsCache();
 }
@@ -1226,17 +1240,29 @@ async function refreshSessionTokenAfterRejection() {
   }
 }
 
-export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+type ApiFetchInit = RequestInit & {
+  timeoutMs?: number;
+};
+
+async function fetchMaybeWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs?: number): Promise<Response> {
+  if (timeoutMs && timeoutMs > 0) {
+    return fetchWithTimeout(input, init, timeoutMs);
+  }
+  return window.fetch(input, init);
+}
+
+export async function apiFetch(input: RequestInfo | URL, init: ApiFetchInit = {}) {
+  const { timeoutMs, ...fetchInit } = init;
   if (!shouldAttachSessionToken(input)) {
-    return window.fetch(input, init);
+    return fetchMaybeWithTimeout(input, fetchInit, timeoutMs);
   }
   const token = await ensureSessionToken();
   if (!token) {
-    return window.fetch(input, init);
+    return fetchMaybeWithTimeout(input, fetchInit, timeoutMs);
   }
-  const headers = new Headers(init.headers || {});
+  const headers = new Headers(fetchInit.headers || {});
   headers.set(SESSION_TOKEN_HEADER, token);
-  const response = await window.fetch(input, { ...init, headers });
+  const response = await fetchMaybeWithTimeout(input, { ...fetchInit, headers }, timeoutMs);
   if (response.status !== 401) {
     return response;
   }
@@ -1245,9 +1271,9 @@ export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {})
   if (!retryToken || retryToken === token) {
     return response;
   }
-  const retryHeaders = new Headers(init.headers || {});
+  const retryHeaders = new Headers(fetchInit.headers || {});
   retryHeaders.set(SESSION_TOKEN_HEADER, retryToken);
-  return window.fetch(input, { ...init, headers: retryHeaders });
+  return fetchMaybeWithTimeout(input, { ...fetchInit, headers: retryHeaders }, timeoutMs);
 }
 
 export async function triggerRunAll(): Promise<{ queued: boolean; message: string }> {
@@ -2064,7 +2090,7 @@ export function mergeBootstrap(data: Partial<BootstrapPayload> | null | undefine
         data: ((data.dashboard || {}).trend?.data as TrendPoint[] | undefined) || FALLBACK_BOOTSTRAP.dashboard.trend.data,
       },
       sourceBreakdown: ((data.dashboard || {}).sourceBreakdown as DashboardSnapshot["sourceBreakdown"] | undefined) || FALLBACK_BOOTSTRAP.dashboard.sourceBreakdown,
-      taskCards: ((data.dashboard || {}).taskCards as ModeCard[] | undefined) || FALLBACK_BOOTSTRAP.dashboard.taskCards,
+      taskCards: sanitizeDashboardModeCards((data.dashboard || {}).taskCards as ModeCard[] | undefined),
       mediaStats: ((data.dashboard || {}).mediaStats as DashboardSnapshot["mediaStats"] | undefined) || FALLBACK_BOOTSTRAP.dashboard.mediaStats,
     },
     platforms: data.platforms || FALLBACK_BOOTSTRAP.platforms,
@@ -2317,7 +2343,7 @@ export type BrandDraftKeyword = {
   keyword: string;
   brand: string;
   platforms: string[];
-  mode: "browser" | "recognition" | "api" | "smart";
+  mode: "browser" | "recognition";
   deep_think_platforms: string[];
 };
 
@@ -2911,6 +2937,7 @@ export async function fetchSettings(options: { force?: boolean } = {}): Promise<
       const res = await apiFetch("/api/settings", {
         headers: { Accept: "application/json" },
         cache: "no-store",
+        timeoutMs: SETTINGS_REQUEST_TIMEOUT_MS,
       });
       if (!res.ok) return settingsCache?.data ?? {};
       const data = await res.json();
@@ -2931,12 +2958,13 @@ export async function fetchSettings(options: { force?: boolean } = {}): Promise<
   return request;
 }
 
-export async function saveSettings(settings: Record<string, unknown>): Promise<{ ok: boolean }> {
+export async function saveSettings(settings: Record<string, unknown>): Promise<{ ok: boolean; message?: string }> {
   try {
     const res = await apiFetch("/api/settings", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(settings),
+      timeoutMs: MUTATION_REQUEST_TIMEOUT_MS,
     });
     const data = await res.json();
     if (data?.ok) {
@@ -2945,7 +2973,7 @@ export async function saveSettings(settings: Record<string, unknown>): Promise<{
     }
     return data;
   } catch {
-    return { ok: false };
+    return { ok: false, message: "设置保存超时或失败" };
   }
 }
 
@@ -3078,22 +3106,6 @@ export async function testLocalModel(model?: string): Promise<{ ok: boolean; mes
     });
     if (!res.ok) {
       return { ok: false, message: "本地模型测试失败" };
-    }
-    return await res.json();
-  } catch {
-    return { ok: false, message: "网络错误" };
-  }
-}
-
-export async function refreshContextSnapshots(force = true): Promise<Record<string, unknown>> {
-  try {
-    const res = await apiFetch("/api/actions/refresh-context-snapshots", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ force }),
-    });
-    if (!res.ok) {
-      return { ok: false, message: "刷新失败" };
     }
     return await res.json();
   } catch {
@@ -3602,9 +3614,10 @@ export async function saveProfile(profile: Record<string, string>): Promise<{ ok
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(profile),
+      timeoutMs: MUTATION_REQUEST_TIMEOUT_MS,
     });
     return await res.json();
   } catch {
-    return { ok: false };
+    return { ok: false, message: "资料保存超时或失败" };
   }
 }

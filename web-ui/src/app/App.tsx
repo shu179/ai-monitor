@@ -46,7 +46,7 @@ const LOGIN_IDENTITY_STORAGE_KEY = "surfaced-web-ui-login-identity";
 const DEFAULT_CLOUD_BASE_URL = "https://api.surfacedlab.com";
 const LOGIN_MODAL_WIDTH = 332;
 const LOGIN_MODAL_HEIGHT = 430;
-const ACCOUNT_DATA_LOADING_MAX_WAIT_MS = 2600;
+const ACCOUNT_DATA_LOADING_MAX_WAIT_MS = 4200;
 
 const loadCenterContent = () => import("./components/CenterContent").then((module) => ({ default: module.CenterContent }));
 const loadBrandsContent = () => import("./components/BrandsContent").then((module) => ({ default: module.BrandsContent }));
@@ -164,7 +164,6 @@ export default function App() {
     offsetY: number;
   } | null>(null);
   const [activeTab, setActiveTab] = useState("看板");
-  const [localOCR, setLocalOCR] = useState(true);
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [recognitionTestWindow, setRecognitionTestWindow] = useState<{
     open: boolean;
@@ -190,14 +189,14 @@ export default function App() {
   const [loginIdentity, setLoginIdentity] = useState(() => readStoredLoginIdentity());
   const [isLoginModalOpen, setIsLoginModalOpen] = useState(false);
   const [loginModalPosition, setLoginModalPosition] = useState({ x: 0, y: 0 });
+  const [authTransitionStartedAt, setAuthTransitionStartedAt] = useState(0);
   const currentCloudIdentityKey = cloudStatusIdentityKey(cloudStatus);
   const currentDetectionMode = (() => {
     const activeCard = bootstrap.dashboard?.taskCards?.find((card) => card.active);
-    if (!activeCard) return "smart";
+    if (!activeCard) return "browser";
     if (activeCard.title === "抓取模式") return "browser";
     if (activeCard.title === "识别模式") return "recognition";
-    if (activeCard.title === "接口模式") return "api";
-    return "smart";
+    return "browser";
   })();
   const residentOcrWindowEnabled = Boolean(bootstrap.config?.recognition?.floating_window_resident_enabled);
   const showResidentOcrWindow = residentOcrWindowEnabled && !recognitionTestWindow.open;
@@ -214,6 +213,7 @@ export default function App() {
       taskId: "",
       taskName: "",
     }));
+    setAuthTransitionStartedAt(Date.now());
     setIsAccountDataLoading(true);
   }, []);
 
@@ -238,6 +238,20 @@ export default function App() {
       setIsLoginModalOpen(false);
     }
   }, [beginAccountDataTransition]);
+
+  const applyCloudAuthStatusFromResult = useCallback(
+    (result: { ok: boolean; cloud?: CloudStatusSnapshot | null }, options?: { allowFailureLogout?: boolean }) => {
+      const nextStatus = result.cloud || null;
+      if (result.ok) {
+        applyCloudAuthStatus(nextStatus);
+        return;
+      }
+      if (options?.allowFailureLogout || !isAuthenticated) {
+        applyCloudAuthStatus(nextStatus);
+      }
+    },
+    [applyCloudAuthStatus, isAuthenticated],
+  );
 
   const refreshBootstrap = useCallback(async (options?: { force?: boolean; fallback?: BootstrapPayload; timeoutMs?: number }) => {
     if (options?.force) {
@@ -276,13 +290,13 @@ export default function App() {
       if (result.cloud?.loggedIn) {
         beginAccountDataTransition();
       }
-      applyCloudAuthStatus(result.cloud);
+      applyCloudAuthStatusFromResult(result, { allowFailureLogout: true });
       setIsAuthChecked(true);
     });
     return () => {
       cancelled = true;
     };
-  }, [applyCloudAuthStatus, beginAccountDataTransition]);
+  }, [applyCloudAuthStatusFromResult, beginAccountDataTransition]);
 
   useEffect(() => {
     if (!isAuthChecked) {
@@ -294,7 +308,7 @@ export default function App() {
       if (cancelled) {
         return;
       }
-      applyCloudAuthStatus(result.cloud);
+      applyCloudAuthStatusFromResult(result);
     };
     const timer = window.setInterval(refreshCloudAuth, isAuthenticated ? 5000 : 30000);
     window.addEventListener("focus", refreshCloudAuth);
@@ -303,7 +317,7 @@ export default function App() {
       window.clearInterval(timer);
       window.removeEventListener("focus", refreshCloudAuth);
     };
-  }, [applyCloudAuthStatus, isAuthChecked, isAuthenticated]);
+  }, [applyCloudAuthStatusFromResult, isAuthChecked, isAuthenticated]);
 
   const handleTabChange = useCallback((tab: string) => {
     preloadPageByTab[tab]?.();
@@ -350,17 +364,25 @@ export default function App() {
     }
     let cancelled = false;
     const secureFallback = createSecureBootstrap();
+    const inFreshAuthWindow = authTransitionStartedAt > 0 && Date.now() - authTransitionStartedAt < 15000;
     setIsAccountDataLoading(true);
     const loadingTimer = window.setTimeout(() => {
       if (!cancelled) {
         setIsAccountDataLoading(false);
       }
     }, ACCOUNT_DATA_LOADING_MAX_WAIT_MS);
-    refreshBootstrap({ force: true, fallback: secureFallback }).then(() => {
+    refreshBootstrap({
+      force: true,
+      fallback: secureFallback,
+      timeoutMs: inFreshAuthWindow ? 9000 : undefined,
+    }).then(() => {
       if (cancelled) {
         return;
       }
       setIsAccountDataLoading(false);
+      if (inFreshAuthWindow) {
+        setAuthTransitionStartedAt(0);
+      }
     }).catch(() => {
       if (!cancelled) {
         setIsAccountDataLoading(false);
@@ -372,7 +394,7 @@ export default function App() {
       cancelled = true;
       window.clearTimeout(loadingTimer);
     };
-  }, [isAuthenticated, refreshBootstrap]);
+  }, [authTransitionStartedAt, isAuthenticated, refreshBootstrap]);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -847,7 +869,6 @@ export default function App() {
         <Suspense fallback={<PageLoadingFallback />}>
           {activeTab === "看板" ? (
             <CenterContent
-              localOCR={localOCR}
               dashboard={bootstrap.dashboard}
               runMessage={runMessage}
               activeRegions={bootstrap.regionTags}
@@ -885,8 +906,6 @@ export default function App() {
             />
           ) : activeTab === "系统设置" ? (
             <SettingsContent
-              localOCR={localOCR}
-              setLocalOCR={setLocalOCR}
               onSaveSuccess={(message) => {
                 showSaveSuccessToast(message);
                 void refreshBootstrap({ force: true });
@@ -895,7 +914,6 @@ export default function App() {
             />
           ) : (
             <CenterContent
-              localOCR={localOCR}
               dashboard={bootstrap.dashboard}
               runMessage={runMessage}
               onDataChanged={refreshBootstrap}
@@ -921,7 +939,6 @@ export default function App() {
           <OcrFloatingWindow
             key={recognitionTestWindow.key}
             onClose={handleRecognitionTestClose}
-            localOCR={localOCR}
             stopOnClose
           />
         </Suspense>
@@ -930,7 +947,6 @@ export default function App() {
         <Suspense fallback={null}>
           <OcrFloatingWindow
             onClose={() => undefined}
-            localOCR={localOCR}
             resident
           />
         </Suspense>

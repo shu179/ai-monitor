@@ -39,9 +39,7 @@ PLATFORMS = [
 
 MODE_LABELS = {
     'browser': '抓取模式',
-    'api': '保险模式',
     'recognition': '识别模式',
-    'smart': '智能模式',
 }
 
 _BG = "#F0F0F0"
