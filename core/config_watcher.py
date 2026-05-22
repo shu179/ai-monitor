@@ -144,11 +144,16 @@ def _split_sensitive_config(config: dict) -> tuple[dict, dict]:
                 continue
             task_id = _normalize_secret_text(task.get("task_id", ""))
             task_name = _normalize_secret_text(task.get("name", ""))
+            cloud_task_id = _normalize_secret_text(task.get("cloud_task_id") or task.get("cloudTaskId"))
+            cloud_task_key = _normalize_secret_text(task.get("cloud_task_key") or task.get("cloudTaskKey"))
             key = task_id or f"name::{task_name}"
             if not key:
                 continue
             task_secret_entries[key] = {
+                "task_id": task_id,
                 "task_name": task_name,
+                "cloud_task_id": cloud_task_id,
+                "cloud_task_key": cloud_task_key,
                 "webhook_url": webhook_url,
             }
     if task_secret_entries:
@@ -157,30 +162,87 @@ def _split_sensitive_config(config: dict) -> tuple[dict, dict]:
     return public_config, _prune_empty_containers(local_patch)
 
 
+def _pick_unique_secret_entry(entries: list[dict] | None) -> dict | None:
+    unique_entries: list[dict] = []
+    seen_keys: set[str] = set()
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        secret_key = _normalize_secret_text(entry.get("_secret_key", ""))
+        if not secret_key or secret_key in seen_keys:
+            continue
+        seen_keys.add(secret_key)
+        unique_entries.append(entry)
+    if len(unique_entries) != 1:
+        return None
+    return unique_entries[0]
+
+
 def _apply_task_secret_overrides(config: dict, local_config: dict) -> dict:
     task_secrets = local_config.get(_TASK_SECRET_SECTION)
     tasks = config.get("tasks")
     if not isinstance(task_secrets, dict) or not isinstance(tasks, list):
         return config
 
-    by_name: dict[str, dict] = {}
-    for entry in task_secrets.values():
-        if not isinstance(entry, dict):
+    entries_by_key: dict[str, dict] = {}
+    by_name: dict[str, list[dict]] = {}
+    by_task_id: dict[str, list[dict]] = {}
+    by_cloud_task_id: dict[str, list[dict]] = {}
+    by_cloud_task_key: dict[str, list[dict]] = {}
+    unique_webhooks = {
+        _normalize_secret_text((entry or {}).get("webhook_url", ""))
+        for entry in task_secrets.values()
+        if isinstance(entry, dict) and _normalize_secret_text((entry or {}).get("webhook_url", ""))
+    }
+    common_cloud_webhook = next(iter(unique_webhooks)) if len(unique_webhooks) == 1 else ""
+
+    for secret_key, raw_entry in task_secrets.items():
+        if not isinstance(raw_entry, dict):
             continue
+        entry = dict(raw_entry)
+        normalized_secret_key = _normalize_secret_text(secret_key)
+        entry["_secret_key"] = normalized_secret_key
+        if not entry.get("task_id") and normalized_secret_key and not normalized_secret_key.startswith("name::"):
+            entry["task_id"] = normalized_secret_key
+        entries_by_key[normalized_secret_key] = entry
+
         task_name = _normalize_secret_text(entry.get("task_name", ""))
         if task_name:
-            by_name[task_name] = entry
+            by_name.setdefault(task_name, []).append(entry)
+        task_id = _normalize_secret_text(entry.get("task_id", ""))
+        if task_id:
+            by_task_id.setdefault(task_id, []).append(entry)
+        cloud_task_id = _normalize_secret_text(entry.get("cloud_task_id", ""))
+        if cloud_task_id:
+            by_cloud_task_id.setdefault(cloud_task_id, []).append(entry)
+        cloud_task_key = _normalize_secret_text(entry.get("cloud_task_key", ""))
+        if cloud_task_key:
+            by_cloud_task_key.setdefault(cloud_task_key, []).append(entry)
 
     for task in tasks:
         if not isinstance(task, dict):
             continue
         task_id = _normalize_secret_text(task.get("task_id", ""))
         task_name = _normalize_secret_text(task.get("name", ""))
-        override = task_secrets.get(task_id) if task_id else None
+        cloud_task_id = _normalize_secret_text(task.get("cloud_task_id") or task.get("cloudTaskId"))
+        cloud_task_key = _normalize_secret_text(task.get("cloud_task_key") or task.get("cloudTaskKey"))
+
+        override = entries_by_key.get(task_id) if task_id else None
+        if not isinstance(override, dict) and cloud_task_key:
+            override = _pick_unique_secret_entry(by_cloud_task_key.get(cloud_task_key))
+        if not isinstance(override, dict) and cloud_task_id:
+            override = _pick_unique_secret_entry(by_cloud_task_id.get(cloud_task_id))
+        if not isinstance(override, dict) and task_id:
+            override = _pick_unique_secret_entry(by_task_id.get(task_id))
         if not isinstance(override, dict) and task_name:
-            override = by_name.get(task_name) or task_secrets.get(f"name::{task_name}")
+            override = entries_by_key.get(f"name::{task_name}") or _pick_unique_secret_entry(by_name.get(task_name))
+
         if isinstance(override, dict) and "webhook_url" in override:
             task["webhook_url"] = _normalize_secret_text(override.get("webhook_url", ""))
+            continue
+
+        if not _normalize_secret_text(task.get("webhook_url", "")) and common_cloud_webhook and (cloud_task_id or cloud_task_key):
+            task["webhook_url"] = common_cloud_webhook
     return config
 
 

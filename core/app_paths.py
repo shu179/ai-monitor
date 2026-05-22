@@ -22,6 +22,7 @@ _DATA_TOP_LEVELS = {
 }
 _DATA_FILES = {
     "config.yaml",
+    "config.local.yaml",
 }
 _migration_lock = threading.Lock()
 _migration_done = False
