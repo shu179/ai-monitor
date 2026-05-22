@@ -335,3 +335,30 @@ def test_keyword_updates_keep_platform_slots_when_later_screenshots_are_missing(
             "image_path": "",
         },
     ]
+
+
+def test_runtime_completed_slots_prefer_item_level_matched_pairs_over_global_order(manager):
+    completed = {}
+    manager._add_runtime_completed_slots_from_batch(
+        completed,
+        {
+            "task_name": "品牌A任务",
+            "matched_pairs": [
+                {"keyword": "词1", "brand": "品牌A", "platforms": ["doubao"]},
+                {"keyword": "词2", "brand": "品牌A", "platforms": ["deepseek"]},
+            ],
+            "image_items": [
+                {
+                    "path": "",
+                    "source_text": "DeepSeek 回答",
+                    "matched_pairs": [
+                        {"keyword": "词2", "brand": "品牌A", "platforms": ["deepseek"]},
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert completed == {
+        ("品牌A任务", "词2", "品牌a"): {"deepseek"},
+    }

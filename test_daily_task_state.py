@@ -118,17 +118,68 @@ class DailyTaskStateTests(unittest.TestCase):
         success_status = dts.get_task_day_status(TASK)
         self.assertEqual(success_status["brand_status"], "success")
         self.assertFalse(success_status["sent_today"])
+        self.assertEqual(success_status["test_brand_status"], "pending")
 
         dts.mark_task_sent(TASK, source_mode="test", message="sent")
         sent_status = dts.get_task_day_status(TASK)
         self.assertEqual(sent_status["brand_status"], "sent")
         self.assertTrue(sent_status["sent_today"])
         self.assertTrue(sent_status["formal_started"])
+        self.assertEqual(sent_status["test_brand_status"], "sent")
 
         dts.mark_task_sent(TASK, source_mode="formal", message="sent")
         formal_sent_status = dts.get_task_day_status(TASK)
         self.assertEqual(formal_sent_status["brand_status"], "sent")
         self.assertTrue(formal_sent_status["sent_today"])
+
+    def test_reset_manual_test_session_state_keeps_shared_success_but_clears_test_pool(self) -> None:
+        screenshot_dir = Path(self._tmpdir.name) / "screenshots"
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        screenshot_path = screenshot_dir / "manual_success.jpg"
+        screenshot_path.write_bytes(b"image")
+
+        manual_task = {
+            "name": "品牌A",
+            "brand": "品牌A",
+            "task_id": "task_manual_reset",
+            "_daily_state_source": "manual_test",
+            "keywords": [
+                {"keyword": "词1", "brand": "品牌A", "platforms": ["doubao"], "mode": "recognition"},
+            ],
+        }
+
+        dts.apply_task_keyword_updates(
+            manual_task,
+            [
+                {
+                    "keyword": "词1",
+                    "brand": "品牌A",
+                    "run_success": True,
+                    "screenshot_saved": True,
+                    "failure_reason": "",
+                    "platform": "doubao",
+                    "image_path": str(screenshot_path),
+                }
+            ],
+            source_mode="test",
+        )
+        dts.mark_task_sent(manual_task, source_mode="test", message="manual sent")
+
+        before_reset = dts.get_task_day_status(manual_task)
+        self.assertEqual(before_reset["brand_status"], "sent")
+        self.assertEqual(before_reset["test_brand_status"], "sent")
+        self.assertEqual(before_reset["test_actual_screenshot_count"], 1)
+
+        dts.reset_manual_test_session_state(manual_task)
+        after_reset = dts.get_task_day_status(manual_task)
+
+        self.assertEqual(after_reset["brand_status"], "sent")
+        self.assertTrue(after_reset["sent_today"])
+        self.assertEqual(after_reset["test_status"], "pending")
+        self.assertEqual(after_reset["test_brand_status"], "pending")
+        self.assertEqual(after_reset["test_completed_keywords"], [])
+        self.assertEqual(after_reset["test_actual_screenshot_count"], 0)
+        self.assertFalse(after_reset["test_has_gap"])
 
     def test_manual_test_failure_does_not_write_pool(self) -> None:
         task = {
@@ -300,6 +351,7 @@ class DailyTaskStateTests(unittest.TestCase):
         self.assertEqual(keyword_state.get("image_path"), str(expected_path))
         self.assertFalse(source_path.exists())
         self.assertTrue(expected_path.exists())
+        self.assertTrue(dict(status["test_keyword_states"].get("词C") or {}).get("image_path", "").endswith("_doubao.jpg"))
 
     def test_manual_test_send_failure_does_not_write_pool_failure(self) -> None:
         task = {
@@ -394,7 +446,7 @@ class DailyTaskStateTests(unittest.TestCase):
         self.assertEqual(status["brand_status"], "sent")
         self.assertEqual(status["test_status"], "success")
         self.assertEqual(status["official_status"], "pending")
-        self.assertFalse(status["formal_started"])
+        self.assertFalse(status["formal_running"])
 
 
 if __name__ == "__main__":

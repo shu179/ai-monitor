@@ -425,7 +425,48 @@ def build_keyword_updates_from_batch(
     *,
     image_paths: list[str],
     detected_platforms: list[str],
+    prepared_results: list[dict] | None = None,
 ) -> list[dict]:
+    if prepared_results is not None:
+        updates: list[dict] = []
+        seen_slots: dict[tuple[tuple[str, str], str], int] = {}
+        for raw_result in prepared_results or []:
+            result = dict(raw_result or {})
+            keyword = str(result.get("keyword") or "").strip()
+            brand = str(result.get("brand") or "").strip()
+            platform_name = normalize_platform_id(result.get("platform") or "")
+            image_path = str(result.get("image_path") or "").strip()
+            run_success = bool(result.get("run_success", True))
+            screenshot_saved = bool(result.get("screenshot_saved", bool(image_path)))
+            failure_reason = str(result.get("failure_reason") or "").strip()
+            if not keyword:
+                continue
+            if run_success and screenshot_saved:
+                failure_reason = ""
+            elif run_success and not failure_reason:
+                failure_reason = "screenshot_save_failed"
+            elif not run_success and not failure_reason:
+                failure_reason = "run_failed"
+            update = {
+                "keyword": keyword,
+                "brand": brand,
+                "run_success": run_success,
+                "screenshot_saved": screenshot_saved,
+                "failure_reason": failure_reason,
+                "platform": platform_name,
+                "image_path": image_path,
+            }
+            slot_key = (normalize_keyword_brand_pair(keyword, brand), platform_name)
+            existing_index = seen_slots.get(slot_key)
+            if existing_index is None:
+                seen_slots[slot_key] = len(updates)
+                updates.append(update)
+                continue
+            existing = updates[existing_index]
+            if (not bool(existing.get("screenshot_saved"))) and screenshot_saved:
+                updates[existing_index] = update
+        return updates
+
     matched_pairs = expand_matched_pair_slots(batch.get("matched_pairs") or [])
     normalized_paths = []
     seen_paths = set()
