@@ -363,24 +363,28 @@ class CloudPlatformAutoSync:
             except CloudClientError as exc:
                 self._update_status(event_stream_connected=False)
                 if exc.status_code == 401 and refresh_token:
-                    if self._refresh_event_token(
-                        base_url=base_url,
-                        access_token=access_token,
-                        refresh_token=refresh_token,
-                        workspace_id=identity["workspace_id"],
-                        user_id=identity["user_id"],
-                    ):
-                        reconnect_failures = 0
-                        continue
-                    self._session_store.clear_if_current(
+                    refreshed, should_clear_session = self._refresh_event_token(
                         base_url=base_url,
                         access_token=access_token,
                         refresh_token=refresh_token,
                         workspace_id=identity["workspace_id"],
                         user_id=identity["user_id"],
                     )
-                    self._update_status(logged_in=False)
-                    reconnect_failures = 0
+                    if refreshed:
+                        reconnect_failures = 0
+                        continue
+                    if should_clear_session:
+                        self._session_store.clear_if_current(
+                            base_url=base_url,
+                            access_token=access_token,
+                            refresh_token=refresh_token,
+                            workspace_id=identity["workspace_id"],
+                            user_id=identity["user_id"],
+                        )
+                        self._update_status(logged_in=False)
+                        reconnect_failures = 0
+                    else:
+                        reconnect_failures += 1
                 else:
                     reconnect_failures += 1
                     self._record_error(str(exc))
@@ -406,7 +410,7 @@ class CloudPlatformAutoSync:
         refresh_token: str,
         workspace_id: str = "",
         user_id: str = "",
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         try:
             client = self._client_factory(base_url)
             refreshed_session = self._session_store.refresh_login_if_current(
@@ -417,14 +421,14 @@ class CloudPlatformAutoSync:
                 workspace_id=workspace_id,
                 user_id=user_id,
             )
-            return bool(refreshed_session.get("access_token"))
+            return bool(refreshed_session.get("access_token")), False
         except CloudSessionChangedError as exc:
             self._record_error(str(exc))
-            return False
+            return False, False
         except CloudClientError as exc:
             if exc.status_code != 401:
                 self._record_error(str(exc))
-            return False
+            return False, exc.status_code == 401
 
     def _pull_now_from_event(self, event_name: str) -> None:
         pull_result = self._invoke_pull_tasks(force=False)

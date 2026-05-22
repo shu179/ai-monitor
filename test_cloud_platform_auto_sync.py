@@ -10,6 +10,7 @@ import requests
 
 from core.cloud_client import _format_request_exception
 from core.cloud_outbox import CloudOutbox
+from core.cloud_client import CloudClientError
 from core.cloud_platform_auto_sync import CloudPlatformAutoSync
 from core.cloud_session_store import CloudSessionStore
 
@@ -340,6 +341,85 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             self.assertEqual(summary["duration_ms"], 123)
             self.assertEqual(summary["run_record_imported"], 2)
             self.assertEqual(summary["task_day_status_applied"], 1)
+
+    def test_refresh_event_token_only_clears_session_on_explicit_401(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.example.com",
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                    "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+                }
+            )
+            manager = CloudPlatformAutoSync(
+                session_store=store,
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            with patch.object(
+                manager,
+                "_client_factory",
+                return_value=type(
+                    "FakeClient",
+                    (),
+                    {"refresh": staticmethod(lambda _token: (_ for _ in ()).throw(CloudClientError("temporary failure")))}
+                )(),
+            ):
+                refreshed, should_clear = manager._refresh_event_token(  # noqa: SLF001
+                    base_url="https://api.example.com",
+                    access_token="old-access",
+                    refresh_token="old-refresh",
+                    workspace_id="1",
+                    user_id="2",
+                )
+
+            self.assertFalse(refreshed)
+            self.assertFalse(should_clear)
+            self.assertEqual(store.load()["refresh_token"], "old-refresh")
+
+    def test_refresh_event_token_marks_session_clear_on_refresh_401(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.example.com",
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                    "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+                }
+            )
+            manager = CloudPlatformAutoSync(
+                session_store=store,
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            with patch.object(
+                manager,
+                "_client_factory",
+                return_value=type(
+                    "FakeClient",
+                    (),
+                    {"refresh": staticmethod(lambda _token: (_ for _ in ()).throw(CloudClientError("refresh revoked", status_code=401)))}
+                )(),
+            ):
+                refreshed, should_clear = manager._refresh_event_token(  # noqa: SLF001
+                    base_url="https://api.example.com",
+                    access_token="old-access",
+                    refresh_token="old-refresh",
+                    workspace_id="1",
+                    user_id="2",
+                )
+
+            self.assertFalse(refreshed)
+            self.assertTrue(should_clear)
 
 
 if __name__ == "__main__":
