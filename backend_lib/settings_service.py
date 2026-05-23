@@ -58,6 +58,20 @@ def _normalize_storage_settings(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _mask_nested_api_keys(value: Any, mask_secret: Callable[[Any], str]) -> Any:
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "api_key":
+                result[key] = mask_secret(item)
+            else:
+                result[key] = _mask_nested_api_keys(item, mask_secret)
+        return result
+    if isinstance(value, list):
+        return [_mask_nested_api_keys(item, mask_secret) for item in value]
+    return value
+
+
 class SettingsService:
     """Read-only settings projection for the frontend API."""
 
@@ -103,6 +117,7 @@ class SettingsService:
         cloud_sync_cfg["api_token"] = self._mask_secret(cloud_sync_cfg.get("api_token", ""))
         ai_assistant_cfg = dict(config.get("ai_assistant", {}) or {})
         recognition_cfg = dict(config.get("recognition", {}) or {})
+        image_generation_cfg = _mask_nested_api_keys(dict(config.get("image_generation", {}) or {}), self._mask_secret)
         recognition_cfg["safe_mode_ocr_enabled"] = True
         for obsolete_key in ("ai_fallback_enabled", "platform", "model"):
             recognition_cfg.pop(obsolete_key, None)
@@ -143,4 +158,5 @@ class SettingsService:
             "app_update": get_app_update_settings(config),
             "update_status": build_update_status(config, include_check=False),
             "cloud_sync_status": self._cloud_sync_status_getter(),
+            "image_generation": image_generation_cfg,
         }

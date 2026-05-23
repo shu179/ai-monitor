@@ -2905,6 +2905,129 @@ export async function runSearchBrandRank(fileId: string, brand: string): Promise
   }
 }
 
+// ── Image generation ────────────────────────────────────────
+
+export type ImageGenerationProvider = "openai" | "gemini";
+export type ImageGenerationModelId = "nano_banana_2" | "gpt_image_2";
+
+export type ImageGenerationModelOption = {
+  id: ImageGenerationModelId;
+  label: string;
+  provider: ImageGenerationProvider;
+  model: string;
+  configured: boolean;
+  has_key: boolean;
+};
+
+export type ImageGenerationConfig = {
+  models: ImageGenerationModelOption[];
+  default_model_id: ImageGenerationModelId;
+};
+
+export type GeneratedImage = {
+  data_url?: string;
+  url?: string;
+  mime_type?: string;
+  revised_prompt?: string;
+};
+
+export type ImageGenerationResult = {
+  ok: boolean;
+  message?: string;
+  model_id?: ImageGenerationModelId;
+  label?: string;
+  provider?: ImageGenerationProvider;
+  model?: string;
+  images?: GeneratedImage[];
+  request?: Record<string, unknown>;
+};
+
+const FALLBACK_IMAGE_GENERATION_CONFIG: ImageGenerationConfig = {
+  default_model_id: "gpt_image_2",
+  models: [
+    {
+      id: "nano_banana_2",
+      label: "Nano Banana 2",
+      provider: "gemini",
+      model: "nano-banana-2",
+      configured: false,
+      has_key: false,
+    },
+    {
+      id: "gpt_image_2",
+      label: "GPT Image 2",
+      provider: "openai",
+      model: "gpt-image-2",
+      configured: false,
+      has_key: false,
+    },
+  ],
+};
+
+function normalizeImageGenerationConfig(value: unknown): ImageGenerationConfig {
+  const raw = value && typeof value === "object" ? value as Partial<ImageGenerationConfig> : {};
+  const fallbackById = Object.fromEntries(FALLBACK_IMAGE_GENERATION_CONFIG.models.map((model) => [model.id, model]));
+  const rawModels = Array.isArray(raw.models) ? raw.models : [];
+  const models = FALLBACK_IMAGE_GENERATION_CONFIG.models.map((fallback) => {
+    const incoming = rawModels.find((item) => item && typeof item === "object" && (item as Partial<ImageGenerationModelOption>).id === fallback.id) as Partial<ImageGenerationModelOption> | undefined;
+    return {
+      ...fallback,
+      ...incoming,
+      id: fallback.id,
+      label: String(incoming?.label || fallback.label),
+      provider: incoming?.provider === "gemini" ? "gemini" : fallback.provider,
+      model: String(incoming?.model || fallback.model),
+      configured: Boolean(incoming?.configured),
+      has_key: Boolean(incoming?.has_key),
+    };
+  });
+  const defaultModelId = raw.default_model_id && fallbackById[raw.default_model_id] ? raw.default_model_id : FALLBACK_IMAGE_GENERATION_CONFIG.default_model_id;
+  return {
+    models,
+    default_model_id: defaultModelId,
+  };
+}
+
+export async function fetchImageGenerationConfig(): Promise<ImageGenerationConfig> {
+  try {
+    const res = await apiFetch("/api/image-generation/config", {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      return FALLBACK_IMAGE_GENERATION_CONFIG;
+    }
+    const data = await res.json();
+    return normalizeImageGenerationConfig(data?.config);
+  } catch {
+    return FALLBACK_IMAGE_GENERATION_CONFIG;
+  }
+}
+
+export async function generateImage(payload: {
+  model_id: ImageGenerationModelId;
+  prompt: string;
+  aspect_ratio: string;
+  canvas_quality: string;
+  quality: string;
+  output_format: string;
+}): Promise<ImageGenerationResult> {
+  try {
+    const res = await apiFetch("/api/image-generation/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      timeoutMs: 190000,
+    });
+    return await res.json();
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return { ok: false, message: "生图超时，请降低画质或稍后重试" };
+    }
+    return { ok: false, message: "生图请求失败" };
+  }
+}
+
 // ── Settings ────────────────────────────────────────────────
 
 export function readSettingsCache(): Record<string, unknown> | null {

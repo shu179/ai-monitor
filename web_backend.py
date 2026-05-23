@@ -101,6 +101,12 @@ from backend_lib.dashboard import (
     _weekday_name_from_iso,
 )
 from backend_lib.home_copy import _build_dashboard_home_copy as _build_dashboard_home_copy_impl
+from backend_lib.image_generation_service import (
+    ImageGenerationError,
+    generate_image_from_config,
+    image_generation_config_to_api,
+    normalize_image_generation_config,
+)
 from backend_lib.keyword_import import (
     KEYWORD_IMPORT_EXTENSIONS,
     _decode_plain_text,
@@ -421,6 +427,7 @@ GET_EXACT_RUNTIME_METHODS = {
     "/api/recognition/status": "get_recognition_status",
     "/api/assistant/tools": "get_assistant_tools",
     "/api/history-storage/status": "get_history_storage_status",
+    "/api/image-generation/config": "get_image_generation_config",
 }
 
 GET_EXACT_SESSION_TOKEN_REQUIRED_PATHS = frozenset(GET_EXACT_RUNTIME_METHODS.keys())
@@ -480,6 +487,7 @@ POST_JSON_RUNTIME_METHODS = {
     "/api/recognition/action": "recognition_action",
     "/api/assistant/action": "assistant_action",
     "/api/history-storage/rebuild-shadow": "rebuild_history_sqlite_shadow",
+    "/api/image-generation/generate": "generate_image",
 }
 
 PUT_DYNAMIC_RUNTIME_METHODS = (
@@ -784,6 +792,21 @@ def _preserve_masked_secret(incoming: Any, existing: Any) -> str:
     if _is_masked_secret(text):
         return str(existing or "").strip()
     return text
+
+
+def _preserve_nested_api_keys(incoming: Any, existing: Any) -> Any:
+    if not isinstance(incoming, dict):
+        return incoming
+    existing_dict = existing if isinstance(existing, dict) else {}
+    result: dict[str, Any] = {}
+    for key, value in incoming.items():
+        if key == "api_key":
+            result[key] = _preserve_masked_secret(value, existing_dict.get(key, ""))
+        elif isinstance(value, dict):
+            result[key] = _preserve_nested_api_keys(value, existing_dict.get(key, {}))
+        else:
+            result[key] = value
+    return result
 
 
 def _is_relative_to(child: Path, parent: Path) -> bool:
@@ -7152,6 +7175,28 @@ return changedCount
     def get_profile_avatar_asset(self) -> tuple[bytes, str] | None:
         return read_profile_avatar_asset(self.load_config())
 
+    # ── Image generation ────────────────────────────────────────
+
+    def get_image_generation_config(self) -> dict:
+        config = self.load_config()
+        return {
+            "ok": True,
+            "config": image_generation_config_to_api(
+                (config.get("image_generation", {}) or {}),
+                _mask_secret,
+            ),
+        }
+
+    def generate_image(self, payload: dict) -> dict:
+        config = self.load_config()
+        try:
+            return generate_image_from_config(config.get("image_generation", {}) or {}, payload)
+        except ImageGenerationError as exc:
+            return {"ok": False, "message": str(exc)}
+        except Exception as exc:
+            print(f"[WebBackend] 生图请求失败: {redact_secret_text(str(exc))}")
+            return {"ok": False, "message": "生图请求失败，请检查接口地址、Key、模型名和网络"}
+
     # ── Platform API Key management ──────────────────────────────
 
     @staticmethod
@@ -9383,6 +9428,14 @@ return changedCount
                     existing_cloud_sync.get("api_token", ""),
                 )
 
+            image_generation_payload = normalized_payload.get("image_generation")
+            if isinstance(image_generation_payload, dict):
+                existing_image_generation = config.get("image_generation", {}) or {}
+                normalized_payload["image_generation"] = _preserve_nested_api_keys(
+                    image_generation_payload,
+                    existing_image_generation,
+                )
+
             app_update_payload = normalized_payload.get("app_update")
             if isinstance(app_update_payload, dict):
                 app_update_payload["channel"] = normalize_update_channel(
@@ -9447,6 +9500,7 @@ return changedCount
                 "article_export",
                 "app_update",
                 "storage",
+                "image_generation",
             ]
             query_execution_payload = normalized_payload.get("query_execution")
             if isinstance(query_execution_payload, dict):
@@ -9495,6 +9549,8 @@ return changedCount
             if "screenshot" in normalized_payload and isinstance(normalized_payload["screenshot"], dict):
                 existing = config.get("screenshot", {}) or {}
                 config["screenshot"] = _deep_merge_dict(existing, normalized_payload["screenshot"])
+            if "image_generation" in normalized_payload and isinstance(normalized_payload["image_generation"], dict):
+                config["image_generation"] = normalize_image_generation_config(config.get("image_generation", {}) or {})
             if "detection_mode" in normalized_payload and isinstance(normalized_payload["detection_mode"], str):
                 config["detection_mode"] = normalized_payload["detection_mode"]
             _apply_guarded_history_storage_defaults(config, session=CloudSessionStore().load())

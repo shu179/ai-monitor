@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
-import { X } from "lucide-react";
+import { UsersRound, X } from "lucide-react";
 import { Sidebar } from "./components/Sidebar";
 import { RightSidebar } from "./components/RightSidebar";
 import { SaveSuccessToast } from "./components/SaveSuccessToast";
@@ -59,6 +59,7 @@ const preloadSettingsContent = () => {
 };
 const loadAccountContent = () => import("./components/AccountContent").then((module) => ({ default: module.AccountContent }));
 const loadReleaseContent = () => import("./components/ReleaseContent").then((module) => ({ default: module.ReleaseContent }));
+const loadImageGenerationContent = () => import("./components/ImageGenerationContent").then((module) => ({ default: module.ImageGenerationContent }));
 
 const CenterContent = lazy(loadCenterContent);
 const BrandsContent = lazy(loadBrandsContent);
@@ -67,11 +68,13 @@ const SearchContent = lazy(loadSearchContent);
 const SettingsContent = lazy(loadSettingsContent);
 const AccountContent = lazy(loadAccountContent);
 const ReleaseContent = lazy(loadReleaseContent);
+const ImageGenerationContent = lazy(loadImageGenerationContent);
 
 const preloadPageByTab: Record<string, () => Promise<unknown>> = {
   看板: loadCenterContent,
   品牌: loadBrandsContent,
   发稿: loadReleaseContent,
+  生图: loadImageGenerationContent,
   搜搜: loadSearchContent,
   账号: loadAccountContent,
   系统设置: preloadSettingsContent,
@@ -885,6 +888,14 @@ export default function App() {
             />
           ) : activeTab === "发稿" ? (
             <ReleaseContent />
+          ) : activeTab === "生图" ? (
+            <ImageGenerationContent />
+          ) : activeTab === "协作" ? (
+            <UpcomingPanel
+              icon={<UsersRound className="w-5 h-5 text-blue-600" />}
+              title={activeTab}
+              subtitle="团队协同空间，任务、品牌、素材一处沉淀"
+            />
           ) : activeTab === "搜搜" ? (
             <SearchContent
               availableModels={bootstrap.availableModels}
@@ -1002,5 +1013,59 @@ export default function App() {
         </div>
       )}
     </>
+  );
+}
+
+function UpcomingPanel({
+  icon,
+  title,
+  subtitle,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  subtitle: string;
+}) {
+  return (
+    <main className="relative flex-1 min-w-0 overflow-hidden bg-transparent px-8 py-8 xl:px-10 flex flex-col">
+      <div className="absolute inset-0 bg-[#fcfdff]" />
+      <div
+        className="absolute inset-0 bg-[linear-gradient(rgba(15,23,42,0.028)_1px,transparent_1px),linear-gradient(90deg,rgba(15,23,42,0.024)_1px,transparent_1px)] bg-[size:34px_34px]"
+        style={{
+          maskImage:
+            "radial-gradient(circle at center, rgba(0,0,0,0.92) 0%, rgba(0,0,0,0.78) 36%, rgba(0,0,0,0.36) 68%, transparent 100%)",
+          WebkitMaskImage:
+            "radial-gradient(circle at center, rgba(0,0,0,0.92) 0%, rgba(0,0,0,0.78) 36%, rgba(0,0,0,0.36) 68%, transparent 100%)",
+        }}
+      />
+
+      <div className="relative z-10 flex justify-between items-end border-b border-gray-200/70 pb-6 mb-6 shrink-0">
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center gap-2">
+            {icon}
+            <h1 className="app-wordmark-heading text-[20px]">{title}</h1>
+          </div>
+          <span className="text-[12px] font-medium text-gray-500 tracking-wide">{subtitle}</span>
+        </div>
+      </div>
+
+      <div className="relative z-10 flex-1 flex items-center justify-center px-8">
+        <div className="flex flex-col items-center justify-center gap-1 text-center">
+          <p
+            className="text-[25px] font-normal tracking-[-0.045em] text-[#b7bbc6]"
+            style={{ fontFamily: "'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', Georgia, serif" }}
+          >
+            Please wait for the next version update
+            <span className="text-[#14C7F3]">.</span>
+          </p>
+          <p
+            className="text-[13px] leading-[1.1] font-normal tracking-[-0.022em] text-[#aeb4c0]"
+            style={{ fontFamily: "'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', Georgia, serif" }}
+          >
+            <span className="opacity-90">Current version:</span>{" "}
+            <span className="text-[#9aa1af]">V26.04.12</span>
+          </p>
+        </div>
+      </div>
+    </main>
   );
 }

@@ -43,6 +43,20 @@ def test_settings_service_projects_masked_settings(monkeypatch):
         },
         "article_export": {"show_keyword_category": True, "show_selfmedia_account": False},
         "storage": {"history_read_backend": "auto", "history_shadow_writes_enabled": True},
+        "image_generation": {
+            "models": {
+                "gpt_image_2": {
+                    "base_url": "https://api.openai.com/v1/images/generations",
+                    "api_key": "image-secret",
+                    "model": "gpt-image-2",
+                },
+                "nano_banana_2": {
+                    "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                    "api_key": "banana-secret",
+                    "model": "nano-banana-2",
+                },
+            },
+        },
     }
 
     service = SettingsService(
@@ -60,6 +74,9 @@ def test_settings_service_projects_masked_settings(monkeypatch):
     assert result["search"]["tavily_api_key"] == "MASK(tavily-secret)"
     assert result["tavily"]["api_key"] == "MASK(tavily-secret)"
     assert result["cloud_sync"]["api_token"] == "MASK(cloud-secret)"
+    assert result["image_generation"]["models"]["gpt_image_2"]["api_key"] == "MASK(image-secret)"
+    assert result["image_generation"]["models"]["nano_banana_2"]["api_key"] == "MASK(banana-secret)"
+    assert result["image_generation"]["models"]["gpt_image_2"]["model"] == "gpt-image-2"
     assert result["browser_auth"] == {"doubao": {"authenticated": True}}
     assert result["profile"] == {"name": "AI 运营"}
     assert result["cloud_sync_status"] == {"connected": False}
