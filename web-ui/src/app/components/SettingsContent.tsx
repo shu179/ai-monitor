@@ -7,6 +7,13 @@ import { notifySaveSuccess } from "../lib/saveToast";
 import { DatePickerField } from "./ui/date-picker-field";
 import { APIContent } from "./APIContent";
 
+type MonitoringSettingsSnapshot = {
+  enabled?: boolean;
+  running?: boolean;
+  statusMessage?: string;
+  status?: string;
+};
+
 function getExcludedArticleUrl(link: ExcludedArticleLinkSnapshot): string {
   return String(link.url || "").trim();
 }
@@ -573,9 +580,13 @@ function normalizeLocalModelConfig(configValue: unknown, statusValue?: unknown):
 export function SettingsContent({
   onSaveSuccess,
   onLogout,
+  monitoring,
+  onMonitoringToggle,
 }: {
   onSaveSuccess?: (message?: string) => void,
   onLogout?: () => void | Promise<void>,
+  monitoring?: MonitoringSettingsSnapshot,
+  onMonitoringToggle?: (enabled: boolean) => void | Promise<void>,
 }) {
   const normalizeBrowserAnswerMode = useCallback((value: unknown) => {
     const mode = String(value || "page").trim().toLowerCase();
@@ -588,10 +599,7 @@ export function SettingsContent({
     [0, 1, 2, 3, 4, 5, 6].reduce((acc, day) => ({ ...acc, [day]: { h: "09", m: "00" } }), {} as Record<number, {h:string, m:string}>)
   );
   
-  const [autoFallback, setAutoFallback] = useState(false);
   const [schedulerNotificationWebhook, setSchedulerNotificationWebhook] = useState("");
-  const [failureAlertThreshold, setFailureAlertThreshold] = useState("7");
-  const [failureAlertCooldownMinutes, setFailureAlertCooldownMinutes] = useState("5");
   const [schedulerWebhookTesting, setSchedulerWebhookTesting] = useState(false);
   const [schedulerWebhookTestMessage, setSchedulerWebhookTestMessage] = useState("");
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
@@ -628,6 +636,7 @@ export function SettingsContent({
   const [localUpdatePending, setLocalUpdatePending] = useState(false);
   const [recognitionMode, setRecognitionMode] = useState("screenshot");
   const [floatingWindowResidentEnabled, setFloatingWindowResidentEnabled] = useState(false);
+  const [monitoringToggleLoading, setMonitoringToggleLoading] = useState(false);
 
   const [searchModels, setSearchModels] = useState<string[]>(["sonar-pro", "sonar"]);
   const [newSearchModel, setNewSearchModel] = useState("");
@@ -818,16 +827,8 @@ export function SettingsContent({
         setTimes(newTimes);
       }
       const scheduler = data.scheduler as Record<string, unknown> | undefined;
-      if (scheduler && typeof scheduler.auto_continue_after_default_failure === "boolean") {
-        setAutoFallback(scheduler.auto_continue_after_default_failure);
-      }
       if (scheduler && scheduler.notification_webhook_url !== undefined) {
         setSchedulerNotificationWebhook(String(scheduler.notification_webhook_url || ""));
-      }
-      const defaultNotification = data.default_notification as Record<string, unknown> | undefined;
-      if (defaultNotification) {
-        setFailureAlertThreshold(String(defaultNotification.failure_alert_threshold ?? "7"));
-        setFailureAlertCooldownMinutes(String(defaultNotification.failure_alert_cooldown_minutes ?? "5"));
       }
       const accountCrawling = data.account_crawling as Record<string, unknown> | undefined;
       if (accountCrawling) {
@@ -1052,19 +1053,11 @@ export function SettingsContent({
     return {
       scheduler: {
         weekly_times,
-        auto_continue_after_default_failure: autoFallback,
         notification_webhook_url: schedulerNotificationWebhook,
-      },
-      default_notification: {
-        failure_alert_threshold: parseInt(failureAlertThreshold, 10) || 7,
-        failure_alert_cooldown_minutes: parseInt(failureAlertCooldownMinutes, 10) || 5,
       },
     };
   }, [
     activeDays,
-    autoFallback,
-    failureAlertCooldownMinutes,
-    failureAlertThreshold,
     schedulerNotificationWebhook,
     times,
   ]);
@@ -1390,6 +1383,20 @@ export function SettingsContent({
   ]);
 
   const saving = Boolean(savingScope);
+  const monitoringEnabled = Boolean(monitoring?.enabled);
+  const monitoringRunning = Boolean(monitoring?.running);
+  const handleMonitoringToggleClick = useCallback(async () => {
+    if (monitoringToggleLoading) {
+      return;
+    }
+    setMonitoringToggleLoading(true);
+    try {
+      await onMonitoringToggle?.(!monitoringEnabled);
+      notifySaveSuccess(onSaveSuccess, !monitoringEnabled ? "已开启自动调度" : "已关闭自动调度");
+    } finally {
+      setMonitoringToggleLoading(false);
+    }
+  }, [monitoringEnabled, monitoringToggleLoading, onMonitoringToggle, onSaveSuccess]);
 
   const handleTestSchedulerWebhook = useCallback(async () => {
     setSchedulerWebhookTesting(true);
@@ -1908,6 +1915,58 @@ export function SettingsContent({
               任务只决定在哪几天参与自动查询；每天具体几点开始，由这里统一控制。
             </p>
 
+            <div className="mb-5 flex items-center justify-between gap-4 border-b border-gray-200/80 pb-4">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <div className="text-[12px] font-bold text-gray-900">自动调度</div>
+                  <span
+                    className={`inline-flex items-center gap-1.5 text-[10px] font-semibold ${
+                      monitoringRunning
+                        ? "text-emerald-700"
+                        : monitoringEnabled
+                          ? "text-sky-700"
+                          : "text-gray-500"
+                    }`}
+                  >
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full ${
+                        monitoringRunning
+                          ? "bg-emerald-500"
+                          : monitoringEnabled
+                            ? "bg-sky-500"
+                            : "bg-gray-400"
+                      }`}
+                    />
+                    {monitoringRunning ? "运行中" : monitoringEnabled ? "已开启" : "已关闭"}
+                  </span>
+                </div>
+                <p className="mt-1 text-[11px] text-gray-500 leading-relaxed">
+                  开启后系统会按下方时间自动执行品牌任务；关闭后仍可手动测试。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  void handleMonitoringToggleClick();
+                }}
+                disabled={monitoringToggleLoading || !onMonitoringToggle}
+                className={`inline-flex shrink-0 items-center justify-center gap-2 rounded-[12px] px-4 py-2.5 text-[12px] font-semibold transition-all ${
+                  monitoringEnabled
+                    ? "bg-emerald-50 text-emerald-700 hover:bg-emerald-100/80"
+                    : "bg-gray-100 text-gray-700 hover:bg-gray-200/80"
+                } disabled:cursor-not-allowed disabled:opacity-70`}
+              >
+                {monitoringToggleLoading ? (
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                ) : monitoringEnabled ? (
+                  <Clock className="h-3.5 w-3.5" />
+                ) : (
+                  <CalendarDays className="h-3.5 w-3.5" />
+                )}
+                {monitoringToggleLoading ? "状态切换中..." : monitoringEnabled ? "关闭定时任务" : "开启定时任务"}
+              </button>
+            </div>
+
             <div className="mb-5 border-b border-gray-200/80 pb-4">
               <ControlledTextInput
                 label="调度通知 Webhook"
@@ -1934,40 +1993,6 @@ export function SettingsContent({
                 <div className="mt-2 text-[12px] font-medium text-blue-600">{schedulerWebhookTestMessage}</div>
               ) : null}
             </div>
-
-            <div className="mb-5 grid grid-cols-1 md:grid-cols-2 gap-4 border-b border-gray-200/80 pb-4">
-              <div className="flex items-center gap-3 text-[12px]">
-                <span className="w-32 font-bold text-gray-700">连续失败告警 :</span>
-                <NumberInput
-                  value={failureAlertThreshold}
-                  onChange={setFailureAlertThreshold}
-                  min={1}
-                  max={50}
-                />
-                <span className="text-gray-500 font-medium">次后发送</span>
-              </div>
-              <div className="flex items-center gap-3 text-[12px]">
-                <span className="w-32 font-bold text-gray-700">失败告警冷却 :</span>
-                <NumberInput
-                  value={failureAlertCooldownMinutes}
-                  onChange={setFailureAlertCooldownMinutes}
-                  min={0}
-                  max={120}
-                />
-                <span className="text-gray-500 font-medium">分钟</span>
-              </div>
-              <p className="md:col-span-2 text-[11px] text-gray-500 leading-relaxed">
-                同一类失败连续累计到阈值后会立刻推送调度 webhook；发送后会进入短冷却，避免刷屏。默认是连续 7 次失败、冷却 5 分钟。
-              </p>
-            </div>
-            
-            <CheckboxRow 
-              checked={autoFallback} 
-              onChange={setAutoFallback}
-              label="默认模式失败后自动启动后续模式"
-              subtext="关闭时，系统会先发主页消息提醒；你确认后才显示可继续的后续模式选项。"
-              className="mb-5"
-            />
 
             <div className="mb-5 border-t border-gray-200/80 pt-4">
               <div className="mb-3">
@@ -2600,7 +2625,7 @@ export function SettingsContent({
               </p>
             </div>
 
-            <div className="space-y-3 mb-6">
+            <div className="space-y-3">
               <CheckboxRow
                 checked={floatingWindowResidentEnabled}
                 onChange={setFloatingWindowResidentEnabled}
@@ -2608,10 +2633,6 @@ export function SettingsContent({
                 subtext="开启后，识别任务未运行时悬浮窗会保留为文章录入与快捷工具；识别任务启动后自动切回关键词引导。"
               />
             </div>
-
-            <p className="text-[11px] text-gray-400 mt-5 leading-relaxed border-l-2 border-gray-200 pl-3">
-              识别模式会固定启用本地 OCR；命中品牌后会直接进入后续发送流程。
-            </p>
           </Section>
 
           {/* Section 6: Search Plugin */}

@@ -1,69 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Zap, Eye, ArrowUpRight, Map, Globe } from "lucide-react";
+import { ArrowUpRight } from "lucide-react";
 import { ChartArea } from "./Charts";
-import { OcrFloatingWindow } from "./OcrFloatingWindow";
 import { FailedTasksModal } from "./FailedTasksModal";
-import type { DashboardSnapshot, TrendSnapshot } from "../lib/backend";
-import { fetchDashboardTrend, fetchRecognitionStatus, recognitionAction, saveSettings } from "../lib/backend";
+import { AmapRegionMap } from "./AmapRegionMap";
+import type { DashboardSnapshot, MonthOverviewDay, MonthOverviewSnapshot, TrendSnapshot } from "../lib/backend";
+import { fetchDashboardTrend } from "../lib/backend";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Tooltip as RechartsTooltip,
   PieChart, Pie, Cell
 } from 'recharts';
-
-function formatHeaderDate(now: Date): string {
-  return new Intl.DateTimeFormat("en", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-  }).format(now).toUpperCase();
-}
-
-function buildCompactCalendar(now: Date) {
-  const items = [];
-  for (let offset = -3; offset <= 1; offset += 1) {
-    const date = new Date(now);
-    date.setDate(now.getDate() + offset);
-    items.push({
-      key: date.toISOString().slice(0, 10),
-      date: date.getDate(),
-      day: ["日", "一", "二", "三", "四", "五", "六"][date.getDay()],
-      active: offset === 0,
-    });
-  }
-  return items;
-}
-
-const _MODE_TITLE_TO_KEY: Record<string, string> = {
-  "抓取模式": "browser",
-  "识别模式": "recognition",
-};
-
-const DASHBOARD_MODE_CARD_DEFS: DashboardSnapshot["taskCards"] = [
-  { key: "capture", title: "抓取模式", desc: "快速提取核心数据", icon: "zap", active: true },
-  { key: "ocr", title: "识别模式", desc: "OCR视觉解析", icon: "eye", active: false },
-];
-
-function normalizeDashboardModeCardKey(card: Partial<DashboardSnapshot["taskCards"][number]> | null | undefined) {
-  const key = String(card?.key || "").trim().toLowerCase();
-  const title = String(card?.title || "").trim();
-  if (key === "capture" || key === "browser" || title === "抓取模式") {
-    return "capture";
-  }
-  if (key === "ocr" || key === "recognition" || title === "识别模式") {
-    return "ocr";
-  }
-  return "";
-}
-
-function sanitizeDashboardModeCards(cards: DashboardSnapshot["taskCards"] | undefined) {
-  const activeKey = (cards || [])
-    .map((card) => ({ key: normalizeDashboardModeCardKey(card), active: Boolean(card?.active) }))
-    .find((item) => item.key && item.active)?.key || "capture";
-  return DASHBOARD_MODE_CARD_DEFS.map((card) => ({
-    ...card,
-    active: card.key === activeKey,
-  }));
-}
 
 const DASHBOARD_DEEP = "#2F5A67";
 const DASHBOARD_TEAL = "#1E7F95";
@@ -112,6 +57,34 @@ function formatMediaStatAxisLabel(
   return MEDIA_STAT_WEEKDAY_LABELS[parsedDate.getDay()] || item.name;
 }
 
+function formatCompactNumber(value: number) {
+  const safeValue = Number.isFinite(value) ? value : 0;
+  if (Math.abs(safeValue) >= 10000) {
+    const compact = safeValue / 10000;
+    return `${Number.isInteger(compact) ? compact.toFixed(0) : compact.toFixed(1)}w`;
+  }
+  return Math.round(safeValue).toLocaleString();
+}
+
+function formatCurrency(value: number) {
+  const safeValue = Number.isFinite(value) ? value : 0;
+  if (Math.abs(safeValue) >= 10000) {
+    const compact = safeValue / 10000;
+    return `¥${Number.isInteger(compact) ? compact.toFixed(0) : compact.toFixed(1)}w`;
+  }
+  return `¥${Math.round(safeValue).toLocaleString()}`;
+}
+
+function formatMonthDayLabel(dateText: string) {
+  const [, month = "", day = ""] = String(dateText || "").split("-");
+  const monthNum = Number(month);
+  const dayNum = Number(day);
+  if (!monthNum || !dayNum) {
+    return dateText || "今日";
+  }
+  return `${monthNum}月${dayNum}日`;
+}
+
 const INDUSTRY_CHART_COLORS = [
   DASHBOARD_DEEP,
   DASHBOARD_TEAL,
@@ -128,31 +101,16 @@ const INDUSTRY_CHART_COLORS = [
 ];
 
 export function CenterContent({
-  localOCR = true,
   dashboard,
   runMessage,
   activeRegions,
   onDataChanged,
-  suppressOcrWindow = false,
-  onRunMessage,
 }: {
-  localOCR?: boolean;
   dashboard?: DashboardSnapshot;
   runMessage?: string;
   activeRegions?: string[];
   onDataChanged?: () => Promise<void> | void;
-  suppressOcrWindow?: boolean;
-  onRunMessage?: (message: string, durationMs?: number) => void;
 }) {
-  const now = new Date();
-  const compactCalendar = buildCompactCalendar(now);
-
-  // 从后端 taskCards 中找到 active 的卡片作为初始模式
-  const initialModeCards = sanitizeDashboardModeCards(dashboard?.taskCards);
-  const initialMode = initialModeCards.find(c => c.active)?.title || '抓取模式';
-  const [activeMode, setActiveMode] = useState<string>(initialMode);
-  const [showOcrWindow, setShowOcrWindow] = useState(false);
-  const headerDate = dashboard?.dateLabel || formatHeaderDate(now);
   const greeting = dashboard?.greeting || "下午好";
   const userName = dashboard?.userName || "Saffron";
   const headline = dashboard?.headline || "系统运行平稳，今日已为您自动拦截 12 项异常请求。";
@@ -160,72 +118,26 @@ export function CenterContent({
   const completedCount = dashboard?.completedCount ?? 38;
   const runningCount = dashboard?.runningCount ?? 4;
   const sourceBreakdown = dashboard?.sourceBreakdown || [];
-  const modeCards = useMemo(() => sanitizeDashboardModeCards(dashboard?.taskCards), [dashboard?.taskCards]);
   const mediaStats = dashboard?.mediaStats || [];
   const failedTasks = dashboard?.failedTasks || [];
   const failedTaskCount = dashboard?.failedTaskCount ?? failedTasks.length;
   const [showFailedTasksModal, setShowFailedTasksModal] = useState(false);
 
-  useEffect(() => {
-    const nextMode = modeCards.find(c => c.active)?.title;
-    if (nextMode) {
-      setActiveMode(nextMode);
-    }
-  }, [modeCards]);
-
-  const handleModeSelect = async (mode: { key: string; title: string; desc: string; icon: "zap" | "eye"; active: boolean }) => {
-    setActiveMode(mode.title);
-    const modeKey = _MODE_TITLE_TO_KEY[mode.title] || mode.key;
-    await saveSettings({ detection_mode: modeKey });
-    if (modeKey === "recognition") {
-      await recognitionAction("start");
-      const recognitionStatus = await fetchRecognitionStatus();
-      const guide = recognitionStatus.status?.keyword_guide as { items?: unknown[] } | undefined;
-      const overview = recognitionStatus.status?.task_overview as
-        | {
-            configured_task_count?: number;
-            watchable_today_count?: number;
-            completed_today_count?: number;
-            available_task_count?: number;
-          }
-        | undefined;
-      const hasRecognitionTasks = Array.isArray(guide?.items) && guide.items.length > 0;
-      setShowOcrWindow(hasRecognitionTasks);
-      if (!hasRecognitionTasks) {
-        const watchableTodayCount = Number(overview?.watchable_today_count || 0);
-        const completedTodayCount = Number(overview?.completed_today_count || 0);
-        const configuredTaskCount = Number(overview?.configured_task_count || 0);
-        const availableTaskCount = Number(overview?.available_task_count || 0);
-        const message = availableTaskCount > 0 || failedTaskCount > 0
-          ? `今日仍有 ${Math.max(availableTaskCount, failedTaskCount, 1)} 个任务待补齐，请继续补跑失败关键词或平台`
-          : watchableTodayCount > 0 && completedTodayCount >= watchableTodayCount
-            ? "今日任务已全部补齐，可前往品牌页开启测试"
-            : configuredTaskCount > 0 && availableTaskCount <= 0
-            ? "当前暂无可执行任务，请前往品牌页检查配置"
-            : "当前暂无任务，可进入品牌页开启测试任务";
-        onRunMessage?.(message);
-      }
-    } else {
-      await recognitionAction("stop");
-      setShowOcrWindow(false);
-    }
-  };
-
   return (
     <div className="flex-1 min-w-0 min-h-0 overflow-x-hidden overflow-y-auto bg-transparent px-6 py-4 xl:px-8 xl:py-5 flex flex-col custom-scrollbar">
-      {/* 1. Header & Calendar */}
-      <div className="flex flex-col gap-3 border-b border-gray-200/70 pb-4 mb-4 shrink-0 xl:flex-row xl:items-center xl:justify-between">
-        <div className="flex flex-1 flex-col gap-1">
-          <p className="text-[10px] text-slate-500 font-semibold tracking-[0.18em] uppercase mb-1">{headerDate}</p>
-          <h1 className="app-display-heading text-[26px] font-semibold text-[#0f1835] tracking-[-0.035em]">
-            {greeting}，{userName}。
+      {/* 1. Header & Month Heatmap */}
+      <div className="flex flex-col gap-3 border-b border-gray-200/70 pb-4 mb-4 shrink-0 xl:flex-row xl:items-start xl:justify-between">
+        <div className="flex flex-1 flex-col gap-1 pt-3">
+          <h1 className="app-display-heading text-[28px] font-semibold text-[#0f1835] tracking-[-0.035em]">
+            {greeting}，{userName}
           </h1>
-          <p className="app-subtle-copy text-[13px] mt-1 max-w-[620px] leading-6 font-medium">
+          <p className="app-subtle-copy text-[13px] mt-0.5 max-w-[620px] leading-6 font-medium">
             {headline}
           </p>
         </div>
 
-        <div className="flex flex-col gap-2 xl:items-end xl:pl-4">
+        <div className="flex shrink-0 flex-col gap-2 xl:items-end xl:pl-4">
+          <MonthOverviewPanel overview={dashboard?.monthOverview} />
           {runMessage && (
             <div className="hidden shrink-0 md:flex items-start gap-2 text-right">
               <span className="mt-[6px] h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: DASHBOARD_CYAN }} />
@@ -234,25 +146,14 @@ export function CenterContent({
               </p>
             </div>
           )}
-          
-          {/* Minimalist Calendar */}
-          <div className="flex gap-4 pr-1 xl:translate-y-[-2px]">
-            {compactCalendar.map((d) => (
-              <div key={d.key} className="flex flex-col items-center justify-center relative min-w-[20px]">
-                <span className={`text-[11px] mb-1.5 ${d.active ? 'font-bold text-gray-900' : 'font-medium text-gray-400'}`}>{d.day}</span>
-                <span className={`text-[16px] ${d.active ? 'font-bold text-gray-900' : 'font-semibold text-gray-700'}`}>{d.date}</span>
-                {d.active && <div className="absolute -bottom-2 w-1 h-1 rounded-full" style={{ backgroundColor: DASHBOARD_CYAN }}></div>}
-              </div>
-            ))}
-          </div>
         </div>
       </div>
 
       <div className="flex flex-col gap-3 min-h-max">
-        {/* Row 1: Tasks & Modes */}
+        {/* Row 1: Tasks */}
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 shrink-0">
           {/* Today's Tasks */}
-          <div className="xl:col-span-4 flex flex-col justify-start">
+          <div className="xl:col-span-12 flex flex-col justify-start">
             <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase mb-3">今日检测任务</h3>
             <div className="flex items-baseline gap-2 mb-3">
               <span className="text-[52px] font-medium text-gray-900 leading-none tracking-tighter">{todayTaskCount}</span>
@@ -277,26 +178,6 @@ export function CenterContent({
                   {failedTaskCount > 0 ? "失败明细" : "运行正常"}
                 </span>
               </button>
-            </div>
-          </div>
-
-          {/* Detection Modes */}
-          <div className="xl:col-span-8 flex flex-col">
-            <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase mb-3">检测模式</h3>
-            <div className="grid grid-cols-2 gap-4 h-full">
-              {modeCards.map((mode) => (
-                <ModeItem
-                  key={mode.key}
-                  onClick={() => { void handleModeSelect(mode); }}
-                  icon={
-                    mode.icon === "zap" ? <Zap className="w-3.5 h-3.5" /> :
-                    <Eye className="w-3.5 h-3.5" />
-                  }
-                  title={mode.title}
-                  desc={mode.desc}
-                  active={activeMode === mode.title}
-                />
-              ))}
             </div>
           </div>
         </div>
@@ -329,7 +210,6 @@ export function CenterContent({
         </div>
       </div>
       
-      {showOcrWindow && !suppressOcrWindow && <OcrFloatingWindow onClose={() => setShowOcrWindow(false)} localOCR={localOCR} />}
       <FailedTasksModal
         isOpen={showFailedTasksModal}
         onClose={() => setShowFailedTasksModal(false)}
@@ -341,6 +221,116 @@ export function CenterContent({
 }
 
 // Subcomponents
+
+function MonthOverviewPanel({ overview }: { overview?: MonthOverviewSnapshot }) {
+  const days = overview?.days || [];
+  const totals = overview?.totals;
+  const metricItems = [
+    { label: "文章发表", value: formatCompactNumber(totals?.articlePublishedTotal ?? 0), hint: "篇" },
+    { label: "花费总额", value: formatCurrency(totals?.totalSpend ?? 0), hint: "" },
+    { label: "工作天数", value: formatCompactNumber(totals?.workDays ?? 0), hint: "天" },
+    { label: "待优化", value: formatCompactNumber(totals?.brandPendingOptimizationCount ?? 0), hint: "项" },
+    { label: "引用总数", value: formatCompactNumber(totals?.referenceTotal ?? 0), hint: "次" },
+    { label: "覆盖平台", value: formatCompactNumber(totals?.platformCoverage ?? 0), hint: "个" },
+  ];
+
+  return (
+    <section className="w-full max-w-[320px] rounded-[8px] bg-[#f2f2f2] p-2 xl:w-[320px]">
+      <div className="grid grid-cols-[168px_auto] items-start gap-2">
+        <div className="flex h-[86px] flex-col">
+          <div className="flex h-[18px] items-center gap-2">
+            <span className="rounded-[5px] bg-[#e2e2e2] px-1.5 py-0.5 text-[10px] font-semibold leading-none text-neutral-900">月度总览</span>
+            <span className="text-[10px] font-medium leading-none text-neutral-500">{overview?.monthLabel || "本月"}</span>
+          </div>
+
+          <div className="mt-1 grid grid-cols-3 gap-1">
+            {metricItems.map((item) => (
+              <div key={item.label} className="h-[30px] rounded-[5px] bg-[#e5e5e5] px-1.5 py-1">
+                <div className="truncate text-[9px] leading-none font-medium text-neutral-500">{item.label}</div>
+                <div className="mt-0.5 flex items-baseline gap-0.5">
+                  <span className="min-w-0 text-[11px] font-semibold leading-none tracking-normal text-neutral-950">{item.value}</span>
+                  {item.hint && <span className="shrink-0 text-[9px] font-medium text-neutral-500">{item.hint}</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <MiniMonthHeatmap days={days} todayDate={overview?.selectedDate} />
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function MiniMonthHeatmap({
+  days,
+  todayDate,
+}: {
+  days: MonthOverviewDay[];
+  todayDate?: string;
+}) {
+  const activeDays = days.length ? days : [];
+  const firstWeekday = activeDays[0]?.weekday ?? 0;
+  const leadingCells = Array.from({ length: firstWeekday }, (_item, index) => ({
+    key: `leading-${index}`,
+    day: null as MonthOverviewDay | null,
+  }));
+  const dayCells = activeDays.map((day) => ({
+    key: day.date,
+    day,
+  }));
+  const filledCellCount = leadingCells.length + dayCells.length;
+  const trailingCellCount = filledCellCount ? (7 - (filledCellCount % 7)) % 7 : 0;
+  const trailingCells = Array.from({ length: trailingCellCount }, (_item, index) => ({
+    key: `trailing-${index}`,
+    day: null as MonthOverviewDay | null,
+  }));
+  const heatmapCells = [...leadingCells, ...dayCells, ...trailingCells];
+
+  return (
+    <div className="overflow-visible">
+      <div
+        className="grid w-max gap-[4px]"
+        style={{
+          gridTemplateColumns: "repeat(7, 14px)",
+        }}
+      >
+        {heatmapCells.map(({ key, day }) => {
+          if (!day) {
+            return <span key={key} className="h-[14px] w-[14px] rounded-[3px] bg-[#e1e1e1]" aria-hidden="true" />;
+          }
+          const toneClass = day.future
+            ? "bg-[#e1e1e1]"
+            : day.intensity >= 4
+              ? "bg-[#1f63d6]"
+              : day.intensity === 3
+                ? "bg-[#6f9feb]"
+                : day.intensity === 2
+                  ? "bg-[#a7c2f2]"
+                  : day.intensity === 1
+                    ? "bg-[#d8e4fa]"
+                    : "bg-[#e1e1e1]";
+          const isToday = todayDate ? day.date === todayDate : false;
+          return (
+            <button
+              key={day.date}
+              type="button"
+              title={`${formatMonthDayLabel(day.date)}：文章 ${day.articleCount}，展示 ${day.displayCount}，引用 ${day.referenceCount}`}
+              aria-label={`${formatMonthDayLabel(day.date)}数据`}
+              className={`group relative h-[14px] w-[14px] rounded-[3px] transition-shadow hover:ring-2 hover:ring-blue-300 focus:outline-none focus:ring-2 focus:ring-blue-300 ${isToday ? "ring-1 ring-neutral-700 ring-offset-1 ring-offset-[#f2f2f2]" : ""} ${toneClass}`}
+            >
+              <span className="pointer-events-none absolute bottom-[13px] left-1/2 z-20 hidden w-max max-w-[220px] -translate-x-1/2 rounded-[6px] bg-black px-2 py-1 text-[10px] font-medium text-white shadow-lg group-hover:block group-focus:block">
+                {formatMonthDayLabel(day.date)}：文章 {day.articleCount} 篇 / 花费 {formatCurrency(day.spend)} / 展示 {day.displayCount} 次 / 引用 {day.referenceCount} 次
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 function AITrendSection({
   initialTrend,
@@ -446,23 +436,6 @@ function AITrendSection({
       </div>
       <div className="w-full h-[106px] relative">
         <ChartArea data={currentData.length ? currentData : [{ name: '', value: 0, predict: 0 }]} />
-      </div>
-    </div>
-  );
-}
-
-function ModeItem({ icon, title, desc, active = false, onClick }: { icon: React.ReactNode, title: string, desc: string, active?: boolean, onClick?: () => void }) {
-  return (
-    <div onClick={onClick} className={`flex flex-col gap-1.5 py-1.5 pr-2 border-l-[3px] pl-3 transition-all cursor-pointer group relative overflow-hidden
-      ${active ? 'border-transparent bg-transparent' : 'border-transparent hover:border-gray-300 hover:bg-gray-50/50'}
-    `}>
-      <div className={`transition-colors relative z-10 ${active ? 'text-gray-900' : 'text-gray-400 group-hover:text-gray-600'}`}>
-        {icon}
-      </div>
-      {active && <div className="absolute inset-y-2 left-0 w-[3px] rounded-full" style={{ backgroundColor: DASHBOARD_CYAN }} />}
-      <div className="relative z-10">
-        <h4 className={`text-[13px] font-bold mb-0.5 transition-colors ${active ? 'text-gray-900' : 'text-gray-900'}`}>{title}</h4>
-        <p className={`text-[11px] leading-relaxed transition-colors ${active ? 'text-gray-500' : 'text-gray-400'}`}>{desc}</p>
       </div>
     </div>
   );
@@ -628,127 +601,18 @@ function MediaBarChart({ data }: { data?: DashboardSnapshot["mediaStats"] }) {
 }
 
 function OptimizationMap({ activeRegions = [] }: { activeRegions?: string[] }) {
-  const [mapType, setMapType] = useState<'domestic' | 'international'>('domestic');
-
-  // Domestic nodes covering all Chinese provinces
-  const domesticNodes = [
-    { id: 'xj', label: '新疆', x: '18%', y: '35%' },
-    { id: 'xz', label: '西藏', x: '18%', y: '65%' },
-    { id: 'qh', label: '青海', x: '35%', y: '48%' },
-    { id: 'gs', label: '甘肃', x: '45%', y: '40%' },
-    { id: 'nm', label: '内蒙古', x: '55%', y: '25%' },
-    { id: 'hlj', label: '黑龙江', x: '82%', y: '15%' },
-    { id: 'jl', label: '吉林', x: '85%', y: '25%' },
-    { id: 'ln', label: '辽宁', x: '80%', y: '32%' },
-    { id: 'bj', label: '北京', x: '70%', y: '35%' },
-    { id: 'tj', label: '天津', x: '73%', y: '38%' },
-    { id: 'he', label: '河北', x: '68%', y: '40%' },
-    { id: 'sx', label: '山西', x: '60%', y: '45%' },
-    { id: 'sn', label: '陕西', x: '55%', y: '52%' },
-    { id: 'nx', label: '宁夏', x: '48%', y: '45%' },
-    { id: 'sd', label: '山东', x: '75%', y: '46%' },
-    { id: 'ha', label: '河南', x: '65%', y: '54%' },
-    { id: 'js', label: '江苏', x: '80%', y: '56%' },
-    { id: 'ah', label: '安徽', x: '75%', y: '60%' },
-    { id: 'sh', label: '上海', x: '85%', y: '59%' },
-    { id: 'zj', label: '浙江', x: '82%', y: '66%' },
-    { id: 'jx', label: '江西', x: '75%', y: '70%' },
-    { id: 'fj', label: '福建', x: '80%', y: '75%' },
-    { id: 'tw', label: '台湾', x: '86%', y: '80%' },
-    { id: 'hb', label: '湖北', x: '65%', y: '62%' },
-    { id: 'hn', label: '湖南', x: '65%', y: '72%' },
-    { id: 'gd', label: '广东', x: '70%', y: '85%' },
-    { id: 'hk', label: '香港', x: '73%', y: '90%' },
-    { id: 'mc', label: '澳门', x: '68%', y: '90%' },
-    { id: 'hi', label: '海南', x: '65%', y: '96%' },
-    { id: 'gx', label: '广西', x: '60%', y: '85%' },
-    { id: 'gz', label: '贵州', x: '52%', y: '76%' },
-    { id: 'sc', label: '四川', x: '45%', y: '66%' },
-    { id: 'cq', label: '重庆', x: '53%', y: '66%' },
-    { id: 'yn', label: '云南', x: '40%', y: '82%' },
-  ].map(n => ({ ...n, active: activeRegions.includes(n.label) }));
-
-  const internationalNodes = [
-    { id: 'usa', label: '美国', x: '20%', y: '35%' },
-    { id: 'japan', label: '日本', x: '85%', y: '30%' },
-    { id: 'uk', label: '英国', x: '45%', y: '25%' },
-    { id: 'singapore', label: '新加坡', x: '75%', y: '55%' },
-    { id: 'germany', label: '德国', x: '52%', y: '30%' },
-    { id: 'australia', label: '澳大利亚', x: '85%', y: '80%' },
-    { id: 'france', label: '法国', x: '50%', y: '35%' },
-    { id: 'canada', label: '加拿大', x: '20%', y: '20%' },
-    { id: 'sk', label: '韩国', x: '80%', y: '35%' },
-    { id: 'brazil', label: '巴西', x: '30%', y: '75%' },
-    { id: 'india', label: '印度', x: '25%', y: '60%' },
-    { id: 'russia', label: '俄罗斯', x: '70%', y: '20%' },
-  ].map(n => ({ ...n, active: activeRegions.includes(n.label) }));
-
-  const nodes = mapType === 'domestic' ? domesticNodes : internationalNodes;
-
   return (
     <div className="flex flex-col h-full min-h-0">
       <div className="flex items-start justify-between mb-3">
-        <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase">优化区域分布</h3>
-        
-        {/* Toggle */}
-        <div className="flex items-center gap-4">
-          <button 
-            onClick={() => setMapType('domestic')}
-            className={`flex items-center gap-1 text-[11px] font-medium transition-colors ${mapType === 'domestic' ? 'text-gray-900' : 'text-gray-400 hover:text-gray-600'}`}
-          >
-            <Map className="w-3 h-3" /> 国内
-          </button>
-          <span className="w-px h-2.5 bg-gray-200"></span>
-          <button 
-            onClick={() => setMapType('international')}
-            className={`flex items-center gap-1 text-[11px] font-medium transition-colors ${mapType === 'international' ? 'text-gray-900' : 'text-gray-400 hover:text-gray-600'}`}
-          >
-            <Globe className="w-3 h-3" /> 国际
-          </button>
-        </div>
+        <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase">品牌地址分布</h3>
       </div>
 
-      <div className="w-full bg-gray-50/50 rounded-2xl relative border border-gray-100/50 overflow-hidden" style={{ height: '152px' }}>
-        {/* Grid Background to simulate tech map */}
-        <div className="absolute inset-0 opacity-[0.03]" style={{ backgroundImage: 'linear-gradient(#000 1px, transparent 1px), linear-gradient(90deg, #000 1px, transparent 1px)', backgroundSize: '16px 16px' }}></div>
-        
-        {/* Abstract Connections */}
-        <svg className="absolute inset-0 w-full h-full pointer-events-none opacity-20">
-          {nodes.filter(n => n.active).map((node, i, arr) => {
-            if (i === arr.length - 1) return null;
-            const next = arr[i + 1];
-            return (
-              <line 
-                key={`line-${i}`}
-                x1={node.x} y1={node.y} x2={next.x} y2={next.y}
-                stroke={DASHBOARD_CYAN} strokeWidth="1" strokeDasharray="3 3"
-              />
-            );
-          })}
-        </svg>
-
-        {/* Nodes */}
-        {nodes.map((node) => (
-          <div 
-            key={node.id}
-            className="absolute transform -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-1"
-            style={{ left: node.x, top: node.y }}
-          >
-            {/* Dot */}
-            <div className="relative flex items-center justify-center">
-              {node.active && <div className="absolute w-5 h-5 rounded-full animate-ping" style={{ backgroundColor: "rgba(47, 184, 230, 0.16)" }}></div>}
-              <div
-                className={`w-2 h-2 rounded-full border-[1.5px] ${node.active ? 'border-white shadow-sm' : 'bg-gray-300 border-white'}`}
-                style={node.active ? { backgroundColor: DASHBOARD_CYAN, borderColor: "#fff" } : undefined}
-              ></div>
-            </div>
-            {/* Label */}
-            <span className={`text-[9px] font-bold tracking-wider ${node.active ? 'text-gray-700' : 'text-gray-400'}`}>
-              {node.label}
-            </span>
-          </div>
-        ))}
-      </div>
+      <AmapRegionMap
+        mapType="domestic"
+        activeRegions={activeRegions}
+        accentColor={DASHBOARD_CYAN}
+        className="h-[196px] w-full rounded-[8px]"
+      />
     </div>
   );
 }

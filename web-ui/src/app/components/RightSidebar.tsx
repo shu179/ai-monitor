@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useState, useRef } from "react";
 import { Plus, Check, Link2, ArrowRight, Zap, Landmark, Trash2, Power, Loader2, Pencil } from "lucide-react";
-import type { ArticleSnapshot, MonitoringSnapshot, TodoSnapshot } from "../lib/backend";
+import type { ArticleSnapshot, TodoSnapshot } from "../lib/backend";
 import { ARTICLE_DATA_CHANGED_EVENT, areArticlesEqual, syncTodos, importArticle, deleteArticle, fetchArticles, updateArticle, updateArticleMediaType, writeTodoCache } from "../lib/backend";
 import type { ArticleEditValue } from "./ArticleEditModal";
 import { ArticleEditModal } from "./ArticleEditModal";
@@ -77,29 +77,21 @@ function normalizeArticleHref(url?: string): string {
 }
 
 export function RightSidebar({
-  monitoring,
+  detectionMode = "recognition",
   cloudRole = "",
   todos,
   articles,
-  stats,
   todoCacheIdentity = "",
-  onMonitoringToggle,
+  onDetectionModeToggle,
   onTodosChange,
   onArticlesChange,
 }: {
-  monitoring?: MonitoringSnapshot;
+  detectionMode?: string;
   cloudRole?: string;
   todos?: TodoSnapshot[];
   articles?: ArticleSnapshot[];
-  stats?: {
-    enabledTasks: number;
-    totalTasks: number;
-    todayRecords: number;
-    hitRecords: number;
-    errorRecords: number;
-  };
   todoCacheIdentity?: string;
-  onMonitoringToggle?: (enabled: boolean) => void | Promise<void>;
+  onDetectionModeToggle?: (mode: "browser" | "recognition") => void | Promise<void>;
   onTodosChange?: (todos: TodoSnapshot[]) => void;
   onArticlesChange?: (articles: ArticleSnapshot[]) => void;
 }) {
@@ -110,7 +102,7 @@ export function RightSidebar({
   const [articleMessage, setArticleMessage] = useState('');
   const [articleMessageTone, setArticleMessageTone] = useState<'default' | 'error' | 'warning'>('default');
   const [todoMessage, setTodoMessage] = useState('');
-  const [toggleLoading, setToggleLoading] = useState(false);
+  const [modeToggleLoading, setModeToggleLoading] = useState(false);
   const [articleTodayCount, setArticleTodayCount] = useState(0);
   const [articleTotalCount, setArticleTotalCount] = useState(0);
   const [articleStatsLoaded, setArticleStatsLoaded] = useState(false);
@@ -342,18 +334,17 @@ export function RightSidebar({
     window.open(normalized, "_blank", "noopener,noreferrer");
   };
 
-  const monitoringEnabled = Boolean(monitoring?.enabled);
-  const monitoringRunning = Boolean(monitoring?.running);
+  const browserModeEnabled = detectionMode === "browser";
   const isViewerAccount = cloudRole === "viewer";
-  const handleMonitoringClick = async () => {
-    if (toggleLoading || isViewerAccount) {
+  const handleDetectionModeClick = async () => {
+    if (modeToggleLoading || isViewerAccount) {
       return;
     }
-    setToggleLoading(true);
+    setModeToggleLoading(true);
     try {
-      await onMonitoringToggle?.(!monitoringEnabled);
+      await onDetectionModeToggle?.(browserModeEnabled ? "recognition" : "browser");
     } finally {
-      setToggleLoading(false);
+      setModeToggleLoading(false);
     }
   };
 
@@ -361,44 +352,36 @@ export function RightSidebar({
     <div className="w-[280px] xl:w-[320px] h-full bg-transparent border-l border-gray-200/80 px-5 py-3 xl:px-6 xl:py-4 flex flex-col shrink-0">
       <div className="flex flex-col shrink-0 mb-4 pb-4 border-b border-gray-200/70">
         <div className="mb-4 flex items-center justify-between gap-3">
-          <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase">自动调度</h3>
+          <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase">检测模式</h3>
           <span
             className={`inline-flex shrink-0 items-center gap-1.5 text-[10px] font-semibold ${
-              monitoringRunning
-                ? "text-emerald-700"
-                : monitoringEnabled
-                  ? "text-sky-700"
-                  : "text-gray-500"
+              browserModeEnabled ? "text-emerald-700" : "text-gray-500"
             }`}
           >
             <span
               className={`h-1.5 w-1.5 rounded-full ${
-                monitoringRunning
-                  ? "bg-emerald-500"
-                  : monitoringEnabled
-                    ? "bg-sky-500"
-                    : "bg-gray-400"
+                browserModeEnabled ? "bg-emerald-500" : "bg-gray-400"
               }`}
             />
-            {monitoringRunning ? "运行中" : monitoringEnabled ? "已开启" : "已关闭"}
+            {browserModeEnabled ? "抓取模式" : "识别模式"}
           </span>
         </div>
         <button
           type="button"
           onClick={() => {
-            void handleMonitoringClick();
+            void handleDetectionModeClick();
           }}
-          disabled={toggleLoading || isViewerAccount}
+          disabled={modeToggleLoading || isViewerAccount}
           className={`inline-flex w-full items-center justify-center gap-2 rounded-[12px] px-3 py-2.5 text-[12px] font-semibold transition-all ${
             isViewerAccount
               ? "bg-gray-100 text-gray-400"
-              : monitoringEnabled
+              : browserModeEnabled
               ? "bg-emerald-50 text-emerald-700 hover:bg-emerald-100/80"
               : "bg-gray-100 text-gray-700 hover:bg-gray-200/80"
           } disabled:cursor-not-allowed disabled:opacity-80`}
         >
-          {toggleLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Power className="h-3.5 w-3.5" />}
-          {isViewerAccount ? "浏览账号仅查看" : toggleLoading ? "状态切换中..." : monitoringEnabled ? "关闭定时任务" : "开启定时任务"}
+          {modeToggleLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Power className="h-3.5 w-3.5" />}
+          {isViewerAccount ? "浏览账号仅查看" : modeToggleLoading ? "模式切换中..." : browserModeEnabled ? "切回识别模式" : "开启抓取模式"}
         </button>
       </div>
 

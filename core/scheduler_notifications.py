@@ -138,16 +138,7 @@ class SchedulerWebhookReporter:
         return ok
 
     def _notification_policy(self) -> tuple[int, int]:
-        notify_cfg = (self._get_config() or {}).get('default_notification', {}) or {}
-        try:
-            threshold = max(1, int(notify_cfg.get('failure_alert_threshold', 7) or 7))
-        except Exception:
-            threshold = 7
-        try:
-            cooldown_minutes = max(0, int(notify_cfg.get('failure_alert_cooldown_minutes', 5) or 5))
-        except Exception:
-            cooldown_minutes = 5
-        return threshold, cooldown_minutes * 60
+        return 6, 5 * 60
 
     def _issue_group_key(
         self,

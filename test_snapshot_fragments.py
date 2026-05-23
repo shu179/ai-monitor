@@ -133,6 +133,7 @@ class SnapshotFragmentTests(unittest.TestCase):
             source_breakdown=[{"name": "科技互联网", "value": 1}],
             task_cards=[{"key": "capture"}],
             media_stats=[{"name": "权威媒体", "value": 2}],
+            month_overview={"month": "2026-01"},
         )
 
         self.assertEqual(dashboard["dateLabel"], "02 JAN 2026")
@@ -144,6 +145,7 @@ class SnapshotFragmentTests(unittest.TestCase):
         self.assertEqual(dashboard["completedCount"], 1)
         self.assertEqual(dashboard["runningCount"], 2)
         self.assertEqual(dashboard["failedTaskCount"], 1)
+        self.assertEqual(dashboard["monthOverview"], {"month": "2026-01"})
 
     def test_source_breakdown_counts_all_tasks_and_uses_fallback(self) -> None:
         tasks = [

@@ -21,9 +21,45 @@ export type ModeCard = {
   active: boolean;
 };
 
+export type MonthOverviewDay = {
+  date: string;
+  day: number;
+  weekday: number;
+  articleCount: number;
+  spend: number;
+  taskCount: number;
+  displayCount: number;
+  pendingOptimizationCount: number;
+  referenceCount: number;
+  platformCount: number;
+  platforms: string[];
+  workDay: boolean;
+  future: boolean;
+  intensity: number;
+};
+
+export type MonthOverviewSnapshot = {
+  month: string;
+  monthLabel: string;
+  startDate: string;
+  endDate: string;
+  selectedDate: string;
+  totals: {
+    articlePublishedTotal: number;
+    totalSpend: number;
+    workDays: number;
+    brandTaskCount: number;
+    brandDisplayTotal: number;
+    brandPendingOptimizationCount: number;
+    referenceTotal: number;
+    platformCoverage: number;
+  };
+  days: MonthOverviewDay[];
+};
+
 const DASHBOARD_MODE_CARD_DEFS: ModeCard[] = [
-  { key: "capture", title: "抓取模式", desc: "快速提取核心数据", icon: "zap", active: true },
-  { key: "ocr", title: "识别模式", desc: "OCR视觉解析", icon: "eye", active: false },
+  { key: "capture", title: "抓取模式", desc: "快速提取核心数据", icon: "zap", active: false },
+  { key: "ocr", title: "识别模式", desc: "OCR视觉解析", icon: "eye", active: true },
 ];
 
 function normalizeDashboardModeCardKey(card: Partial<ModeCard> | null | undefined): "capture" | "ocr" | "" {
@@ -41,7 +77,7 @@ function normalizeDashboardModeCardKey(card: Partial<ModeCard> | null | undefine
 function sanitizeDashboardModeCards(cards: ModeCard[] | undefined): ModeCard[] {
   const activeKey = (cards || [])
     .map((card) => ({ key: normalizeDashboardModeCardKey(card), active: Boolean(card?.active) }))
-    .find((item) => item.key && item.active)?.key || "capture";
+    .find((item) => item.key && item.active)?.key || "ocr";
   return DASHBOARD_MODE_CARD_DEFS.map((card) => ({
     ...card,
     active: card.key === activeKey,
@@ -94,6 +130,7 @@ export type DashboardSnapshot = {
     date?: string;
     label?: string;
   }>;
+  monthOverview?: MonthOverviewSnapshot;
 };
 
 export type SidebarSnapshot = {
@@ -662,6 +699,54 @@ const WEB_APP_NAME = "Surfaced";
 const WEB_APP_SLUG = "surfaced";
 const WEB_ASSISTANT_NAME = "Surfaced.Bot";
 
+function buildFallbackMonthOverview(): MonthOverviewSnapshot {
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+  const days: MonthOverviewDay[] = [];
+  for (let day = 1; day <= monthEnd.getDate(); day += 1) {
+    const current = new Date(now.getFullYear(), now.getMonth(), day);
+    const date = `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    days.push({
+      date,
+      day,
+      weekday: current.getDay() === 0 ? 6 : current.getDay() - 1,
+      articleCount: 0,
+      spend: 0,
+      taskCount: 0,
+      displayCount: 0,
+      pendingOptimizationCount: 0,
+      referenceCount: 0,
+      platformCount: 0,
+      platforms: [],
+      workDay: false,
+      future: current > now,
+      intensity: 0,
+    });
+  }
+  const month = `${monthStart.getFullYear()}-${String(monthStart.getMonth() + 1).padStart(2, "0")}`;
+  return {
+    month,
+    monthLabel: `${monthStart.getFullYear()}年${monthStart.getMonth() + 1}月`,
+    startDate: days[0]?.date || month,
+    endDate: days[days.length - 1]?.date || month,
+    selectedDate: now.toISOString().slice(0, 10),
+    totals: {
+      articlePublishedTotal: 0,
+      totalSpend: 0,
+      workDays: 0,
+      brandTaskCount: 0,
+      brandDisplayTotal: 0,
+      brandPendingOptimizationCount: 0,
+      referenceTotal: 0,
+      platformCoverage: 0,
+    },
+    days,
+  };
+}
+
+const FALLBACK_MONTH_OVERVIEW = buildFallbackMonthOverview();
+
 export type BootstrapPayload = {
   session?: {
     token: string;
@@ -792,6 +877,7 @@ export const FALLBACK_BOOTSTRAP: BootstrapPayload = {
       { name: "5日", auth: 0, self: 0 },
       { name: "6日", auth: 0, self: 0 },
     ],
+    monthOverview: FALLBACK_MONTH_OVERVIEW,
   },
   platforms: [],
   tasks: [],
@@ -2092,6 +2178,7 @@ export function mergeBootstrap(data: Partial<BootstrapPayload> | null | undefine
       sourceBreakdown: ((data.dashboard || {}).sourceBreakdown as DashboardSnapshot["sourceBreakdown"] | undefined) || FALLBACK_BOOTSTRAP.dashboard.sourceBreakdown,
       taskCards: sanitizeDashboardModeCards((data.dashboard || {}).taskCards as ModeCard[] | undefined),
       mediaStats: ((data.dashboard || {}).mediaStats as DashboardSnapshot["mediaStats"] | undefined) || FALLBACK_BOOTSTRAP.dashboard.mediaStats,
+      monthOverview: ((data.dashboard || {}).monthOverview as MonthOverviewSnapshot | undefined) || FALLBACK_BOOTSTRAP.dashboard.monthOverview,
     },
     platforms: data.platforms || FALLBACK_BOOTSTRAP.platforms,
     tasks: data.tasks || FALLBACK_BOOTSTRAP.tasks,

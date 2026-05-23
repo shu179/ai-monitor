@@ -9,6 +9,7 @@ from backend_lib.dashboard import (
     _build_dashboard_failed_tasks,
     _build_dashboard_media_stats,
     _build_dashboard_media_stats_monthly,
+    _build_dashboard_month_overview,
     _build_dashboard_today_task_summary,
     _build_media_stats,
     _build_task_failure_summary,
@@ -446,6 +447,80 @@ class DashboardHelperTests(unittest.TestCase):
         self.assertEqual(stats[0]["auth"], 1)
         self.assertEqual(stats[0]["self"], 0)
         self.assertEqual(stats[-1]["self"], 1)
+
+    def test_dashboard_month_overview_summarizes_articles_tasks_references_and_platforms(self) -> None:
+        today = date(2026, 5, 15)
+        scheduler = {"weekly_times": {"0": "09:30", "4": "09:30"}}
+        tasks = [
+            {
+                "task_id": "task-a",
+                "name": "品牌A",
+                "brand": "品牌A",
+                "enabled": True,
+                "weekdays": [0, 4],
+                "optimization_start_date": "2026-05-01",
+                "optimization_end_date": "2026-05-31",
+            },
+            {
+                "task_id": "task-b",
+                "name": "品牌B",
+                "brand": "品牌B",
+                "enabled": False,
+                "weekdays": [0, 4],
+            },
+        ]
+        articles = [
+            {
+                "id": "article-a",
+                "ts": "2026-05-05 10:00",
+                "media_type": "authority",
+                "platform": "doubao",
+                "price": 1200,
+                "reference_hits": {
+                    "品牌A": {
+                        "count": 2,
+                        "events": [
+                            {"referenced_at": "2026-05-05 11:00", "platform": "kimi"},
+                            {"referenced_at": "2026-05-05 12:00", "platform": "kimi"},
+                        ],
+                    }
+                },
+            },
+            {"id": "article-b", "published_at": "2026-05-15", "media_type": "selfmedia", "platform": "wechat", "spend": 300},
+            {"id": "article-old", "ts": "2026-04-30", "price": 900},
+        ]
+        history_batches = [[
+            {"ts": "2026-05-05 09:00", "platform": "doubao", "success": True, "rank": 1, "review_status": ""},
+            {"ts": "2026-05-05 10:00", "platform": "deepseek", "success": False, "rank": 99, "error_message": ""},
+            {"ts": "2026-05-15 09:00", "platform": "kimi", "success": True, "rank": 2, "review_status": "pending"},
+        ]]
+
+        overview = _build_dashboard_month_overview(
+            tasks,
+            scheduler,
+            articles,
+            today=today,
+            history_records_loader=lambda specs: history_batches,
+            day_status_loader=lambda task, target_date=None: {
+                "brand_status": "success" if target_date == date(2026, 5, 5) else "pending",
+                "formal_started": target_date == date(2026, 5, 15),
+            },
+        )
+
+        self.assertEqual(overview["month"], "2026-05")
+        self.assertEqual(overview["totals"]["articlePublishedTotal"], 2)
+        self.assertEqual(overview["totals"]["totalSpend"], 1500)
+        self.assertEqual(overview["totals"]["brandTaskCount"], 1)
+        self.assertEqual(overview["totals"]["brandDisplayTotal"], 2)
+        self.assertEqual(overview["totals"]["brandPendingOptimizationCount"], 1)
+        self.assertEqual(overview["totals"]["referenceTotal"], 2)
+        self.assertEqual(overview["totals"]["platformCoverage"], 4)
+        may_fifth = next(day for day in overview["days"] if day["date"] == "2026-05-05")
+        self.assertEqual(may_fifth["articleCount"], 1)
+        self.assertEqual(may_fifth["spend"], 1200)
+        self.assertEqual(may_fifth["displayCount"], 1)
+        self.assertEqual(may_fifth["referenceCount"], 2)
+        self.assertEqual(may_fifth["platformCount"], 3)
 
 
 if __name__ == "__main__":

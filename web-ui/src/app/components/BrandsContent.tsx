@@ -248,7 +248,7 @@ export function BrandsContent({
 
   // Dropdown states
   const [selectedIndustry, setSelectedIndustry] = useState<string>('行业筛选');
-  const [selectedRegion, setSelectedRegion] = useState<string>('地区筛选');
+  const [selectedRegion, setSelectedRegion] = useState<string>('地址筛选');
   const [activeDropdown, setActiveDropdown] = useState<'industry' | 'region' | null>(null);
 
   const dropdownRef = useRef<HTMLDivElement>(null);
@@ -357,7 +357,7 @@ export function BrandsContent({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  // Derive industries and regions from task data
+  // Derive industries and brand addresses from task data
   const industries = useMemo(() => {
     const tags = new Set<string>();
     tasks.forEach(t => (t.industry_tags || []).forEach(tag => tags.add(tag)));
@@ -398,7 +398,7 @@ export function BrandsContent({
   const filteredBrands = useMemo(() => allBrandsData
     .filter(brand => {
       const matchIndustry = selectedIndustry === '行业筛选' || selectedIndustry === '全部' || brand.industry === selectedIndustry;
-      const matchRegion = selectedRegion === '地区筛选' || selectedRegion === '全部' || brand.region === selectedRegion;
+      const matchRegion = selectedRegion === '地址筛选' || selectedRegion === '全部' || brand.region === selectedRegion;
       const matchSearch = brand.name.toLowerCase().includes(searchQuery.toLowerCase());
       return matchIndustry && matchRegion && matchSearch;
     })
@@ -847,7 +847,7 @@ export function BrandsContent({
               type="button"
               onClick={() => setActiveDropdown(activeDropdown === 'region' ? null : 'region')}
               className={`flex h-8 items-center gap-1.5 px-0 py-1.5 text-[12px] font-medium transition-colors ${
-                activeDropdown === 'region' || selectedRegion !== '地区筛选' ? 'text-[var(--brand-navy)]' : 'text-gray-700 hover:text-gray-900'
+                activeDropdown === 'region' || selectedRegion !== '地址筛选' ? 'text-[var(--brand-navy)]' : 'text-gray-700 hover:text-gray-900'
               }`}
             >
               {selectedRegion} <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${activeDropdown === 'region' ? 'rotate-180 text-[var(--brand-navy)]' : 'text-gray-400'}`} />
@@ -861,15 +861,15 @@ export function BrandsContent({
                     type="button"
                     key={reg}
                     onClick={() => {
-                      setSelectedRegion(reg === '全部' ? '地区筛选' : reg);
+                      setSelectedRegion(reg === '全部' ? '地址筛选' : reg);
                       setActiveDropdown(null);
                     }}
                     className="w-full flex items-center justify-between px-4 py-2.5 text-[12px] hover:bg-gray-50 transition-colors text-left group"
                   >
-                    <span className={`font-medium ${selectedRegion === reg || (reg === '全部' && selectedRegion === '地区筛选') ? 'text-[var(--brand-navy)]' : 'text-gray-700 group-hover:text-gray-900'}`}>
+                    <span className={`font-medium ${selectedRegion === reg || (reg === '全部' && selectedRegion === '地址筛选') ? 'text-[var(--brand-navy)]' : 'text-gray-700 group-hover:text-gray-900'}`}>
                       {reg}
                     </span>
-                    {(selectedRegion === reg || (reg === '全部' && selectedRegion === '地区筛选')) && (
+                    {(selectedRegion === reg || (reg === '全部' && selectedRegion === '地址筛选')) && (
                       <Check className="w-3.5 h-3.5 text-[var(--brand-navy)]" />
                     )}
                   </button>
@@ -1577,7 +1577,7 @@ function BrandCard({
 
           <div className="mt-4 space-y-4">
             <div>
-              <div className="text-[9px] font-bold text-gray-400 tracking-widest uppercase">区域分布</div>
+              <div className="text-[9px] font-bold text-gray-400 tracking-widest uppercase">地址分布</div>
               <div className="mt-2 h-[54px] relative overflow-hidden border-b border-gray-100/80">
                 <MiniMap />
               </div>

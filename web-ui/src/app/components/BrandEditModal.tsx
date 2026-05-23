@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
-import { X, Plus, Brain, Save, Trash2, Settings2, Check, Map as MapIcon, Globe, ArrowUpRight, Calendar, Download, ChevronDown } from "lucide-react";
+import { X, Plus, Brain, Save, Trash2, Settings2, Check, ArrowUpRight, Calendar, Download, ChevronDown } from "lucide-react";
 import { ChartArea } from "./Charts";
+import { AmapRegionMap } from "./AmapRegionMap";
 import { createTask, fetchTaskTrend, generateBrandTaskDraft, importKeywordsFromFile, updateTask, type BrandTaskDraft, type CloudAdminTaskSnapshot, type CloudUserSnapshot, type DeletedTaskSnapshot, type TaskFull, type TrendSnapshot } from "../lib/backend";
+import { splitRegionTags } from "../lib/regionMap";
 import { DatePickerField } from "./ui/date-picker-field";
 
 type PlatformState = {
@@ -1054,13 +1056,13 @@ export function BrandEditModal({
                 </div>
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[11px] font-bold text-gray-500 tracking-widest uppercase">
-                    重点优化区域 <span className="text-gray-400 font-normal normal-case tracking-normal">(可选，逗号分隔)</span>
+                    品牌地址 <span className="text-gray-400 font-normal normal-case tracking-normal">(可选，逗号分隔)</span>
                   </label>
                   <input 
                     type="text" 
                     value={regions}
                     onChange={e => setRegions(e.target.value)}
-                    placeholder="例如：北京, 上海, 广东..."
+                    placeholder="例如：上海市浦东新区世纪大道 100 号"
                     className={inputClass}
                   />
                 </div>
@@ -1663,128 +1665,21 @@ function BrandAITrendSection({ taskId }: { taskId?: string }) {
 }
 
 function BrandOptimizationMap({ regions }: { regions: string }) {
-  const [mapType, setMapType] = useState<'domestic' | 'international'>('domestic');
-
-  const checkActive = (label: string) => regions.includes(label);
-
-  // Domestic nodes covering all Chinese provinces
-  const domesticNodes = [
-    { id: 'xj', label: '新疆', x: '18%', y: '35%' },
-    { id: 'xz', label: '西藏', x: '18%', y: '65%' },
-    { id: 'qh', label: '青海', x: '35%', y: '48%' },
-    { id: 'gs', label: '甘肃', x: '45%', y: '40%' },
-    { id: 'nm', label: '内蒙古', x: '55%', y: '25%' },
-    { id: 'hlj', label: '黑龙江', x: '82%', y: '15%' },
-    { id: 'jl', label: '吉林', x: '85%', y: '25%' },
-    { id: 'ln', label: '辽宁', x: '80%', y: '32%' },
-    { id: 'bj', label: '北京', x: '70%', y: '35%' },
-    { id: 'tj', label: '天津', x: '73%', y: '38%' },
-    { id: 'he', label: '河北', x: '68%', y: '40%' },
-    { id: 'sx', label: '山西', x: '60%', y: '45%' },
-    { id: 'sn', label: '陕西', x: '55%', y: '52%' },
-    { id: 'nx', label: '宁夏', x: '48%', y: '45%' },
-    { id: 'sd', label: '山东', x: '75%', y: '46%' },
-    { id: 'ha', label: '河南', x: '65%', y: '54%' },
-    { id: 'js', label: '江苏', x: '80%', y: '56%' },
-    { id: 'ah', label: '安徽', x: '75%', y: '60%' },
-    { id: 'sh', label: '上海', x: '85%', y: '59%' },
-    { id: 'zj', label: '浙江', x: '82%', y: '66%' },
-    { id: 'jx', label: '江西', x: '75%', y: '70%' },
-    { id: 'fj', label: '福建', x: '80%', y: '75%' },
-    { id: 'tw', label: '台湾', x: '86%', y: '80%' },
-    { id: 'hb', label: '湖北', x: '65%', y: '62%' },
-    { id: 'hn', label: '湖南', x: '65%', y: '72%' },
-    { id: 'gd', label: '广东', x: '70%', y: '85%' },
-    { id: 'hk', label: '香港', x: '73%', y: '90%' },
-    { id: 'mc', label: '澳门', x: '68%', y: '90%' },
-    { id: 'hi', label: '海南', x: '65%', y: '96%' },
-    { id: 'gx', label: '广西', x: '60%', y: '85%' },
-    { id: 'gz', label: '贵州', x: '52%', y: '76%' },
-    { id: 'sc', label: '四川', x: '45%', y: '66%' },
-    { id: 'cq', label: '重庆', x: '53%', y: '66%' },
-    { id: 'yn', label: '云南', x: '40%', y: '82%' },
-  ].map(n => ({ ...n, active: checkActive(n.label) }));
-
-  const internationalNodes = [
-    { id: 'usa', label: '美国', x: '20%', y: '35%' },
-    { id: 'japan', label: '日本', x: '85%', y: '30%' },
-    { id: 'uk', label: '英国', x: '45%', y: '25%' },
-    { id: 'singapore', label: '新加坡', x: '75%', y: '55%' },
-    { id: 'germany', label: '德国', x: '52%', y: '30%' },
-    { id: 'australia', label: '澳大利亚', x: '85%', y: '80%' },
-    { id: 'france', label: '法国', x: '50%', y: '35%' },
-    { id: 'canada', label: '加拿大', x: '20%', y: '20%' },
-    { id: 'sk', label: '韩国', x: '80%', y: '35%' },
-    { id: 'brazil', label: '巴西', x: '30%', y: '75%' },
-    { id: 'india', label: '印度', x: '25%', y: '60%' },
-    { id: 'russia', label: '俄罗斯', x: '70%', y: '20%' },
-  ].map(n => ({ ...n, active: checkActive(n.label) }));
-
-  const nodes = mapType === 'domestic' ? domesticNodes : internationalNodes;
+  const activeRegions = useMemo(() => splitRegionTags(regions), [regions]);
 
   return (
     <div className="grid h-[220px] grid-rows-[24px_1fr] gap-1 pl-0 md:-mt-[2px] md:pl-6 md:border-l border-gray-100">
       <div className="flex items-start justify-between">
-        <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase">优化区域分布</h3>
-        
-        {/* Toggle */}
-        <div className="flex items-center gap-4">
-          <button 
-            type="button"
-            onClick={() => setMapType('domestic')}
-            className={`flex items-center gap-1 text-[11px] font-medium transition-colors ${mapType === 'domestic' ? 'text-[var(--brand-navy)]' : 'text-gray-400 hover:text-gray-600'}`}
-          >
-            <MapIcon className="w-3 h-3" /> 国内
-          </button>
-          <span className="w-px h-2.5 bg-gray-200"></span>
-          <button 
-            type="button"
-            onClick={() => setMapType('international')}
-            className={`flex items-center gap-1 text-[11px] font-medium transition-colors ${mapType === 'international' ? 'text-[var(--brand-navy)]' : 'text-gray-400 hover:text-gray-600'}`}
-          >
-            <Globe className="w-3 h-3" /> 国际
-          </button>
-        </div>
+        <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase">品牌地址分布</h3>
       </div>
 
-      <div className="w-full bg-gray-50/40 relative border-b border-gray-100 overflow-hidden h-full">
-        {/* Grid Background to simulate tech map */}
-        <div className="absolute inset-0 opacity-[0.03]" style={{ backgroundImage: 'linear-gradient(#000 1px, transparent 1px), linear-gradient(90deg, #000 1px, transparent 1px)', backgroundSize: '16px 16px' }}></div>
-        
-        {/* Abstract Connections */}
-        <svg className="absolute inset-0 w-full h-full pointer-events-none opacity-20">
-          {nodes.filter(n => n.active).map((node, i, arr) => {
-            if (i === arr.length - 1) return null;
-            const next = arr[i + 1];
-            return (
-              <line 
-                key={`line-${i}`}
-                x1={node.x} y1={node.y} x2={next.x} y2={next.y}
-                stroke="var(--brand-cyan)" strokeWidth="1" strokeDasharray="3 3"
-              />
-            );
-          })}
-        </svg>
-
-        {/* Nodes */}
-        {nodes.map((node) => (
-          <div 
-            key={node.id}
-            className="absolute transform -translate-x-1/2 -translate-y-1/2 flex flex-col items-center gap-1"
-            style={{ left: node.x, top: node.y }}
-          >
-            {/* Dot */}
-            <div className="relative flex items-center justify-center">
-              {node.active && <div className="absolute w-5 h-5 bg-[rgba(var(--brand-cyan-rgb),0.22)] rounded-full animate-ping"></div>}
-              <div className={`w-2 h-2 rounded-full border-[1.5px] ${node.active ? 'bg-[var(--brand-cyan)] border-white shadow-sm' : 'bg-gray-300 border-white'}`}></div>
-            </div>
-            {/* Label */}
-            <span className={`text-[9px] font-bold tracking-wider ${node.active ? 'text-gray-700' : 'text-gray-400'}`}>
-              {node.label}
-            </span>
-          </div>
-        ))}
-      </div>
+      <AmapRegionMap
+        mapType="domestic"
+        activeRegions={activeRegions}
+        accentColor="var(--brand-cyan)"
+        className="h-full w-full"
+        fallbackBorderClassName="border-b border-gray-100"
+      />
     </div>
   );
 }

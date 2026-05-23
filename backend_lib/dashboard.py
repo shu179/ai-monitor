@@ -29,6 +29,7 @@ from backend_lib.dashboard_trends import (
     _summarize_trend_points,
     _weekday_name_from_iso,
 )
+from backend_lib.dashboard_month_overview import _build_dashboard_month_overview
 
 __all__ = [
     "DEFAULT_MEDIA_STAT_PLATFORM_LABELS",
@@ -37,6 +38,7 @@ __all__ = [
     "_build_dashboard_failed_tasks",
     "_build_dashboard_media_stats",
     "_build_dashboard_media_stats_monthly",
+    "_build_dashboard_month_overview",
     "_build_dashboard_today_task_summary",
     "_build_dashboard_trend",
     "_build_media_stats",

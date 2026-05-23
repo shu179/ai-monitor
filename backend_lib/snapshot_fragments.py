@@ -122,6 +122,7 @@ def _build_snapshot_dashboard(
     source_breakdown: list[dict[str, Any]],
     task_cards: list[dict[str, Any]],
     media_stats: list[dict[str, Any]],
+    month_overview: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "dateLabel": current_date.strftime("%d %b %Y").upper(),
@@ -144,6 +145,7 @@ def _build_snapshot_dashboard(
         "sourceBreakdown": source_breakdown,
         "taskCards": task_cards,
         "mediaStats": media_stats,
+        "monthOverview": month_overview or {},
     }
 
 

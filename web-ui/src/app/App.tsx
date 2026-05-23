@@ -37,6 +37,8 @@ import {
   warmTasksFullCache,
   writeTodoCache,
   setMonitoringEnabled,
+  saveSettings,
+  recognitionAction,
   type BootstrapPayload,
   type CloudStatusSnapshot,
 } from "./lib/backend";
@@ -195,11 +197,15 @@ export default function App() {
   const [authTransitionStartedAt, setAuthTransitionStartedAt] = useState(0);
   const currentCloudIdentityKey = cloudStatusIdentityKey(cloudStatus);
   const currentDetectionMode = (() => {
+    const configMode = String(bootstrap.config?.detection_mode || "").trim();
+    if (configMode === "browser" || configMode === "recognition") return configMode;
     const activeCard = bootstrap.dashboard?.taskCards?.find((card) => card.active);
-    if (!activeCard) return "browser";
+    if (!activeCard) return "recognition";
+    if (activeCard.key === "capture" || activeCard.key === "browser") return "browser";
+    if (activeCard.key === "ocr" || activeCard.key === "recognition") return "recognition";
     if (activeCard.title === "抓取模式") return "browser";
     if (activeCard.title === "识别模式") return "recognition";
-    return "browser";
+    return "recognition";
   })();
   const residentOcrWindowEnabled = Boolean(bootstrap.config?.recognition?.floating_window_resident_enabled);
   const showResidentOcrWindow = residentOcrWindowEnabled && !recognitionTestWindow.open;
@@ -483,6 +489,46 @@ export default function App() {
     invalidateBootstrapCache();
     const result = await setMonitoringEnabled(enabled);
     const nextMessage = result.message || (result.ok ? (enabled ? "已开启定时任务" : "已关闭定时任务") : "切换失败");
+    if (runMessageTimerRef.current !== null) {
+      window.clearTimeout(runMessageTimerRef.current);
+    }
+    setRunMessage(nextMessage);
+    await refreshBootstrap({ force: true });
+    runMessageTimerRef.current = window.setTimeout(() => {
+      setRunMessage("");
+      runMessageTimerRef.current = null;
+    }, 3000);
+  };
+
+  const handleDetectionModeToggle = async (mode: "browser" | "recognition") => {
+    setBootstrap((prev) => ({
+      ...prev,
+      dashboard: {
+        ...prev.dashboard,
+        taskCards: (prev.dashboard.taskCards || []).map((card) => {
+          const key = String(card.key || "").trim().toLowerCase();
+          const isBrowserCard = key === "capture" || key === "browser" || card.title === "抓取模式";
+          const isRecognitionCard = key === "ocr" || key === "recognition" || card.title === "识别模式";
+          return {
+            ...card,
+            active: mode === "browser" ? isBrowserCard : isRecognitionCard,
+          };
+        }),
+      },
+      config: {
+        ...(prev.config || {}),
+        detection_mode: mode,
+      },
+    }));
+
+    invalidateBootstrapCache();
+    const result = await saveSettings({ detection_mode: mode });
+    if (mode === "recognition") {
+      await recognitionAction("start");
+    } else {
+      await recognitionAction("stop");
+    }
+    const nextMessage = result.message || (mode === "browser" ? "已切换为抓取模式" : "已切换为识别模式");
     if (runMessageTimerRef.current !== null) {
       window.clearTimeout(runMessageTimerRef.current);
     }
@@ -876,8 +922,6 @@ export default function App() {
               runMessage={runMessage}
               activeRegions={bootstrap.regionTags}
               onDataChanged={refreshBootstrap}
-              suppressOcrWindow={recognitionTestWindow.open || showResidentOcrWindow}
-              onRunMessage={showRunMessage}
             />
           ) : activeTab === "品牌" ? (
             <BrandsContent
@@ -917,6 +961,8 @@ export default function App() {
             />
           ) : activeTab === "系统设置" ? (
             <SettingsContent
+              monitoring={bootstrap.monitoring}
+              onMonitoringToggle={handleMonitoringToggle}
               onSaveSuccess={(message) => {
                 showSaveSuccessToast(message);
                 void refreshBootstrap({ force: true });
@@ -928,19 +974,16 @@ export default function App() {
               dashboard={bootstrap.dashboard}
               runMessage={runMessage}
               onDataChanged={refreshBootstrap}
-              suppressOcrWindow={recognitionTestWindow.open || showResidentOcrWindow}
-              onRunMessage={showRunMessage}
             />
           )}
         </Suspense>
         <RightSidebar
-          monitoring={bootstrap.monitoring}
+          detectionMode={currentDetectionMode}
           cloudRole={cloudStatus?.user.role || ""}
           todos={bootstrap.todos}
           articles={bootstrap.articles}
-          stats={bootstrap.stats}
           todoCacheIdentity={currentCloudIdentityKey}
-          onMonitoringToggle={handleMonitoringToggle}
+          onDetectionModeToggle={handleDetectionModeToggle}
           onTodosChange={handleTodosChange}
           onArticlesChange={handleArticlesChange}
         />

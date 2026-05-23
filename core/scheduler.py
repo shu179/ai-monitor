@@ -392,9 +392,6 @@ class SmartScheduler:
         mode = str(self.config.get("default_mode") or "").strip()
         return mode if mode in MODE_ORDER else "browser"
 
-    def _should_auto_continue_after_failure(self) -> bool:
-        return bool(self.config.get("auto_continue_after_default_failure", False))
-
     def _clear_followup_state(self) -> None:
         self._pending_followup_units = {}
         self._pending_followup_message = ""
@@ -776,23 +773,6 @@ class SmartScheduler:
                 skip_units.extend(mode_groups.get(mode) or [])
             if skip_units:
                 self._mark_units_skipped(skip_units, current_date)
-            self._emit_cycle_complete(due_units, executed_rounds, current_date, default_mode, on_cycle_complete)
-            return
-
-        if self._should_auto_continue_after_failure():
-            for mode in later_modes:
-                round_payload = self._run_mode_round(
-                    mode,
-                    mode_groups.get(mode) or [],
-                    executor,
-                    on_status_change,
-                    current_date,
-                    on_round_complete=on_round_complete,
-                )
-                if round_payload:
-                    executed_rounds.append(round_payload)
-                if not self._running or self._stop_event.is_set():
-                    break
             self._emit_cycle_complete(due_units, executed_rounds, current_date, default_mode, on_cycle_complete)
             return
 

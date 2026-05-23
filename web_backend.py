@@ -84,6 +84,7 @@ from backend_lib.dashboard import (
     _build_dashboard_failed_tasks as _build_dashboard_failed_tasks_impl,
     _build_dashboard_media_stats,
     _build_dashboard_media_stats_monthly,
+    _build_dashboard_month_overview,
     _build_dashboard_today_task_summary as _build_dashboard_today_task_summary_impl,
     _build_dashboard_trend,
     _build_media_stats as _build_media_stats_impl,
@@ -1469,17 +1470,6 @@ ASSISTANT_TOOLS: list[dict[str, Any]] = [
                 "weekday": {"type": "number", "description": "0-6 表示周一到周日"},
                 "enabled": {"type": "boolean"},
                 "time": {"type": "string", "description": "HH:MM"},
-            },
-        },
-    ),
-    _tool(
-        "set_scheduler_auto_continue",
-        "修改默认模式失败后是否自动启动后续模式。",
-        {
-            "type": "object",
-            "required": ["enabled"],
-            "properties": {
-                "enabled": {"type": "boolean"},
             },
         },
     ),
@@ -6876,6 +6866,11 @@ return changedCount
                 source_breakdown=source_breakdown,
                 task_cards=_build_task_cards(config.get("detection_mode", "browser")),
                 media_stats=_build_dashboard_media_stats_monthly(synced_articles),
+                month_overview=_build_dashboard_month_overview(
+                    enabled_tasks,
+                    config.get("scheduler", {}),
+                    synced_articles,
+                ),
             ),
             "platforms": platform_items,
             "tasks": tasks_payload,
@@ -10554,11 +10549,6 @@ return changedCount
         self._refresh_monitoring_runtime()
         return {"ok": True, "message": f"已更新周{['一', '二', '三', '四', '五', '六', '日'][weekday]} 的自动查询时间"}
 
-    def set_scheduler_auto_continue(self, payload: dict[str, Any]) -> dict:
-        result = self.save_settings({"scheduler": {"auto_continue_after_default_failure": bool(payload.get("enabled", False))}})
-        result["message"] = "已更新默认模式失败后的自动续跑设置"
-        return result
-
     def test_scheduler_notification_webhook(self, payload: dict[str, Any]) -> dict:
         webhook_url = str(payload.get("webhook_url", "") or "").strip()
         config = self.load_config()
@@ -10741,8 +10731,6 @@ return changedCount
                 result = self.set_detection_mode(params)
             elif action == "set_scheduler_day_time":
                 result = self.set_scheduler_day_time(params)
-            elif action == "set_scheduler_auto_continue":
-                result = self.set_scheduler_auto_continue(params)
             elif action == "set_monitoring_enabled":
                 result = self.set_monitoring_enabled(params)
             elif action == "set_ai_assistant_model":

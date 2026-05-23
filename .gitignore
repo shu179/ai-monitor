@@ -28,6 +28,9 @@ env/
 # 敏感配置（包含真实webhook等）
 config.local.yaml
 .env
+.env.*
+!.env.example
+!.env.*.example
 doubao.json
 doubao_auth.json
 doubao_profile*/
