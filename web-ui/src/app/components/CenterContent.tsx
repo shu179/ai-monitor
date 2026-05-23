@@ -125,61 +125,69 @@ export function CenterContent({
 
   return (
     <div className="flex-1 min-w-0 min-h-0 overflow-x-hidden overflow-y-auto bg-transparent px-6 py-4 xl:px-8 xl:py-5 flex flex-col custom-scrollbar">
-      {/* 1. Header & Month Heatmap */}
-      <div className="flex flex-col gap-3 border-b border-gray-200/70 pb-4 mb-4 shrink-0 xl:flex-row xl:items-start xl:justify-between">
-        <div className="flex flex-1 flex-col gap-1 pt-3">
-          <h1 className="app-display-heading text-[28px] font-semibold text-[#0f1835] tracking-[-0.035em]">
-            {greeting}，{userName}
-          </h1>
-          <p className="app-subtle-copy text-[13px] mt-0.5 max-w-[620px] leading-6 font-medium">
-            {headline}
-          </p>
-        </div>
-
-        <div className="flex shrink-0 flex-col gap-2 xl:items-end xl:pl-4">
-          <MonthOverviewPanel overview={dashboard?.monthOverview} />
-          {runMessage && (
-            <div className="hidden shrink-0 md:flex items-start gap-2 text-right">
-              <span className="mt-[6px] h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: DASHBOARD_CYAN }} />
-              <p className="whitespace-nowrap text-[12px] leading-5 font-medium text-slate-500">
-                {runMessage}
-              </p>
-            </div>
-          )}
-        </div>
+      {/* 1. Header */}
+      <div className="flex flex-col gap-1 border-b border-gray-200/70 pb-4 mb-4 pt-3 shrink-0">
+        <h1 className="app-display-heading text-[28px] font-semibold text-[#0f1835] tracking-[-0.035em]">
+          {greeting}，{userName}
+        </h1>
+        <p className="app-subtle-copy text-[13px] mt-0.5 max-w-[720px] leading-6 font-medium">
+          {headline}
+        </p>
+        {runMessage && (
+          <div className="mt-1.5 flex items-center gap-2">
+            <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: DASHBOARD_CYAN }} />
+            <p className="text-[12px] leading-5 font-medium text-slate-500">
+              {runMessage}
+            </p>
+          </div>
+        )}
       </div>
 
       <div className="flex flex-col gap-3 min-h-max">
-        {/* Row 1: Tasks */}
-        <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 shrink-0">
-          {/* Today's Tasks */}
-          <div className="xl:col-span-12 flex flex-col justify-start">
-            <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase mb-3">今日检测任务</h3>
-            <div className="flex items-baseline gap-2 mb-3">
-              <span className="text-[52px] font-medium text-gray-900 leading-none tracking-tighter">{todayTaskCount}</span>
-              <span className="text-[13px] text-gray-500 font-medium">项</span>
+        {/* Row 1: Today's Tasks + Month Overview */}
+        <div className="flex flex-col gap-6 shrink-0 xl:flex-row xl:items-start xl:justify-between xl:gap-10">
+          {/* Today's Tasks — 与月度总览同款 [header] [metrics + 视觉锚点] 结构 */}
+          <div className="flex flex-col">
+            <div className="mb-3 flex items-baseline justify-between gap-3">
+              <h3 className="text-[11px] font-bold uppercase tracking-widest text-gray-400">今日检测任务</h3>
+              <span className="text-[10px] font-medium tabular-nums text-gray-400">今日</span>
             </div>
-            <div className="flex gap-6 border-t border-gray-200/70 pt-3">
-              <div className="flex flex-col gap-0.5">
-                <span className="text-[11px] text-gray-400 font-medium">已完成</span>
-                <span className="text-[18px] text-gray-900 font-bold">{completedCount}</span>
+
+            <div className="grid grid-cols-[1fr_auto] items-center gap-5">
+              <div className="grid grid-cols-2 gap-x-5 gap-y-2.5">
+                <div className="flex min-w-0 flex-col gap-1.5">
+                  <span className="truncate text-[9px] font-medium leading-none text-gray-400">今日任务</span>
+                  <div className="flex items-baseline gap-0.5">
+                    <span className="text-[14px] font-semibold leading-none tabular-nums text-gray-900">{todayTaskCount}</span>
+                    <span className="shrink-0 text-[9px] font-medium leading-none text-gray-400">项</span>
+                  </div>
+                </div>
+                <div className="flex min-w-0 flex-col gap-1.5">
+                  <span className="truncate text-[9px] font-medium leading-none text-gray-400">已完成</span>
+                  <span className="text-[14px] font-semibold leading-none tabular-nums text-gray-900">{completedCount}</span>
+                </div>
+                <div className="flex min-w-0 flex-col gap-1.5">
+                  <span className="truncate text-[9px] font-medium leading-none text-gray-400">进行中</span>
+                  <span className="text-[14px] font-semibold leading-none tabular-nums text-gray-900">{runningCount}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowFailedTasksModal(true)}
+                  className="group flex min-w-0 flex-col gap-1.5 text-left transition-opacity hover:opacity-70"
+                >
+                  <span className="truncate text-[9px] font-medium leading-none text-gray-400">任务状态</span>
+                  <span className={`truncate text-[14px] font-semibold leading-none ${failedTaskCount > 0 ? "text-red-600" : "text-gray-900"}`}>
+                    {failedTaskCount > 0 ? "失败明细" : "运行正常"}
+                  </span>
+                </button>
               </div>
-              <div className="flex flex-col gap-0.5">
-                <span className="text-[11px] text-gray-400 font-medium">进行中</span>
-                <span className="text-[18px] text-gray-900 font-bold">{runningCount}</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowFailedTasksModal(true)}
-                className="group flex flex-col gap-0.5 text-left shrink-0 transition-opacity hover:opacity-80"
-              >
-                <span className="text-[11px] text-gray-400 font-medium whitespace-nowrap">任务状态</span>
-                <span className={`text-[18px] font-bold whitespace-nowrap ${failedTaskCount > 0 ? "text-red-600" : "text-gray-900"}`}>
-                  {failedTaskCount > 0 ? "失败明细" : "运行正常"}
-                </span>
-              </button>
+
+              <CompletionRing completed={completedCount} total={todayTaskCount} />
             </div>
           </div>
+
+          {/* Month Overview */}
+          <MonthOverviewPanel overview={dashboard?.monthOverview} />
         </div>
 
         {/* Row 2: Trend & Pie Chart */}
@@ -222,6 +230,57 @@ export function CenterContent({
 
 // Subcomponents
 
+function CompletionRing({ completed, total }: { completed: number; total: number }) {
+  const size = 86;
+  const strokeWidth = 5;
+  const radius = (size - strokeWidth) / 2;
+  const circumference = radius * 2 * Math.PI;
+  const safeTotal = total > 0 ? total : 0;
+  const safeCompleted = Math.max(0, Math.min(completed, safeTotal));
+  const percent = safeTotal > 0 ? Math.round((safeCompleted / safeTotal) * 100) : 0;
+  const dashoffset = circumference - (percent / 100) * circumference;
+
+  return (
+    <div className="relative shrink-0" style={{ width: size, height: size }}>
+      <svg width={size} height={size} className="-rotate-90">
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          stroke="#f1f5f9"
+          strokeWidth={strokeWidth}
+          fill="none"
+        />
+        {safeTotal > 0 && (
+          <circle
+            cx={size / 2}
+            cy={size / 2}
+            r={radius}
+            stroke={DASHBOARD_CYAN}
+            strokeWidth={strokeWidth}
+            fill="none"
+            strokeDasharray={circumference}
+            strokeDashoffset={dashoffset}
+            strokeLinecap="round"
+            style={{ transition: "stroke-dashoffset 600ms ease" }}
+          />
+        )}
+      </svg>
+      <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
+        <span className="flex items-baseline gap-0.5 leading-none">
+          <span className="text-[20px] font-semibold tabular-nums text-gray-900">{percent}</span>
+          <span className="text-[10px] font-medium text-gray-500">%</span>
+        </span>
+        <span className="mt-1 flex items-baseline gap-0.5 text-[9px] font-medium leading-none text-gray-400 tabular-nums">
+          <span>{safeCompleted}</span>
+          <span>/</span>
+          <span>{safeTotal}</span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function MonthOverviewPanel({ overview }: { overview?: MonthOverviewSnapshot }) {
   const days = overview?.days || [];
   const totals = overview?.totals;
@@ -235,30 +294,26 @@ function MonthOverviewPanel({ overview }: { overview?: MonthOverviewSnapshot }) 
   ];
 
   return (
-    <section className="w-full max-w-[320px] rounded-[8px] bg-[#f2f2f2] p-2 xl:w-[320px]">
-      <div className="grid grid-cols-[168px_auto] items-start gap-2">
-        <div className="flex h-[86px] flex-col">
-          <div className="flex h-[18px] items-center gap-2">
-            <span className="rounded-[5px] bg-[#e2e2e2] px-1.5 py-0.5 text-[10px] font-semibold leading-none text-neutral-900">月度总览</span>
-            <span className="text-[10px] font-medium leading-none text-neutral-500">{overview?.monthLabel || "本月"}</span>
-          </div>
+    <section className="w-full max-w-[340px] xl:w-[340px]">
+      <div className="mb-3 flex items-baseline justify-between">
+        <h3 className="text-[11px] font-bold uppercase tracking-widest text-gray-400">月度总览</h3>
+        <span className="text-[10px] font-medium tabular-nums text-gray-400">{overview?.monthLabel || "本月"}</span>
+      </div>
 
-          <div className="mt-1 grid grid-cols-3 gap-1">
-            {metricItems.map((item) => (
-              <div key={item.label} className="h-[30px] rounded-[5px] bg-[#e5e5e5] px-1.5 py-1">
-                <div className="truncate text-[9px] leading-none font-medium text-neutral-500">{item.label}</div>
-                <div className="mt-0.5 flex items-baseline gap-0.5">
-                  <span className="min-w-0 text-[11px] font-semibold leading-none tracking-normal text-neutral-950">{item.value}</span>
-                  {item.hint && <span className="shrink-0 text-[9px] font-medium text-neutral-500">{item.hint}</span>}
-                </div>
+      <div className="grid grid-cols-[1fr_auto] items-center gap-5">
+        <div className="grid grid-cols-3 gap-x-4 gap-y-2.5">
+          {metricItems.map((item) => (
+            <div key={item.label} className="flex min-w-0 flex-col gap-1.5">
+              <span className="truncate text-[9px] font-medium leading-none text-gray-400">{item.label}</span>
+              <div className="flex min-w-0 items-baseline gap-0.5">
+                <span className="truncate text-[14px] font-semibold leading-none tabular-nums text-gray-900">{item.value}</span>
+                {item.hint && <span className="shrink-0 text-[9px] font-medium leading-none text-gray-400">{item.hint}</span>}
               </div>
-            ))}
-          </div>
+            </div>
+          ))}
         </div>
 
-        <div>
-          <MiniMonthHeatmap days={days} todayDate={overview?.selectedDate} />
-        </div>
+        <MiniMonthHeatmap days={days} todayDate={overview?.selectedDate} />
       </div>
     </section>
   );
@@ -299,19 +354,19 @@ function MiniMonthHeatmap({
       >
         {heatmapCells.map(({ key, day }) => {
           if (!day) {
-            return <span key={key} className="h-[14px] w-[14px] rounded-[3px] bg-[#e1e1e1]" aria-hidden="true" />;
+            return <span key={key} className="h-[14px] w-[14px] rounded-[3px] bg-slate-100" aria-hidden="true" />;
           }
           const toneClass = day.future
-            ? "bg-[#e1e1e1]"
+            ? "bg-slate-100"
             : day.intensity >= 4
-              ? "bg-[#1f63d6]"
+              ? "bg-[#2F5A67]"
               : day.intensity === 3
-                ? "bg-[#6f9feb]"
+                ? "bg-[#1E7F95]"
                 : day.intensity === 2
-                  ? "bg-[#a7c2f2]"
+                  ? "bg-[#2FB8E6]"
                   : day.intensity === 1
-                    ? "bg-[#d8e4fa]"
-                    : "bg-[#e1e1e1]";
+                    ? "bg-[#74D2EE]"
+                    : "bg-slate-100";
           const isToday = todayDate ? day.date === todayDate : false;
           return (
             <button
@@ -319,9 +374,9 @@ function MiniMonthHeatmap({
               type="button"
               title={`${formatMonthDayLabel(day.date)}：文章 ${day.articleCount}，展示 ${day.displayCount}，引用 ${day.referenceCount}`}
               aria-label={`${formatMonthDayLabel(day.date)}数据`}
-              className={`group relative h-[14px] w-[14px] rounded-[3px] transition-shadow hover:ring-2 hover:ring-blue-300 focus:outline-none focus:ring-2 focus:ring-blue-300 ${isToday ? "ring-1 ring-neutral-700 ring-offset-1 ring-offset-[#f2f2f2]" : ""} ${toneClass}`}
+              className={`group relative h-[14px] w-[14px] rounded-[3px] transition-shadow hover:ring-[1.5px] hover:ring-[#2FB8E6]/50 focus:outline-none focus:ring-[1.5px] focus:ring-[#2FB8E6]/70 ${isToday ? "ring-[1.5px] ring-[#2FB8E6] ring-offset-1 ring-offset-white" : ""} ${toneClass}`}
             >
-              <span className="pointer-events-none absolute bottom-[13px] left-1/2 z-20 hidden w-max max-w-[220px] -translate-x-1/2 rounded-[6px] bg-black px-2 py-1 text-[10px] font-medium text-white shadow-lg group-hover:block group-focus:block">
+              <span className="pointer-events-none absolute bottom-[18px] left-1/2 z-20 hidden w-max max-w-[220px] -translate-x-1/2 rounded-[6px] bg-[#0f1835] px-2 py-1 text-[10px] font-medium text-white shadow-[0_8px_24px_-12px_rgba(15,23,42,0.4)] group-hover:block group-focus:block">
                 {formatMonthDayLabel(day.date)}：文章 {day.articleCount} 篇 / 花费 {formatCurrency(day.spend)} / 展示 {day.displayCount} 次 / 引用 {day.referenceCount} 次
               </span>
             </button>
