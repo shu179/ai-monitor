@@ -221,6 +221,42 @@ class ArticleTableImportTests(unittest.TestCase):
         self.assertEqual(items[0]["published_at"], "2024-01-05")
         self.assertEqual(details["sheets"][0]["count"], 1)
 
+    def test_import_extracts_article_price_column(self) -> None:
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "报价"
+        worksheet.append(["文章标题", "文章链接", "来源媒体", "发布时间", "价格"])
+        worksheet.append(["品牌A 报价报道", "https://example.com/price", "示例媒体", "2024-01-06", "¥1,280.50"])
+        output = BytesIO()
+        workbook.save(output)
+
+        items, details = _extract_article_import_items("报价.xlsx", output.getvalue())
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["price"], 1280.5)
+        self.assertEqual(details["sheets"][0]["columns"]["price"], "价格")
+
+    def test_import_table_stores_article_price(self) -> None:
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "文章链接", "来源媒体", "发布时间", "发布费用"])
+        worksheet.append(["品牌A 费用报道", "https://example.com/fee", "示例媒体", "2024-01-06", "1200元"])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+
+        result = service.import_articles_from_file("费用.xlsx", output.getvalue())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["articles"][0].get("price"), 1200)
+        article = article_store.find_article_by_url("https://example.com/fee")
+        self.assertIsNotNone(article)
+        self.assertEqual(article.get("price"), 1200)
+
     def test_import_detects_vertical_article_tables(self) -> None:
         from openpyxl import Workbook
 

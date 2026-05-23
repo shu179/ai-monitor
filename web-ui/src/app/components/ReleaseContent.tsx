@@ -15,6 +15,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import { AnimatePresence, motion } from "motion/react";
 import { DayPicker } from "react-day-picker";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { ScrollArea } from "./ui/scroll-area";
@@ -63,6 +64,11 @@ type PublishRecord = {
 };
 
 const STORAGE_KEY = "surfaced-release-records-v1";
+
+const releaseMotionEase = [0.22, 1, 0.36, 1] as const;
+const fadeMotionTransition = { duration: 0.18, ease: releaseMotionEase } as const;
+const drawerMotionTransition = { type: "spring", stiffness: 360, damping: 34, mass: 0.85 } as const;
+const dialogMotionTransition = { type: "spring", stiffness: 420, damping: 34, mass: 0.75 } as const;
 
 const CATEGORY_LABEL: Record<MediaCategory, string> = {
   media: "媒体",
@@ -734,6 +740,55 @@ function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: (next
   );
 }
 
+function DrawerShell({
+  open,
+  onClose,
+  children,
+  widthClass = "max-w-[520px]",
+  zIndex = 50,
+}: {
+  open: boolean;
+  onClose: () => void;
+  children: React.ReactNode;
+  widthClass?: string;
+  zIndex?: number;
+}) {
+  return (
+    <AnimatePresence>
+      {open ? (
+        <motion.div
+          key="release-drawer"
+          className="fixed inset-0 flex justify-end"
+          style={{ zIndex }}
+          initial={{ opacity: 1 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 1 }}
+        >
+          <motion.button
+            type="button"
+            aria-label="关闭"
+            onClick={onClose}
+            className="absolute inset-0 bg-gray-900/30 backdrop-blur-[2px]"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={fadeMotionTransition}
+          />
+          <motion.div
+            className={`relative flex h-full w-full ${widthClass} flex-col bg-[#fcfdff]`}
+            initial={{ x: 44, opacity: 0.7 }}
+            animate={{ x: 0, opacity: 1 }}
+            exit={{ x: 36, opacity: 0 }}
+            transition={drawerMotionTransition}
+          >
+            {children}
+          </motion.div>
+        </motion.div>
+      ) : null}
+    </AnimatePresence>
+  );
+}
+
 /* ---------- Media picker drawer ---------- */
 
 function MediaPickerDrawer({
@@ -772,11 +827,8 @@ function MediaPickerDrawer({
     [selected],
   );
 
-  if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex justify-end">
-      <button type="button" aria-label="关闭" onClick={onClose} className="absolute inset-0 bg-gray-900/30 backdrop-blur-[2px]" />
-      <div className="relative flex h-full w-full max-w-[520px] flex-col bg-[#fcfdff]">
+    <DrawerShell open={open} onClose={onClose}>
         {/* Header */}
         <div className="flex shrink-0 items-end justify-between px-8 pb-5 pt-8">
           <div className="flex flex-col gap-1.5">
@@ -926,8 +978,7 @@ function MediaPickerDrawer({
             </ul>
           )}
         </div>
-      </div>
-    </div>
+    </DrawerShell>
   );
 }
 
@@ -1036,11 +1087,8 @@ function BrandPickerDrawer({
     [brands],
   );
 
-  if (!open) return null;
   return (
-    <div className="fixed inset-0 flex justify-end" style={{ zIndex }}>
-      <button type="button" aria-label="关闭" onClick={onClose} className="absolute inset-0 bg-gray-900/30 backdrop-blur-[2px]" />
-      <div className="relative flex h-full w-full max-w-[520px] flex-col bg-[#fcfdff]">
+    <DrawerShell open={open} onClose={onClose} zIndex={zIndex}>
         {/* Header */}
         <div className="flex shrink-0 items-end justify-between px-8 pb-5 pt-8">
           <div className="flex flex-col gap-1.5">
@@ -1124,8 +1172,7 @@ function BrandPickerDrawer({
             </ul>
           )}
         </div>
-      </div>
-    </div>
+    </DrawerShell>
   );
 }
 
@@ -1183,8 +1230,6 @@ function StatusDrawer({
     }));
   }, [filtered]);
 
-  if (!open) return null;
-
   const FILTER_ITEMS: Array<{ key: "all" | PublishStatus; label: string }> = [
     { key: "all", label: "全部" },
     { key: "submitting", label: "提交中" },
@@ -1194,9 +1239,7 @@ function StatusDrawer({
   ];
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end">
-      <button type="button" aria-label="关闭" onClick={onClose} className="absolute inset-0 bg-gray-900/30 backdrop-blur-[2px]" />
-      <div className="relative flex h-full w-full max-w-[640px] flex-col bg-[#fcfdff]">
+    <DrawerShell open={open} onClose={onClose} widthClass="max-w-[640px]">
         <div className="flex shrink-0 items-end justify-between px-10 pb-5 pt-8">
           <div className="flex flex-col gap-1.5">
             <h2 className="app-wordmark-heading text-[18px]">发布情况</h2>
@@ -1256,8 +1299,7 @@ function StatusDrawer({
             </div>
           )}
         </div>
-      </div>
-    </div>
+    </DrawerShell>
   );
 }
 
@@ -1351,9 +1393,10 @@ function RecordEditDialog({
     }
   }, [record]);
 
-  if (!record) return null;
   return (
-    <DialogShell title="修改发布记录" subtitle={record.mediaName} onClose={onClose}>
+    <DialogShell open={!!record} title="修改发布记录" subtitle={record?.mediaName} onClose={onClose}>
+      {record ? (
+        <>
       <div className="flex flex-col gap-5 px-8 pb-6">
         <DialogField label="标题">
           <input
@@ -1417,6 +1460,8 @@ function RecordEditDialog({
         }}
         zIndex={70}
       />
+        </>
+      ) : null}
     </DialogShell>
   );
 }
@@ -1430,9 +1475,10 @@ function ConfirmDeleteDialog({
   onClose: () => void;
   onConfirm: () => void;
 }) {
-  if (!record) return null;
   return (
-    <DialogShell title="确认删除" subtitle="删除后无法恢复" onClose={onClose}>
+    <DialogShell open={!!record} title="确认删除" subtitle="删除后无法恢复" onClose={onClose}>
+      {record ? (
+        <>
       <div className="px-8 pb-6 text-[13px] leading-6 text-gray-600">
         将删除「{record.mediaName}」的发布记录：
         <span className="ml-1 font-bold text-gray-900">{record.title}</span>
@@ -1446,6 +1492,8 @@ function ConfirmDeleteDialog({
           删除
         </button>
       </div>
+        </>
+      ) : null}
     </DialogShell>
   );
 }
@@ -1460,37 +1508,64 @@ function DialogField({ label, children }: { label: string; children: React.React
 }
 
 function DialogShell({
+  open,
   title,
   subtitle,
   onClose,
   children,
 }: {
+  open: boolean;
   title: string;
   subtitle?: string;
   onClose: () => void;
   children: React.ReactNode;
 }) {
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center px-6">
-      <button type="button" aria-label="关闭" onClick={onClose} className="absolute inset-0 bg-gray-900/30 backdrop-blur-[2px]" />
-      <div className="relative w-full max-w-[440px] bg-[#fcfdff] shadow-[0_30px_120px_-30px_rgba(15,23,42,0.5)]">
-        <div className="flex items-start justify-between px-8 pb-5 pt-7">
-          <div className="flex flex-col gap-1">
-            <h3 className="text-[15px] font-bold text-gray-900">{title}</h3>
-            {subtitle ? <span className="text-[11px] font-medium text-gray-400">{subtitle}</span> : null}
-          </div>
-          <button
+    <AnimatePresence>
+      {open ? (
+        <motion.div
+          key="release-dialog"
+          className="fixed inset-0 z-[60] flex items-center justify-center px-6"
+          initial={{ opacity: 1 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 1 }}
+        >
+          <motion.button
             type="button"
-            onClick={onClose}
-            className="text-gray-400 transition-colors hover:text-gray-900"
             aria-label="关闭"
+            onClick={onClose}
+            className="absolute inset-0 bg-gray-900/30 backdrop-blur-[2px]"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={fadeMotionTransition}
+          />
+          <motion.div
+            className="relative w-full max-w-[440px] bg-[#fcfdff] shadow-[0_30px_120px_-30px_rgba(15,23,42,0.5)]"
+            initial={{ y: 18, scale: 0.96, opacity: 0 }}
+            animate={{ y: 0, scale: 1, opacity: 1 }}
+            exit={{ y: 10, scale: 0.97, opacity: 0 }}
+            transition={dialogMotionTransition}
           >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-        {children}
-      </div>
-    </div>
+            <div className="flex items-start justify-between px-8 pb-5 pt-7">
+              <div className="flex flex-col gap-1">
+                <h3 className="text-[15px] font-bold text-gray-900">{title}</h3>
+                {subtitle ? <span className="text-[11px] font-medium text-gray-400">{subtitle}</span> : null}
+              </div>
+              <button
+                type="button"
+                onClick={onClose}
+                className="text-gray-400 transition-colors hover:text-gray-900"
+                aria-label="关闭"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            {children}
+          </motion.div>
+        </motion.div>
+      ) : null}
+    </AnimatePresence>
   );
 }
 

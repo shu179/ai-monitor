@@ -22,6 +22,7 @@ _ARTICLE_IMPORT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "account_name": ("账号", "账号名", "账号名称", "作者", "作者名", "博主", "达人", "自媒体", "自媒体名", "自媒体名称", "account", "author", "user", "creator"),
     "brand_name": ("品牌", "品牌名", "品牌名称", "客户", "客户名", "客户名称", "公司", "公司名", "公司名称", "企业", "企业名称", "brand", "client", "company"),
     "task_name": ("任务", "任务名", "任务名称", "项目", "项目名", "项目名称", "监测任务", "归属任务", "task", "project"),
+    "price": ("价格", "报价", "费用", "金额", "花费", "成本", "单价", "刊例价", "结算价", "采购价", "客户报价", "客户费用", "发布价格", "发布费用", "发稿价格", "发稿费用", "媒体价格", "媒体费用", "price", "cost", "fee", "amount", "spend", "publish_price", "publish_cost", "publish_fee"),
 }
 
 _CELL_HYPERLINK_MARKER = "\x1eHYPERLINK:"
@@ -72,6 +73,8 @@ def _match_article_import_field(value: Any) -> str:
         return "published_at"
     if any(token in normalized for token in ("自媒体", "账号", "作者", "博主", "达人", "creator")):
         return "account_name"
+    if any(token in normalized for token in ("价格", "报价", "费用", "金额", "花费", "成本", "单价", "刊例价", "price", "cost", "fee", "amount", "spend")):
+        return "price"
     if any(token in normalized for token in ("品牌", "客户", "公司", "企业", "brand", "client", "company")):
         return "brand_name"
     if any(token in normalized for token in ("任务", "项目", "监测任务", "归属任务", "task", "project")):
@@ -399,6 +402,36 @@ def _normalize_article_import_date(value: Any) -> str:
     return ""
 
 
+def _normalize_article_import_price(value: Any) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        if value < 0:
+            return None
+        return int(value) if value.is_integer() else value
+    text = _stringify_table_cell(value)
+    if not text:
+        return None
+    text = text.replace(",", "").replace("，", "").replace("￥", "¥")
+    match = re.search(r"(?<!\d)-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        amount = float(match.group(0))
+    except ValueError:
+        return None
+    suffix = text[match.end(): match.end() + 2].strip().lower()
+    if suffix.startswith(("万", "w")):
+        amount *= 10000
+    elif suffix.startswith(("千", "k")):
+        amount *= 1000
+    if amount < 0:
+        return None
+    return int(amount) if amount.is_integer() else amount
+
+
 def _normalize_article_import_media_type(value: Any, url: str, media_name: str) -> str:
     text = _stringify_table_cell(value).lower()
     if any(token in text for token in ("自媒体", "账号", "号", "博主", "self", "creator", "account")):
@@ -607,6 +640,7 @@ def _extract_article_import_items(file_name: str, data: bytes) -> tuple[list[dic
                     "account_name": value_for("account_name"),
                     "brand_name": value_for("brand_name"),
                     "task_name": value_for("task_name"),
+                    "price": _normalize_article_import_price(value_for("price")) if "price" in field_map else None,
                     "_sheet": sheet_name,
                     "_row": row_index + 1,
                 }

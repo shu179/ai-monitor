@@ -159,6 +159,8 @@ def _article_to_api(
         "referencedTasks": referenced_tasks,
         "lastReferencedAt": last_referenced_at,
     }
+    if article.get("price") is not None:
+        payload["price"] = article.get("price")
     if include_export_keywords:
         payload["exportKeywords"] = resolve_article_export_keywords(
             article,
@@ -1011,6 +1013,7 @@ class ArticleService:
                 "media_name",
                 "media_type",
                 "excerpt",
+                "price",
                 "published_at",
                 "ts",
                 "account_name",
@@ -1117,6 +1120,8 @@ class ArticleService:
                 }
                 if account_name:
                     draft_article["account_name"] = account_name
+                if raw_item.get("price") is not None:
+                    draft_article["price"] = raw_item["price"]
 
                 existing_article = existing_by_url.get(normalized_url) if normalized_url else None
                 if existing_article is None:
@@ -1143,6 +1148,8 @@ class ArticleService:
                         })
                     if account_name:
                         candidate_article["account_name"] = account_name
+                    if raw_item.get("price") is not None:
+                        candidate_article["price"] = raw_item["price"]
                     if published_at:
                         candidate_article["published_at"] = published_at
                         candidate_article["ts"] = published_at
