@@ -138,9 +138,18 @@ class BrowserFingerprint:
         }
 
     def _detect_screen_resolution(self) -> tuple[int, int]:
-        """尽量读取真实分辨率；失败时回退到常见桌面分辨率。"""
+        """尽量读取真实分辨率；失败时回退到常见桌面分辨率。
+
+        返回值统一为浏览器使用的逻辑像素（CSS pixels），与 Chrome `--window-size`
+        以及 `screen.width/height` 的语义一致。Retina/HiDPI 上不能直接返回物理像素，
+        否则窗口会被开到屏外、且指纹会与浏览器报告的 screen 维度互相矛盾。
+        """
         if sys.platform == "darwin":
             resolution = self._detect_macos_resolution()
+            if resolution:
+                return resolution
+        elif sys.platform == "win32":
+            resolution = self._detect_windows_resolution()
             if resolution:
                 return resolution
         elif sys.platform.startswith("linux"):
@@ -170,14 +179,106 @@ class BrowserFingerprint:
         if result.returncode != 0:
             return None
 
-        matches = re.findall(r"Resolution:\s*(\d+)\s*x\s*(\d+)", result.stdout or "")
-        if not matches:
-            return None
+        text = result.stdout or ""
+        # system_profiler 在多显示器时输出多段；优先用 "Main Display: Yes" 标记的段。
+        segments = re.split(r"\n(?=\s{2,}\S)", text)
+        ordered = [seg for seg in segments if re.search(r"Main Display:\s*Yes", seg)]
+        ordered.extend(seg for seg in segments if seg not in ordered)
+        ordered.append(text)
+
+        for segment in ordered:
+            # 优先 "UI Looks like: W x H" —— 这是逻辑像素，最准。
+            ui_match = re.search(r"UI Looks like:\s*(\d+)\s*x\s*(\d+)", segment)
+            if ui_match:
+                try:
+                    return int(ui_match.group(1)), int(ui_match.group(2))
+                except Exception:
+                    pass
+
+            res_match = re.search(r"Resolution:\s*(\d+)\s*x\s*(\d+)(.*)", segment)
+            if res_match:
+                try:
+                    width = int(res_match.group(1))
+                    height = int(res_match.group(2))
+                except Exception:
+                    continue
+                trailing = (res_match.group(3) or "").lower()
+                # Retina 显示器 Resolution 行通常给的是原生像素，逻辑像素一般是其 1/2。
+                if "retina" in trailing and width >= 2560 and height >= 1600:
+                    width //= 2
+                    height //= 2
+                return width, height
+        return None
+
+    def _detect_windows_resolution(self) -> tuple[int, int] | None:
+        """通过 user32/shcore 拿主显示器逻辑像素分辨率。
+
+        打包后 manifest 声明 PerMonitorV2，进程是 DPI-aware，GetSystemMetrics 返回物理像素，
+        需要除以主显示器 DPI scale 还原成逻辑像素；开发模式直接跑 python 时进程非 DPI-aware，
+        GetSystemMetrics 已经返回逻辑像素，跳过换算。
+        """
         try:
-            width, height = matches[0]
-            return int(width), int(height)
+            import ctypes
+            from ctypes import wintypes
         except Exception:
             return None
+
+        try:
+            user32 = ctypes.windll.user32
+        except Exception:
+            return None
+
+        try:
+            phys_w = int(user32.GetSystemMetrics(0))
+            phys_h = int(user32.GetSystemMetrics(1))
+        except Exception:
+            return None
+        if phys_w <= 0 or phys_h <= 0:
+            return None
+
+        is_aware = False
+        try:
+            is_aware = bool(user32.IsProcessDPIAware())
+        except Exception:
+            is_aware = False
+
+        scale = 1.0
+        if is_aware:
+            try:
+                class _POINT(ctypes.Structure):
+                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+                user32.MonitorFromPoint.restype = ctypes.c_void_p
+                user32.MonitorFromPoint.argtypes = [_POINT, ctypes.c_uint]
+                hmon = user32.MonitorFromPoint(_POINT(0, 0), 1)  # MONITOR_DEFAULTTOPRIMARY
+                shcore = ctypes.windll.shcore
+                shcore.GetDpiForMonitor.restype = ctypes.c_long
+                shcore.GetDpiForMonitor.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint,
+                    ctypes.POINTER(ctypes.c_uint),
+                    ctypes.POINTER(ctypes.c_uint),
+                ]
+                dpi_x = ctypes.c_uint()
+                dpi_y = ctypes.c_uint()
+                hresult = shcore.GetDpiForMonitor(ctypes.c_void_p(hmon), 0, ctypes.byref(dpi_x), ctypes.byref(dpi_y))
+                if hresult == 0 and dpi_x.value > 0:
+                    scale = dpi_x.value / 96.0
+            except Exception:
+                try:
+                    dpi = int(user32.GetDpiForSystem())  # Windows 10 1607+
+                    if dpi > 0:
+                        scale = dpi / 96.0
+                except Exception:
+                    scale = 1.0
+
+        if scale <= 0:
+            scale = 1.0
+        logical_w = int(round(phys_w / scale))
+        logical_h = int(round(phys_h / scale))
+        if logical_w <= 0 or logical_h <= 0:
+            return None
+        return logical_w, logical_h
 
     def _detect_linux_resolution(self) -> tuple[int, int] | None:
         try:

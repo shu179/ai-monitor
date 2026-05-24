@@ -867,6 +867,29 @@ class BasePlatform(ABC):
             raise last_error
         raise RuntimeError("连接外部 Chrome CDP 超时")
 
+    def _resolve_browser_window_size(self) -> tuple[int, int]:
+        """返回 --window-size / viewport 使用的逻辑像素尺寸。
+
+        指纹中的 screen 已是逻辑像素（CSS pixels），这里只需要：
+        预留 OS chrome（菜单栏/任务栏，留出足够余量覆盖任务栏放大、Dock 自动隐藏关闭等场景），
+        并夹紧到 [1024×720, 3840×2160]，避免小屏上窗口超出可视区、超宽屏上 Chrome 拒绝过大窗口。
+        """
+        screen_width, screen_height = self._fingerprint.get_screen_resolution()
+        try:
+            screen_width = int(screen_width)
+            screen_height = int(screen_height)
+        except Exception:
+            screen_width, screen_height = 1920, 1080
+        if sys.platform == "darwin":
+            reserved_h = 60   # 顶部菜单栏 + Dock 余量
+        elif sys.platform == "win32":
+            reserved_h = 80   # 任务栏放大 / HiDPI 缩放下 40 不够
+        else:
+            reserved_h = 60
+        width = max(1024, min(screen_width, 3840))
+        height = max(720, min(screen_height - reserved_h, 2160))
+        return width, height
+
     def start(self) -> "BasePlatform":
         """启动浏览器（复用 doubao.json 的 persistent context 模式）"""
         from patchright.sync_api import sync_playwright
@@ -879,17 +902,14 @@ class BasePlatform(ABC):
 
         pw = sync_playwright().start()
         try:
-            # 增强：从指纹配置读取窗口尺寸，确保与 screen 一致
-            screen_width, screen_height = self._fingerprint.get_screen_resolution()
-            # 窗口高度减去任务栏/菜单栏高度（macOS ~28px, Windows ~40px）
-            window_height = screen_height - (28 if sys.platform == "darwin" else 40)
+            window_width, window_height = self._resolve_browser_window_size()
 
             prefer_headed_runtime = bool(self.always_headed or getattr(self, "prefer_headed_runtime", False))
             self.context = self._launch_browser_context(
                 pw,
                 headless=(not self.inspect) and (not prefer_headed_runtime),
                 no_viewport=(self.inspect or prefer_headed_runtime),
-                viewport=None if (self.inspect or prefer_headed_runtime) else {"width": screen_width, "height": window_height},
+                viewport=None if (self.inspect or prefer_headed_runtime) else {"width": window_width, "height": window_height},
             )
         except Exception:
             pw.stop()
@@ -2260,10 +2280,8 @@ class BasePlatform(ABC):
         return args
 
     def _launch_browser_context(self, playwright, *, headless: bool, no_viewport: bool, viewport) -> object:
-        # 增强：从指纹配置读取窗口尺寸，确保与 screen 一致
-        screen_width, screen_height = self._fingerprint.get_screen_resolution()
-        window_height = screen_height - (28 if sys.platform == "darwin" else 40)
-        window_size = f"{screen_width},{window_height}"
+        window_width, window_height = self._resolve_browser_window_size()
+        window_size = f"{window_width},{window_height}"
 
         launch_kwargs = {
             "user_data_dir": self.user_data_dir,
