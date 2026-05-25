@@ -803,17 +803,12 @@ function AihotDailyFeedSection({ compact = false }: { compact?: boolean }) {
 
   const items = feed?.items || [];
   const visibleItems = items.slice(0, 3);
-  const dateBadge = useMemo(() => {
-    const now = new Date();
-    return `${now.getMonth() + 1}/${now.getDate()}`;
-  }, []);
 
   return (
     <section className={compact ? "flex flex-col min-w-0" : "border-t border-gray-200/70 pt-8 pb-4 shrink-0"}>
       <div className="mb-1 flex items-baseline justify-between">
         <div className="flex items-baseline gap-2">
           <h3 className="text-[11px] font-bold uppercase tracking-wider text-gray-400">今日速览</h3>
-          <span className="text-[10px] font-bold tabular-nums tracking-tight text-gray-300">{dateBadge}</span>
         </div>
         {visibleItems.length > 0 && (
           <button
@@ -878,11 +873,6 @@ function AihotDailyFeedDetail({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [onClose]);
 
-  const dateLabel = useMemo(() => {
-    const now = new Date();
-    return `${now.getMonth() + 1}月${now.getDate()}日`;
-  }, []);
-
   return (
     <div className="fixed inset-0 z-[110] flex items-center justify-center">
       <div
@@ -903,7 +893,7 @@ function AihotDailyFeedDetail({
         <div className="shrink-0 px-10 pt-10 pb-2">
           <h2 className="text-[22px] font-semibold leading-none tracking-tight text-[#0f1835]">今日速览</h2>
           <p className="mt-2 text-[12px] font-medium tabular-nums text-gray-400">
-            {dateLabel} · {feed.items.length} 条
+            {feed.items.length} 条
           </p>
         </div>
 
@@ -938,8 +928,6 @@ function AihotDailyFeedArticle({
 }) {
   const summaryText = String(item.summary || item.content || "").replace(/\s+/g, " ").trim();
   const author = item.author?.trim();
-  const publishedAt = item.publishedAt?.replace("T", " ").trim();
-  const meta = [author, publishedAt].filter(Boolean).join("  ·  ");
 
   const body = (
     <>
@@ -951,8 +939,8 @@ function AihotDailyFeedArticle({
           {summaryText}
         </p>
       )}
-      {meta && (
-        <p className="mt-3 text-[11px] font-medium tabular-nums text-gray-400">{meta}</p>
+      {author && (
+        <p className="mt-3 text-[11px] font-medium tabular-nums text-gray-400">{author}</p>
       )}
     </>
   );

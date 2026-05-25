@@ -9,6 +9,8 @@ const CHINA_CENTER: [number, number] = [104.5, 36.2];
 const CHINA_OVERVIEW_ZOOM = 3.05;
 const AMAP_MIN_ZOOM = 2.85;
 const AMAP_MIN_ZOOM_EPSILON = 0.03;
+const WHEEL_ZOOM_THRESHOLD = 40;
+const WHEEL_ZOOM_STEP = 0.35;
 const GEOCODE_CACHE_KEY = "dashboard.amap.regionGeocodeCache.v1";
 const AMAP_BRANDING_SELECTOR = ".amap-logo, .amap-copyright";
 
@@ -121,6 +123,7 @@ export function AmapRegionMap({
   const markerRef = useRef<any[]>([]);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const viewInitializedRef = useRef(false);
+  const wheelDeltaRef = useRef(0);
   const [loadState, setLoadState] = useState<"idle" | "ready" | "fallback">("idle");
   const [geocodedNodes, setGeocodedNodes] = useState<RegionMapNode[] | null>(null);
   const normalizedActiveRegions = useMemo(() => splitRegionTags(activeRegions), [activeRegions]);
@@ -297,28 +300,37 @@ export function AmapRegionMap({
 
     const handleWheel = (event: WheelEvent) => {
       const currentZoom = typeof map.getZoom === "function" ? Number(map.getZoom()) : CHINA_OVERVIEW_ZOOM;
-      const scrollingOut = event.deltaY > 0;
-      if (scrollingOut && currentZoom <= AMAP_MIN_ZOOM + AMAP_MIN_ZOOM_EPSILON) {
-        event.preventDefault();
-        event.stopPropagation();
-        if (currentZoom < AMAP_MIN_ZOOM) {
-          map.setZoom(AMAP_MIN_ZOOM);
-        }
+      const deltaScale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1;
+      const normalizedDelta = event.deltaY * deltaScale;
+      if (!Number.isFinite(normalizedDelta) || normalizedDelta === 0) {
         return;
       }
       event.preventDefault();
       event.stopPropagation();
-      const nextZoom = scrollingOut
-        ? Math.max(AMAP_MIN_ZOOM, currentZoom - 0.25)
-        : Math.min(18, currentZoom + 0.25);
-      if (Math.abs(nextZoom - currentZoom) >= 0.01) {
+      event.stopImmediatePropagation();
+
+      wheelDeltaRef.current += normalizedDelta;
+      const steps = Math.trunc(wheelDeltaRef.current / WHEEL_ZOOM_THRESHOLD);
+      if (steps === 0) return;
+      wheelDeltaRef.current -= steps * WHEEL_ZOOM_THRESHOLD;
+
+      const nextZoom = Math.min(18, Math.max(AMAP_MIN_ZOOM, currentZoom - steps * WHEEL_ZOOM_STEP));
+      if (nextZoom <= AMAP_MIN_ZOOM + AMAP_MIN_ZOOM_EPSILON && steps > 0) {
+        wheelDeltaRef.current = 0;
+      }
+      if (Math.abs(nextZoom - currentZoom) < 0.01) return;
+
+      const center = typeof map.getCenter === "function" ? map.getCenter() : null;
+      if (center && typeof map.setZoomAndCenter === "function") {
+        map.setZoomAndCenter(nextZoom, center);
+      } else {
         map.setZoom(nextZoom);
       }
     };
 
-    container.addEventListener("wheel", handleWheel, { passive: false });
+    container.addEventListener("wheel", handleWheel, { passive: false, capture: true });
     return () => {
-      container.removeEventListener("wheel", handleWheel);
+      container.removeEventListener("wheel", handleWheel, { capture: true });
     };
   }, [loadState]);
 

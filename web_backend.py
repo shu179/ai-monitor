@@ -7710,20 +7710,42 @@ return changedCount
         return default
 
     @staticmethod
+    def _parse_feed_datetime(value: str) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return parsedate_to_datetime(text)
+        except Exception:
+            pass
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _feed_datetime_local_date(value: str) -> date | None:
+        parsed = AppRuntime._parse_feed_datetime(value)
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.date()
+        tz = local_now().tzinfo
+        return parsed.astimezone(tz).date() if tz is not None else parsed.astimezone().date()
+
+    @staticmethod
     def _format_feed_datetime(value: str) -> str:
         text = str(value or "").strip()
         if not text:
             return ""
-        try:
-            parsed = parsedate_to_datetime(text)
-            return parsed.astimezone().strftime("%m月%d日 %H:%M")
-        except Exception:
-            pass
-        try:
-            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-            return parsed.astimezone().strftime("%m月%d日 %H:%M")
-        except Exception:
+        parsed = AppRuntime._parse_feed_datetime(text)
+        if parsed is None:
             return text
+        if parsed.tzinfo is None:
+            return parsed.strftime("%m月%d日 %H:%M")
+        tz = local_now().tzinfo
+        localized = parsed.astimezone(tz) if tz is not None else parsed.astimezone()
+        return localized.strftime("%m月%d日 %H:%M")
 
     @staticmethod
     def _strip_feed_html(value: str) -> str:
@@ -7761,11 +7783,16 @@ return changedCount
         item_nodes = channel.findall("item") if channel is not None else []
         if not item_nodes:
             item_nodes = [node for node in root.iter() if str(node.tag or "").split("}")[-1] in {"item", "entry"}]
+        today = local_today()
         for node in item_nodes:
             link = self._xml_text(node, "link")
             if not link:
                 link_node = node.find("link")
                 link = str(link_node.attrib.get("href") or "").strip() if link_node is not None else ""
+            published_raw = self._xml_text(node, "pubDate") or self._xml_text(node, "updated")
+            published_date = self._feed_datetime_local_date(published_raw)
+            if published_date != today:
+                continue
             content = self._strip_feed_html(
                 self._xml_text(node, "encoded")
                 or self._xml_text(node, "content")
@@ -7779,7 +7806,7 @@ return changedCount
                     "summary": content,
                     "content": content,
                     "author": self._xml_text(node, "author"),
-                    "publishedAt": self._format_feed_datetime(self._xml_text(node, "pubDate") or self._xml_text(node, "updated")),
+                    "publishedAt": self._format_feed_datetime(published_raw),
                 }
             )
         return {
