@@ -57,6 +57,26 @@ export type MonthOverviewSnapshot = {
   days: MonthOverviewDay[];
 };
 
+export type AihotDailyFeedItem = {
+  title: string;
+  link: string;
+  summary?: string;
+  content?: string;
+  author?: string;
+  publishedAt?: string;
+};
+
+export type AihotDailyFeedSnapshot = {
+  ok: boolean;
+  title: string;
+  feedUrl: string;
+  updatedAt?: string;
+  message?: string;
+  items: AihotDailyFeedItem[];
+};
+
+const AIHOT_DAILY_FEED_URL = "https://aihot.virxact.com/feed/daily.xml";
+
 const DASHBOARD_MODE_CARD_DEFS: ModeCard[] = [
   { key: "capture", title: "抓取模式", desc: "快速提取核心数据", icon: "zap", active: false },
   { key: "ocr", title: "识别模式", desc: "OCR视觉解析", icon: "eye", active: true },
@@ -3590,6 +3610,45 @@ export async function fetchDashboardTrend(range: "week" | "month" | "year"): Pro
     return (await res.json()) as TrendSnapshot;
   } catch {
     return FALLBACK_BOOTSTRAP.dashboard.trend;
+  }
+}
+
+export async function fetchAihotDailyFeed(): Promise<AihotDailyFeedSnapshot> {
+  try {
+    const res = await apiFetch("/api/aihot/daily-feed", { cache: "no-store" });
+    if (!res.ok) {
+      return {
+        ok: false,
+        title: "AI 热点日报",
+        feedUrl: AIHOT_DAILY_FEED_URL,
+        items: [],
+        message: "订阅读取失败",
+      };
+    }
+    const data = (await res.json()) as Partial<AihotDailyFeedSnapshot>;
+    return {
+      ok: Boolean(data.ok),
+      title: String(data.title || "AI 热点日报"),
+      feedUrl: String(data.feedUrl || AIHOT_DAILY_FEED_URL),
+      updatedAt: data.updatedAt ? String(data.updatedAt) : "",
+      message: data.message ? String(data.message) : "",
+      items: Array.isArray(data.items) ? data.items.map((item) => ({
+        title: String(item?.title || "未命名热点"),
+        link: String(item?.link || ""),
+        summary: item?.summary ? String(item.summary) : "",
+        content: item?.content ? String(item.content) : "",
+        author: item?.author ? String(item.author) : "",
+        publishedAt: item?.publishedAt ? String(item.publishedAt) : "",
+      })) : [],
+    };
+  } catch {
+    return {
+      ok: false,
+      title: "AI 热点日报",
+      feedUrl: AIHOT_DAILY_FEED_URL,
+      items: [],
+      message: "订阅读取失败",
+    };
   }
 }
 

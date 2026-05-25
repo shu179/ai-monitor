@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import html
 import importlib
 import json
 import mimetypes
@@ -19,6 +20,7 @@ import signal
 import shutil
 import socket
 import sqlite3
+import ssl
 import struct
 import subprocess
 import sys
@@ -26,15 +28,27 @@ import threading
 import tempfile
 import time
 import traceback
+from email.utils import parsedate_to_datetime
 from collections import Counter
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
+
+try:
+    import certifi
+except Exception:
+    certifi = None  # type: ignore[assignment]
+
+AIHOT_DAILY_FEED_URL = "https://aihot.virxact.com/feed/daily.xml"
+AIHOT_DAILY_FEED_CACHE_SECONDS = 30 * 60
+AIHOT_DAILY_FEED_MAX_BYTES = 1024 * 1024
 
 from backend_lib.analysis_context import (
     _ASSISTANT_ANALYSIS_ACTION_KEYWORDS,
@@ -2030,6 +2044,11 @@ class AppRuntime:
         self._browser_auth_lock = self._browser_auth_state.lock
         self._search_uploads: dict[str, dict[str, Any]] = {}
         self._search_outputs: dict[str, dict[str, Any]] = {}
+        self._aihot_daily_feed_lock = threading.RLock()
+        self._aihot_daily_feed_cache: dict[str, Any] | None = None
+        self._aihot_daily_feed_cached_at = 0.0
+        self._aihot_daily_feed_etag = ""
+        self._aihot_daily_feed_last_modified = ""
         self._monitoring_status_message = "定时任务已关闭"
         self._exit_callback: Any | None = None
         self._directory_picker_callback: Any | None = None
@@ -4325,20 +4344,8 @@ return changedCount
                     if isinstance(me_payload, dict) and cloud_session_identity_key(store.load()) == cloud_session_identity_key(refreshed_session):
                         store.update_user(me_payload)
                 except CloudClientError as verify_exc:
-                    if verify_exc.status_code == 401:
-                        refreshed_identity = cloud_session_identity(refreshed_session)
-                        store.clear_if_current(
-                            base_url=base_url,
-                            access_token=refreshed_access_token,
-                            refresh_token=str(refreshed_session.get("refresh_token") or "").strip(),
-                            workspace_id=refreshed_identity["workspace_id"],
-                            user_id=refreshed_identity["user_id"],
-                        )
-                        with self._cloud_status_validation_lock:
-                            self._cloud_status_validation_error = str(verify_exc)
-                    else:
-                        with self._cloud_status_validation_lock:
-                            self._cloud_status_validation_error = str(verify_exc)
+                    with self._cloud_status_validation_lock:
+                        self._cloud_status_validation_error = str(verify_exc)
                     return
             with self._cloud_status_validation_lock:
                 self._cloud_status_validation_error = ""
@@ -4346,14 +4353,8 @@ return changedCount
             with self._cloud_status_validation_lock:
                 self._cloud_status_validation_error = str(exc)
         except CloudClientError as refresh_exc:
-            if refresh_exc.status_code == 401:
-                store.clear_if_current(
-                    base_url=base_url,
-                    access_token=access_token,
-                    refresh_token=refresh_token,
-                    workspace_id=identity["workspace_id"],
-                    user_id=identity["user_id"],
-                )
+            # Status polling is passive; it should surface auth problems without
+            # deleting the saved login while background sync may still recover.
             with self._cloud_status_validation_lock:
                 self._cloud_status_validation_error = str(refresh_exc)
 
@@ -4517,6 +4518,8 @@ return changedCount
         token: str,
         local_snapshots: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        session = CloudSessionStore().load()
+        default_operator_user_id = self._default_cloud_operator_user_id(session)
         remote_tasks = client.list_admin_tasks(token)
         if not isinstance(remote_tasks, list):
             remote_tasks = []
@@ -4546,7 +4549,7 @@ return changedCount
                 saved_task = client.create_admin_task(token, {"task_key": task_key, **payload})
                 changed_remote = True
                 saved_task_id = _safe_int(saved_task.get("id") if isinstance(saved_task, dict) else 0, 0)
-                operator_user_id = _safe_int(snapshot.get("operator_user_id"), 0)
+                operator_user_id = _safe_int(snapshot.get("operator_user_id"), 0) or default_operator_user_id
                 if saved_task_id > 0 and operator_user_id > 0:
                     client.assign_admin_task_member(
                         token,
@@ -4555,12 +4558,44 @@ return changedCount
                         access_level="operate",
                         note="同步本地品牌任务",
                     )
+                    if isinstance(saved_task, dict):
+                        saved_task = dict(saved_task)
+                        saved_task["assigned_operator_user_id"] = operator_user_id
             if not isinstance(saved_task, dict):
                 continue
             saved_task_id = _safe_int(saved_task.get("id"), 0)
             if saved_task_id <= 0:
                 continue
-            if cloud_task_id != saved_task_id or task_key != str(saved_task.get("task_key") or "").strip():
+            operator_assignment_changed = False
+            desired_operator_user_id = _safe_int(snapshot.get("operator_user_id"), 0) or default_operator_user_id
+            current_operator_user_id = _safe_int(saved_task.get("assigned_operator_user_id"), 0)
+            if desired_operator_user_id > 0 and current_operator_user_id != desired_operator_user_id:
+                client.assign_admin_task_member(
+                    token,
+                    saved_task_id,
+                    user_id=desired_operator_user_id,
+                    access_level="operate",
+                    note="同步本地品牌任务",
+                )
+                changed_remote = True
+                operator_assignment_changed = True
+                try:
+                    refreshed_tasks = client.list_admin_tasks(token)
+                    if isinstance(refreshed_tasks, list):
+                        remote_tasks = refreshed_tasks
+                        remote_by_id = {
+                            _safe_int(task.get("id") if isinstance(task, dict) else 0, 0): task
+                            for task in remote_tasks
+                            if isinstance(task, dict) and _safe_int(task.get("id"), 0) > 0
+                        }
+                        saved_task = remote_by_id.get(saved_task_id, saved_task)
+                except Exception:
+                    pass
+            if (
+                cloud_task_id != saved_task_id
+                or task_key != str(saved_task.get("task_key") or "").strip()
+                or operator_assignment_changed
+            ):
                 local_updates.append({
                     "local_task_id": local_task_id,
                     "task": saved_task,
@@ -4599,6 +4634,13 @@ return changedCount
                 task["cloud_workspace_id"] = _safe_int(saved_task.get("workspace_id"), _safe_int(task.get("cloud_workspace_id"), 0))
                 task["cloud_config_version"] = _safe_int(saved_task.get("config_version"), _safe_int(task.get("cloud_config_version"), 1))
                 task["cloud_access_level"] = "admin"
+                task["cloud_assigned_operator_user_id"] = _safe_int(
+                    saved_task.get("assigned_operator_user_id"),
+                    _safe_int(task.get("cloud_assigned_operator_user_id"), 0),
+                )
+                task["cloud_assigned_operator_username"] = str(
+                    saved_task.get("assigned_operator_username") or task.get("cloud_assigned_operator_username") or ""
+                ).strip()
                 task["cloud_synced_at"] = _local_iso_seconds()
                 if task != before:
                     changed = True
@@ -4607,6 +4649,20 @@ return changedCount
                 self.save_config(config)
                 self._invalidate_tasks_full_cache()
                 self._invalidate_article_cache()
+
+    @staticmethod
+    def _default_cloud_operator_user_id(session: dict[str, Any] | None) -> int:
+        session_payload = session if isinstance(session, dict) else {}
+        user = session_payload.get("user") if isinstance(session_payload.get("user"), dict) else {}
+        if str(user.get("role") or "").strip() != "admin":
+            return 0
+        return _safe_int(user.get("id"), 0)
+
+    def _resolve_cloud_operator_user_id(self, session: dict[str, Any] | None, requested_user_id: int) -> int:
+        operator_user_id = _safe_int(requested_user_id, 0)
+        if operator_user_id > 0:
+            return operator_user_id
+        return self._default_cloud_operator_user_id(session)
 
     def list_cloud_admin_users(self) -> dict[str, Any]:
         session = CloudSessionStore().load()
@@ -5019,6 +5075,7 @@ return changedCount
     def pull_cloud_tasks(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
         force_full = bool(request_payload.get("force") or request_payload.get("force_full") or request_payload.get("forceFull"))
+        task_config_changed = 0
         with self._lock:
             config = self.load_config()
             result = pull_cloud_tasks_into_config(config, force_full=force_full)
@@ -5069,7 +5126,10 @@ return changedCount
                     self._invalidate_tasks_full_cache()
                     self._invalidate_article_cache()
         if result.get("ok"):
-            self._refresh_monitoring_runtime()
+            # Only restart the scheduler when the cloud pull actually changed the
+            # task definitions — restarting on a no-op pull would interrupt any
+            # query currently running under the browser scraper.
+            self._refresh_monitoring_runtime(restart_scheduler=task_config_changed > 0)
             result["cloud"] = self.get_cloud_status().get("cloud")
         return result
 
@@ -5114,7 +5174,10 @@ return changedCount
         local_task_id = str(request_payload.get("local_task_id") or request_payload.get("task_id") or "").strip()
         if not local_task_id:
             return {"ok": False, "message": "缺少本地任务 ID", "cloud": self.get_cloud_status().get("cloud")}
-        operator_user_id = _safe_int(request_payload.get("operator_user_id") or request_payload.get("operatorUserId"), 0)
+        operator_user_id = self._resolve_cloud_operator_user_id(
+            session,
+            _safe_int(request_payload.get("operator_user_id") or request_payload.get("operatorUserId"), 0),
+        )
 
         with self._lock:
             config = self.load_config()
@@ -5159,8 +5222,6 @@ return changedCount
                     access_level="operate",
                     note="品牌编辑页分配",
                 )
-            elif saved_task_id > 0:
-                client.clear_admin_task_operator(token, saved_task_id)
             if saved_task_id > 0:
                 try:
                     for task in client.list_admin_tasks(token):
@@ -7635,6 +7696,161 @@ return changedCount
         tasks = list(config.get("tasks", []) or [])
         enabled_tasks = [task for task in tasks if task.get("enabled", True)]
         return _build_dashboard_trend(enabled_tasks, range_key)
+
+    @staticmethod
+    def _xml_text(node: ElementTree.Element | None, tag: str, default: str = "") -> str:
+        if node is None:
+            return default
+        direct = node.find(tag)
+        if direct is not None and direct.text:
+            return str(direct.text or "").strip()
+        for child in list(node):
+            if str(child.tag or "").split("}")[-1] == tag and child.text:
+                return str(child.text or "").strip()
+        return default
+
+    @staticmethod
+    def _format_feed_datetime(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            parsed = parsedate_to_datetime(text)
+            return parsed.astimezone().strftime("%m月%d日 %H:%M")
+        except Exception:
+            pass
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return parsed.astimezone().strftime("%m月%d日 %H:%M")
+        except Exception:
+            return text
+
+    @staticmethod
+    def _strip_feed_html(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", text)
+        text = re.sub(r"(?i)</\s*(p|div|li|h[1-6]|blockquote)\s*>", "\n", text)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = html.unescape(text)
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    @staticmethod
+    def _aihot_ssl_context() -> ssl.SSLContext | None:
+        if certifi is None:
+            return None
+        try:
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            return None
+
+    def _parse_aihot_daily_feed(self, xml_text: str) -> dict:
+        root = ElementTree.fromstring(xml_text.encode("utf-8"))
+        channel = root.find("channel")
+        if channel is None and str(root.tag or "").split("}")[-1] == "channel":
+            channel = root
+        title = self._xml_text(channel, "title", "AI 热点日报")
+        updated_at = self._format_feed_datetime(
+            self._xml_text(channel, "lastBuildDate") or self._xml_text(channel, "pubDate")
+        )
+        items: list[dict[str, str]] = []
+        item_nodes = channel.findall("item") if channel is not None else []
+        if not item_nodes:
+            item_nodes = [node for node in root.iter() if str(node.tag or "").split("}")[-1] in {"item", "entry"}]
+        for node in item_nodes:
+            link = self._xml_text(node, "link")
+            if not link:
+                link_node = node.find("link")
+                link = str(link_node.attrib.get("href") or "").strip() if link_node is not None else ""
+            content = self._strip_feed_html(
+                self._xml_text(node, "encoded")
+                or self._xml_text(node, "content")
+                or self._xml_text(node, "description")
+                or self._xml_text(node, "summary")
+            )
+            items.append(
+                {
+                    "title": self._xml_text(node, "title", "未命名热点"),
+                    "link": link,
+                    "summary": content,
+                    "content": content,
+                    "author": self._xml_text(node, "author"),
+                    "publishedAt": self._format_feed_datetime(self._xml_text(node, "pubDate") or self._xml_text(node, "updated")),
+                }
+            )
+        return {
+            "ok": True,
+            "title": title or "AI 热点日报",
+            "feedUrl": AIHOT_DAILY_FEED_URL,
+            "updatedAt": updated_at,
+            "items": items,
+        }
+
+    def get_aihot_daily_feed(self) -> dict:
+        now = time.time()
+        with self._aihot_daily_feed_lock:
+            if self._aihot_daily_feed_cache and now - self._aihot_daily_feed_cached_at < AIHOT_DAILY_FEED_CACHE_SECONDS:
+                return dict(self._aihot_daily_feed_cache)
+            cached_payload = dict(self._aihot_daily_feed_cache) if self._aihot_daily_feed_cache else None
+            etag = self._aihot_daily_feed_etag
+            last_modified = self._aihot_daily_feed_last_modified
+        try:
+            headers = {
+                "User-Agent": f"{APP_NAME}/1.0 (+https://localhost; RSS reader)",
+                "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
+            }
+            if etag:
+                headers["If-None-Match"] = etag
+            if last_modified:
+                headers["If-Modified-Since"] = last_modified
+            request = Request(
+                AIHOT_DAILY_FEED_URL,
+                headers=headers,
+            )
+            with urlopen(request, timeout=8, context=self._aihot_ssl_context()) as response:
+                content_type = str(response.headers.get("Content-Type") or "")
+                if "xml" not in content_type.lower():
+                    raise ValueError(f"订阅源返回了非 RSS 内容：{content_type or '未知内容类型'}")
+                xml_text = response.read(AIHOT_DAILY_FEED_MAX_BYTES).decode("utf-8", errors="replace")
+                response_etag = str(response.headers.get("ETag") or "").strip()
+                response_last_modified = str(response.headers.get("Last-Modified") or "").strip()
+            payload = self._parse_aihot_daily_feed(xml_text)
+            with self._aihot_daily_feed_lock:
+                self._aihot_daily_feed_etag = response_etag
+                self._aihot_daily_feed_last_modified = response_last_modified
+        except HTTPError as exc:
+            if cached_payload:
+                payload = cached_payload
+            else:
+                payload = {
+                    "ok": False,
+                    "title": "AI 热点日报",
+                    "feedUrl": AIHOT_DAILY_FEED_URL,
+                    "updatedAt": "",
+                    "items": [],
+                    "message": f"订阅读取失败：HTTP {exc.code}",
+                }
+        except Exception as exc:
+            if cached_payload:
+                payload = cached_payload
+            else:
+                payload = {
+                    "ok": False,
+                    "title": "AI 热点日报",
+                    "feedUrl": AIHOT_DAILY_FEED_URL,
+                    "updatedAt": "",
+                    "items": [],
+                    "message": f"订阅读取失败：{exc}",
+                }
+        with self._aihot_daily_feed_lock:
+            if payload.get("ok"):
+                self._aihot_daily_feed_cache = dict(payload)
+                self._aihot_daily_feed_cached_at = time.time()
+        return payload
 
     def get_task_monthly_stats(self, task_id: str) -> dict:
         """返回某任务过去6个月每月的文章数，用于品牌柱状图。"""
@@ -11105,6 +11321,9 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             range_key = (qs.get("range", ["week"])[0] or "week").strip()
             _json_response(self, self.runtime.get_dashboard_trend(range_key))
+            return True
+        if path == "/api/aihot/daily-feed":
+            _json_response(self, self.runtime.get_aihot_daily_feed())
             return True
         if path.startswith("/api/test-runs/"):
             run_id = path.replace("/api/test-runs/", "").strip()

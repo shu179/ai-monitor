@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import copy
 import threading
+import tempfile
 import unittest
 from datetime import date
+from pathlib import Path
 from unittest.mock import Mock, patch
 
+from core.cloud_client import CloudClientError
+from core.cloud_session_store import CloudSessionStore
 from web_backend import AppRuntime
 
 
@@ -49,6 +53,11 @@ class FakeAdminTaskClient:
             "note": note,
         }
         self.assigned.append(event)
+        for task in self.tasks:
+            if int(task.get("id") or 0) == int(task_id):
+                task["assigned_operator_user_id"] = user_id
+                task["assigned_operator_username"] = f"user-{user_id}"
+                break
         return event
 
 
@@ -171,6 +180,18 @@ class FakeLoginClient:
                 "role": "operator",
             },
         }
+
+
+class Refresh401StatusClient:
+    def __init__(self, base_url: str, timeout_seconds: float = 15.0) -> None:
+        self.base_url = base_url
+        self.timeout_seconds = timeout_seconds
+
+    def me(self, _access_token: str) -> dict:
+        raise CloudClientError("Session revoked", status_code=401)
+
+    def refresh(self, _refresh_token: str) -> dict:
+        raise CloudClientError("Refresh token revoked", status_code=401)
 
 
 class WebBackendCloudAdminTaskTests(unittest.TestCase):
@@ -365,6 +386,65 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         self.assertEqual(client.assigned[0]["user_id"], 7)
         runtime.task_overview_service.get_tasks_full.assert_not_called()
 
+    def test_sync_cloud_admin_task_defaults_unassigned_operator_to_admin(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        self._install_light_snapshot_runtime(
+            runtime,
+            {
+                "detection_mode": "browser",
+                "scheduler": {"weekly_times": {"0": "09:30"}},
+                "tasks": [
+                    {
+                        "task_id": "task-1",
+                        "name": "品牌A",
+                        "brand": "品牌A",
+                        "enabled": True,
+                        "weekdays": [0],
+                        "keywords": [{"keyword": "品牌A", "brand": "品牌A", "platforms": ["doubao"], "mode": "browser"}],
+                    }
+                ],
+            },
+            {
+                "id": "task-1",
+                "total_records": 5,
+                "success_records": 4,
+                "success_rate": 80.0,
+                "article_count": 3,
+                "optimization_trend": [{"value": 88.0}],
+            },
+        )
+        client = FakeAdminTaskClient()
+        runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]
+        runtime._cloud_request_with_refresh = Mock(  # type: ignore[method-assign]
+            side_effect=lambda operation: (True, operation(client, "access-token"), "")
+        )
+
+        with patch("web_backend.CloudSessionStore", return_value=FakeCloudSessionStore()):
+            with patch("web_backend.local_today", return_value=date(2026, 1, 5)):
+                with patch(
+                    "web_backend.get_task_day_status",
+                    return_value={"status": "pending", "brand_status": "pending", "gap_reasons": []},
+                ):
+                    with patch(
+                        "web_backend._build_task_failure_summary_impl",
+                        return_value={
+                            "failedToday": False,
+                            "failedModes": [],
+                            "failedUpdatedAt": "",
+                            "failureKind": "",
+                            "statusMessage": "",
+                        },
+                    ):
+                        with patch(
+                            "web_backend._collect_today_successful_task_payload_impl",
+                            return_value={"completedKeywords": [], "detectedPlatforms": [], "actualScreenshotCount": 0},
+                        ):
+                            result = runtime.sync_cloud_admin_task({"local_task_id": "task-1"})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.assigned[0]["user_id"], 1)
+        self.assertEqual(result["local_task"]["cloud_assigned_operator_user_id"], 1)
+
     def test_admin_task_list_ensures_unsynced_local_tasks_exist_in_cloud(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         client = FakeAdminTaskClient([
@@ -380,30 +460,31 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
             }
         ])
 
-        payload = runtime._ensure_local_admin_tasks_in_cloud(
-            client,
-            "token",
-            [
-                {
-                    "local_task_id": "local-existing",
-                    "cloud_task_id": 0,
-                    "task_key": "existing-key",
-                    "payload": {"name": "已有品牌", "brand": "已有品牌", "config_json": {}, "enabled": True},
-                    "operator_user_id": 0,
-                },
-                {
-                    "local_task_id": "local-new",
-                    "cloud_task_id": 0,
-                    "task_key": "new-key",
-                    "payload": {"name": "新品牌", "brand": "新品牌", "config_json": {}, "enabled": True},
-                    "operator_user_id": 7,
-                },
-            ],
-        )
+        with patch("web_backend.CloudSessionStore", return_value=FakeCloudSessionStore()):
+            payload = runtime._ensure_local_admin_tasks_in_cloud(
+                client,
+                "token",
+                [
+                    {
+                        "local_task_id": "local-existing",
+                        "cloud_task_id": 0,
+                        "task_key": "existing-key",
+                        "payload": {"name": "已有品牌", "brand": "已有品牌", "config_json": {}, "enabled": True},
+                        "operator_user_id": 0,
+                    },
+                    {
+                        "local_task_id": "local-new",
+                        "cloud_task_id": 0,
+                        "task_key": "new-key",
+                        "payload": {"name": "新品牌", "brand": "新品牌", "config_json": {}, "enabled": True},
+                        "operator_user_id": 7,
+                    },
+                ],
+            )
 
         self.assertEqual([item["task_key"] for item in payload["tasks"]], ["existing-key", "new-key"])
         self.assertEqual([item["task_key"] for item in client.created], ["new-key"])
-        self.assertEqual(client.assigned[0]["user_id"], 7)
+        self.assertEqual([item["user_id"] for item in client.assigned], [1, 7])
         updates_by_id = {item["local_task_id"]: item["task"]["id"] for item in payload["local_updates"]}
         self.assertEqual(updates_by_id["local-existing"], 1)
         self.assertEqual(updates_by_id["local-new"], 100)
@@ -558,6 +639,32 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         self.assertEqual(result["message"], "云端登录成功")
         self.assertTrue(result["cloud"]["loggedIn"])
         runtime.pull_cloud_tasks.assert_not_called()
+
+    def test_cloud_status_validation_keeps_session_on_passive_refresh_401(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.surfacedlab.com",
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                    "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+                }
+            )
+            runtime = AppRuntime.__new__(AppRuntime)
+            runtime._cloud_status_validation_lock = threading.RLock()
+            runtime._cloud_status_validated_identity = ""
+            runtime._cloud_status_validated_at = 0.0
+            runtime._cloud_status_validation_error = ""
+
+            with (
+                patch("web_backend.CloudSessionStore", return_value=store),
+                patch("web_backend.SurfacedCloudClient", Refresh401StatusClient),
+            ):
+                runtime._validate_cloud_session_if_needed(force=True)  # noqa: SLF001
+
+            self.assertEqual(store.load()["access_token"], "old-access")
+            self.assertEqual(runtime._cloud_status_validation_error, "Refresh token revoked")
 
     def test_cloud_login_returns_immediately_after_auth_without_blocking_pull(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)

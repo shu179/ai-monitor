@@ -423,6 +423,122 @@ class RunTaskGroupPlatformExecutionTests(unittest.TestCase):
         self.assertIn("query_done", progress_events)
         self.assertEqual(progress_events[-1], "finished")
 
+    def test_fixed_screenshot_resume_after_cancel_preserves_completed_platform_image(self) -> None:
+        task = {
+            "name": "固定截图续跑任务",
+            "task_id": "fixed_screenshot_resume_task",
+            "fixed_screenshot_enabled": True,
+            "fixed_screenshot_count": 2,
+            "keywords": [
+                {
+                    "keyword": "品牌A 评测",
+                    "brand": "品牌A",
+                    "platforms": ["doubao", "deepseek"],
+                    "mode": "browser",
+                }
+            ],
+        }
+        stop_after_first = {"enabled": False}
+        progress_events: list[str] = []
+
+        def stop_checker() -> bool:
+            return stop_after_first["enabled"]
+
+        def progress_callback(payload: dict) -> None:
+            progress_events.append(str(payload.get("stage") or ""))
+            if payload.get("stage") == "query_done":
+                stop_after_first["enabled"] = True
+
+        with patch("core.task_executor_browser.create_browser_platform", side_effect=self._create_platform):
+            with patch(
+                "core.task_executor_impl._send_task_notifications",
+                return_value={"attempted": True, "success": True, "found_results": 2, "error_message": ""},
+            ) as send_notifications:
+                first_results, first_report = task_executor_impl.run_task_group(
+                    task,
+                    {},
+                    {"detection_mode": "browser"},
+                    return_report=True,
+                    stop_checker=stop_checker,
+                    progress_callback=progress_callback,
+                )
+
+                status_after_cancel = dts.get_task_day_status(task)
+                self.assertTrue(first_report["_scheduler_cancelled"])
+                self.assertEqual(len(first_results), 1)
+                self.assertEqual(status_after_cancel["actual_screenshot_count"], 1)
+                self.assertFalse(status_after_cancel["has_gap"] is False and status_after_cancel["brand_status"] == "success")
+
+                stop_after_first["enabled"] = False
+                second_results, second_report = task_executor_impl.run_task_group(
+                    task,
+                    {},
+                    {"detection_mode": "browser"},
+                    return_report=True,
+                )
+
+        self.assertEqual(self.calls, ["doubao", "deepseek"])
+        self.assertEqual(len(second_results), 1)
+        self.assertEqual(second_report["attempted_queries"], 1)
+        self.assertTrue(second_report["completed_by_quota"])
+        self.assertEqual(second_report["fixed_screenshot_target"], 2)
+        self.assertEqual(dts.get_task_day_status(task)["actual_screenshot_count"], 2)
+        self.assertTrue(send_notifications.called)
+
+    def test_fixed_screenshot_resume_after_incomplete_first_platform_reruns_from_first_platform(self) -> None:
+        task = {
+            "name": "固定截图首轮未完成续跑任务",
+            "task_id": "fixed_screenshot_incomplete_resume_task",
+            "fixed_screenshot_enabled": True,
+            "fixed_screenshot_count": 2,
+            "keywords": [
+                {
+                    "keyword": "品牌A 评测",
+                    "brand": "品牌A",
+                    "platforms": ["doubao", "deepseek"],
+                    "mode": "browser",
+                }
+            ],
+        }
+        first_attempt = {"enabled": True}
+
+        def stop_checker() -> bool:
+            return first_attempt["enabled"]
+
+        with patch("core.task_executor_browser.create_browser_platform", side_effect=self._create_platform):
+            with patch(
+                "core.task_executor_impl._send_task_notifications",
+                return_value={"attempted": True, "success": True, "found_results": 2, "error_message": ""},
+            ) as send_notifications:
+                first_results, first_report = task_executor_impl.run_task_group(
+                    task,
+                    {},
+                    {"detection_mode": "browser"},
+                    return_report=True,
+                    stop_checker=stop_checker,
+                )
+
+                status_after_cancel = dts.get_task_day_status(task)
+                self.assertTrue(first_report["_scheduler_cancelled"])
+                self.assertEqual(first_results, [])
+                self.assertEqual(status_after_cancel["actual_screenshot_count"], 0)
+
+                first_attempt["enabled"] = False
+                second_results, second_report = task_executor_impl.run_task_group(
+                    task,
+                    {},
+                    {"detection_mode": "browser"},
+                    return_report=True,
+                )
+
+        self.assertEqual(self.calls, ["doubao", "deepseek"])
+        self.assertEqual([item["platform"] for item in second_results], ["doubao", "deepseek"])
+        self.assertEqual(second_report["attempted_queries"], 2)
+        self.assertTrue(second_report["completed_by_quota"])
+        self.assertEqual(second_report["fixed_screenshot_target"], 2)
+        self.assertEqual(dts.get_task_day_status(task)["actual_screenshot_count"], 2)
+        self.assertTrue(send_notifications.called)
+
 
 if __name__ == "__main__":
     unittest.main()

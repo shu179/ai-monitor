@@ -183,8 +183,9 @@ export function TestRunModal({
                     className={`rounded-lg border px-3 py-2 ${isCancelled ? "border-gray-200 bg-white" : "border-red-100 bg-white/80"}`}
                   >
                     <div className={`text-[12px] font-bold leading-relaxed ${isCancelled ? "text-gray-800" : "text-red-800"}`}>
-                      {item.keyword || "未定位到关键词"}
-                      {item.platform ? ` · ${item.platform}` : ""}
+                      {item.keyword || item.platform
+                        ? `${item.keyword || "未定位到关键词"}${item.platform ? ` · ${item.platform}` : ""}`
+                        : "状态说明"}
                     </div>
                     <div className={`mt-1 text-[11px] leading-relaxed ${isCancelled ? "text-gray-600" : "text-red-600"}`}>
                       {item.errorMessage || (isCancelled ? "任务在该位置被中断" : "未提供失败原因")}

@@ -189,11 +189,23 @@ def _build_dashboard_failed_tasks(
             continue
         if brand_status == "running" or bool(status.get("formal_running")):
             continue
+        # User-disabled or pending-deletion tasks should not surface their
+        # earlier-today failures: the user has explicitly opted out of running
+        # them, so the dashboard "failed tasks" panel must drop them.
+        if not task.get("enabled", True) or bool(task.get("delete_pending")):
+            continue
 
         task_id = str(task.get("task_id") or derive_task_id(task)).strip()
         task_name = str(task.get("name") or task_id).strip()
         status_extra = status.get("extra") if isinstance(status.get("extra"), dict) else {}
-        is_notification_failure = bool(status_extra.get("last_send_error")) and not bool(status.get("has_gap"))
+        official_extra = status.get("official_extra") if isinstance(status.get("official_extra"), dict) else {}
+        failure_kind_today = str(official_extra.get("task_failure_kind") or "").strip()
+        last_send_error = str(status_extra.get("last_send_error") or "").strip()
+        is_notification_failure = bool(last_send_error) and not bool(status.get("has_gap"))
+        is_no_screenshot_failure = (
+            not is_notification_failure
+            and failure_kind_today == "no_screenshot"
+        )
         failed_modes_today, failed_updated_at, failure_kind_today = _collect_failed_modes_today(
             task,
             today_text=today_text,
@@ -220,16 +232,24 @@ def _build_dashboard_failed_tasks(
             })
         failed_queries.sort(key=lambda item: str(item.get("ts") or ""), reverse=True)
 
-        if not failed_queries and not failed_modes_today and not is_notification_failure:
+        if not failed_queries and not failed_modes_today and not is_notification_failure and not is_no_screenshot_failure:
             continue
 
-        issue_type = "notification" if is_notification_failure else "query"
-        issue_title = "企业微信发送失败，等待自动补发" if is_notification_failure else "查询失败，等待自动补跑"
+        issue_type = "notification" if is_notification_failure else "material" if is_no_screenshot_failure else "query"
+        issue_title = (
+            "企业微信发送失败，等待自动补发"
+            if is_notification_failure
+            else "查询已完成，但暂无可发送图片"
+            if is_no_screenshot_failure
+            else "查询失败，等待自动补跑"
+        )
         issue_description = str(status.get("message") or "").strip()
         if not issue_description and issue_type == "query":
             issue_description = "当前仍有关键词缺口待补齐"
         elif not issue_description and issue_type == "notification":
-            issue_description = str(status_extra.get("last_send_error") or "").strip() or "企业微信发送失败，等待自动补发"
+            issue_description = last_send_error or "企业微信发送失败，等待自动补发"
+        elif not issue_description and issue_type == "material":
+            issue_description = "当前任务已完成，但暂无可发送图片，暂时无法补发"
 
         failed_tasks.append({
             "taskId": task_id,
@@ -242,7 +262,14 @@ def _build_dashboard_failed_tasks(
                 str(status.get("updated_at") or "")
                 or failed_updated_at
             ),
-            "failureKind": ("notification" if is_notification_failure else failure_kind_today or "query"),
+            "failureKind": (
+                "notification"
+                if is_notification_failure
+                else "no_screenshot"
+                if is_no_screenshot_failure
+                else failure_kind_today
+                or "query"
+            ),
             "issueType": issue_type,
             "issueTitle": issue_title,
             "issueDescription": issue_description,
@@ -322,6 +349,7 @@ def _collect_today_successful_task_payload(
     task_status = load_day_status(task, None)
     task_id = str(task.get("task_id") or derive_task_id(task)).strip()
     task_name = str(task.get("name") or task_id).strip()
+    fixed_screenshot_enabled = bool(task.get("fixed_screenshot_enabled", False))
     status_extra = dict(task_status.get("extra") or {})
     official_extra = dict(task_status.get("official_extra") or {}) if isinstance(task_status.get("official_extra"), dict) else {}
     keyword_states = dict(task_status.get("keyword_states") or {})
@@ -330,27 +358,32 @@ def _collect_today_successful_task_payload(
         for item in keyword_states.values()
         if str(item.get("brand") or "").strip()
     ])
-    completed_keywords = [
-        str(item).strip()
-        for item in (status_extra.get("completed_keywords") or [])
-        if str(item).strip()
-    ]
+    completed_keywords = []
+    if not fixed_screenshot_enabled:
+        completed_keywords = [
+            str(item).strip()
+            for item in (status_extra.get("completed_keywords") or [])
+            if str(item).strip()
+        ]
     if (
         not completed_keywords
         and str(task_status.get("brand_status") or "").strip() in {"success", "sent"}
         and not bool(status_extra.get("forced_ignore_failure") or official_extra.get("forced_ignore_failure"))
         and not bool(status_extra.get("completed_by_quota") or official_extra.get("completed_by_quota"))
+        and not fixed_screenshot_enabled
     ):
         completed_keywords = [
             str(item).strip()
             for item in (task_status.get("required_keywords") or [])
             if str(item).strip()
         ]
-    detected_platforms = [
-        str(item).strip()
-        for item in (status_extra.get("detected_platforms") or [])
-        if str(item).strip()
-    ]
+    detected_platforms = []
+    if not fixed_screenshot_enabled:
+        detected_platforms = [
+            str(item).strip()
+            for item in (status_extra.get("detected_platforms") or [])
+            if str(item).strip()
+        ]
     status_screenshot_paths = [
         str(item).strip()
         for item in (
@@ -363,13 +396,17 @@ def _collect_today_successful_task_payload(
     screenshot_paths = normalize_values(status_screenshot_paths + _collect_successful_screenshot_paths(keyword_states))
     history_results = _load_today_successful_query_results(task_name, task_id)
     if history_results:
+        progress_history_results = [
+            item for item in history_results
+            if (not fixed_screenshot_enabled) or screenshot_path_exists(str(item.get("screenshot") or "").strip())
+        ]
         completed_keywords = normalize_values(
             completed_keywords
-            + [str(item.get("keyword") or "").strip() for item in history_results]
+            + [str(item.get("keyword") or "").strip() for item in progress_history_results]
         )
         detected_platforms = normalize_values(
             detected_platforms
-            + [str(item.get("platform") or "").strip() for item in history_results]
+            + [str(item.get("platform") or "").strip() for item in progress_history_results]
         )
         screenshot_paths = normalize_values(
             screenshot_paths

@@ -210,6 +210,32 @@ function taskToBrand(task: TaskFull, idx: number) {
   };
 }
 
+function isBrandTaskSuccessful(brand: ReturnType<typeof taskToBrand>) {
+  return brand.sentToday
+    || brand.completedByQuotaToday
+    || brand.brandStatus === "success"
+    || brand.brandStatus === "sent";
+}
+
+function getBrandSortBucket(brand: ReturnType<typeof taskToBrand>) {
+  // 已关闭任务始终最后；已成功任务优先；当天未完成任务次之；非当天未完成任务再往后。
+  if (!brand.isTest) {
+    return 3;
+  }
+  if (isBrandTaskSuccessful(brand)) {
+    return 0;
+  }
+  if (brand.scheduledToday) {
+    return 1;
+  }
+  return 2;
+}
+
+function getBrandSortUpdatedAt(brand: ReturnType<typeof taskToBrand>) {
+  const parsed = Date.parse(brand.failedUpdatedAt || "");
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
 export function BrandsContent({
   currentDetectionMode = "browser",
   cloudRole = "",
@@ -403,16 +429,25 @@ export function BrandsContent({
       return matchIndustry && matchRegion && matchSearch;
     })
     .sort((a, b) => {
+      const aBucket = getBrandSortBucket(a);
+      const bBucket = getBrandSortBucket(b);
+      if (aBucket !== bBucket) {
+        return aBucket - bBucket;
+      }
+
       const aNeedsAttention = a.failedToday || !!a.testFailureNotice;
       const bNeedsAttention = b.failedToday || !!b.testFailureNotice;
       if (aNeedsAttention !== bNeedsAttention) {
         return aNeedsAttention ? -1 : 1;
       }
-      if (a.failedToday !== b.failedToday) {
+      if (aBucket !== 3 && a.failedToday !== b.failedToday) {
         return a.failedToday ? -1 : 1;
       }
-      if (a.failedUpdatedAt !== b.failedUpdatedAt) {
-        return b.failedUpdatedAt.localeCompare(a.failedUpdatedAt);
+
+      const aUpdatedAt = getBrandSortUpdatedAt(a);
+      const bUpdatedAt = getBrandSortUpdatedAt(b);
+      if (aUpdatedAt !== bUpdatedAt) {
+        return bUpdatedAt - aUpdatedAt;
       }
       return a.name.localeCompare(b.name, "zh-Hans-CN");
     }), [allBrandsData, searchQuery, selectedIndustry, selectedRegion]);
@@ -1355,12 +1390,17 @@ function BrandCard({
   }, [taskKeywords, taskPlatforms]);
 
   const isSendFailure = failureKindToday === "notification";
+  const isNoScreenshotFailure = failureKindToday === "no_screenshot";
   const failureBadgeClassName = isSendFailure
     ? "bg-amber-100/90 text-amber-700 border-amber-200/80"
+    : isNoScreenshotFailure
+      ? "bg-orange-100/90 text-orange-700 border-orange-200/80"
     : "bg-red-100/90 text-red-600 border-red-200/80";
-  const failureLabel = isSendFailure ? "待补发" : "待补跑";
+  const failureLabel = isSendFailure ? "待补发" : isNoScreenshotFailure ? "待补图" : "待补跑";
   const failureSummary = isSendFailure
     ? "发送状态：企业微信发送未成功"
+    : isNoScreenshotFailure
+      ? "发送状态：暂无可发送图片"
     : `失败模式：${failedModes.length > 0 ? failedModes.join("、") : "今日任务失败"}`;
   const completedToday = sentToday;
   const configuredKeywordCount = useMemo(() => {
@@ -1475,7 +1515,7 @@ function BrandCard({
               {(failedToday || successProgressSummary || testStatusBadge || testFailureMessage || deletePendingMessage || (showFormalGap && gapReasons.length > 0)) && (
                 <div className="mt-3 space-y-1.5">
                   {failedToday && (
-                    <div className="text-[11px] text-red-500/90 font-medium">
+                    <div className={`text-[11px] font-medium ${isNoScreenshotFailure ? "text-orange-600/90" : "text-red-500/90"}`}>
                       {failureSummary}
                       {statusMessage ? ` · ${statusMessage}` : ""}
                     </div>

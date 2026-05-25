@@ -54,7 +54,7 @@ class CloudPlatformAutoSync:
             0.5,
             max(0.0, float(event_reconnect_jitter_ratio or 0.0)),
         )
-        self._client_factory = client_factory or (lambda base_url: SurfacedCloudClient(base_url))
+        self._client_factory = client_factory or (lambda base_url: SurfacedCloudClient(base_url, timeout_seconds=30.0))
         self._logger = logger or print
         self._stop_event = threading.Event()
         self._lock = threading.RLock()

@@ -128,3 +128,39 @@ def test_manual_test_plan_replays_historical_successes(tmp_path):
         fixed_screenshot_enabled=False,
         manual_test_replay_completed_keywords=True,
     ) is None
+
+
+def test_build_task_execution_plan_filters_stale_history_progress_for_fixed_screenshot(tmp_path):
+    screenshot_path = tmp_path / "hit.jpg"
+    historical_success = {
+        ("品牌A 评测", "doubao", "品牌A"): {
+            "keyword": "品牌A 评测",
+            "platform": "doubao",
+            "brand": "品牌A",
+            "rank": 1,
+            "screenshot": str(screenshot_path),
+        }
+    }
+
+    plan_without_file = build_task_execution_plan(
+        task={"fixed_screenshot_enabled": True, "fixed_screenshot_count": 1},
+        keywords=[{"keyword": "品牌A 评测", "brand": "品牌A", "platforms": ["doubao"], "mode": "browser"}],
+        default_brand="品牌A",
+        runtime_mode="browser",
+        historical_success_map=historical_success,
+        manual_test_replay_completed_keywords=False,
+    )
+    assert plan_without_file.historical_completed_keywords == []
+    assert plan_without_file.historical_selected_results == []
+
+    screenshot_path.write_bytes(b"image")
+    plan_with_file = build_task_execution_plan(
+        task={"fixed_screenshot_enabled": True, "fixed_screenshot_count": 1},
+        keywords=[{"keyword": "品牌A 评测", "brand": "品牌A", "platforms": ["doubao"], "mode": "browser"}],
+        default_brand="品牌A",
+        runtime_mode="browser",
+        historical_success_map=historical_success,
+        manual_test_replay_completed_keywords=False,
+    )
+    assert plan_with_file.historical_completed_keywords == ["品牌A 评测"]
+    assert len(plan_with_file.historical_selected_results) == 1

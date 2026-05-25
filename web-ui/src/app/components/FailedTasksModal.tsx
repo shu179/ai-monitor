@@ -15,7 +15,8 @@ export function FailedTasksModal({ isOpen, onClose, failedTasks, onActionComplet
   if (!isOpen) return null;
 
   const notificationIssueCount = failedTasks.filter((task) => task.issueType === "notification").length;
-  const queryIssueCount = failedTasks.length - notificationIssueCount;
+  const materialIssueCount = failedTasks.filter((task) => task.issueType === "material").length;
+  const queryIssueCount = failedTasks.length - notificationIssueCount - materialIssueCount;
 
   return (
     <div className="fixed inset-0 z-[110] flex items-center justify-center">
@@ -47,6 +48,8 @@ export function FailedTasksModal({ isOpen, onClose, failedTasks, onActionComplet
                 <span>个异常任务</span>
                 <span className="text-gray-300">•</span>
                 <span>查询失败 {queryIssueCount}</span>
+                <span className="text-gray-300">•</span>
+                <span>待补图 {materialIssueCount}</span>
                 <span className="text-gray-300">•</span>
                 <span>待补发 {notificationIssueCount}</span>
               </div>
@@ -94,14 +97,17 @@ function FailedTaskCard({
 }) {
   const failedCount = task.failedQueries?.length || 0;
   const isNotificationIssue = task.issueType === "notification";
+  const isMaterialIssue = task.issueType === "material";
   const [sending, setSending] = useState(false);
   const [actionMessage, setActionMessage] = useState("");
   const [actionError, setActionError] = useState("");
   const badgeClassName = isNotificationIssue
     ? "border-amber-200/80 bg-amber-50/80 text-amber-700"
+    : isMaterialIssue
+      ? "border-orange-200/80 bg-orange-50/80 text-orange-700"
     : "border-red-200/80 bg-red-50/80 text-red-600";
-  const badgeLabel = isNotificationIssue ? "待补发" : "任务失败";
-  const countLabel = isNotificationIssue ? "待补发状态" : `${failedCount} 条失败查询`;
+  const badgeLabel = isNotificationIssue ? "待补发" : isMaterialIssue ? "待补图" : "任务失败";
+  const countLabel = isNotificationIssue ? "待补发状态" : isMaterialIssue ? "暂无可发送图片" : `${failedCount} 条失败查询`;
   const sendableSuccessCount = Math.max(0, Number(task.sendableSuccessCount || 0));
   const updatedAtText = task.failedUpdatedAt ? task.failedUpdatedAt.replace("T", " ") : "刚刚更新";
 
@@ -158,7 +164,7 @@ function FailedTaskCard({
           </div>
         </div>
 
-        {task.canForceSendSuccess && (
+        {task.canForceSendSuccess && !isMaterialIssue && (
           <div className="flex flex-col gap-2 border-t border-gray-100 pt-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0">
               <p className="text-[11px] font-medium text-gray-600">
@@ -231,6 +237,8 @@ function FailedTaskCard({
             <p className="text-[11px] leading-relaxed text-gray-500">
               {isNotificationIssue
                 ? "当前任务查询素材已补齐，但企业微信发送未成功。系统会在后续自动运行时继续尝试补发，发送成功后会自动从这里消失。"
+                : isMaterialIssue
+                  ? "当前任务已经跑完，但没有留下可发送的有效图片，所以现在既不会自动发，也不能事后补发。需要后续运行重新产出有效截图后才会恢复。"
                 : "当前没有更细的失败查询明细，可能是任务在发送或调度阶段失败。"}
             </p>
           </div>

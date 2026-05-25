@@ -15,6 +15,14 @@ class TongyiPlatform(BasePlatform):
     # 通义千问对话 SSE 流的 endpoint 关键字（用于网络拦截定位 reference 数据）
     _chat_endpoint_marker = "chat2.qianwen.com/api/v2/chat"
 
+    generation_min_wait_seconds = 0.8
+    generation_completion_confirm_min_seconds = 0.15
+    generation_completion_confirm_max_seconds = 0.35
+    generation_completion_confirm_force_scroll = False
+    generation_post_complete_scroll_reads = False
+    generation_defer_initial_scroll_until_new_content = True
+    generation_stable_first_wait_seconds = 0.2
+    generation_stable_answer_interval_seconds = 0.35
     use_external_chrome_cdp = True
     external_chrome_launch_target_url = True
     skip_runtime_startup_goto = True

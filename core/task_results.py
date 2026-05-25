@@ -528,8 +528,13 @@ def finalize_execution_report(report: dict, notify_result: dict | None = None) -
 
     if query_round_status == 'success' and not bool(notify_result.get('success')):
         task_status = 'failed'
-        task_failure_kind = 'notification'
         task_failure_message = str(notify_result.get('error_message') or '企业微信发送未成功').strip()
+        if notify_result.get('attempted') is not False:
+            task_failure_kind = 'notification'
+        elif '暂无可发送截图' in task_failure_message:
+            task_failure_kind = 'no_screenshot'
+        else:
+            task_failure_kind = 'temporary'
     elif query_round_status != 'success':
         task_failure_message = str(notify_result.get('error_message') or '').strip()
         if not task_failure_message:

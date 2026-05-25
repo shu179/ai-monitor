@@ -14,6 +14,14 @@ from .base import BasePlatform, InterruptionDetected
 class DoubaoPlatform(BasePlatform):
     screenshot_brand_top_padding_px = 56
     screenshot_brand_top_ratio = 0.18
+    generation_min_wait_seconds = 0.8
+    generation_completion_confirm_min_seconds = 0.15
+    generation_completion_confirm_max_seconds = 0.35
+    generation_completion_confirm_force_scroll = False
+    generation_post_complete_scroll_reads = False
+    generation_defer_initial_scroll_until_new_content = True
+    generation_stable_first_wait_seconds = 0.2
+    generation_stable_answer_interval_seconds = 0.35
     use_automation_control_flag = True
     use_automation_user_agent = False
     use_automation_extra_headers = False
@@ -26,9 +34,20 @@ class DoubaoPlatform(BasePlatform):
     target_url = "https://www.doubao.com/chat/"
     input_selector = 'textarea.semi-input-textarea.semi-input-textarea-autosize[placeholder="发消息..."]'
     new_chat_selector = 'xpath=//div[contains(@class,"sidebar_nav_item") and contains(normalize-space(.),"新对话")]'
-    chat_container_selector = '[class*="scrollable"]'
+    chat_container_selector = (
+        # 新：豆包当前外层视口滚动器（h≈1130）+ 内层虚拟列表滚动器（h≈3732）
+        '[class*="flow-scrollbar"], '
+        '[class*="v_list_scroller"], '
+        # 旧：保留兜底，新版完全不命中
+        '[class*="scrollable"]'
+    )
     composer_status_selector = 'button#flow-end-msg-send, div[data-trigger-type="hover"][data-state]'
     result_selector = (
+        # 新：豆包当前主用（语义化类名，最稳）
+        '[class*="conversation-page-message-host"], '
+        # 新：列表外层（前缀稳定，后缀 hash 会变）
+        '[class*="message-list-"], '
+        # 旧：保留兜底，新版完全不命中
         '[data-testid*="message-content"], '
         '[data-testid*="message_content"], '
         '[data-testid*="messageText"], '
@@ -40,6 +59,12 @@ class DoubaoPlatform(BasePlatform):
         '[class*="message-content"]'
     )
     think_content_selector = (
+        # 新：豆包当前思考块（class + data-attr 双保险）
+        '[class*="thinking-box-root"], '
+        '[data-thinking-box], '
+        # 新：排除"跟问气泡"——会被 conversation-page-message-host 兜进来，要排掉
+        '[class*="suggest-message-list"], '
+        # 旧：保留兜底，新版完全不命中
         '[data-testid*="deep-think"], '
         '[data-testid*="deep_think"], '
         '[data-testid*="thinking"], '
@@ -168,11 +193,17 @@ class DoubaoPlatform(BasePlatform):
             self._reraise_stop_requested(e)
         return None
 
-    def _wait_for_submit_started(self, before_input: str, timeout: float = 8.0) -> bool:
+    def _wait_for_submit_started(
+        self,
+        before_input: str,
+        *,
+        before_snapshot: dict | None = None,
+        timeout: float = 8.0,
+    ) -> bool:
         keyword = str(getattr(self, "_last_prompt_text", "") or "")
         keyword_compact = self._normalize_compact_text(keyword)
         before_input_compact = self._normalize_compact_text(before_input)
-        before_snapshot = self._composer_snapshot(keyword)
+        before_snapshot = before_snapshot if isinstance(before_snapshot, dict) else self._composer_snapshot(keyword)
         baseline_result_count = int(before_snapshot.get("resultCount", 0) or 0)
         baseline_result_length = int(before_snapshot.get("resultLength", 0) or 0)
         baseline_container_length = int(before_snapshot.get("containerLength", 0) or 0)
@@ -334,6 +365,70 @@ class DoubaoPlatform(BasePlatform):
 
     def _get_status_button_snapshot(self) -> dict:
         try:
+            fast_snapshot = self.page.evaluate(
+                """({statusSel, stopSel, sendSel}) => {
+                    const queryAllSafe = (selector) => {
+                        const text = String(selector || '').trim();
+                        if (!text || text.startsWith('xpath=') || text.startsWith('//') || text.startsWith('(//')) {
+                            return [];
+                        }
+                        try {
+                            return Array.from(document.querySelectorAll(text));
+                        } catch (_) {
+                            return [];
+                        }
+                    };
+                    const isVisible = (node) => {
+                        if (!node) return false;
+                        const style = window.getComputedStyle(node);
+                        const rect = node.getBoundingClientRect();
+                        return (
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            style.opacity !== '0' &&
+                            rect.width > 0 &&
+                            rect.height > 0
+                        );
+                    };
+                    const snapshotFor = (el, stateGuess) => {
+                        if (!el || !isVisible(el)) return null;
+                        return {
+                            found: true,
+                            stateGuess,
+                            text: String(el.innerText || el.textContent || '').trim(),
+                            className: String(el.getAttribute('class') || ''),
+                            outerHTML: String(el.outerHTML || ''),
+                            dataState: String(el.getAttribute('data-state') || ''),
+                            paths: Array.from(el.querySelectorAll('svg path'))
+                                .filter((node) => isVisible(node.closest('svg') || node))
+                                .map((node) => String(node.getAttribute('d') || ''))
+                                .filter(Boolean),
+                            disabled: el.hasAttribute('disabled') ||
+                                String(el.getAttribute('aria-disabled') || '').toLowerCase() === 'true',
+                        };
+                    };
+                    for (const el of queryAllSafe(stopSel)) {
+                        const snap = snapshotFor(el, 'pause');
+                        if (snap) return snap;
+                    }
+                    for (const el of queryAllSafe(sendSel)) {
+                        const snap = snapshotFor(el, 'send');
+                        if (snap) return snap;
+                    }
+                    for (const el of queryAllSafe(statusSel)) {
+                        const snap = snapshotFor(el, '');
+                        if (snap) return snap;
+                    }
+                    return { found: false };
+                }""",
+                {
+                    "statusSel": self.composer_status_selector or "",
+                    "stopSel": self.stop_generating_selector or "",
+                    "sendSel": self.send_button_selector or "",
+                },
+            ) or {}
+            if fast_snapshot.get("found"):
+                return fast_snapshot
             state_guess, button = self._resolve_status_button_locator(timeout_ms=1500)
             if button is None:
                 return {"found": False}
@@ -1097,6 +1192,7 @@ class DoubaoPlatform(BasePlatform):
     def submit_prompt(self) -> None:
         keyword = str(getattr(self, "_last_prompt_text", "") or "")
         before_input = self._read_input_value()
+        before_snapshot = self._composer_snapshot(keyword)
         try:
             self._raise_if_stop_requested()
             self._disable_captcha_pointer_intercept()
@@ -1106,7 +1202,7 @@ class DoubaoPlatform(BasePlatform):
             chat_input.focus(timeout=3000)
             chat_input.press("Enter", timeout=3000)
             strategy_name = "input_enter"
-            if self._wait_for_submit_started(before_input, timeout=8.0):
+            if self._wait_for_submit_started(before_input, before_snapshot=before_snapshot, timeout=8.0):
                 print(f"[{self.name}] 已确认问题已发送（策略: {strategy_name}）")
                 return
             if self._wait_for_submit_start_signal(timeout=4.0):
@@ -1125,7 +1221,7 @@ class DoubaoPlatform(BasePlatform):
             print(f"[{self.name}] Enter 提交未确认，尝试点击发送按钮兜底")
             if self._click_send_button_via_dom():
                 strategy_name = "dom_send_button"
-                if self._wait_for_submit_started(before_input, timeout=8.0):
+                if self._wait_for_submit_started(before_input, before_snapshot=before_snapshot, timeout=8.0):
                     print(f"[{self.name}] 已确认问题已发送（策略: {strategy_name}）")
                     return
                 if self._wait_for_submit_start_signal(timeout=4.0):

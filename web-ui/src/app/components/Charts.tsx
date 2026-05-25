@@ -12,9 +12,60 @@ type ChartAreaProps = {
   data?: any[];
   margin?: Partial<{ top: number; right: number; left: number; bottom: number }>;
   xAxisDy?: number;
+  /** Y 轴数字从容器最左 x=0 起左对齐（用于和上方标题/数字对齐），且收窄 YAxis 宽度保持与曲线的自然距离 */
+  yLabelAtLeft?: boolean;
+  alignEdgeXTicks?: boolean;
 };
 
-export function ChartArea({ data, margin, xAxisDy = 10 }: ChartAreaProps) {
+function LeftAlignedYTick({ y, payload }: { y?: number; payload?: { value: number | string } }) {
+  return (
+    <text
+      x={0}
+      y={y}
+      fontSize={10}
+      fontWeight={400}
+      fill="#9ca3af"
+      textAnchor="start"
+      dominantBaseline="middle"
+    >
+      {payload?.value}
+    </text>
+  );
+}
+
+function EdgeAlignedXAxisTick({
+  x,
+  y,
+  payload,
+  index,
+  total,
+}: {
+  x?: number;
+  y?: number;
+  payload?: { value: number | string };
+  index?: number;
+  total: number;
+}) {
+  const safeIndex = Number(index ?? 0);
+  const isFirst = safeIndex === 0;
+  const isLast = total > 0 && safeIndex === total - 1;
+  const textAnchor = isFirst ? "start" : isLast ? "end" : "middle";
+
+  return (
+    <text
+      x={x}
+      y={(y ?? 0) + 10}
+      fontSize={10}
+      fontWeight={400}
+      fill="#9ca3af"
+      textAnchor={textAnchor}
+    >
+      {payload?.value}
+    </text>
+  );
+}
+
+export function ChartArea({ data, margin, xAxisDy = 10, yLabelAtLeft = false, alignEdgeXTicks = false }: ChartAreaProps) {
   const defaultData = [
     { name: '周一', value: 30, predict: 40 },
     { name: '周二', value: 45, predict: 42 },
@@ -56,19 +107,31 @@ export function ChartArea({ data, margin, xAxisDy = 10 }: ChartAreaProps) {
           dataKey="name" 
           axisLine={false} 
           tickLine={false} 
-          tick={{ fontSize: 10, fill: '#9ca3af', fontWeight: 400 }}
+          tick={alignEdgeXTicks ? <EdgeAlignedXAxisTick total={chartData.length} /> : { fontSize: 10, fill: '#9ca3af', fontWeight: 400 }}
           dy={xAxisDy}
         />
-        <YAxis 
-          key="yaxis"
-          axisLine={false} 
-          tickLine={false} 
-          ticks={[0, 25, 50, 75, 100]}
-          domain={[0, 100]}
-          width={34}
-          tick={{ fontSize: 10, fill: '#9ca3af', fontWeight: 400 }}
-          dx={-2}
-        />
+        {yLabelAtLeft ? (
+          <YAxis
+            key="yaxis"
+            axisLine={false}
+            tickLine={false}
+            ticks={[0, 25, 50, 75, 100]}
+            domain={[0, 100]}
+            width={22}
+            tick={<LeftAlignedYTick />}
+          />
+        ) : (
+          <YAxis
+            key="yaxis"
+            axisLine={false}
+            tickLine={false}
+            ticks={[0, 25, 50, 75, 100]}
+            domain={[0, 100]}
+            width={34}
+            tick={{ fontSize: 10, fill: '#9ca3af', fontWeight: 400 }}
+            dx={-2}
+          />
+        )}
         <Tooltip 
           key="tooltip"
           contentStyle={{ 

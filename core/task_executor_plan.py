@@ -93,6 +93,11 @@ def build_task_execution_plan(
         if fixed_screenshot_enabled
         else []
     )
+    historical_progress_results = (
+        historical_selected_results
+        if fixed_screenshot_enabled
+        else list(historical_success_map.values())
+    )
 
     return TaskExecutionPlan(
         fixed_screenshot_enabled=fixed_screenshot_enabled,
@@ -104,13 +109,13 @@ def build_task_execution_plan(
         fixed_screenshot_target=fixed_screenshot_target,
         historical_selected_results=historical_selected_results,
         historical_completed_keywords=_dedupe_non_empty(
-            [str(item.get("keyword") or "").strip() for item in historical_success_map.values()]
+            [str(item.get("keyword") or "").strip() for item in historical_progress_results]
         ),
         historical_detected_platforms=_dedupe_non_empty(
-            [str(item.get("platform") or "").strip() for item in historical_success_map.values()]
+            [str(item.get("platform") or "").strip() for item in historical_progress_results]
         ),
         historical_brands=_dedupe_non_empty(
-            [str(item.get("brand") or "").strip() for item in historical_success_map.values()]
+            [str(item.get("brand") or "").strip() for item in historical_progress_results]
         ),
     )
 

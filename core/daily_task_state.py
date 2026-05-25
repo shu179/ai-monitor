@@ -1148,7 +1148,21 @@ def _apply_keyword_update_to_pool(
         return pool, False
 
     brand = str(update.get("brand") or keyword_states.get(keyword, {}).get("brand") or pool.get("brand_name") or "").strip()
-    current_state = _coerce_keyword_state(keyword_states.get(keyword), keyword=keyword, brand=brand)
+    configured_platforms_by_keyword = {
+        str(item.get("keyword") or "").strip(): [
+            str(platform).strip()
+            for platform in (item.get("platforms") or [])
+            if str(platform).strip()
+        ]
+        for item in _extract_required_keyword_entries(task)
+        if str(item.get("keyword") or "").strip()
+    }
+    current_state = _coerce_keyword_state(
+        keyword_states.get(keyword),
+        keyword=keyword,
+        brand=brand,
+        platforms=configured_platforms_by_keyword.get(keyword),
+    )
     run_success = _coerce_bool(update.get("run_success"))
     screenshot_saved = _coerce_bool(update.get("screenshot_saved"))
     failure_reason = str(update.get("failure_reason") or "").strip()
@@ -1176,6 +1190,9 @@ def _apply_keyword_update_to_pool(
     elif not run_success and not failure_reason:
         failure_reason = KEYWORD_REASON_RUN_FAILED
 
+    existing_image_path = str(current_state.get("image_path") or "").strip()
+    resolved_image_path = image_path or (existing_image_path if run_success and screenshot_saved else "")
+
     current_state.update({
         "keyword": keyword,
         "brand": brand,
@@ -1183,7 +1200,7 @@ def _apply_keyword_update_to_pool(
         "screenshot_saved": screenshot_saved,
         "failure_reason": failure_reason or ("" if run_success and screenshot_saved else KEYWORD_REASON_NOT_RUN),
         "source_mode": normalized_source,
-        "image_path": image_path,
+        "image_path": resolved_image_path,
         "platform": platform,
         "updated_at": str(update.get("updated_at") or now_text).strip() or now_text,
     })
@@ -1195,6 +1212,10 @@ def _apply_keyword_update_to_pool(
             brand=brand,
             platforms=[],
         )
+        existing_platform_image_path = str(platform_state.get("image_path") or "").strip()
+        resolved_platform_image_path = image_path or (
+            existing_platform_image_path if run_success and screenshot_saved else ""
+        )
         platform_state.update({
             "keyword": keyword,
             "brand": brand,
@@ -1202,7 +1223,7 @@ def _apply_keyword_update_to_pool(
             "screenshot_saved": screenshot_saved,
             "failure_reason": failure_reason or ("" if run_success and screenshot_saved else KEYWORD_REASON_NOT_RUN),
             "source_mode": normalized_source,
-            "image_path": image_path,
+            "image_path": resolved_platform_image_path,
             "platform": platform,
             "required_platforms": [],
             "platform_states": {},

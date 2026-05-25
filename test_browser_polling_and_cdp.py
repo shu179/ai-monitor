@@ -5,6 +5,8 @@ from unittest.mock import patch
 from core.browser_platform_factory import apply_browser_runtime_config
 from platforms.base import BasePlatform
 from platforms.deepseek import DeepSeekPlatform
+from platforms.doubao import DoubaoPlatform
+from platforms.tongyi import TongyiPlatform
 from platforms.yuanbao import YuanbaoPlatform
 
 
@@ -269,6 +271,99 @@ class BrowserPollingAndCDPTests(unittest.TestCase):
 
             self.assertTrue(platform.debug_poll_metrics)
 
+    def test_without_answer_read_scroll_can_clear_pending_scroll(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            platform = FakePlatform(tmpdir)
+            platform._answer_scroll_reads_remaining = 1
+
+            with platform._without_answer_read_scroll(restore_pending=False):
+                self.assertFalse(platform._consume_answer_read_scroll())
+
+            self.assertEqual(platform._answer_scroll_reads_remaining, 0)
+
+    def test_late_brand_grace_capture_does_not_scroll(self):
+        class NoScrollGracePlatform(FakePlatform):
+            def __init__(self, user_data_dir: str):
+                super().__init__(user_data_dir)
+                self.wheel_calls = 0
+
+            def check_for_interruption(self):
+                return None
+
+            def _wheel_answer_view(self, *args, **kwargs):
+                self.wheel_calls += 1
+                return True
+
+            def _capture_answer_snapshot(self):
+                self._consume_answer_read_scroll()
+                text = "TO 直燃炉厂家推荐\n可迪尔空气技术（北京）有限公司"
+                return {
+                    "root_key": "",
+                    "blocks": [{"key": "answer:0", "order": 0, "text": text, "html": ""}],
+                    "raw_text": text,
+                    "raw_html": "",
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            platform = NoScrollGracePlatform(tmpdir)
+            platform._begin_answer_capture(keyword="TO直燃炉厂家推荐", brand="可迪尔")
+            platform._answer_scroll_reads_remaining = 1
+
+            text = platform._capture_late_brand_mention_grace_text(
+                lambda: "",
+                answer_text="TO 直燃炉厂家推荐",
+                keyword="TO直燃炉厂家推荐",
+                brand="可迪尔",
+            )
+
+            self.assertIn("可迪尔空气技术", text)
+            self.assertEqual(platform.wheel_calls, 0)
+            self.assertEqual(platform._answer_scroll_reads_remaining, 0)
+
+    def test_doubao_completion_uses_short_dom_only_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            platform = DoubaoPlatform(tmpdir)
+
+            self.assertLess(platform.generation_min_wait_seconds, BasePlatform.generation_min_wait_seconds)
+            self.assertLess(
+                platform.generation_completion_confirm_max_seconds,
+                BasePlatform.generation_completion_confirm_max_seconds,
+            )
+            self.assertFalse(platform.generation_completion_confirm_force_scroll)
+            self.assertFalse(platform.generation_post_complete_scroll_reads)
+            self.assertTrue(platform.generation_defer_initial_scroll_until_new_content)
+
+    def test_yuanbao_and_tongyi_use_same_safe_polling_profile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for platform in (YuanbaoPlatform(tmpdir), TongyiPlatform(tmpdir)):
+                self.assertLess(platform.generation_min_wait_seconds, BasePlatform.generation_min_wait_seconds)
+                self.assertLess(
+                    platform.generation_completion_confirm_max_seconds,
+                    BasePlatform.generation_completion_confirm_max_seconds,
+                )
+                self.assertFalse(platform.generation_completion_confirm_force_scroll)
+                self.assertFalse(platform.generation_post_complete_scroll_reads)
+                self.assertTrue(platform.generation_defer_initial_scroll_until_new_content)
+
+    def test_initial_scroll_can_be_deferred_until_new_answer_content(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            platform = FakePlatform(tmpdir)
+            platform.generation_defer_initial_scroll_until_new_content = True
+            platform.page = type("WheelPage", (), {"mouse": FakeMouse()})()
+            platform._answer_scroll_target_point = lambda: {"x": 120, "y": 240}  # type: ignore[method-assign]
+
+            with patch("platforms.base.random.randint", return_value=5):
+                platform._begin_answer_capture(keyword="keyword", brand="brand")
+                platform._schedule_answer_poll_read()
+                self.assertEqual(platform._answer_scroll_reads_remaining, 0)
+                self.assertFalse(platform._consume_answer_read_scroll())
+                self.assertFalse(platform._answer_first_content_scroll_done)
+
+                self.assertTrue(platform._perform_deferred_first_content_scroll())
+
+            self.assertEqual(platform.page.mouse.wheels, [(0, 5)])
+            self.assertEqual(platform._answer_scroll_reads_remaining, 0)
+
     def test_yuanbao_blocks_text_stable_completion_while_streaming(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             platform = YuanbaoPlatform(tmpdir)
@@ -335,6 +430,56 @@ class BrowserPollingAndCDPTests(unittest.TestCase):
 
             self.assertTrue(usable)
             self.assertIn("更多内容", text)
+
+    def test_poll_until_complete_uses_brand_grace_window_for_late_table_rows(self):
+        class LateBrandPlatform(FakePlatform):
+            def __init__(self, user_data_dir: str):
+                super().__init__(user_data_dir)
+                self._snapshots = [
+                    "TO 直燃炉厂家推荐（工业废气处理专用）\n以下是国内优质 TO 直燃炉厂家推荐。",
+                    "TO 直燃炉厂家推荐（工业废气处理专用）\n以下是国内优质 TO 直燃炉厂家推荐。",
+                    "TO 直燃炉厂家推荐（工业废气处理专用）\n以下是国内优质 TO 直燃炉厂家推荐。",
+                    "TO 直燃炉厂家推荐（工业废气处理专用）\n以下是国内优质 TO 直燃炉厂家推荐。\n可迪尔空气技术（北京）有限公司\n3 大生产基地，服务全球客户。",
+                ]
+
+            def check_for_interruption(self):
+                return None
+
+            def _cooperative_sleep(self, seconds):
+                return None
+
+            def _cooperative_sleep_jittered(self, seconds, spread=0.0):
+                return None
+
+            def is_generation_complete(self, page_text: str, start_time: float) -> bool:
+                del page_text, start_time
+                return True
+
+            def _capture_answer_snapshot(self):
+                text = self._snapshots.pop(0) if self._snapshots else ""
+                return {
+                    "root_key": "",
+                    "blocks": [{"key": "answer:0", "order": 0, "text": text, "html": ""}] if text else [],
+                    "raw_text": text,
+                    "raw_html": "",
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            platform = LateBrandPlatform(tmpdir)
+            ranked = []
+
+            platform._poll_until_complete(
+                "可迪尔",
+                lambda rank, text: ranked.append((rank, text)),
+                get_text=lambda: "",
+                timeout=2,
+                min_wait=0,
+                keyword="TO直燃炉厂家推荐",
+            )
+
+            self.assertEqual(len(ranked), 1)
+            self.assertEqual(ranked[0][0], 99)
+            self.assertIn("可迪尔空气技术", ranked[0][1])
 
 
 if __name__ == "__main__":

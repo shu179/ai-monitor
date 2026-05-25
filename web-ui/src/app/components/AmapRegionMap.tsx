@@ -10,6 +10,7 @@ const CHINA_OVERVIEW_ZOOM = 3.05;
 const AMAP_MIN_ZOOM = 2.85;
 const AMAP_MIN_ZOOM_EPSILON = 0.03;
 const GEOCODE_CACHE_KEY = "dashboard.amap.regionGeocodeCache.v1";
+const AMAP_BRANDING_SELECTOR = ".amap-logo, .amap-copyright";
 
 type AmapRegionMapProps = {
   mapType: RegionMapType;
@@ -83,6 +84,14 @@ function writeGeocodeCache(cache: Record<string, { lng: number; lat: number }>) 
   } catch {
     // localStorage may be unavailable in restricted WebViews.
   }
+}
+
+function hideAmapBranding(root: ParentNode = document) {
+  root.querySelectorAll<HTMLElement>(AMAP_BRANDING_SELECTOR).forEach((element) => {
+    element.style.setProperty("display", "none", "important");
+    element.style.setProperty("opacity", "0", "important");
+    element.style.setProperty("pointer-events", "none", "important");
+  });
 }
 
 function buildFallbackNodes(mapType: RegionMapType, labels: string[]) {
@@ -168,6 +177,7 @@ export function AmapRegionMap({
         }
 
         setLoadState("ready");
+        window.requestAnimationFrame(() => hideAmapBranding());
       })
       .catch(() => {
         if (!cancelled) {
@@ -313,12 +323,31 @@ export function AmapRegionMap({
   }, [loadState]);
 
   useEffect(() => {
+    if (loadState !== "ready") {
+      return;
+    }
+
+    hideAmapBranding();
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const observer = new MutationObserver(() => hideAmapBranding());
+    observer.observe(container, { childList: true, subtree: true });
+    return () => {
+      observer.disconnect();
+    };
+  }, [loadState]);
+
+  useEffect(() => {
     return () => {
       markerRef.current.forEach((marker) => marker.setMap?.(null));
       markerRef.current = [];
       mapRef.current?.destroy?.();
       mapRef.current = null;
       viewInitializedRef.current = false;
+      hideAmapBranding();
     };
   }, []);
 

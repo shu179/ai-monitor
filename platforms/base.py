@@ -15,6 +15,7 @@ import html
 import subprocess
 import threading
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from abc import ABC
 from pathlib import Path
@@ -131,6 +132,14 @@ class BasePlatform(ABC):
     external_chrome_launch_target_url: bool = False
     skip_runtime_startup_goto: bool = False
     external_chrome_light_control: bool = True
+    generation_min_wait_seconds: float = 3.0
+    generation_completion_confirm_min_seconds: float = 0.8
+    generation_completion_confirm_max_seconds: float = 1.5
+    generation_completion_confirm_force_scroll: bool = True
+    generation_post_complete_scroll_reads: bool = True
+    generation_defer_initial_scroll_until_new_content: bool = False
+    generation_stable_first_wait_seconds: float | None = None
+    generation_stable_answer_interval_seconds: float | None = None
     force_reclaim_profile_processes_on_start: bool = False
     debug_poll_metrics: str = ""
 
@@ -161,7 +170,9 @@ class BasePlatform(ABC):
         self._answer_capture_session: AnswerCaptureSession | None = None
         self._answer_poll_iteration = 0
         self._answer_next_scroll_poll = 1
+        self._answer_next_scroll_at = 0.0  # 墙上时间兜底：iter 卡住时也强制按时滚动
         self._answer_scroll_reads_remaining = 0
+        self._answer_first_content_scroll_done = False
         self._answer_next_full_text_poll = 1
         self._answer_poll_metrics = {}
         self.last_answer_poll_metrics = {}
@@ -1110,8 +1121,19 @@ class BasePlatform(ABC):
     def _reset_answer_read_controls(self) -> None:
         self._answer_poll_iteration = 0
         self._answer_next_scroll_poll = 1
+        self._answer_next_scroll_at = 0.0
         self._answer_scroll_reads_remaining = 0
+        self._answer_first_content_scroll_done = False
         self._answer_next_full_text_poll = 1
+
+    @contextmanager
+    def _without_answer_read_scroll(self, *, restore_pending: bool = True):
+        previous = int(self._answer_scroll_reads_remaining or 0)
+        self._answer_scroll_reads_remaining = 0
+        try:
+            yield
+        finally:
+            self._answer_scroll_reads_remaining = previous if restore_pending else 0
 
     @staticmethod
     def _config_truthy(value) -> bool:
@@ -1309,18 +1331,39 @@ class BasePlatform(ABC):
             return
         self._answer_poll_iteration += 1
         current_poll = max(1, int(self._answer_poll_iteration or 1))
-        should_scroll = bool(
-            force_scroll
-            or current_poll == 1
-            or current_poll >= self._answer_next_scroll_poll
+        now = time.monotonic()
+        defer_initial_scroll = (
+            bool(getattr(self, "generation_defer_initial_scroll_until_new_content", False))
+            and not bool(getattr(self, "_answer_first_content_scroll_done", False))
         )
+        if defer_initial_scroll:
+            should_scroll = bool(force_scroll)
+        else:
+            should_scroll = bool(
+                force_scroll
+                or current_poll == 1
+                or current_poll >= self._answer_next_scroll_poll
+                or now >= self._answer_next_scroll_at
+            )
         self._answer_scroll_reads_remaining = 1 if should_scroll else 0
         self._record_answer_poll_schedule(should_scroll=should_scroll, force_scroll=force_scroll)
         if should_scroll:
             self._answer_next_scroll_poll = current_poll + random.randint(5, 8)
+            self._answer_next_scroll_at = now + random.uniform(5.0, 8.0)
 
     def _force_next_answer_read_scroll(self) -> None:
         self._answer_scroll_reads_remaining = max(1, int(self._answer_scroll_reads_remaining or 0))
+
+    def _perform_deferred_first_content_scroll(self) -> bool:
+        moved = self._wheel_answer_view()
+        self._answer_scroll_reads_remaining = 0
+        current_poll = max(1, int(self._answer_poll_iteration or 1))
+        now = time.monotonic()
+        self._answer_next_scroll_poll = current_poll + random.randint(5, 8)
+        self._answer_next_scroll_at = now + random.uniform(5.0, 8.0)
+        if moved:
+            self._increment_answer_poll_metric("answer_scrolls")
+        return moved
 
     def _consume_answer_read_scroll(self, *, force: bool = False) -> bool:
         if force or self._answer_capture_session is None:
@@ -3937,8 +3980,12 @@ class BasePlatform(ABC):
         captured_text = self._materialize_captured_answer(keyword=keyword, brand=brand)
         if callable(get_text):
             try:
-                self._force_next_answer_read_scroll()
-                dom_text = str(get_text() or "").strip()
+                if bool(getattr(self, "generation_post_complete_scroll_reads", True)):
+                    self._force_next_answer_read_scroll()
+                    dom_text = str(get_text() or "").strip()
+                else:
+                    with self._without_answer_read_scroll(restore_pending=False):
+                        dom_text = str(get_text() or "").strip()
             except Exception as exc:
                 self._reraise_stop_requested(exc)
                 dom_text = ""
@@ -3977,13 +4024,24 @@ class BasePlatform(ABC):
             except InterruptionDetected:
                 raise
 
-            self._schedule_answer_poll_read(force_scroll=(index == 0 or index % 3 == 0))
+            allow_scroll_reads = bool(getattr(self, "generation_post_complete_scroll_reads", True))
+            self._schedule_answer_poll_read(force_scroll=allow_scroll_reads and (index == 0 or index % 3 == 0))
 
-            wait_seconds = 0.5 if index == 0 else interval
+            configured_first_wait = getattr(self, "generation_stable_first_wait_seconds", None)
+            configured_interval = getattr(self, "generation_stable_answer_interval_seconds", None)
+            wait_seconds = (
+                (0.5 if configured_first_wait is None else float(configured_first_wait))
+                if index == 0
+                else (interval if configured_interval is None else float(configured_interval))
+            )
             self._cooperative_sleep(wait_seconds)
 
             try:
-                snapshot = self._capture_answer_snapshot()
+                if allow_scroll_reads:
+                    snapshot = self._capture_answer_snapshot()
+                else:
+                    with self._without_answer_read_scroll(restore_pending=False):
+                        snapshot = self._capture_answer_snapshot()
             except Exception as exc:
                 self._reraise_stop_requested(exc)
                 snapshot = {}
@@ -3996,7 +4054,11 @@ class BasePlatform(ABC):
                 answer_text = captured_text
             else:
                 try:
-                    answer_text = get_text() or ""
+                    if allow_scroll_reads:
+                        answer_text = get_text() or ""
+                    else:
+                        with self._without_answer_read_scroll(restore_pending=False):
+                            answer_text = get_text() or ""
                 except Exception as exc:
                     self._reraise_stop_requested(exc)
                     raise
@@ -4016,11 +4078,74 @@ class BasePlatform(ABC):
             print(f"[{self.name}] 回答可用性校验未通过: {reason}; 预览: {preview}")
         return best_text, False
 
+    def _capture_late_brand_mention_grace_text(
+        self,
+        get_text,
+        *,
+        answer_text: str,
+        keyword: str = "",
+        brand: str = "",
+        attempts: int = 2,
+        interval: float = 0.0,
+    ) -> str:
+        """
+        某些平台会先收起“停止生成”按钮，回答 DOM/HTML 再晚一个渲染节拍才完整。
+        如果正文已可用但暂未命中品牌，立即做一轮强制补抓，尽量不增加体感等待。
+        """
+        current_text = str(answer_text or "")
+        if not brand:
+            return current_text
+        mentioned, _, _ = self.detect_brand_mention(current_text, brand, keyword=keyword)
+        if mentioned:
+            return current_text
+
+        best_text = current_text
+        for index in range(max(0, int(attempts or 0))):
+            self._raise_if_stop_requested()
+            try:
+                self.check_for_interruption()
+            except InterruptionDetected:
+                raise
+
+            if interval > 0:
+                self._cooperative_sleep(interval)
+
+            try:
+                with self._without_answer_read_scroll(restore_pending=False):
+                    snapshot = self._capture_answer_snapshot()
+            except Exception as exc:
+                self._reraise_stop_requested(exc)
+                snapshot = {}
+            captured_text = self._merge_answer_snapshot(
+                snapshot,
+                keyword=keyword,
+                brand=brand,
+            )
+            if not captured_text:
+                try:
+                    with self._without_answer_read_scroll(restore_pending=False):
+                        captured_text = str(get_text() or "")
+                except Exception as exc:
+                    self._reraise_stop_requested(exc)
+                    raise
+            best_text = self._choose_better_answer_text(
+                best_text,
+                captured_text,
+                baseline_text=self._active_baseline_answer_text,
+                keyword=keyword,
+                brand=brand,
+            )
+            mentioned, _, _ = self.detect_brand_mention(best_text, brand, keyword=keyword)
+            if mentioned:
+                print(f"[{self.name}] 补抓窗口命中品牌名，已采用更完整回答")
+                return best_text
+        return best_text
+
     def is_generation_complete(self, page_text: str, start_time: float) -> bool:
         """DOM-based completion check. ``start_time`` is a monotonic timestamp."""
         return False
 
-    def _poll_until_complete(self, brand: str, on_rank, get_text=None, timeout: int = 180, min_wait: int = 5, keyword: str = "") -> None:
+    def _poll_until_complete(self, brand: str, on_rank, get_text=None, timeout: int = 180, min_wait: float = 3.0, keyword: str = "") -> None:
         """Centralized polling loop. Waits for generation to complete, then calls on_rank once."""
         if get_text is None:
             def get_text():
@@ -4035,12 +4160,16 @@ class BasePlatform(ABC):
         last_wait_log_bucket = -1
         baseline_text = str(getattr(self, "_active_baseline_answer_text", "") or "")
 
-        def read_answer_text_for_poll(*, force_scroll: bool = False) -> str:
+        def read_answer_text_for_poll(*, force_scroll: bool = False, allow_scroll: bool = True) -> str:
             if force_scroll:
                 self._schedule_answer_poll_read(force_scroll=True)
             snapshot = {}
             try:
-                snapshot = self._capture_answer_snapshot()
+                if allow_scroll:
+                    snapshot = self._capture_answer_snapshot()
+                else:
+                    with self._without_answer_read_scroll(restore_pending=False):
+                        snapshot = self._capture_answer_snapshot()
             except Exception as exc:
                 self._reraise_stop_requested(exc)
             captured_text = self._merge_answer_snapshot(
@@ -4057,7 +4186,10 @@ class BasePlatform(ABC):
                     brand=brand,
                 )
             try:
-                return get_text() or ""
+                if allow_scroll:
+                    return get_text() or ""
+                with self._without_answer_read_scroll(restore_pending=False):
+                    return get_text() or ""
             except Exception as exc:
                 self._reraise_stop_requested(exc)
                 raise
@@ -4103,6 +4235,13 @@ class BasePlatform(ABC):
                 keyword=keyword,
                 brand=brand,
             )
+            if (
+                has_new_content
+                and bool(getattr(self, "generation_defer_initial_scroll_until_new_content", False))
+                and not bool(getattr(self, "_answer_first_content_scroll_done", False))
+            ):
+                self._answer_first_content_scroll_done = True
+                self._perform_deferred_first_content_scroll()
             wait_bucket = int(elapsed // 20)
             if elapsed >= min_wait and wait_bucket > last_wait_log_bucket:
                 last_wait_log_bucket = wait_bucket
@@ -4130,11 +4269,25 @@ class BasePlatform(ABC):
                     dom_fail_count = 0
                     dom_pending_count = 0
                     # 再等待随机时间二次确认，避免流式输出刚开始时误判
-                    confirm_wait = random.uniform(0.8, 1.5)
+                    confirm_min = max(
+                        0.0,
+                        float(getattr(self, "generation_completion_confirm_min_seconds", 0.8) or 0.8),
+                    )
+                    confirm_max = max(
+                        confirm_min,
+                        float(getattr(self, "generation_completion_confirm_max_seconds", 1.5) or 1.5),
+                    )
+                    confirm_wait = random.uniform(confirm_min, confirm_max)
                     self._cooperative_sleep(confirm_wait)
                     try:
                         self._record_full_text_read_decision(did_read=True)
-                        page_text = read_answer_text_for_poll(force_scroll=True)
+                        force_confirm_scroll = bool(
+                            getattr(self, "generation_completion_confirm_force_scroll", True)
+                        )
+                        page_text = read_answer_text_for_poll(
+                            force_scroll=force_confirm_scroll,
+                            allow_scroll=force_confirm_scroll,
+                        )
                         self._mark_answer_text_read_cadence(elapsed=elapsed, min_wait=min_wait)
                         fresh_text_read = True
                     except Exception as exc:
@@ -4235,6 +4388,12 @@ class BasePlatform(ABC):
                     keyword=keyword,
                     brand=brand,
                 )
+                final_text = self._capture_late_brand_mention_grace_text(
+                    get_text,
+                    answer_text=final_text,
+                    keyword=keyword,
+                    brand=brand,
+                )
                 usable = self.has_usable_answer_text(final_text, keyword=keyword, brand=brand)
                 self.last_answer_text = final_text or ""
                 if not usable:
@@ -4273,6 +4432,12 @@ class BasePlatform(ABC):
                     final_text,
                     capture_final_text,
                     baseline_text=baseline_text,
+                    keyword=keyword,
+                    brand=brand,
+                )
+                final_text = self._capture_late_brand_mention_grace_text(
+                    get_text,
+                    answer_text=final_text,
                     keyword=keyword,
                     brand=brand,
                 )
@@ -5344,7 +5509,13 @@ class BasePlatform(ABC):
                         # rank==99 表示找到品牌词但无序号，视为排名=1（有提及）
                         found_rank[0] = rank if (rank is not None and rank != 99) else 1
 
-                self._poll_until_complete(brand, on_rank, get_text=self._get_answer_text, keyword=keyword)
+                self._poll_until_complete(
+                    brand,
+                    on_rank,
+                    get_text=self._get_answer_text,
+                    keyword=keyword,
+                    min_wait=float(getattr(self, "generation_min_wait_seconds", 3.0) or 3.0),
+                )
 
                 if self.last_error:
                     print(

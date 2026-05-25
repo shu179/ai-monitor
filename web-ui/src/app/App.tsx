@@ -22,6 +22,7 @@ import {
   cloudStatusIdentityKey,
   fetchBootstrap,
   fetchCloudStatus,
+  fetchRecognitionStatus,
   invalidateAccountScopedCaches,
   invalidateBootstrapCache,
   loginCloud,
@@ -195,6 +196,8 @@ export default function App() {
   const [isLoginModalOpen, setIsLoginModalOpen] = useState(false);
   const [loginModalPosition, setLoginModalPosition] = useState({ x: 0, y: 0 });
   const [authTransitionStartedAt, setAuthTransitionStartedAt] = useState(0);
+  const [recognitionRuntimeRunning, setRecognitionRuntimeRunning] = useState(false);
+  const [detectionControlSwitching, setDetectionControlSwitching] = useState(false);
   const currentCloudIdentityKey = cloudStatusIdentityKey(cloudStatus);
   const currentDetectionMode = (() => {
     const configMode = String(bootstrap.config?.detection_mode || "").trim();
@@ -207,8 +210,20 @@ export default function App() {
     if (activeCard.title === "识别模式") return "recognition";
     return "recognition";
   })();
+  const monitoringEnabled = Boolean(bootstrap.monitoring?.enabled);
+  const detectionControlState: "off" | "recognition" | "browser" = recognitionRuntimeRunning
+    ? "recognition"
+    : monitoringEnabled
+      ? "browser"
+      : "off";
   const residentOcrWindowEnabled = Boolean(bootstrap.config?.recognition?.floating_window_resident_enabled);
   const showResidentOcrWindow = residentOcrWindowEnabled && !recognitionTestWindow.open;
+  const showRecognitionRunOcrWindow =
+    !residentOcrWindowEnabled
+    && !recognitionTestWindow.open
+    && detectionControlState === "recognition";
+  const cloudUserRole = String(cloudStatus?.user.role || "").trim();
+  const isViewerAccount = cloudUserRole === "viewer";
 
   const beginAccountDataTransition = useCallback(() => {
     bootstrapRequestSeqRef.current += 1;
@@ -500,54 +515,6 @@ export default function App() {
     }, 3000);
   };
 
-  const handleDetectionModeToggle = async (mode: "browser" | "recognition") => {
-    setBootstrap((prev) => ({
-      ...prev,
-      dashboard: {
-        ...prev.dashboard,
-        taskCards: (prev.dashboard.taskCards || []).map((card) => {
-          const key = String(card.key || "").trim().toLowerCase();
-          const isBrowserCard = key === "capture" || key === "browser" || card.title === "抓取模式";
-          const isRecognitionCard = key === "ocr" || key === "recognition" || card.title === "识别模式";
-          return {
-            ...card,
-            active: mode === "browser" ? isBrowserCard : isRecognitionCard,
-          };
-        }),
-      },
-      config: {
-        ...(prev.config || {}),
-        detection_mode: mode,
-      },
-    }));
-
-    invalidateBootstrapCache();
-    const result = await saveSettings({ detection_mode: mode });
-    if (mode === "recognition") {
-      await recognitionAction("start");
-    } else {
-      await recognitionAction("stop");
-    }
-    const nextMessage = result.message || (mode === "browser" ? "已切换为抓取模式" : "已切换为识别模式");
-    if (runMessageTimerRef.current !== null) {
-      window.clearTimeout(runMessageTimerRef.current);
-    }
-    setRunMessage(nextMessage);
-    await refreshBootstrap({ force: true });
-    runMessageTimerRef.current = window.setTimeout(() => {
-      setRunMessage("");
-      runMessageTimerRef.current = null;
-    }, 3000);
-  };
-
-  const handleTodosChange = useCallback((todos: BootstrapPayload["todos"]) => {
-    setBootstrap((prev) => ({ ...prev, todos }));
-  }, []);
-
-  const handleArticlesChange = useCallback((articles: BootstrapPayload["articles"]) => {
-    setBootstrap((prev) => ({ ...prev, articles }));
-  }, []);
-
   const showRunMessage = useCallback((message: string, durationMs = 3000) => {
     if (runMessageTimerRef.current !== null) {
       window.clearTimeout(runMessageTimerRef.current);
@@ -557,6 +524,138 @@ export default function App() {
       setRunMessage("");
       runMessageTimerRef.current = null;
     }, durationMs);
+  }, []);
+
+  const refreshRecognitionRuntime = useCallback(async () => {
+    const res = await fetchRecognitionStatus({ compact: true, passive: true });
+    const status = (res.ok ? res.status : undefined) as { running?: unknown } | undefined;
+    const running = Boolean(status && status.running);
+    setRecognitionRuntimeRunning(running);
+    return running;
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthenticated) {
+      setRecognitionRuntimeRunning(false);
+      return;
+    }
+    void refreshRecognitionRuntime();
+    const timer = window.setInterval(() => {
+      void refreshRecognitionRuntime();
+    }, 5000);
+    const handleFocus = () => {
+      void refreshRecognitionRuntime();
+    };
+    window.addEventListener("focus", handleFocus);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [isAuthenticated, refreshRecognitionRuntime]);
+
+  const switchDetectionControlState = useCallback(
+    async (target: "off" | "recognition" | "browser") => {
+      if (detectionControlSwitching || isViewerAccount) {
+        return;
+      }
+      const currentState: "off" | "recognition" | "browser" = recognitionRuntimeRunning
+        ? "recognition"
+        : monitoringEnabled
+          ? "browser"
+          : "off";
+      if (target === currentState) {
+        return;
+      }
+
+      setDetectionControlSwitching(true);
+      const syncRuntime = async () => {
+        await Promise.all([
+          refreshBootstrap({ force: true }),
+          refreshRecognitionRuntime(),
+        ]);
+      };
+
+      try {
+        // Phase 1 — tear down anything that must not be running in the target state.
+        if (target !== "browser" && monitoringEnabled) {
+          const stopMonitoring = await setMonitoringEnabled(false);
+          if (!stopMonitoring.ok) {
+            showRunMessage(stopMonitoring.message || "关闭定时任务失败");
+            await syncRuntime();
+            return;
+          }
+        }
+        if (target !== "recognition" && recognitionRuntimeRunning) {
+          const stopRecognition = await recognitionAction("stop");
+          if (!stopRecognition.ok) {
+            showRunMessage(stopRecognition.message || "关闭识别模式失败");
+            await syncRuntime();
+            return;
+          }
+        }
+
+        // Phase 2 — persist detection_mode so the backend's _sync_recognition_mode
+        // sees the intended mode (off keeps a neutral "browser" value).
+        const persistedMode: "browser" | "recognition" = target === "recognition" ? "recognition" : "browser";
+        invalidateBootstrapCache();
+        const saveResult = await saveSettings({ detection_mode: persistedMode });
+        if (!saveResult?.ok) {
+          showRunMessage(saveResult?.message || "切换检测模式失败");
+          await syncRuntime();
+          return;
+        }
+
+        // Phase 3 — start the work the target state requires.
+        if (target === "browser") {
+          const startMonitoring = await setMonitoringEnabled(true);
+          if (!startMonitoring.ok) {
+            showRunMessage(startMonitoring.message || "开启抓取模式失败");
+            await syncRuntime();
+            return;
+          }
+        } else if (target === "recognition") {
+          const startRecognition = await recognitionAction("start");
+          if (!startRecognition.ok) {
+            showRunMessage(startRecognition.message || "开启识别模式失败");
+            await syncRuntime();
+            return;
+          }
+        }
+
+        // Phase 4 — re-read authoritative runtime so the UI reflects backend reality.
+        await syncRuntime();
+        showRunMessage(
+          target === "off"
+            ? "检测模式已关闭"
+            : target === "browser"
+              ? "抓取模式已启动"
+              : "识别模式已启动",
+        );
+      } finally {
+        setDetectionControlSwitching(false);
+      }
+    },
+    [
+      detectionControlSwitching,
+      isViewerAccount,
+      monitoringEnabled,
+      recognitionRuntimeRunning,
+      refreshBootstrap,
+      refreshRecognitionRuntime,
+      showRunMessage,
+    ],
+  );
+
+  const handleRecognitionRunWindowClose = useCallback(() => {
+    void refreshRecognitionRuntime();
+  }, [refreshRecognitionRuntime]);
+
+  const handleTodosChange = useCallback((todos: BootstrapPayload["todos"]) => {
+    setBootstrap((prev) => ({ ...prev, todos }));
+  }, []);
+
+  const handleArticlesChange = useCallback((articles: BootstrapPayload["articles"]) => {
+    setBootstrap((prev) => ({ ...prev, articles }));
   }, []);
 
   const showSaveSuccessToast = useCallback((message = "保存成功") => {
@@ -978,12 +1077,13 @@ export default function App() {
           )}
         </Suspense>
         <RightSidebar
-          detectionMode={currentDetectionMode}
-          cloudRole={cloudStatus?.user.role || ""}
+          detectionControlState={detectionControlState}
+          detectionControlSwitching={detectionControlSwitching}
+          cloudRole={cloudUserRole}
           todos={bootstrap.todos}
           articles={bootstrap.articles}
           todoCacheIdentity={currentCloudIdentityKey}
-          onDetectionModeToggle={handleDetectionModeToggle}
+          onSwitchDetectionControlState={switchDetectionControlState}
           onTodosChange={handleTodosChange}
           onArticlesChange={handleArticlesChange}
         />
@@ -1003,6 +1103,11 @@ export default function App() {
             onClose={() => undefined}
             resident
           />
+        </Suspense>
+      )}
+      {showRecognitionRunOcrWindow && (
+        <Suspense fallback={null}>
+          <OcrFloatingWindow onClose={handleRecognitionRunWindowClose} />
         </Suspense>
       )}
       {isLoginModalOpen && !isAuthenticated && (

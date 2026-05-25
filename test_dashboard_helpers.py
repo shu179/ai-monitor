@@ -141,6 +141,128 @@ class DashboardHelperTests(unittest.TestCase):
         self.assertEqual(item["sendableSuccessCount"], 1)
         self.assertTrue(item["canForceSendSuccess"])
 
+    def test_dashboard_failed_tasks_marks_no_screenshot_as_material_issue(self) -> None:
+        task = {"task_id": "task-2", "name": "任务二", "brand": "品牌B"}
+        status = {
+            "status": "query_failed",
+            "brand_status": "gap",
+            "formal_started": True,
+            "formal_running": False,
+            "has_gap": False,
+            "updated_at": "2026-01-05 11:00:00",
+            "message": "暂无可发送截图，未发送企业微信",
+            "extra": {
+                "gap_details": [],
+                "last_send_error": "",
+            },
+            "official_extra": {
+                "task_failure_kind": "no_screenshot",
+            },
+            "keyword_states": {},
+        }
+
+        failed = _build_dashboard_failed_tasks(
+            [task],
+            day_status_loader=lambda _task, _target_date=None: status,
+            scheduler_state_loader=lambda _unit_id: {
+                "last_auto_run_date": "2026-01-05",
+                "last_round_status": "failed",
+                "last_auto_fail_at": "2026-01-05 11:00:00",
+                "last_failure_kind": "no_screenshot",
+            },
+            today_text="2026-01-05",
+        )
+
+        self.assertEqual(len(failed), 1)
+        item = failed[0]
+        self.assertEqual(item["issueType"], "material")
+        self.assertEqual(item["failureKind"], "no_screenshot")
+        self.assertFalse(item["canForceSendSuccess"])
+
+    def test_dashboard_failed_tasks_skips_disabled_tasks(self) -> None:
+        """Once a user disables a task, today's failures should drop off the dashboard."""
+        task = {
+            "task_id": "task-1",
+            "name": "任务一",
+            "brand": "品牌A",
+            "enabled": False,
+        }
+        status = {
+            "status": "query_failed",
+            "brand_status": "gap",
+            "formal_started": True,
+            "formal_running": False,
+            "has_gap": True,
+            "updated_at": "2026-01-05 10:00:00",
+            "message": "",
+            "extra": {
+                "gap_details": [
+                    {
+                        "keyword": "关键词1",
+                        "platform": "doubao",
+                        "reason": "run_failed",
+                        "updated_at": "2026-01-05 09:59:00",
+                    }
+                ],
+            },
+            "keyword_states": {},
+        }
+
+        failed = _build_dashboard_failed_tasks(
+            [task],
+            day_status_loader=lambda _task, _target_date=None: status,
+            scheduler_state_loader=lambda unit_id: {
+                "last_auto_run_date": "2026-01-05",
+                "last_round_status": "failed",
+                "last_auto_fail_at": "2026-01-05 10:01:00",
+                "last_failure_kind": "query",
+            },
+            today_text="2026-01-05",
+        )
+
+        self.assertEqual(failed, [])
+
+    def test_dashboard_failed_tasks_skips_delete_pending_tasks(self) -> None:
+        task = {
+            "task_id": "task-1",
+            "name": "任务一",
+            "brand": "品牌A",
+            "delete_pending": True,
+        }
+        status = {
+            "status": "query_failed",
+            "brand_status": "gap",
+            "formal_started": True,
+            "formal_running": False,
+            "has_gap": True,
+            "updated_at": "2026-01-05 10:00:00",
+            "extra": {
+                "gap_details": [
+                    {
+                        "keyword": "关键词1",
+                        "platform": "doubao",
+                        "reason": "run_failed",
+                        "updated_at": "2026-01-05 09:59:00",
+                    }
+                ],
+            },
+            "keyword_states": {},
+        }
+
+        failed = _build_dashboard_failed_tasks(
+            [task],
+            day_status_loader=lambda _task, _target_date=None: status,
+            scheduler_state_loader=lambda _unit_id: {
+                "last_auto_run_date": "2026-01-05",
+                "last_round_status": "failed",
+                "last_auto_fail_at": "2026-01-05 10:01:00",
+                "last_failure_kind": "query",
+            },
+            today_text="2026-01-05",
+        )
+
+        self.assertEqual(failed, [])
+
     def test_task_failure_summary_returns_empty_shape_when_no_failure(self) -> None:
         task = {"task_id": "task-1", "name": "任务一", "brand": "品牌A"}
         summary = _build_task_failure_summary(
@@ -263,6 +385,50 @@ class DashboardHelperTests(unittest.TestCase):
         self.assertEqual(payload["detectedPlatforms"], ["doubao"])
         self.assertEqual(payload["screenshotPaths"], [str(screenshot_path)])
         self.assertEqual(payload["actualScreenshotCount"], 1)
+
+    def test_collect_today_successful_task_payload_ignores_stale_history_without_screenshot_for_fixed_tasks(self) -> None:
+        task = {
+            "task_id": "task-1",
+            "name": "任务一",
+            "brand": "品牌A",
+            "fixed_screenshot_enabled": True,
+        }
+        status = {
+            "status": "send_failed",
+            "brand_status": "send_failed",
+            "extra": {
+                "completed_keywords": ["关键词1"],
+                "detected_platforms": ["doubao"],
+                "actual_screenshot_count": 0,
+            },
+            "keyword_states": {},
+        }
+        original_loader = dashboard_trends.get_records_many
+        try:
+            from unittest.mock import patch
+
+            with patch(
+                "backend_lib.dashboard_tasks.load_today_success_only_query_results",
+                return_value={
+                    ("关键词1", "doubao", "品牌A"): {
+                        "keyword": "关键词1",
+                        "platform": "doubao",
+                        "brand": "品牌A",
+                        "rank": 1,
+                        "screenshot": "/tmp/missing.png",
+                    }
+                },
+            ):
+                payload = _collect_today_successful_task_payload(
+                    task,
+                    day_status_loader=lambda _task, _target_date=None: status,
+                )
+        finally:
+            dashboard_trends.get_records_many = original_loader
+
+        self.assertEqual(payload["completedKeywords"], [])
+        self.assertEqual(payload["detectedPlatforms"], [])
+        self.assertEqual(payload["screenshotPaths"], [])
 
     def test_compute_fixed_screenshot_target_respects_flag_count_and_platform_floor(self) -> None:
         self.assertEqual(

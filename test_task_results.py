@@ -67,6 +67,13 @@ class TaskResultsTests(unittest.TestCase):
         self.assertEqual(finalized["task_status"], "failed")
         self.assertEqual(finalized["task_failure_kind"], "notification")
 
+        finalized_no_screenshot = finalize_execution_report(
+            {"round_status": "success", "failure_kind": ""},
+            {"attempted": False, "success": False, "error_message": "暂无可发送截图，未发送企业微信"},
+        )
+        self.assertEqual(finalized_no_screenshot["task_status"], "failed")
+        self.assertEqual(finalized_no_screenshot["task_failure_kind"], "no_screenshot")
+
     def test_query_key_normalizes_platform_and_screenshot_requires_existing_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             screenshot = Path(tmpdir) / "hit.jpg"

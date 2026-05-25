@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUpRight } from "lucide-react";
+import { ArrowUpRight, ExternalLink, X } from "lucide-react";
 import { ChartArea } from "./Charts";
 import { FailedTasksModal } from "./FailedTasksModal";
 import { AmapRegionMap } from "./AmapRegionMap";
-import type { DashboardSnapshot, MonthOverviewDay, MonthOverviewSnapshot, TrendSnapshot } from "../lib/backend";
-import { fetchDashboardTrend } from "../lib/backend";
+import type { AihotDailyFeedSnapshot, DashboardSnapshot, MonthOverviewDay, MonthOverviewSnapshot, TrendSnapshot } from "../lib/backend";
+import { fetchAihotDailyFeed, fetchDashboardTrend } from "../lib/backend";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Tooltip as RechartsTooltip,
   PieChart, Pie, Cell
@@ -15,6 +15,7 @@ const DASHBOARD_TEAL = "#1E7F95";
 const DASHBOARD_CYAN = "#2FB8E6";
 const DASHBOARD_CYAN_LIGHT = "#74D2EE";
 const DASHBOARD_CYAN_SOFT = "#CBEFF9";
+const AIHOT_DAILY_FEED_URL = "https://aihot.virxact.com/feed/daily.xml";
 const MEDIA_STAT_WEEKDAY_LABELS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 const FALLBACK_MEDIA_STATS = [
   { name: '1月', auth: 400, self: 240 },
@@ -123,60 +124,72 @@ export function CenterContent({
   const failedTaskCount = dashboard?.failedTaskCount ?? failedTasks.length;
   const [showFailedTasksModal, setShowFailedTasksModal] = useState(false);
 
+  const todayFormatted = useMemo(() => {
+    const now = new Date();
+    return `${now.getMonth() + 1}月${now.getDate()}日`;
+  }, []);
+
   return (
     <div className="flex-1 min-w-0 min-h-0 overflow-x-hidden overflow-y-auto bg-transparent px-6 py-4 xl:px-8 xl:py-5 flex flex-col custom-scrollbar">
       {/* 1. Header */}
-      <div className="flex flex-col gap-1 border-b border-gray-200/70 pb-4 mb-4 pt-3 shrink-0">
-        <h1 className="app-display-heading text-[28px] font-semibold text-[#0f1835] tracking-[-0.035em]">
-          {greeting}，{userName}
-        </h1>
-        <p className="app-subtle-copy text-[13px] mt-0.5 max-w-[720px] leading-6 font-medium">
-          {headline}
-        </p>
-        {runMessage && (
-          <div className="mt-1.5 flex items-center gap-2">
-            <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: DASHBOARD_CYAN }} />
-            <p className="text-[12px] leading-5 font-medium text-slate-500">
-              {runMessage}
-            </p>
-          </div>
-        )}
+      <div className="grid gap-5 border-b border-gray-200/70 pb-3 mb-3 pt-1 shrink-0 xl:grid-cols-[minmax(0,1fr)_300px] xl:items-start">
+        <div className="flex min-w-0 flex-col gap-1.5">
+          <h1 className="app-display-heading text-[28px] font-semibold text-[#0f1835] tracking-[-0.035em]">
+            {greeting}，{userName}
+          </h1>
+          <p className="app-subtle-copy text-[13px] mt-0.5 max-w-[720px] leading-6 font-medium">
+            {headline}
+          </p>
+          {runMessage && (
+            <div className="mt-1.5 flex items-center gap-2">
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: DASHBOARD_CYAN }} />
+              <p className="text-[12px] leading-5 font-medium text-slate-500">
+                {runMessage}
+              </p>
+            </div>
+          )}
+        </div>
+        <AihotDailyFeedSection compact />
       </div>
 
-      <div className="flex flex-col gap-3 min-h-max">
+      <div className="flex flex-col min-h-max">
         {/* Row 1: Today's Tasks + Month Overview */}
-        <div className="flex flex-col gap-6 shrink-0 xl:flex-row xl:items-start xl:justify-between xl:gap-8">
+        <div className="flex flex-col gap-6 pb-5 shrink-0 xl:flex-row xl:items-start xl:justify-between xl:gap-8">
           {/* Today's Tasks — 与月度总览同款 [header] [metrics + 视觉锚点] 结构 */}
-          <div className="flex w-full max-w-[292px] flex-col xl:w-[292px]">
-            <div className="mb-3 flex items-baseline justify-between gap-3">
-              <h3 className="text-[11px] font-bold uppercase tracking-widest text-gray-400">今日检测任务</h3>
-              <span className="text-[10px] font-medium tabular-nums text-gray-400">今日</span>
+          <div className="flex w-full max-w-[310px] flex-col xl:w-[310px]">
+            <div className="mb-4 flex items-baseline justify-between gap-3">
+              <h3 className="text-[11px] font-bold uppercase tracking-wider text-gray-400">今日检测任务</h3>
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-gray-50 border border-gray-100/80">
+                <span className="text-[10px] font-bold tabular-nums text-gray-400 uppercase tracking-tight">{todayFormatted}</span>
+              </div>
             </div>
 
-            <div className="grid min-h-[110px] grid-cols-[minmax(0,1fr)_auto] items-end gap-5">
-              <div className="grid grid-cols-2 gap-x-4 gap-y-8">
-                <div className="flex min-w-0 flex-col gap-2">
-                  <span className="truncate text-[12px] font-medium leading-none text-gray-400">今日任务</span>
-                  <div className="flex items-baseline gap-0.5">
-                    <span className="text-[18px] font-semibold leading-none tabular-nums text-gray-900">{todayTaskCount}</span>
-                    <span className="shrink-0 text-[10px] font-medium leading-none text-gray-400">项</span>
+            <div className="grid min-h-[120px] grid-cols-[minmax(0,1fr)_auto] items-center gap-6">
+              <div className="grid grid-cols-2 gap-x-4 gap-y-7">
+                <div className="flex min-w-0 flex-col gap-1">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-gray-400/80 whitespace-nowrap">今日任务</span>
+                  <div className="flex items-baseline gap-1">
+                    <span className="text-[19px] font-bold leading-none tabular-nums text-gray-900 tracking-tight">{todayTaskCount}</span>
+                    <span className="shrink-0 text-[10px] font-bold text-gray-400">项</span>
                   </div>
                 </div>
-                <div className="flex min-w-0 flex-col gap-2">
-                  <span className="truncate text-[12px] font-medium leading-none text-gray-400">已完成</span>
-                  <span className="text-[18px] font-semibold leading-none tabular-nums text-gray-900">{completedCount}</span>
+                <div className="flex min-w-0 flex-col gap-1">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-gray-400/80 whitespace-nowrap">已完成</span>
+                  <span className="text-[19px] font-bold leading-none tabular-nums text-gray-900 tracking-tight">{completedCount}</span>
                 </div>
-                <div className="flex min-w-0 flex-col gap-2">
-                  <span className="truncate text-[12px] font-medium leading-none text-gray-400">进行中</span>
-                  <span className="text-[18px] font-semibold leading-none tabular-nums text-gray-900">{runningCount}</span>
+                <div className="flex min-w-0 flex-col gap-1">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-gray-400/80 whitespace-nowrap">进行中</span>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[19px] font-bold leading-none tabular-nums text-gray-900 tracking-tight">{runningCount}</span>
+                  </div>
                 </div>
                 <button
                   type="button"
                   onClick={() => setShowFailedTasksModal(true)}
-                  className="group flex min-w-0 flex-col gap-2 text-left transition-opacity hover:opacity-70"
+                  className="group flex min-w-0 flex-col gap-1 text-left transition-all hover:opacity-75 active:scale-95"
                 >
-                  <span className="truncate text-[12px] font-medium leading-none text-gray-400">任务状态</span>
-                  <span className={`truncate text-[18px] font-semibold leading-none ${failedTaskCount > 0 ? "text-red-600" : "text-gray-900"}`}>
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-gray-400/80 whitespace-nowrap">任务状态</span>
+                  <span className={`text-[17px] font-bold leading-none whitespace-nowrap tracking-tight ${failedTaskCount > 0 ? "text-red-600" : "text-gray-900"}`}>
                     {failedTaskCount > 0 ? "失败明细" : "运行正常"}
                   </span>
                 </button>
@@ -191,12 +204,12 @@ export function CenterContent({
         </div>
 
         {/* Row 2: Trend & Pie Chart */}
-        <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 border-t border-gray-200/70 pt-4 shrink-0 items-start">
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 border-t border-gray-200/70 pt-5 pb-1 shrink-0 items-start">
           {/* AI Trend */}
           <AITrendSection initialTrend={dashboard?.trend} />
 
           {/* Industry Pie */}
-          <div className="xl:col-span-4 flex flex-col">
+          <div className="xl:col-span-6 flex flex-col">
             <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase mb-3">品牌行业来源</h3>
             <div className="w-full relative">
               <IndustryPieChart data={sourceBreakdown} />
@@ -205,7 +218,7 @@ export function CenterContent({
         </div>
 
         {/* Row 3: Bar & Map */}
-        <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 border-t border-gray-200/70 pt-3 shrink-0 items-start">
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 border-t border-gray-200/70 pt-7 shrink-0 items-start">
           {/* Media Bar */}
           <div className="xl:col-span-6 flex flex-col">
             <MediaBarChart data={mediaStats} />
@@ -217,7 +230,7 @@ export function CenterContent({
           </div>
         </div>
       </div>
-      
+
       <FailedTasksModal
         isOpen={showFailedTasksModal}
         onClose={() => setShowFailedTasksModal(false)}
@@ -231,7 +244,7 @@ export function CenterContent({
 // Subcomponents
 
 function CompletionRing({ completed, total }: { completed: number; total: number }) {
-  const size = 90;
+  const size = 108;
   const strokeWidth = 5;
   const radius = (size - strokeWidth) / 2;
   const circumference = radius * 2 * Math.PI;
@@ -241,16 +254,18 @@ function CompletionRing({ completed, total }: { completed: number; total: number
   const dashoffset = circumference - (percent / 100) * circumference;
 
   return (
-    <div className="relative shrink-0" style={{ width: size, height: size }}>
+    <div className="relative shrink-0 flex items-center justify-center select-none" style={{ width: size, height: size }}>
       <svg width={size} height={size} className="-rotate-90">
+        {/* Track circle */}
         <circle
           cx={size / 2}
           cy={size / 2}
           r={radius}
-          stroke="#f3f6fa"
+          stroke="#f1f5f9"
           strokeWidth={strokeWidth}
           fill="none"
         />
+        {/* Progress circle */}
         {safeTotal > 0 && (
           <circle
             cx={size / 2}
@@ -262,20 +277,25 @@ function CompletionRing({ completed, total }: { completed: number; total: number
             strokeDasharray={circumference}
             strokeDashoffset={dashoffset}
             strokeLinecap="round"
-            style={{ transition: "stroke-dashoffset 600ms ease" }}
+            className="transition-all duration-1000 cubic-bezier(0.4, 0, 0.2, 1)"
           />
         )}
       </svg>
-      <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
-        <span className="flex items-baseline gap-0.5 leading-none">
-          <span className="text-[21px] font-semibold tabular-nums text-gray-900">{percent}</span>
-          <span className="text-[10px] font-medium text-gray-500">%</span>
-        </span>
-        <span className="mt-1 flex items-baseline gap-0.5 text-[9px] font-medium leading-none text-gray-400 tabular-nums">
-          <span>{safeCompleted}</span>
-          <span>/</span>
-          <span>{safeTotal}</span>
-        </span>
+
+      <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+        <div className="flex items-baseline gap-0.5 leading-none">
+          <span className="text-[24px] font-bold text-gray-900 tracking-tight">{percent}</span>
+          <span className="text-[12px] font-bold text-gray-400/80">%</span>
+        </div>
+        <div className="mt-1.5 flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-50 border border-gray-100/50">
+          <span className="text-[10px] font-bold leading-none text-gray-500 tabular-nums">
+            {safeCompleted}
+          </span>
+          <span className="text-[9px] font-medium text-gray-300">/</span>
+          <span className="text-[10px] font-bold leading-none text-gray-400 tabular-nums">
+            {safeTotal}
+          </span>
+        </div>
       </div>
     </div>
   );
@@ -294,20 +314,22 @@ function MonthOverviewPanel({ overview }: { overview?: MonthOverviewSnapshot }) 
   ];
 
   return (
-    <section className="w-full max-w-[396px] xl:ml-auto xl:w-[396px]">
-      <div className="mb-3 flex items-baseline justify-between">
-        <h3 className="text-[11px] font-bold uppercase tracking-widest text-gray-400">月度总览</h3>
-        <span className="text-[10px] font-medium tabular-nums text-gray-400">{overview?.monthLabel || "本月"}</span>
+    <section className="w-full max-w-[420px] xl:ml-auto xl:w-[420px]">
+      <div className="mb-4 flex items-baseline justify-between">
+        <h3 className="text-[11px] font-bold uppercase tracking-wider text-gray-400">月度总览</h3>
+        <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-gray-50 border border-gray-100/80">
+          <span className="text-[10px] font-bold tabular-nums text-gray-400 uppercase tracking-tight">{overview?.monthLabel || "Monthly"}</span>
+        </div>
       </div>
 
-      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-5">
-        <div className="grid grid-cols-3 gap-x-4 gap-y-2.5">
+      <div className="grid min-h-[120px] grid-cols-[minmax(0,1fr)_auto] items-center gap-6">
+        <div className="grid grid-cols-3 gap-x-4 gap-y-7">
           {metricItems.map((item) => (
-            <div key={item.label} className="flex min-w-0 flex-col gap-1.5">
-              <span className="truncate text-[10px] font-medium leading-none text-gray-400">{item.label}</span>
-              <div className="flex min-w-0 items-baseline gap-0.5">
-                <span className="truncate text-[15px] font-semibold leading-none tabular-nums text-gray-900">{item.value}</span>
-                {item.hint && <span className="shrink-0 text-[9px] font-medium leading-none text-gray-400">{item.hint}</span>}
+            <div key={item.label} className="flex min-w-0 flex-col gap-1">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-gray-400/80 whitespace-nowrap">{item.label}</span>
+              <div className="flex min-w-0 items-baseline gap-1">
+                <span className="text-[19px] font-bold leading-none tabular-nums text-gray-900 tracking-tight">{item.value}</span>
+                {item.hint && <span className="shrink-0 text-[10px] font-bold text-gray-400">{item.hint}</span>}
               </div>
             </div>
           ))}
@@ -328,56 +350,95 @@ function MiniMonthHeatmap({
 }) {
   const activeDays = days.length ? days : [];
   const firstWeekday = activeDays[0]?.weekday ?? 0;
+
+  // Determine current view month ("YYYY-MM") — used to mark days from the
+  // previous/next month as "virtual" even when the backend sends them as real day objects.
+  const viewMonth =
+    (todayDate || activeDays[Math.floor(activeDays.length / 2)]?.date || "").slice(0, 7);
+
+  // 1. Leading cells (not in this month)
   const leadingCells = Array.from({ length: firstWeekday }, (_item, index) => ({
     key: `leading-${index}`,
     day: null as MonthOverviewDay | null,
   }));
+
   const dayCells = activeDays.map((day) => ({
     key: day.date,
     day,
   }));
-  const filledCellCount = leadingCells.length + dayCells.length;
-  const trailingCellCount = filledCellCount ? (7 - (filledCellCount % 7)) % 7 : 0;
+
+  // 2. Trailing cells to fill a complete rectangle (35 or 42 cells)
+  const currentTotal = leadingCells.length + dayCells.length;
+  const targetTotal = currentTotal <= 35 ? 35 : 42;
+  const trailingCellCount = targetTotal - currentTotal;
   const trailingCells = Array.from({ length: trailingCellCount }, (_item, index) => ({
     key: `trailing-${index}`,
     day: null as MonthOverviewDay | null,
   }));
+
   const heatmapCells = [...leadingCells, ...dayCells, ...trailingCells];
 
   return (
-    <div className="overflow-visible">
+    <div className="overflow-visible select-none">
       <div
-        className="grid w-max gap-[4px]"
+        className="grid w-max gap-[5px]"
         style={{
-          gridTemplateColumns: "repeat(7, 15px)",
+          gridTemplateColumns: "repeat(7, 18px)",
         }}
       >
         {heatmapCells.map(({ key, day }) => {
-          if (!day) {
-            return <span key={key} className="h-[15px] w-[15px] rounded-[3px] bg-slate-100" aria-hidden="true" />;
+          // Out of current view month: either a filler null cell, or a real
+          // day object from previous/next month — both rendered as subtle ghost.
+          if (!day || (viewMonth && day.date.slice(0, 7) !== viewMonth)) {
+            return (
+              <span
+                key={key}
+                className="h-[18px] w-[18px] rounded-[4px] bg-gray-100/30 border border-gray-200/30"
+                aria-hidden="true"
+              />
+            );
           }
-          const toneClass = day.future
-            ? "bg-slate-100"
-            : day.intensity >= 4
-              ? "bg-[#2F5A67]"
-              : day.intensity === 3
-                ? "bg-[#1E7F95]"
-                : day.intensity === 2
-                  ? "bg-[#2FB8E6]"
-                  : day.intensity === 1
-                    ? "bg-[#74D2EE]"
-                    : "bg-slate-100";
+
+          // In month: Solid base color (including future/zero-intensity days)
+          const toneClass = day.intensity >= 4
+            ? "bg-[#2F5A67]"
+            : day.intensity === 3
+              ? "bg-[#1E7F95]"
+              : day.intensity === 2
+                ? "bg-[#2FB8E6]"
+                : day.intensity === 1
+                  ? "bg-[#74D2EE]"
+                  : "bg-slate-100";
+
           const isToday = todayDate ? day.date === todayDate : false;
+
           return (
             <button
               key={day.date}
               type="button"
               title={`${formatMonthDayLabel(day.date)}：文章 ${day.articleCount}，展示 ${day.displayCount}，引用 ${day.referenceCount}`}
               aria-label={`${formatMonthDayLabel(day.date)}数据`}
-              className={`group relative h-[15px] w-[15px] rounded-[3px] transition-shadow hover:ring-[1.5px] hover:ring-[#2FB8E6]/50 focus:outline-none focus:ring-[1.5px] focus:ring-[#2FB8E6]/70 ${isToday ? "ring-[1.5px] ring-[#2FB8E6] ring-offset-1 ring-offset-white" : ""} ${toneClass}`}
+              className={`group relative h-[18px] w-[18px] rounded-[4px] transition-all duration-300 hover:ring-2 hover:ring-[#2FB8E6]/40 hover:scale-110 hover:z-10 focus:outline-none focus:ring-2 focus:ring-[#2FB8E6]/50 ${isToday ? "ring-[2.5px] ring-[#2FB8E6] ring-offset-2 ring-offset-white z-10" : ""} ${toneClass}`}
             >
-              <span className="pointer-events-none absolute bottom-[18px] left-1/2 z-20 hidden w-max max-w-[220px] -translate-x-1/2 rounded-[6px] bg-[#0f1835] px-2 py-1 text-[10px] font-medium text-white shadow-[0_8px_24px_-12px_rgba(15,23,42,0.4)] group-hover:block group-focus:block">
-                {formatMonthDayLabel(day.date)}：文章 {day.articleCount} 篇 / 花费 {formatCurrency(day.spend)} / 展示 {day.displayCount} 次 / 引用 {day.referenceCount} 次
+              <span className="pointer-events-none absolute bottom-full left-1/2 z-20 mb-2 hidden w-max max-w-[220px] -translate-x-1/2 rounded-[8px] bg-[#0f1835] px-2.5 py-1.5 text-[11px] font-bold text-white shadow-xl animate-in fade-in zoom-in duration-200 group-hover:block group-focus:block">
+                <div className="flex items-center justify-between gap-4 mb-1 border-b border-white/10 pb-1">
+                  <span className="text-white/70">{formatMonthDayLabel(day.date)}</span>
+                  {isToday && <span className="text-[#2FB8E6] text-[10px]">今日</span>}
+                </div>
+                <div className="space-y-0.5 opacity-90">
+                  <div className="flex justify-between gap-3">
+                    <span className="text-white/50 font-medium">发表</span>
+                    <span className="font-mono">{day.articleCount} 篇</span>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span className="text-white/50 font-medium">花费</span>
+                    <span className="font-mono">{formatCurrency(day.spend)}</span>
+                  </div>
+                  <div className="flex justify-between gap-3 border-t border-white/5 pt-0.5 mt-0.5">
+                    <span className="text-white/50 font-medium">展示</span>
+                    <span className="font-mono">{day.displayCount}</span>
+                  </div>
+                </div>
               </span>
             </button>
           );
@@ -431,27 +492,27 @@ function AITrendSection({
   const deltaIconClass = chartDelta < 0 ? 'rotate-90' : chartDelta === 0 ? 'rotate-45' : '';
 
   return (
-    <div className="xl:col-span-8 flex flex-col min-h-0">
+    <div className="xl:col-span-6 flex flex-col min-h-0">
       <div className="flex items-start justify-between mb-3">
         <div className="flex flex-col gap-2">
           <div className="flex items-center gap-4">
             <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase">AI 辅助优化趋势</h3>
             <div className="flex items-center gap-2">
-              <button 
+              <button
                 onClick={() => setTimeRange('week')}
                 className={`text-[10px] font-bold transition-colors ${timeRange === 'week' ? 'text-gray-900' : 'text-gray-400 hover:text-gray-700'}`}
               >
                 周
               </button>
               <span className="w-px h-2.5 bg-gray-200"></span>
-              <button 
+              <button
                 onClick={() => setTimeRange('month')}
                 className={`text-[10px] font-bold transition-colors ${timeRange === 'month' ? 'text-gray-900' : 'text-gray-400 hover:text-gray-700'}`}
               >
                 月
               </button>
               <span className="w-px h-2.5 bg-gray-200"></span>
-              <button 
+              <button
                 onClick={() => setTimeRange('year')}
                 className={`text-[10px] font-bold transition-colors ${timeRange === 'year' ? 'text-gray-900' : 'text-gray-400 hover:text-gray-700'}`}
               >
@@ -466,7 +527,7 @@ function AITrendSection({
                 <ArrowUpRight className={`w-3 h-3 transition-transform ${deltaIconClass}`} /> {chartDeltaText}
               </span>
             </div>
-            
+
             <div className="flex items-center gap-4 ml-3 pl-4 border-l border-gray-200/80 mb-0.5">
               <div className="flex flex-col gap-0.5">
                 <span className="text-[9px] text-gray-400 font-medium tracking-wider">峰值</span>
@@ -479,18 +540,25 @@ function AITrendSection({
             </div>
           </div>
         </div>
-        
-        <div className="flex items-center gap-4 text-[11px] text-gray-500 font-medium mt-1">
-            <div className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full border-[1.5px] bg-transparent" style={{ borderColor: DASHBOARD_CYAN_LIGHT }}></div>预测值
-            </div>
-            <div className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full" style={{ backgroundColor: DASHBOARD_CYAN }}></div>实际值
-            </div>
+
+        {/* 预测/实际 legend — 垂直堆叠，放在 header 右边 */}
+        <div className="mr-[10px] mt-1 flex flex-col gap-1.5 text-[11px] text-gray-500 font-medium">
+          <div className="flex items-center gap-1.5">
+            <div className="w-2 h-2 rounded-full border-[1.5px] bg-transparent" style={{ borderColor: DASHBOARD_CYAN_LIGHT }}></div>
+            <span>预测</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-2 h-2 rounded-full" style={{ backgroundColor: DASHBOARD_CYAN }}></div>
+            <span>实际</span>
+          </div>
         </div>
       </div>
-      <div className="w-full h-[106px] relative">
-        <ChartArea data={currentData.length ? currentData : [{ name: '', value: 0, predict: 0 }]} />
+      <div className="w-full h-[116px] relative">
+        <ChartArea
+          data={currentData.length ? currentData : [{ name: '', value: 0, predict: 0 }]}
+          yLabelAtLeft
+          alignEdgeXTicks
+        />
       </div>
     </div>
   );
@@ -504,9 +572,16 @@ function IndustryPieChart({ data }: { data?: { name: string; value: number }[] }
     { name: '汽车制造', value: 10 },
   ];
 
+  const total = chartData.reduce((sum, item) => sum + (item.value || 0), 0);
+  const MAX_LEGEND_ROWS = 5;
+  const hasOverflow = chartData.length > MAX_LEGEND_ROWS;
+  const visibleItems = hasOverflow ? chartData.slice(0, MAX_LEGEND_ROWS - 1) : chartData;
+  const hiddenCount = chartData.length - visibleItems.length;
+
   return (
-    <div className="w-full">
-      <div className="relative h-[126px]">
+    <div className="flex w-full items-start gap-6">
+      {/* 左侧环形图 — 固定尺寸 */}
+      <div className="relative h-[126px] w-[126px] shrink-0">
         <ResponsiveContainer width="100%" height="100%">
           <PieChart>
             <Pie
@@ -523,7 +598,7 @@ function IndustryPieChart({ data }: { data?: { name: string; value: number }[] }
                 <Cell key={`cell-${entry.name}-${index}`} fill={INDUSTRY_CHART_COLORS[index % INDUSTRY_CHART_COLORS.length]} />
               ))}
             </Pie>
-            <RechartsTooltip 
+            <RechartsTooltip
               contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.05)', fontSize: '11px' }}
               itemStyle={{ color: '#111827' }}
             />
@@ -535,6 +610,36 @@ function IndustryPieChart({ data }: { data?: { name: string; value: number }[] }
           <span className="text-[9px] text-gray-400 mt-1 uppercase tracking-wider">总来源</span>
         </div>
       </div>
+
+      {/* 右侧分类 legend — 最多 5 行，超出用 "…还有 N 个分类" 顶替 */}
+      <ul className="flex min-w-0 flex-1 flex-col gap-4 pt-1">
+        {visibleItems.map((item, index) => {
+          const pct = total > 0 ? Math.round(((item.value || 0) / total) * 100) : 0;
+          const color = INDUSTRY_CHART_COLORS[index % INDUSTRY_CHART_COLORS.length];
+          return (
+            <li key={`legend-${item.name}-${index}`} className="flex items-center gap-3 text-[12px] leading-none">
+              <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: color }} />
+              <span className="truncate font-medium text-gray-600" title={item.name}>{item.name}</span>
+              <span className="ml-auto shrink-0 tabular-nums font-semibold text-gray-900">{pct}%</span>
+            </li>
+          );
+        })}
+        {hasOverflow && (() => {
+          const hiddenItemsList = chartData.slice(visibleItems.length);
+          const hiddenSum = hiddenItemsList.reduce((s, item) => s + (item.value || 0), 0);
+          const hiddenPct = total > 0 ? Math.round((hiddenSum / total) * 100) : 0;
+          return (
+            <li
+              className="flex items-center gap-3 text-[12px] leading-none"
+              title={hiddenItemsList.map((item) => item.name).join("、")}
+            >
+              <span className="h-2 w-2 shrink-0 rounded-full bg-gray-300" />
+              <span className="truncate font-medium text-gray-400">其他 {hiddenCount} 项</span>
+              <span className="ml-auto shrink-0 tabular-nums font-semibold text-gray-400">{hiddenPct}%</span>
+            </li>
+          );
+        })()}
+      </ul>
     </div>
   );
 }
@@ -606,19 +711,19 @@ function MediaBarChart({ data }: { data?: DashboardSnapshot["mediaStats"] }) {
       <div className="w-full overflow-hidden">
         <div className="flex w-full">
           <div className="w-[40px] shrink-0">
-            <div className="flex h-[132px] flex-col justify-between pt-[8px] pr-2 pb-0 text-right text-[10px] font-medium leading-none text-gray-400">
+            <div className="flex h-[154px] flex-col justify-between pt-[8px] pr-2 pb-0 text-right text-[10px] font-medium leading-none text-gray-400">
               {[...yTicks].reverse().map((tick, index) => (
                 <div key={`${tick}-${index}`} className="tabular-nums">
                   {tick}
                 </div>
               ))}
             </div>
-            <div className="h-[24px]" />
+              <div className="h-[22px]" />
           </div>
 
           <div ref={scrollContainerRef} className="flex-1 overflow-x-auto overflow-y-hidden custom-scrollbar">
             <div className="h-full" style={{ minWidth: chartMinWidth }}>
-              <div className="h-[132px]">
+              <div className="h-[154px]">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={displayData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }} barCategoryGap="10%" barGap={2}>
                     <CartesianGrid key="grid" strokeDasharray="3 3" vertical={false} stroke="#f3f4f6" />
@@ -666,8 +771,203 @@ function OptimizationMap({ activeRegions = [] }: { activeRegions?: string[] }) {
         mapType="domestic"
         activeRegions={activeRegions}
         accentColor={DASHBOARD_CYAN}
-        className="h-[196px] w-full rounded-[8px]"
+        className="h-[176px] w-full rounded-[8px]"
       />
     </div>
+  );
+}
+
+function AihotDailyFeedSection({ compact = false }: { compact?: boolean }) {
+  const [feed, setFeed] = useState<AihotDailyFeedSnapshot | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [showFeedDetail, setShowFeedDetail] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    void fetchAihotDailyFeed()
+      .then((data) => {
+        if (!cancelled) {
+          setFeed(data);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const items = feed?.items || [];
+  const visibleItems = items.slice(0, 3);
+  const dateBadge = useMemo(() => {
+    const now = new Date();
+    return `${now.getMonth() + 1}/${now.getDate()}`;
+  }, []);
+
+  return (
+    <section className={compact ? "flex flex-col min-w-0" : "border-t border-gray-200/70 pt-8 pb-4 shrink-0"}>
+      <div className="mb-1 flex items-baseline justify-between">
+        <div className="flex items-baseline gap-2">
+          <h3 className="text-[11px] font-bold uppercase tracking-wider text-gray-400">今日速览</h3>
+          <span className="text-[10px] font-bold tabular-nums tracking-tight text-gray-300">{dateBadge}</span>
+        </div>
+        {visibleItems.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setShowFeedDetail(true)}
+            className="group inline-flex items-center gap-1 text-[11px] font-medium text-gray-400 transition-colors hover:text-[#0f1835]"
+          >
+            查看全部
+            <ArrowUpRight className="h-3 w-3 transition-transform group-hover:-translate-y-0.5 group-hover:translate-x-0.5" />
+          </button>
+        )}
+      </div>
+
+      {loading ? (
+        <ul className="flex flex-col">
+          {[0, 1, 2].map((index) => (
+            <li
+              key={index}
+              className={`py-2 ${index !== 2 ? "border-b border-gray-100/70" : ""}`}
+            >
+              <div className="h-3 w-3/4 animate-pulse rounded bg-gray-100" />
+            </li>
+          ))}
+        </ul>
+      ) : visibleItems.length > 0 ? (
+        <ul className="flex flex-col">
+          {visibleItems.map((item, index) => (
+            <li
+              key={`${item.link || item.title}-${index}`}
+              className={`group cursor-pointer py-2 transition-colors ${index !== visibleItems.length - 1 ? "border-b border-gray-100/70" : ""}`}
+              onClick={() => setShowFeedDetail(true)}
+            >
+              <p
+                className="truncate text-[13px] font-semibold leading-6 tracking-tight text-[#0f1835] transition-colors duration-200 group-hover:text-[#1E7F95]"
+                title={item.title}
+              >
+                {item.title}
+              </p>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="py-2 text-[12px] font-medium text-gray-300">暂无更新</p>
+      )}
+      {showFeedDetail && feed && <AihotDailyFeedDetail feed={feed} onClose={() => setShowFeedDetail(false)} />}
+    </section>
+  );
+}
+
+function AihotDailyFeedDetail({
+  feed,
+  onClose,
+}: {
+  feed: AihotDailyFeedSnapshot;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  const dateLabel = useMemo(() => {
+    const now = new Date();
+    return `${now.getMonth() + 1}月${now.getDate()}日`;
+  }, []);
+
+  return (
+    <div className="fixed inset-0 z-[110] flex items-center justify-center">
+      <div
+        className="absolute inset-0 bg-black/20 backdrop-blur-[2px] animate-in fade-in duration-200"
+        onClick={onClose}
+      />
+
+      <div className="relative mx-4 flex h-full max-h-[720px] w-full max-w-[680px] flex-col overflow-hidden rounded-2xl border border-gray-200/60 bg-white shadow-[0_20px_60px_-15px_rgba(0,0,0,0.1)] animate-in slide-in-from-bottom-4 duration-300">
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="关闭"
+          className="absolute right-5 top-5 z-10 inline-flex h-8 w-8 items-center justify-center rounded-full text-gray-300 transition-colors hover:bg-gray-50 hover:text-gray-700"
+        >
+          <X className="w-4 h-4" />
+        </button>
+
+        <div className="shrink-0 px-10 pt-10 pb-2">
+          <h2 className="text-[22px] font-semibold leading-none tracking-tight text-[#0f1835]">今日速览</h2>
+          <p className="mt-2 text-[12px] font-medium tabular-nums text-gray-400">
+            {dateLabel} · {feed.items.length} 条
+          </p>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-10 pb-10 custom-scrollbar">
+          {feed.items.length > 0 ? (
+            <ul className="flex flex-col">
+              {feed.items.map((item, index) => (
+                <AihotDailyFeedArticle
+                  key={`${item.link || item.title}-${index}`}
+                  item={item}
+                  isLast={index === feed.items.length - 1}
+                />
+              ))}
+            </ul>
+          ) : (
+            <p className="py-16 text-center text-[12px] font-medium text-gray-300">
+              {feed.message || "暂无更新"}
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AihotDailyFeedArticle({
+  item,
+  isLast,
+}: {
+  item: AihotDailyFeedSnapshot["items"][number];
+  isLast: boolean;
+}) {
+  const summaryText = String(item.summary || item.content || "").replace(/\s+/g, " ").trim();
+  const author = item.author?.trim();
+  const publishedAt = item.publishedAt?.replace("T", " ").trim();
+  const meta = [author, publishedAt].filter(Boolean).join("  ·  ");
+
+  const body = (
+    <>
+      <h3 className="text-[15px] font-semibold leading-snug tracking-tight text-[#0f1835] transition-colors duration-200 group-hover:text-[#1E7F95]">
+        {item.title}
+      </h3>
+      {summaryText && (
+        <p className="mt-2 line-clamp-2 text-[13px] font-normal leading-relaxed text-gray-500">
+          {summaryText}
+        </p>
+      )}
+      {meta && (
+        <p className="mt-3 text-[11px] font-medium tabular-nums text-gray-400">{meta}</p>
+      )}
+    </>
+  );
+
+  const className = `group block py-5 ${isLast ? "" : "border-b border-gray-100"}`;
+
+  return (
+    <li>
+      {item.link ? (
+        <a href={item.link} target="_blank" rel="noreferrer" className={className}>
+          {body}
+        </a>
+      ) : (
+        <div className={className}>{body}</div>
+      )}
+    </li>
   );
 }

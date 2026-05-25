@@ -76,22 +76,28 @@ function normalizeArticleHref(url?: string): string {
   return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw) ? raw : `https://${raw}`;
 }
 
+type DetectionControlState = "off" | "recognition" | "browser";
+
+const DETECTION_DOUBLE_CLICK_THRESHOLD_MS = 240;
+
 export function RightSidebar({
-  detectionMode = "recognition",
+  detectionControlState = "off",
+  detectionControlSwitching = false,
   cloudRole = "",
   todos,
   articles,
   todoCacheIdentity = "",
-  onDetectionModeToggle,
+  onSwitchDetectionControlState,
   onTodosChange,
   onArticlesChange,
 }: {
-  detectionMode?: string;
+  detectionControlState?: DetectionControlState;
+  detectionControlSwitching?: boolean;
   cloudRole?: string;
   todos?: TodoSnapshot[];
   articles?: ArticleSnapshot[];
   todoCacheIdentity?: string;
-  onDetectionModeToggle?: (mode: "browser" | "recognition") => void | Promise<void>;
+  onSwitchDetectionControlState?: (target: DetectionControlState) => void | Promise<void>;
   onTodosChange?: (todos: TodoSnapshot[]) => void;
   onArticlesChange?: (articles: ArticleSnapshot[]) => void;
 }) {
@@ -102,7 +108,6 @@ export function RightSidebar({
   const [articleMessage, setArticleMessage] = useState('');
   const [articleMessageTone, setArticleMessageTone] = useState<'default' | 'error' | 'warning'>('default');
   const [todoMessage, setTodoMessage] = useState('');
-  const [modeToggleLoading, setModeToggleLoading] = useState(false);
   const [articleTodayCount, setArticleTodayCount] = useState(0);
   const [articleTotalCount, setArticleTotalCount] = useState(0);
   const [articleStatsLoaded, setArticleStatsLoaded] = useState(false);
@@ -112,6 +117,8 @@ export function RightSidebar({
   const latestArticlesRef = useRef<ArticleSnapshot[]>(articles ?? FALLBACK_ARTICLES);
   const todoInputRef = useRef<HTMLInputElement>(null);
   const articleInputRef = useRef<HTMLInputElement>(null);
+  const detectionClickTimerRef = useRef<number | null>(null);
+  const detectionPendingRef = useRef(false);
   const articleItems = articles ?? FALLBACK_ARTICLES;
   const filteredArticles = articleItems.filter(a => filterType === 'all' || a.type === filterType);
   const todoItems = todos ?? FALLBACK_TODOS;
@@ -334,19 +341,100 @@ export function RightSidebar({
     window.open(normalized, "_blank", "noopener,noreferrer");
   };
 
-  const browserModeEnabled = detectionMode === "browser";
   const isViewerAccount = cloudRole === "viewer";
-  const handleDetectionModeClick = async () => {
-    if (modeToggleLoading || isViewerAccount) {
+  const detectionDisabled = detectionControlSwitching || isViewerAccount;
+
+  const runDetectionSwitch = (target: DetectionControlState) => {
+    if (target === detectionControlState || detectionDisabled || detectionPendingRef.current) {
       return;
     }
-    setModeToggleLoading(true);
+    detectionPendingRef.current = true;
     try {
-      await onDetectionModeToggle?.(browserModeEnabled ? "recognition" : "browser");
-    } finally {
-      setModeToggleLoading(false);
+      const maybePromise = onSwitchDetectionControlState?.(target);
+      if (maybePromise && typeof (maybePromise as Promise<unknown>).then === "function") {
+        (maybePromise as Promise<unknown>).finally(() => {
+          detectionPendingRef.current = false;
+        });
+      } else {
+        detectionPendingRef.current = false;
+      }
+    } catch {
+      detectionPendingRef.current = false;
     }
   };
+
+  const dispatchDetectionAction = (action: "single" | "double") => {
+    if (detectionDisabled) return;
+    if (action === "single") {
+      runDetectionSwitch(detectionControlState === "off" ? "recognition" : "off");
+      return;
+    }
+    if (detectionControlState === "off" || detectionControlState === "browser") {
+      runDetectionSwitch(detectionControlState === "off" ? "browser" : "recognition");
+      return;
+    }
+    // current === "recognition"
+    runDetectionSwitch("browser");
+  };
+
+  const clearDetectionClickTimer = () => {
+    if (detectionClickTimerRef.current !== null) {
+      window.clearTimeout(detectionClickTimerRef.current);
+      detectionClickTimerRef.current = null;
+    }
+  };
+
+  const handleDetectionButtonClick = () => {
+    if (detectionDisabled) return;
+    if (detectionClickTimerRef.current !== null) {
+      // Second click within threshold — defer to onDoubleClick.
+      return;
+    }
+    detectionClickTimerRef.current = window.setTimeout(() => {
+      detectionClickTimerRef.current = null;
+      dispatchDetectionAction("single");
+    }, DETECTION_DOUBLE_CLICK_THRESHOLD_MS);
+  };
+
+  const handleDetectionButtonDoubleClick = () => {
+    clearDetectionClickTimer();
+    dispatchDetectionAction("double");
+  };
+
+  useEffect(() => () => {
+    clearDetectionClickTimer();
+  }, []);
+
+  const detectionStatusBadge = (() => {
+    if (detectionControlState === "browser") {
+      return { label: "抓取模式", dotClass: "bg-emerald-500", textClass: "text-emerald-700" };
+    }
+    if (detectionControlState === "recognition") {
+      return { label: "识别模式", dotClass: "bg-[var(--brand-cyan)]", textClass: "text-[var(--brand-navy)]" };
+    }
+    return { label: "已关闭", dotClass: "bg-gray-400", textClass: "text-gray-500" };
+  })();
+
+  const detectionButtonStyle = (() => {
+    if (isViewerAccount) {
+      return "bg-gray-100 text-gray-400";
+    }
+    if (detectionControlState === "browser") {
+      return "bg-emerald-50 text-emerald-700 hover:bg-emerald-100/80";
+    }
+    if (detectionControlState === "recognition") {
+      return "bg-[rgba(var(--brand-cyan-rgb),0.12)] text-[var(--brand-navy)] hover:bg-[rgba(var(--brand-cyan-rgb),0.2)]";
+    }
+    return "bg-gray-100 text-gray-700 hover:bg-gray-200/80";
+  })();
+
+  const detectionButtonLabel = (() => {
+    if (isViewerAccount) return "浏览账号仅查看";
+    if (detectionControlSwitching) return "模式切换中...";
+    if (detectionControlState === "off") return "单击识别 · 双击抓取";
+    if (detectionControlState === "recognition") return "单击关闭 · 双击抓取";
+    return "单击关闭 · 双击识别";
+  })();
 
   return (
     <div className="w-[280px] xl:w-[320px] h-full bg-transparent border-l border-gray-200/80 px-5 py-3 xl:px-6 xl:py-4 flex flex-col shrink-0">
@@ -354,34 +442,26 @@ export function RightSidebar({
         <div className="mb-4 flex items-center justify-between gap-3">
           <h3 className="text-[11px] font-bold text-gray-400 tracking-widest uppercase">检测模式</h3>
           <span
-            className={`inline-flex shrink-0 items-center gap-1.5 text-[10px] font-semibold ${
-              browserModeEnabled ? "text-emerald-700" : "text-gray-500"
-            }`}
+            className={`inline-flex shrink-0 items-center gap-1.5 text-[10px] font-semibold ${detectionStatusBadge.textClass}`}
           >
-            <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                browserModeEnabled ? "bg-emerald-500" : "bg-gray-400"
-              }`}
-            />
-            {browserModeEnabled ? "抓取模式" : "识别模式"}
+            <span className={`h-1.5 w-1.5 rounded-full ${detectionStatusBadge.dotClass}`} />
+            {detectionStatusBadge.label}
           </span>
         </div>
         <button
           type="button"
-          onClick={() => {
-            void handleDetectionModeClick();
-          }}
-          disabled={modeToggleLoading || isViewerAccount}
-          className={`inline-flex w-full items-center justify-center gap-2 rounded-[12px] px-3 py-2.5 text-[12px] font-semibold transition-all ${
+          onClick={handleDetectionButtonClick}
+          onDoubleClick={handleDetectionButtonDoubleClick}
+          disabled={detectionDisabled}
+          title={
             isViewerAccount
-              ? "bg-gray-100 text-gray-400"
-              : browserModeEnabled
-              ? "bg-emerald-50 text-emerald-700 hover:bg-emerald-100/80"
-              : "bg-gray-100 text-gray-700 hover:bg-gray-200/80"
-          } disabled:cursor-not-allowed disabled:opacity-80`}
+              ? "浏览账号仅查看，无法切换检测模式"
+              : "单击切换关闭/识别 · 双击切换抓取模式"
+          }
+          className={`inline-flex w-full items-center justify-center gap-2 rounded-[12px] px-3 py-2.5 text-[12px] font-semibold transition-all ${detectionButtonStyle} disabled:cursor-not-allowed disabled:opacity-80`}
         >
-          {modeToggleLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Power className="h-3.5 w-3.5" />}
-          {isViewerAccount ? "浏览账号仅查看" : modeToggleLoading ? "模式切换中..." : browserModeEnabled ? "切回识别模式" : "开启抓取模式"}
+          {detectionControlSwitching ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Power className="h-3.5 w-3.5" />}
+          {detectionButtonLabel}
         </button>
       </div>
 

@@ -49,6 +49,43 @@ from core.time_utils import local_now
 from platforms.base import SchedulerStopRequested
 
 
+def _hydrate_fixed_screenshot_history_map(
+    historical_success_map: dict,
+    historical_keyword_states: dict | None,
+) -> dict:
+    hydrated: dict = {}
+    keyword_states = dict(historical_keyword_states or {})
+    for key, result in dict(historical_success_map or {}).items():
+        item = dict(result or {})
+        keyword = str(item.get("keyword") or "").strip()
+        platform = str(item.get("platform") or "").strip()
+        if not keyword:
+            continue
+        keyword_state = dict(keyword_states.get(keyword) or {})
+        if not keyword_state:
+            continue
+        candidate_state = keyword_state
+        platform_states = keyword_state.get("platform_states") if isinstance(keyword_state.get("platform_states"), dict) else {}
+        if platform and platform_states:
+            candidate_state = dict(platform_states.get(platform) or {})
+        if not candidate_state:
+            continue
+        image_path = str(candidate_state.get("image_path") or "").strip()
+        if (
+            not bool(candidate_state.get("run_success"))
+            or not bool(candidate_state.get("screenshot_saved"))
+            or not image_path
+        ):
+            continue
+        item["screenshot"] = image_path
+        item["platform"] = str(candidate_state.get("platform") or item.get("platform") or "").strip()
+        item["brand"] = str(candidate_state.get("brand") or item.get("brand") or "").strip()
+        if not _result_has_usable_screenshot(item):
+            continue
+        hydrated[key] = item
+    return hydrated
+
+
 def run_task_group(
     task: dict,
     default_notify_config: dict,
@@ -111,6 +148,11 @@ def run_task_group(
         task_name,
         task_id=history_task_id,
     )
+    if bool(task.get("fixed_screenshot_enabled", False)):
+        historical_success_map = _hydrate_fixed_screenshot_history_map(
+            historical_success_map,
+            historical_keyword_states,
+        )
     sent_before_run = is_task_sent_today(daily_state_task)
     # 手动测试始终整组重跑，且不受“今日已发送”影响。
     manual_test_replay_completed_keywords = execution_source == 'manual_test'
@@ -459,6 +501,16 @@ def run_task_group(
                 print(f"[Main] 复用会话清理失败: {e}")
 
     if _should_stop_remaining_work():
+        if all_results:
+            try:
+                _finalize_daily_pool_keyword_results(
+                    task,
+                    all_results=all_results,
+                    execution_source=execution_source,
+                    historical_keyword_states=historical_keyword_states,
+                )
+            except Exception as exc:
+                print(f"[Main] 任务暂停时同步已完成截图状态失败: {exc}")
         cancelled_results, report = finalize_cancelled_run(
             task=task,
             default_brand=default_brand,
