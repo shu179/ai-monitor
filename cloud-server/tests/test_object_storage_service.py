@@ -260,8 +260,10 @@ class ObjectUploadFlowTests(unittest.TestCase):
         settings = _settings_with_local_dir("/tmp/object-data")
         settings.object_storage_min_free_bytes = 999_999_999_999_999
 
-        with self.assertRaises(ObjectStorageQuotaExceeded):
-            _enforce_local_disk_headroom(1, settings=settings)
+        with self.assertLogs("app.services.object_storage_service", level="WARNING") as logs:
+            with self.assertRaises(ObjectStorageQuotaExceeded):
+                _enforce_local_disk_headroom(1, settings=settings)
+        self.assertTrue(any("reason=disk_headroom_exceeded" in line for line in logs.output))
 
 
 if __name__ == "__main__":

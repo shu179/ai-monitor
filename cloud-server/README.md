@@ -127,6 +127,16 @@ SURFACED_CLOUD_OBJECT_STORAGE_MIN_FREE_BYTES=8589934592
 
 这组默认值表示对象总量最多 10GB、单 workspace 最多 5GB、单文件最多 512MB，并且上传后磁盘剩余空间低于 8GB 时直接拒绝。`docker-compose.yml` 会把 `/opt/surfaced/object-data` 挂进 API 和 worker 容器，避免容器重建后对象文件丢失。本地磁盘模式只支持服务端直传单 PUT，不启用 multipart；后续接 R2/COS 时再切回 presigned multipart。
 
+对象存储运维检查：
+
+```bash
+python -m scripts.storage_doctor
+python -m scripts.storage_doctor --json
+SURFACED_CLOUD_ALLOW_SMOKE=1 python -m scripts.smoke_object_storage --base-url http://127.0.0.1:8080
+```
+
+`storage_doctor` 是只读检查，会输出磁盘剩余、对象目录占用、DB manifest 占用、workspace 占用、缺失文件和孤儿文件。`smoke_object_storage` 会创建一次性 smoke 用户，并通过真实 HTTP 路径完成申请上传、PUT、下载和 sha256 比对；没有 `SURFACED_CLOUD_ALLOW_SMOKE=1` 时会拒绝运行。上传被拒绝时，服务端日志会打印 `[ObjectStorage] reject_upload reason=...`，用于区分单文件超限、workspace 超限、总量超限和磁盘安全水位不足。
+
 生产环境必须把 `.env` 里的 `SURFACED_CLOUD_SECRET_KEY` 和 `POSTGRES_PASSWORD` 改成高强度随机值。
 测试完成后，可以把 `.env` 里的 `SURFACED_CLOUD_DOCS_ENABLED` 改成 `false`，然后重启服务以关闭公网 Swagger 文档。
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import math
 import os
 import re
@@ -51,6 +52,7 @@ _ALLOWED_CONTENT_TYPES = {
     "text/markdown",
     "text/plain",
 }
+logger = logging.getLogger(__name__)
 
 
 class ObjectStorageError(RuntimeError):
@@ -821,7 +823,12 @@ def _enforce_object_limits(
     incoming_size = int(incoming_storage_size_bytes)
     if local_backend:
         if incoming_size > _max_file_bytes(settings):
-            raise ObjectStorageQuotaExceeded("object exceeds local max file size")
+            _reject_upload(
+                "max_file_exceeded",
+                workspace_id=workspace_id,
+                incoming_size=incoming_size,
+                limit_bytes=_max_file_bytes(settings),
+            )
         _enforce_local_disk_headroom(incoming_size, settings=settings)
         total_quota = int(settings.object_storage_total_quota_bytes or DEFAULT_TOTAL_OBJECT_QUOTA_BYTES)
         if total_quota > 0:
@@ -831,7 +838,13 @@ def _enforce_object_limits(
                 )
             )
             if int(total_used or 0) + incoming_size > total_quota:
-                raise ObjectStorageQuotaExceeded("server object storage quota exceeded")
+                _reject_upload(
+                    "total_quota_exceeded",
+                    workspace_id=workspace_id,
+                    incoming_size=incoming_size,
+                    used_bytes=int(total_used or 0),
+                    limit_bytes=total_quota,
+                )
     quota = int(settings.object_storage_workspace_quota_bytes or DEFAULT_WORKSPACE_OBJECT_QUOTA_BYTES)
     if quota <= 0:
         return
@@ -842,7 +855,13 @@ def _enforce_object_limits(
         )
     )
     if int(used or 0) + incoming_size > quota:
-        raise ObjectStorageQuotaExceeded("workspace object storage quota exceeded")
+        _reject_upload(
+            "workspace_quota_exceeded",
+            workspace_id=workspace_id,
+            incoming_size=incoming_size,
+            used_bytes=int(used or 0),
+            limit_bytes=quota,
+        )
 
 
 def _enforce_local_disk_headroom(incoming_size: int, *, settings: Settings) -> None:
@@ -851,7 +870,26 @@ def _enforce_local_disk_headroom(incoming_size: int, *, settings: Settings) -> N
     usage = shutil.disk_usage(root)
     min_free = int(settings.object_storage_min_free_bytes or DEFAULT_MIN_FREE_BYTES)
     if usage.free - int(incoming_size) < min_free:
-        raise ObjectStorageQuotaExceeded("server disk free space is below object storage safety threshold")
+        _reject_upload(
+            "disk_headroom_exceeded",
+            workspace_id=None,
+            incoming_size=int(incoming_size),
+            free_bytes=int(usage.free),
+            min_free_bytes=min_free,
+            root=str(root),
+        )
+
+
+def _reject_upload(reason: str, **fields: Any) -> None:
+    details = " ".join(f"{key}={value}" for key, value in sorted(fields.items()) if value is not None)
+    logger.warning("[ObjectStorage] reject_upload reason=%s %s", reason, details)
+    messages = {
+        "disk_headroom_exceeded": "server disk free space is below object storage safety threshold",
+        "max_file_exceeded": "object exceeds local max file size",
+        "total_quota_exceeded": "server object storage quota exceeded",
+        "workspace_quota_exceeded": "workspace object storage quota exceeded",
+    }
+    raise ObjectStorageQuotaExceeded(messages.get(reason, reason))
 
 
 def _is_local_upload_session(upload_session: ObjectUploadSession) -> bool:
