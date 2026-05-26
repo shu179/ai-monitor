@@ -44,9 +44,42 @@ const PLATFORM_ID_TO_NAME: Record<string, string> = {
 };
 
 type ActiveTestRun = { runId: string; brandName: string; taskId: string };
+type PaginationItem = number | "ellipsis";
 
 const ACTIVE_TEST_RUN_STORAGE_KEY = "surfaced-active-test-run";
 const TASK_EVENT_SOURCE = TASK_DATA_CHANGED_SOURCE_BRANDS;
+
+function buildPaginationItems(currentPage: number, totalPages: number): PaginationItem[] {
+  if (totalPages <= 5) {
+    return Array.from({ length: totalPages }, (_, index) => index + 1);
+  }
+
+  const visiblePages = new Set<number>([1, totalPages]);
+  for (let page = Math.max(1, currentPage - 1); page <= Math.min(totalPages, currentPage + 1); page += 1) {
+    visiblePages.add(page);
+  }
+
+  if (currentPage <= 3) {
+    visiblePages.add(2);
+    visiblePages.add(3);
+    visiblePages.add(4);
+  }
+  if (currentPage >= totalPages - 2) {
+    visiblePages.add(totalPages - 3);
+    visiblePages.add(totalPages - 2);
+    visiblePages.add(totalPages - 1);
+  }
+
+  const pages = Array.from(visiblePages).filter((page) => page >= 1 && page <= totalPages).sort((a, b) => a - b);
+  return pages.reduce<PaginationItem[]>((items, page) => {
+    const previous = pages[pages.indexOf(page) - 1];
+    if (previous && page - previous > 1) {
+      items.push("ellipsis");
+    }
+    items.push(page);
+    return items;
+  }, []);
+}
 
 function emitTaskDataChanged() {
   window.dispatchEvent(new CustomEvent(TASK_DATA_CHANGED_EVENT, { detail: { source: TASK_EVENT_SOURCE } }));
@@ -456,6 +489,7 @@ export function BrandsContent({
   const totalPages = Math.max(1, Math.ceil(filteredBrands.length / PAGE_SIZE));
   const safePage = Math.min(currentPage, totalPages);
   const pagedBrands = filteredBrands.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const paginationItems = useMemo(() => buildPaginationItems(safePage, totalPages), [safePage, totalPages]);
 
   const resolveBrandName = useCallback((taskId: string, fallback = "当前品牌") => {
     return allBrandsData.find((item) => item.id === taskId)?.name || fallback || "当前品牌";
@@ -826,7 +860,7 @@ export function BrandsContent({
   }, [cloudAdminEnabled]);
 
   return (
-    <div className="flex-1 h-full overflow-hidden bg-transparent px-8 py-8 xl:px-10 flex flex-col relative">
+    <div className="flex-1 h-full min-h-0 min-w-0 overflow-hidden bg-transparent px-8 py-8 xl:px-10 flex flex-col relative">
       {/* 1. Header & Filters */}
       <div className="grid grid-cols-[248px_minmax(0,1fr)] items-end gap-3 border-b border-gray-200/70 pb-4 mb-5 shrink-0">
         <div className="grid grid-cols-[68px_1px_128px] items-end gap-3 shrink-0">
@@ -1062,35 +1096,28 @@ export function BrandsContent({
       </div>
         
       {/* Pagination / Footer (Fixed at bottom) */}
-      <div className="flex items-center justify-between pt-5 mt-4 border-t border-gray-200/70 shrink-0 bg-transparent">
+      <div className="flex min-h-[52px] items-center justify-between pt-5 mt-4 border-t border-gray-200/70 shrink-0 bg-transparent">
         <span className="text-[12px] text-gray-500 font-medium">
           显示 {filteredBrands.length > 0 ? (safePage - 1) * PAGE_SIZE + 1 : 0} 至 {Math.min(safePage * PAGE_SIZE, filteredBrands.length)} 项，共 {filteredBrands.length} 项
         </span>
-        <div className="flex gap-1">
+        <div className="flex h-8 items-center justify-end gap-1">
           <button
             type="button"
             onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
             disabled={safePage <= 1}
-            className={`px-0 py-1.5 text-[12px] font-medium transition-colors ${
+            className={`inline-flex h-8 items-center justify-center px-0 text-[12px] font-medium leading-none transition-colors ${
               safePage <= 1 ? 'text-gray-300 cursor-not-allowed' : 'text-gray-700 hover:text-gray-900'
             }`}
           >上一页</button>
-          {Array.from({ length: totalPages }, (_, i) => i + 1)
-            .filter(p => p === 1 || p === totalPages || Math.abs(p - safePage) <= 1)
-            .reduce<(number | "ellipsis")[]>((acc, p, i, arr) => {
-              if (i > 0 && p - (arr[i - 1] as number) > 1) acc.push("ellipsis");
-              acc.push(p);
-              return acc;
-            }, [])
-            .map((item, i) =>
+          {paginationItems.map((item, i) =>
               item === "ellipsis" ? (
-                <span key={`e${i}`} className="px-2 py-1.5 text-gray-400">...</span>
+                <span key={`e${i}`} className="inline-flex h-8 min-w-7 items-center justify-center px-2 text-[12px] font-bold leading-none text-gray-400">...</span>
               ) : (
                 <button
                   type="button"
                   key={item}
                   onClick={() => setCurrentPage(item as number)}
-                  className={`px-2 py-1.5 text-[12px] font-bold transition-colors ${
+                  className={`inline-flex h-8 min-w-7 items-center justify-center px-2 text-[12px] font-bold leading-none transition-colors ${
                     safePage === item
                       ? 'text-[var(--brand-navy)]'
                       : 'text-gray-700 hover:text-gray-900'
@@ -1103,7 +1130,7 @@ export function BrandsContent({
             type="button"
             onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
             disabled={safePage >= totalPages}
-            className={`px-0 py-1.5 text-[12px] font-medium transition-colors ${
+            className={`inline-flex h-8 items-center justify-center px-0 text-[12px] font-medium leading-none transition-colors ${
               safePage >= totalPages ? 'text-gray-300 cursor-not-allowed' : 'text-gray-700 hover:text-gray-900'
             }`}
           >下一页</button>
@@ -1443,13 +1470,14 @@ function BrandCard({
           : showPendingBadge
             ? { className: "bg-gray-100/90 text-gray-600 border-gray-200/80", label: "未运行" }
             : null;
+  const hasStatusLine = failedToday || successProgressSummary || testStatusBadge || testFailureMessage || deletePendingMessage || (showFormalGap && gapReasons.length > 0);
   const rootClassName = isCancelling
-    ? "relative border-b border-amber-300/90 py-6"
+    ? "relative h-[298px] overflow-hidden border-b border-amber-300/90 py-6"
     : isTesting
-      ? "relative border-b border-slate-300/90 py-6"
+      ? "relative h-[298px] overflow-hidden border-b border-slate-300/90 py-6"
       : (showFormalGap || failedToday)
-        ? "border-b border-red-200/80 py-6"
-        : "border-b border-gray-200/80 py-6";
+        ? "h-[298px] overflow-hidden border-b border-red-200/80 py-6"
+        : "h-[298px] overflow-hidden border-b border-gray-200/80 py-6";
 
   return (
     <div className={rootClassName}>
@@ -1460,9 +1488,9 @@ function BrandCard({
               {logo}
             </div>
             <div className="min-w-0 flex-1">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0 flex flex-wrap items-center gap-1.5">
-                  <span className="text-[16px] font-bold text-gray-900 leading-none">{name}</span>
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0 flex flex-nowrap items-center gap-1.5 overflow-hidden">
+                  <span className="min-w-0 truncate text-[16px] font-bold text-gray-900 leading-none">{name}</span>
                   <span className="px-1.5 py-0.5 bg-gray-100 text-gray-500 text-[9px] rounded font-bold tracking-wider">{industry}</span>
                   <span className="px-1.5 py-0.5 bg-gray-100 text-gray-500 text-[9px] rounded font-bold tracking-wider">{region}</span>
                   {testStatusBadge && (
@@ -1492,7 +1520,7 @@ function BrandCard({
                   )}
                 </div>
                 {showOperatorBadge && (
-                  <span className="shrink-0 px-1.5 py-0.5 bg-slate-50 text-slate-600 text-[9px] rounded font-bold tracking-wider border border-slate-200">
+                  <span className="max-w-[150px] shrink-0 truncate px-1.5 py-0.5 bg-slate-50 text-slate-600 text-[9px] rounded font-bold tracking-wider border border-slate-200">
                     运营 {operatorUserId ? `#${operatorUserId}` : "未分配"}{operatorUsername ? ` · ${operatorUsername}` : ""}
                   </span>
                 )}
@@ -1512,16 +1540,17 @@ function BrandCard({
                 </button>
               </div>
 
-              {(failedToday || successProgressSummary || testStatusBadge || testFailureMessage || deletePendingMessage || (showFormalGap && gapReasons.length > 0)) && (
-                <div className="mt-3 space-y-1.5">
+              <div className="mt-3 h-[16px] overflow-hidden">
+                {hasStatusLine && (
+                  <div className="space-y-1.5">
                   {failedToday && (
-                    <div className={`text-[11px] font-medium ${isNoScreenshotFailure ? "text-orange-600/90" : "text-red-500/90"}`}>
+                    <div className={`truncate text-[11px] font-medium leading-4 ${isNoScreenshotFailure ? "text-orange-600/90" : "text-red-500/90"}`}>
                       {failureSummary}
                       {statusMessage ? ` · ${statusMessage}` : ""}
                     </div>
                   )}
                   {!failedToday && showFormalGap && gapReasons.length > 0 && (
-                    <div className="text-[11px] text-red-500/90 font-medium">
+                    <div className="truncate text-[11px] text-red-500/90 font-medium leading-4">
                       缺口：{gapReasons.join("；")}
                     </div>
                   )}
@@ -1530,7 +1559,7 @@ function BrandCard({
                       type="button"
                       onClick={onProgressClick}
                       disabled={!onProgressClick}
-                      className={`block text-left text-[11px] font-medium transition-colors disabled:cursor-default ${progressToneClassName}`}
+                      className={`block max-w-full truncate text-left text-[11px] font-medium leading-4 transition-colors disabled:cursor-default ${progressToneClassName}`}
                     >
                       {successProgressSummary}
                     </button>
@@ -1540,7 +1569,7 @@ function BrandCard({
                       type="button"
                       onClick={onTestRunStatusClick}
                       disabled={!onTestRunStatusClick}
-                      className={`inline-flex items-center gap-1 text-left text-[11px] font-medium transition-colors disabled:cursor-default ${isCancelling ? "text-amber-700 hover:text-amber-800" : "text-[var(--brand-navy)] hover:text-blue-700"}`}
+                      className={`inline-flex max-w-full items-center gap-1 truncate text-left text-[11px] font-medium leading-4 transition-colors disabled:cursor-default ${isCancelling ? "text-amber-700 hover:text-amber-800" : "text-[var(--brand-navy)] hover:text-blue-700"}`}
                     >
                       <Loader2 className="w-3 h-3 animate-spin" />
                       {isCancelling ? "测试任务正在安全中断，当前步骤结束后会停止" : "测试任务正在后台执行，关闭弹窗后仍会继续"}
@@ -1550,18 +1579,19 @@ function BrandCard({
                     <button
                       type="button"
                       onClick={onTestFailureNoticeClick}
-                      className="block text-left text-[11px] text-amber-600 font-medium transition-colors hover:text-amber-700"
+                      className="block max-w-full truncate text-left text-[11px] text-amber-600 font-medium leading-4 transition-colors hover:text-amber-700"
                     >
                       测试失败提醒：{testFailureMessage}
                     </button>
                   )}
                   {deletePendingMessage && (
-                    <div className="text-[11px] text-rose-500 font-medium">
+                    <div className="truncate text-[11px] text-rose-500 font-medium leading-4">
                       {deletePendingMessage}
                     </div>
                   )}
-                </div>
-              )}
+                  </div>
+                )}
+              </div>
 
               <div className="mt-4">
                 <div className="min-w-0">
