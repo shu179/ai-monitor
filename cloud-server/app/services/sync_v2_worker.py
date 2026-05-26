@@ -249,10 +249,7 @@ def run_sync_v2_worker(
     while True:
         with session_factory() as db:
             if statement_timeout_ms is not None:
-                db.execute(
-                    text("SET statement_timeout = :timeout_ms"),
-                    {"timeout_ms": max(0, int(statement_timeout_ms))},
-                )
+                _apply_statement_timeout(db, statement_timeout_ms)
             stats = process_sync_batch_items_once(
                 db,
                 worker_id=worker_id,
@@ -264,6 +261,16 @@ def run_sync_v2_worker(
             return
         if stats.get("claimed", 0) <= 0:
             time.sleep(max(0.1, float(poll_seconds or 1.0)))
+
+
+def _apply_statement_timeout(db: Session, timeout_ms: int) -> None:
+    """Set a per-session Postgres statement timeout for worker sessions.
+
+    Postgres does not accept bind parameters in SET statements, so clamp to an
+    integer before formatting the literal into SQL.
+    """
+    safe_timeout_ms = max(0, int(timeout_ms))
+    db.execute(text(f"SET statement_timeout = {safe_timeout_ms}"))
 
 
 def _materialize_claimed_item(db: Session, *, item: dict[str, Any], worker_id: str) -> None:

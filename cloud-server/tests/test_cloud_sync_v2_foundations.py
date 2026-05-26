@@ -40,6 +40,7 @@ from app.services.sync_v2_service import (  # noqa: E402
     cloud_capabilities,
 )
 from app.services.sync_v2_worker import (  # noqa: E402
+    _apply_statement_timeout,
     _mark_item_dead_letter,
     _mark_item_done,
     _mirror_legacy_sync_event,
@@ -202,6 +203,15 @@ class SyncV2ServiceTests(unittest.TestCase):
 
 
 class SyncV2WorkerSqlTests(unittest.TestCase):
+    def test_apply_statement_timeout_uses_integer_literal_sql(self) -> None:
+        db = MagicMock()
+
+        _apply_statement_timeout(db, 60_000)
+
+        sql = str(db.execute.call_args.args[0])
+        self.assertEqual(sql, "SET statement_timeout = 60000")
+        self.assertEqual(db.execute.call_args.args[1:], ())
+
     @patch("app.services.sync_v2_worker.renew_sync_worker_shard_leases", return_value=[1, 2])
     def test_claim_uses_cte_not_update_limit_and_matches_created_at(self, _renew) -> None:
         db = MagicMock()
