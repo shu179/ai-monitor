@@ -2015,7 +2015,7 @@ export function SettingsContent({
                 </div>
                 <div>
                   <p className="mt-1 text-[11px] text-gray-500 leading-relaxed">
-                    用于账号页维护的自媒体账号主页链接（搜狐号、头条号、知乎、博客园等）；定时只抓首页 / RSS / 接口返回的最新列表。RSSHub 会自动记住可用源，并短期跳过连续失败源。
+                    用于账号页维护的自媒体账号主页链接（搜狐号、头条号、知乎、博客园等）；定时只抓首页 / RSS / 接口返回的最新列表。默认使用官方 RSSHub，可手动填写自建源；系统会自动记住可用源，并短期跳过连续失败源。
                   </p>
                 </div>
               </div>
@@ -2057,7 +2057,7 @@ export function SettingsContent({
                   label="RSSHub 地址（可多个）:"
                   value={accountCrawlRsshubBaseUrl}
                   onChange={setAccountCrawlRsshubBaseUrl}
-                  placeholder="https://rsshub.app, https://rsshub.akr.moe"
+                  placeholder="https://rsshub.app"
                 />
               </div>
               {accountExclusionsOpen ? (

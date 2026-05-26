@@ -125,6 +125,14 @@ class AccountCrawlExclusionTests(unittest.TestCase):
         self.assertEqual(stored["last_manual_run_at"], "2026-05-09 10:00:00")
         self.assertEqual(stored["last_excluded_count"], 2)
 
+    def test_normalize_rsshub_base_urls_keeps_official_and_strips_legacy_fallbacks(self) -> None:
+        bases = account_crawler._normalize_rsshub_base_urls(
+            ["https://rsshub.akr.moe", "https://rsshub.example", "https://rsshub.app"],
+            "https://rss.neoz.cc, https://rsshub.umzzz.com",
+        )
+
+        self.assertEqual(bases, ["https://rsshub.example", "https://rsshub.app"])
+
     def test_account_crawl_keeps_media_name_and_stores_account_name(self) -> None:
         account = {
             "id": "toutiao-a",
@@ -463,6 +471,56 @@ class AccountCrawlExclusionTests(unittest.TestCase):
 
         self.assertEqual([item["title"] for item in articles], ["RSSHub 本账号文章"])
         self.assertEqual(account_crawler._normalize_published_at(articles[0]["published_at"]), "2024-01-02")
+
+    def test_smzdm_source_candidates_include_rsshub_article_route(self) -> None:
+        account = {
+            "id": "smzdm-a",
+            "name": "值得买作者",
+            "url": "https://zhiyou.smzdm.com/member/6902738986/",
+            "platform": "smzdm",
+            "platform_label": "什么值得买",
+        }
+
+        candidates = account_crawler._build_source_candidates(
+            account,
+            {"rsshub_base_urls": ["https://rsshub.example"], "max_items_per_account": 20},
+        )
+
+        candidate_urls = [item["url"] for item in candidates]
+        self.assertIn("https://rsshub.example/smzdm/article/6902738986", candidate_urls)
+        self.assertIn("https://rsshub.app/smzdm/article/6902738986", candidate_urls)
+        self.assertIn("https://zhiyou.smzdm.com/member/6902738986/", candidate_urls)
+        self.assertTrue(any(item["type"] == "rss" for item in candidates))
+
+    def test_smzdm_html_fallback_only_keeps_article_links(self) -> None:
+        account = {
+            "id": "smzdm-a",
+            "name": "值得买作者",
+            "url": "https://zhiyou.smzdm.com/member/6902738986/",
+            "platform": "smzdm",
+            "platform_label": "什么值得买",
+        }
+        html = """
+        <a href="https://post.smzdm.com/p/aqzedvpx/">值得买文章</a>
+        <a href="https://post.smzdm.com/zz/p/ardmqn0g/">值得买专栏文章</a>
+        <a href="https://zhiyou.smzdm.com/member/6902738986/">个人主页</a>
+        <a href="https://www.smzdm.com/tag/shuma/">标签页</a>
+        """
+
+        articles = account_crawler._extract_articles_from_html(
+            html,
+            "https://zhiyou.smzdm.com/member/6902738986/",
+            "smzdm",
+            account=account,
+        )
+
+        self.assertEqual(
+            [item["url"] for item in articles],
+            [
+                "https://post.smzdm.com/p/aqzedvpx/",
+                "https://post.smzdm.com/zz/p/ardmqn0g/",
+            ],
+        )
 
     def test_rss_parser_uses_url_guid_when_link_is_missing(self) -> None:
         xml = """<?xml version="1.0" encoding="UTF-8"?>

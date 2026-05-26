@@ -39,6 +39,7 @@ const ARTICLE_ACCOUNT_PLATFORM_LABELS: Record<string, string> = {
   sohu: "搜狐号",
   zhihu: "知乎",
   cnblogs: "博客园",
+  smzdm: "什么值得买",
   rss: "RSS",
   unknown: "未知平台",
 };
@@ -179,6 +180,7 @@ function inferArticleAccountPlatform(url: string) {
     if (host.includes("sohu.com")) return "sohu";
     if (host.includes("toutiao.com") || host.includes("toutiaohao.com")) return "toutiao";
     if (host.includes("zhihu.com")) return "zhihu";
+    if (host.includes("smzdm.com")) return "smzdm";
     if (host.includes("rsshub") || path.endsWith(".xml") || path.endsWith(".rss") || path.includes("/rss")) return "rss";
   } catch {
     return "unknown";

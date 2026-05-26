@@ -40,7 +40,7 @@ from core.time_utils import local_now, local_today
 
 ACCOUNT_CRAWL_STATE_FILE = resolve_app_path("logs/account_crawl_state.json")
 DEFAULT_RSSHUB_BASE_URL = "https://rsshub.app"
-DEFAULT_RSSHUB_FALLBACK_BASE_URLS = (
+LEGACY_RSSHUB_FALLBACK_BASE_URLS = (
     "https://rsshub.akr.moe",
     "https://rss.neoz.cc",
     "https://rsshub.umzzz.com",
@@ -77,6 +77,7 @@ PLATFORM_LABELS: dict[str, str] = {
     "sohu": "搜狐号",
     "zhihu": "知乎",
     "cnblogs": "博客园",
+    "smzdm": "什么值得买",
     "rss": "RSS",
     "unknown": "未知平台",
 }
@@ -85,6 +86,7 @@ ACCOUNT_PLATFORM_MEDIA_NAMES: dict[str, str] = {
     "sohu": "搜狐",
     "zhihu": "知乎",
     "cnblogs": "博客园",
+    "smzdm": "什么值得买",
 }
 PUBLISHED_JSON_KEYS = (
     "publicTime",
@@ -286,6 +288,8 @@ def infer_account_platform(url: str) -> str:
         return "toutiao"
     if "zhihu.com" in host:
         return "zhihu"
+    if "smzdm.com" in host:
+        return "smzdm"
     if "rsshub" in host or path.endswith((".xml", ".rss")) or "/rss" in path:
         return "rss"
     return "unknown"
@@ -423,8 +427,8 @@ def _normalize_rsshub_base_urls(*values: Any) -> list[str]:
 
     for value in values:
         add(value)
+    bases = [base for base in bases if base not in LEGACY_RSSHUB_FALLBACK_BASE_URLS]
     add(DEFAULT_RSSHUB_BASE_URL)
-    add(DEFAULT_RSSHUB_FALLBACK_BASE_URLS)
     return bases
 
 
@@ -850,6 +854,11 @@ def _build_source_candidates(account: dict[str, Any], settings: dict[str, Any]) 
             for base_url in rsshub_bases:
                 add(f"{base_url}/zhihu/people/activities/{quote(people_id, safe='')}", "rss", rsshub_base=base_url)
                 add(f"{base_url}/zhihu/xhu/people/activities/{quote(people_id, safe='')}", "rss", rsshub_base=base_url)
+    elif platform == "smzdm":
+        uid = _extract_smzdm_uid(url)
+        if uid:
+            for base_url in rsshub_bases:
+                add(f"{base_url}/smzdm/article/{quote(uid, safe='')}", "rss", rsshub_base=base_url)
 
     if _allow_direct_account_page_fallback(account, platform, url):
         add(url, "auto")
@@ -1605,6 +1614,24 @@ def _extract_zhihu_people_id(url: str) -> str:
     return str(match.group(1) or "").strip() if match else ""
 
 
+def _extract_smzdm_uid(url: str) -> str:
+    parsed = urlparse(_ensure_url_scheme(url))
+    qs = parse_qs(parsed.query)
+    for key in ("uid", "user_id", "userId", "id"):
+        value = str((qs.get(key) or [""])[0] or "").strip()
+        if value and re.fullmatch(r"\d{3,}", value):
+            return value
+    for pattern in (
+        r"/member/(\d{3,})(?:/|$)",
+        r"/user/(\d{3,})(?:/|$)",
+        r"/profile/(\d{3,})(?:/|$)",
+    ):
+        match = re.search(pattern, parsed.path, re.IGNORECASE)
+        if match:
+            return str(match.group(1) or "").strip()
+    return ""
+
+
 def _build_headers(url: str) -> dict[str, str]:
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
@@ -1909,6 +1936,17 @@ def _looks_like_article_url(platform: str, url: str, *, account_xpt: str = "") -
         if account_author_id:
             return author_id == account_author_id
         return True
+    if platform == "smzdm":
+        parsed = urlparse(_ensure_url_scheme(raw))
+        host = parsed.netloc.lower()
+        if host and "smzdm.com" not in host:
+            return False
+        path = parsed.path.lower()
+        return bool(
+            re.search(r"/(?:zz/)?p/[a-z0-9]+/?$", path)
+            or re.search(r"/faxian/\d+/?$", path)
+            or re.search(r"/youhui/\d+/?$", path)
+        )
     return bool(re.search(r"/\d{4}/|/p/|/article|/post|/archives?", lowered))
 
 
