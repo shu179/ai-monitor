@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app /app/app
 COPY alembic /app/alembic
+COPY scripts /app/scripts
 COPY alembic.ini /app/alembic.ini
 
 EXPOSE 8080
