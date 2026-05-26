@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from .sqlite_tuning import apply_runtime_pragmas
+
 
 MISSING = object()
 
@@ -113,7 +115,7 @@ class SQLiteJsonDocumentStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path, timeout=30)
         try:
-            conn.execute("PRAGMA busy_timeout = 30000")
+            apply_runtime_pragmas(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS json_documents (

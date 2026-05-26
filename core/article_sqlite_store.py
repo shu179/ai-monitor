@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .sqlite_tuning import apply_runtime_pragmas
 from .time_utils import local_now, local_today, parse_local_date
 
 
@@ -751,8 +752,7 @@ class ArticleSQLiteStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path, timeout=30)
         try:
-            conn.execute("PRAGMA busy_timeout = 30000")
-            conn.execute("PRAGMA foreign_keys = ON")
+            apply_runtime_pragmas(conn)
         except BaseException:
             conn.close()
             raise

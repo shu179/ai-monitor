@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from .sqlite_tuning import apply_runtime_pragmas
 from .time_utils import local_now, local_today, parse_local_date
 
 
@@ -1033,8 +1034,7 @@ class ArticleHistorySQLiteStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path, timeout=self._sqlite_timeout)
         try:
-            conn.execute(f"PRAGMA busy_timeout = {int(self._sqlite_timeout * 1000)}")
-            conn.execute("PRAGMA foreign_keys = ON")
+            apply_runtime_pragmas(conn, busy_timeout_ms=int(self._sqlite_timeout * 1000))
         except BaseException:
             conn.close()
             raise
