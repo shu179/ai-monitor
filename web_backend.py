@@ -201,12 +201,10 @@ from core.browser_platform_factory import (
 )
 from core.browser_runtime import resolve_system_browser_executable
 from core.batch_test_storage import merge_batch_json, read_batch_json, write_batch_json
-from core.cloud_sync import CloudSyncManager
 from core.cloud_client import CloudClientError, SurfacedCloudClient
 from core.cloud_event_types import EVENT_ARTICLE_CHANGED, EVENT_PROFILE_UPDATE, FORCE_SEND_SOURCE
 from core.cloud_article_sync import pull_cloud_articles_into_store
 from core.cloud_outbox import CloudOutbox
-from core.cloud_platform_auto_sync import CloudPlatformAutoSync
 from core.cloud_run_sync import (
     enqueue_cloud_articles,
     enqueue_profile_update,
@@ -214,6 +212,7 @@ from core.cloud_run_sync import (
     enqueue_task_day_status,
     flush_cloud_outbox as flush_cloud_outbox_events,
 )
+from core.cloud_sync_runtime import LocalCloudSyncRuntime, create_local_cloud_sync_runtime
 from core.cloud_session_store import (
     CloudSessionChangedError,
     CloudSessionStore,
@@ -2059,29 +2058,16 @@ class AppRuntime:
             self._scheduler_reporter = SchedulerWebhookReporter(self.load_config)
         except Exception:
             self._scheduler_reporter = None
-        self._cloud_sync_manager = CloudSyncManager(
+        self._cloud_runtime: LocalCloudSyncRuntime = create_local_cloud_sync_runtime(
             config_getter=self.load_config,
-            bundle_builder=lambda include_secrets=False: build_sync_bundle(
-                self.load_config(),
-                include_secrets=include_secrets,
-            ),
             bundle_applier=lambda bundle, mode="merge": self._apply_sync_bundle(bundle, mode=mode),
             config_updater=self._save_runtime_config,
-            logger=lambda message: print(redact_secret_text(message)),
-        )
-        self._cloud_platform_auto_sync = CloudPlatformAutoSync(
             pull_tasks=lambda force=False: self.pull_cloud_tasks({"force": force}),
             recover_upload_candidates=lambda: self._recover_cloud_run_history_uploads(),
-            upload_burst_interval_seconds=_safe_float(
-                os.environ.get("AIBRANDMONITOR_CLOUD_UPLOAD_BURST_INTERVAL_SECONDS"),
-                1.0,
-            ),
-            upload_burst_pending_threshold=_safe_int(
-                os.environ.get("AIBRANDMONITOR_CLOUD_UPLOAD_BURST_PENDING_THRESHOLD"),
-                100,
-            ),
             logger=lambda message: print(redact_secret_text(message)),
         )
+        self._cloud_sync_manager = self._cloud_runtime.manager
+        self._cloud_platform_auto_sync = self._cloud_runtime.platform_auto_sync
         self._isolate_ordinary_cloud_account_config(CloudSessionStore().load())
 
     def _sync_loaded_config(self, config: dict[str, Any]) -> None:
@@ -5767,15 +5753,13 @@ return changedCount
         }
 
     def restore_monitoring_if_needed(self) -> None:
-        self._cloud_sync_manager.start()
-        self._cloud_platform_auto_sync.start()
+        self._cloud_runtime.start()
         self.start_account_crawl_scheduler()
         if should_auto_resume_monitoring():
             self.start_monitoring()
 
     def shutdown(self) -> None:
-        self._cloud_sync_manager.stop()
-        self._cloud_platform_auto_sync.stop()
+        self._cloud_runtime.stop()
         self.stop_account_crawl_scheduler()
         self._stop_recognition_test_session(restore_previous=False)
         if self._is_monitoring_running():
