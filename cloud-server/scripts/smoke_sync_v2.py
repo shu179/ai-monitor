@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -39,10 +40,11 @@ def main() -> int:
         return 2
 
     with SessionLocal() as db:
-        workspace, user, task = _seed_workspace(db)
+        suffix = f"{os.getpid()}-{uuid4().hex[:10]}"
+        workspace, user, task = _seed_workspace(db, suffix=suffix)
         event = SyncEventIn(
             event_type=EVENT_RUN_RECORD,
-            idempotency_key=f"smoke-run-{os.getpid()}",
+            idempotency_key=f"smoke-run-{suffix}",
             payload={
                 "task_id": int(task.id),
                 "platform": "smoke",
@@ -111,8 +113,7 @@ def main() -> int:
     return 0
 
 
-def _seed_workspace(db):
-    suffix = str(os.getpid())
+def _seed_workspace(db, *, suffix: str):
     workspace = Workspace(name=f"Smoke Workspace {suffix}")
     db.add(workspace)
     db.flush()
