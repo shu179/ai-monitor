@@ -229,6 +229,9 @@ def _hydrate_article_export_urls(articles: list[dict[str, Any]]) -> list[dict[st
     return hydrated
 
 
+ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL = "未知"
+
+
 def _article_export_keyword_sort_key(label: str, keyword_order: dict[str, int]) -> tuple[int, str]:
     text = str(label or "").strip()
     return (keyword_order.get(text, len(keyword_order) + 1), text)
@@ -257,15 +260,17 @@ def _article_export_items(
             keyword_plan=keyword_plan,
             keyword_config_signature=keyword_config_signature,
         )
+        cleaned_labels = [
+            str(label or "").strip()
+            for label in labels
+            if str(label or "").strip()
+        ]
         ordered_labels = sorted(
-            [
-                str(label or "").strip()
-                for label in labels
-                if str(label or "").strip()
-            ],
+            cleaned_labels,
             key=lambda label: _article_export_keyword_sort_key(label, keyword_order),
         )
-        items.append(("、".join(ordered_labels), article))
+        cell_value = "、".join(ordered_labels) if ordered_labels else ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL
+        items.append((cell_value, article))
 
     return items
 

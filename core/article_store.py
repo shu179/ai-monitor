@@ -16,6 +16,7 @@ import re
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
@@ -4467,6 +4468,8 @@ def mark_articles_referenced_by_urls(
 # ---------------------------------------------------------------------------
 
 _MATCH_NORMALIZE_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+", re.IGNORECASE)
+# NFKC \u628a\u5168\u89d2\u5b57\u6bcd/\u6570\u5b57/\u7a7a\u683c\u6298\u53e0\u6210\u534a\u89d2\uff0c\u907f\u514d\u6807\u9898\u91cc\u7684\u201c\uff21\uff29 \u4f18\u5316\u201d\u201c\uff27\uff25\uff2f"\u88ab\u4e22\u6389\u9996\u5c3e\u82f1\u6587\uff1b
+# \u4e5f\u987a\u624b\u628a Roman/\u4e0a\u4e0b\u6807\u7b49\u517c\u5bb9\u5b57\u7b26\u89c4\u8303\u5316\uff0c\u6574\u4f53\u53ea\u4f1a\u8ba9\u5339\u914d\u547d\u4e2d\u66f4\u591a\uff0c\u4e0d\u4f1a\u8ba9\u539f\u672c\u547d\u4e2d\u7684\u4e22\u6389\u3002
 _INTENT_TERMS = (
     "品牌推荐", "品牌", "牌子", "推荐", "排行", "榜单", "测评", "评测",
     "对比", "横评", "盘点", "怎么选", "选购", "口碑", "值得买", "合集",
@@ -4493,7 +4496,11 @@ _PROVIDER_EQUIVALENT_TERMS = (
 
 
 def _normalize_match_text(text: str) -> str:
-    return _MATCH_NORMALIZE_RE.sub("", str(text or "").strip().lower())
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    folded = unicodedata.normalize("NFKC", raw).lower()
+    return _MATCH_NORMALIZE_RE.sub("", folded)
 
 
 _TITLE_INSERTION_NOISE_NORMALIZED = {
@@ -4504,6 +4511,18 @@ _TITLE_INSERTION_NOISE_NORMALIZED = {
 _PROVIDER_EQUIVALENT_NORMALIZED = {
     _normalize_match_text(term)
     for term in _PROVIDER_EQUIVALENT_TERMS
+    if _normalize_match_text(term)
+}
+# 受控的"虚词/连接词"集合：导出关键词允许标题在关键词中间多塞这些短词后仍命中，
+# 例如关键词 "数字化转型" 命中标题 "数字化的转型实践"。集合刻意保持很小，
+# 防止把"编程"→"教程"这类语义不同的两个字也当作可插入项造成误匹配。
+_EXPORT_KEYWORD_FILLER_TERMS = (
+    "的", "之", "与", "和", "及", "或", "在", "并", "以",
+    "上", "中", "下", "里", "对", "为",
+)
+_EXPORT_KEYWORD_FILLER_NORMALIZED = {
+    _normalize_match_text(term)
+    for term in _EXPORT_KEYWORD_FILLER_TERMS
     if _normalize_match_text(term)
 }
 
@@ -5474,7 +5493,7 @@ def _task_keyword_terms(task: dict) -> list[str]:
     ])
 
 
-ARTICLE_EXPORT_KEYWORD_CACHE_VERSION = 2
+ARTICLE_EXPORT_KEYWORD_CACHE_VERSION = 4
 ARTICLE_EXPORT_KEYWORD_CACHE_FIELDS = (
     "export_keyword_categories",
     "export_keyword_categories_by_task",
@@ -5522,10 +5541,12 @@ def _contains_ascii_token(haystack: str, needle: str) -> bool:
 
 def _export_keyword_matches_title(title: str, keyword: str) -> bool:
     raw_title = str(title or "")
+    # NFKC 折叠把"ＧＥＯ优化"里的全角字母变成半角，让短英文关键词的词边界判断也能落地。
+    raw_title_lower = unicodedata.normalize("NFKC", raw_title).lower()
     normalized_title = _normalize_match_text(title)
     normalized_keyword = _normalize_match_text(keyword)
     return _export_keyword_matches_normalized_title(
-        raw_title.lower(),
+        raw_title_lower,
         normalized_title,
         normalized_keyword,
     )
@@ -5539,11 +5560,47 @@ def _export_keyword_matches_normalized_title(
     if not normalized_title or not normalized_keyword:
         return False
     if re.fullmatch(r"[a-z0-9]{1,3}", normalized_keyword):
+        # 短英文/数字关键词必须走词边界，避免 "AI" 命中 "OpenAI"。
+        # 这条路径不开放近似匹配，否则 "AI" 类关键词会泛滥。
         return (
             _contains_ascii_token(raw_title_lower, normalized_keyword)
             or _contains_ascii_token(normalized_title, normalized_keyword)
         )
-    return normalized_keyword in normalized_title
+    if normalized_keyword in normalized_title:
+        return True
+    return _export_keyword_matches_with_insertion(normalized_title, normalized_keyword)
+
+
+def _export_keyword_matches_with_insertion(
+    normalized_title: str,
+    normalized_keyword: str,
+) -> bool:
+    """允许关键词被劈成两段、中间夹一段受控的虚词/修饰词后仍命中。
+
+    例如关键词 "数字化转型" 在标题 "数字化的转型实践" 中：
+    切成 "数字化"+"转型"，中间是 "的" ∈ filler → 命中。
+    刻意只放行 _TITLE_INSERTION_NOISE_NORMALIZED 与 _EXPORT_KEYWORD_FILLER_NORMALIZED 两份集合，
+    避免 "AI编程" 这种关键词被 "AI综合编程" 之类语义不同的标题误命中。
+    """
+    if len(normalized_keyword) < 4:
+        return False
+    allowed_gaps = _TITLE_INSERTION_NOISE_NORMALIZED | _EXPORT_KEYWORD_FILLER_NORMALIZED
+    for split_idx in range(2, len(normalized_keyword) - 1):
+        left = normalized_keyword[:split_idx]
+        right = normalized_keyword[split_idx:]
+        if len(left) < 2 or len(right) < 2:
+            continue
+        left_idx = normalized_title.find(left)
+        while left_idx >= 0:
+            search_start = left_idx + len(left)
+            right_idx = normalized_title.find(right, search_start)
+            if right_idx < 0:
+                break
+            gap = normalized_title[search_start:right_idx]
+            if 1 <= len(gap) <= 4 and gap in allowed_gaps:
+                return True
+            left_idx = normalized_title.find(left, left_idx + 1)
+    return False
 
 
 def build_article_export_keyword_plan(config: dict | None, task_name: str = "") -> list[dict[str, str]]:
@@ -5660,7 +5717,7 @@ def build_article_export_keyword_cache(
     resolved_config_signature = config_signature or build_article_export_keyword_signature(config)
     article_signature = _article_export_keyword_article_signature(article)
     article_title = str((article or {}).get("title", "") or "")
-    raw_title_lower = article_title.lower()
+    raw_title_lower = unicodedata.normalize("NFKC", article_title).lower()
     normalized_title = _normalize_match_text(article_title)
     matched_task_set = {
         str(name or "").strip()
@@ -5729,7 +5786,7 @@ def resolve_article_export_keywords(
 ) -> list[str]:
     """Resolve export keyword labels from user-configured task keywords only."""
     article_title = str((article or {}).get("title", "") or "")
-    raw_title_lower = article_title.lower()
+    raw_title_lower = unicodedata.normalize("NFKC", article_title).lower()
     normalized_title = _normalize_match_text(article_title)
     matched_tasks = [
         str(name or "").strip()

@@ -186,6 +186,8 @@ function formatArticleExportBrand(article: Article) {
   return names.length ? names.join("、") : "未归类";
 }
 
+const ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL = "未知";
+
 function formatArticleExportKeywords(article: Article) {
   const labels = (article.exportKeywords || [])
     .map((name) => String(name || "").trim())
@@ -194,9 +196,10 @@ function formatArticleExportKeywords(article: Article) {
 }
 
 function formatArticleExportKeywordCell(article: Article) {
-  return formatArticleExportKeywords(article)
+  const cell = formatArticleExportKeywords(article)
     .filter(Boolean)
     .join("、");
+  return cell || ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL;
 }
 
 function mergeArticleExportKeywords(baseArticles: Article[], keywordArticles: Article[]) {

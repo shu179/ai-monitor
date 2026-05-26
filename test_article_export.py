@@ -390,7 +390,7 @@ def test_article_export_keyword_cache_is_used_and_invalidated():
     ) == []
 
 
-def test_article_export_xlsx_leaves_keyword_blank_when_only_brand_matched(tmp_path):
+def test_article_export_xlsx_falls_back_to_unknown_when_only_brand_matched(tmp_path):
     output_path = tmp_path / "articles.xlsx"
     config = {
         "tasks": [
@@ -428,5 +428,186 @@ def test_article_export_xlsx_leaves_keyword_blank_when_only_brand_matched(tmp_pa
     workbook = load_workbook(output_path, read_only=True, data_only=True)
     sheet = workbook.active
 
-    assert sheet.cell(row=6, column=1).value in (None, "")
+    assert sheet.cell(row=6, column=1).value == "未知"
     assert sheet.cell(row=6, column=4).value == "品牌A 新闻动态"
+
+
+def test_article_export_keyword_category_fallback_unknown_in_export_items():
+    config = {
+        "tasks": [
+            {
+                "name": "品牌A",
+                "brand": "品牌A",
+                "keywords": [{"keyword": "新品"}],
+            }
+        ]
+    }
+    article = {
+        "id": "brand-only",
+        "title": "品牌A 普通动态",
+        "matched_tasks": ["品牌A"],
+    }
+
+    items = _backend_article_export_items(
+        [article],
+        show_keyword_category=True,
+        config=config,
+        task_name="品牌A",
+    )
+    assert items == [("未知", article)]
+
+
+def test_article_export_keywords_match_full_width_letters_and_digits():
+    """全角字母/数字标题应能匹配半角关键词。"""
+    config = {
+        "tasks": [
+            {
+                "name": "品牌A",
+                "brand": "品牌A",
+                "keywords": [
+                    {"keyword": "GEO"},
+                    {"keyword": "AI 编程"},
+                    {"keyword": "GPT-4"},
+                ],
+            }
+        ]
+    }
+
+    # 全角字母
+    assert resolve_article_export_keywords(
+        {"title": "品牌A ＧＥＯ优化方案", "matched_tasks": ["品牌A"]},
+        config,
+        "品牌A",
+    ) == ["GEO"]
+
+    # 全角字母 + 全角空格
+    assert resolve_article_export_keywords(
+        {"title": "品牌A ＡＩ　编程实战", "matched_tasks": ["品牌A"]},
+        config,
+        "品牌A",
+    ) == ["AI 编程"]
+
+    # 全角数字 + 半角字母混合
+    assert resolve_article_export_keywords(
+        {"title": "品牌A GPT-４ 全面解析", "matched_tasks": ["品牌A"]},
+        config,
+        "品牌A",
+    ) == ["GPT-4"]
+
+
+def test_article_export_keywords_tolerate_inserted_filler_words():
+    """标题在关键词中间多一两个虚词时仍应命中。"""
+    config = {
+        "tasks": [
+            {
+                "name": "品牌A",
+                "brand": "品牌A",
+                "keywords": [
+                    {"keyword": "数字化转型"},
+                    {"keyword": "AI 编程"},
+                ],
+            }
+        ]
+    }
+
+    assert resolve_article_export_keywords(
+        {"title": "数字化的转型实践图景", "matched_tasks": ["品牌A"]},
+        config,
+        "品牌A",
+    ) == ["数字化转型"]
+
+    assert resolve_article_export_keywords(
+        {"title": "企业数字化与转型路径", "matched_tasks": ["品牌A"]},
+        config,
+        "品牌A",
+    ) == ["数字化转型"]
+
+    assert resolve_article_export_keywords(
+        {"title": "AI 优质 编程实战", "matched_tasks": ["品牌A"]},
+        config,
+        "品牌A",
+    ) == ["AI 编程"]
+
+
+def test_article_export_keywords_reject_semantically_different_titles():
+    """中间塞入不在白名单的内容，必须保持不命中，避免“AI编程→AI教程”这种错配。"""
+    config = {
+        "tasks": [
+            {
+                "name": "品牌A",
+                "brand": "品牌A",
+                "keywords": [
+                    {"keyword": "AI 编程"},
+                    {"keyword": "数字化转型"},
+                ],
+            }
+        ]
+    }
+
+    # 主体不同的“AI 教程”不应命中“AI 编程”
+    assert resolve_article_export_keywords(
+        {"title": "AI 教程合集", "matched_tasks": ["品牌A"]},
+        config,
+        "品牌A",
+    ) == []
+
+    # 中间塞 5 个字以上的修饰词不应命中
+    assert resolve_article_export_keywords(
+        {"title": "数字化非常重要的转型", "matched_tasks": ["品牌A"]},
+        config,
+        "品牌A",
+    ) == []
+
+    # 中间塞数字也不命中（数字不是白名单）
+    assert resolve_article_export_keywords(
+        {"title": "数字化123转型", "matched_tasks": ["品牌A"]},
+        config,
+        "品牌A",
+    ) == []
+
+
+def test_article_export_keywords_short_ascii_still_strict_with_boundary():
+    """短 ASCII 关键词 (AI/GEO) 仍然走词边界，近似匹配不应放宽它。"""
+    config = {
+        "tasks": [
+            {
+                "name": "品牌A",
+                "brand": "品牌A",
+                "keywords": [{"keyword": "AI"}],
+            }
+        ]
+    }
+    assert resolve_article_export_keywords(
+        {"title": "品牌A OpenAI 教程", "matched_tasks": ["品牌A"]},
+        config,
+        "品牌A",
+    ) == []
+
+
+def test_desktop_article_export_items_falls_back_to_unknown():
+    """桌面端导出当 keyword_categories 为空时也要回填“未知”。"""
+    from ui.article_window import _article_export_items as desktop_article_export_items
+
+    rows = [
+        {
+            "id": "no-keyword",
+            "title": "品牌A 普通动态",
+            "keyword_categories": [],
+            "published_at": "2024-01-02",
+        },
+        {
+            "id": "with-keyword",
+            "title": "品牌A 新品发布",
+            "keyword_categories": ["新品"],
+            "published_at": "2024-01-01",
+        },
+    ]
+    items = desktop_article_export_items(
+        rows,
+        show_keyword_category=True,
+        keyword_order={"新品": 0},
+    )
+    assert [(label, row["id"]) for label, row in items] == [
+        ("新品", "with-keyword"),
+        ("未知", "no-keyword"),
+    ]

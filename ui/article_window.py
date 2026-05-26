@@ -212,6 +212,9 @@ def _sort_articles_for_export(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=sort_key)
 
 
+ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL = "未知"
+
+
 def _article_export_keyword_sort_key(label: str, keyword_order: dict[str, int]) -> tuple[int, str]:
     text = str(label or "").strip()
     return (keyword_order.get(text, len(keyword_order) + 1), text)
@@ -235,7 +238,8 @@ def _article_export_items(
             if str(label or "").strip()
         ]
         labels.sort(key=lambda label: _article_export_keyword_sort_key(label, resolved_keyword_order))
-        items.append(("、".join(labels), row))
+        cell_value = "、".join(labels) if labels else ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL
+        items.append((cell_value, row))
 
     return items
 
