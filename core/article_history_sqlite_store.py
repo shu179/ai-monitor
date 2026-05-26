@@ -11,8 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from .sqlite_tuning import apply_runtime_pragmas, perform_startup_maintenance
-from .sqlite_tuning import apply_runtime_pragmas, perform_startup_maintenance
+from .sqlite_tuning import apply_runtime_pragmas, perform_startup_maintenance, truncate_wal_if_oversized
 from .time_utils import local_now, local_today, parse_local_date
 
 
@@ -195,6 +194,11 @@ class ArticleHistorySQLiteStore:
                 perform_startup_maintenance(conn, self.db_path)
             except Exception:
                 pass
+
+    def vacuum_wal_if_needed(self) -> bool:
+        """Future daily-maintenance hook; startup maintenance is the current safety net."""
+        with self._connection() as conn:
+            return truncate_wal_if_oversized(conn, self.db_path)
 
     def import_articles(
         self,

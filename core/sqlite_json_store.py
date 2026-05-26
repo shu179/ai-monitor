@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .sqlite_tuning import apply_runtime_pragmas, perform_startup_maintenance
+from .sqlite_tuning import apply_runtime_pragmas, perform_startup_maintenance, truncate_wal_if_oversized
 
 
 MISSING = object()
@@ -137,6 +137,11 @@ class SQLiteJsonDocumentStore:
             conn.close()
             raise
         return conn
+
+    def vacuum_wal_if_needed(self) -> bool:
+        """Future daily-maintenance hook; startup maintenance is the current safety net."""
+        with self._connection() as conn:
+            return truncate_wal_if_oversized(conn, self.db_path)
 
     @staticmethod
     def _normalize_key(key: str) -> str:

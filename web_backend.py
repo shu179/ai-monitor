@@ -221,6 +221,7 @@ from core.cloud_session_store import (
     cloud_session_identity_key,
     normalize_cloud_base_url,
 )
+from core.sqlite_retry import call_with_locked_retry
 from core.cloud_task_sync import (
     pull_cloud_tasks_into_config,
     refresh_visible_cloud_task_day_statuses_from_history,
@@ -5914,12 +5915,14 @@ return changedCount
                 normalize_article_url=normalize_article_url,
                 sqlite_timeout=0.2,
             )
-            page = store.get_article_page(
-                limit=resolved_limit,
-                offset=0,
-                task_name=str(task_name or "").strip(),
-                media_type=normalized_media_type,
-                today=local_today().isoformat(),
+            page = call_with_locked_retry(
+                lambda: store.get_article_page(
+                    limit=resolved_limit,
+                    offset=0,
+                    task_name=str(task_name or "").strip(),
+                    media_type=normalized_media_type,
+                    today=local_today().isoformat(),
+                )
             )
             if bool(page.get("fallback_required")):
                 self._record_sqlite_shadow_fallback(
