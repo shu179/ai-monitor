@@ -233,6 +233,82 @@ class StateDeltaResponse(BaseModel):
     retry_after_seconds: int = 0
 
 
+class ObjectUploadCreateRequest(BaseModel):
+    sha256: str = Field(min_length=64, max_length=64)
+    size_bytes: int = Field(gt=0)
+    content_type: str = Field(min_length=1, max_length=128)
+    storage_size_bytes: int | None = Field(default=None, gt=0)
+    compression: str | None = Field(default="auto", max_length=32)
+
+
+class ObjectUploadResponse(BaseModel):
+    strategy: Literal["inline", "already_exists", "single_put", "multipart"]
+    object_id: str | None = None
+    session_id: str | None = None
+    sha256: str
+    size_bytes: int
+    storage_size_bytes: int
+    content_type: str
+    compression: str
+    storage_key: str
+    upload: dict[str, Any] | None = None
+    part_size_bytes: int | None = None
+    parts_total: int | None = None
+    expires_at: datetime | None = None
+
+
+class ObjectPartsPresignRequest(BaseModel):
+    part_numbers: list[int] = Field(min_length=1, max_length=100)
+
+
+class ObjectPartsPresignResponse(BaseModel):
+    session_id: str
+    part_size_bytes: int
+    parts_total: int
+    upload_urls: list[dict[str, Any]]
+    expires_at: datetime
+
+
+class ObjectPartCompleteRequest(BaseModel):
+    part_number: int = Field(ge=1)
+    etag: str = Field(min_length=1, max_length=512)
+    size_bytes: int = Field(gt=0)
+    sha256: str | None = Field(default=None, min_length=64, max_length=64)
+
+
+class ObjectPartCompleteResponse(BaseModel):
+    session_id: str
+    part_number: int
+    parts_completed: int
+    parts_total: int
+
+
+class ObjectUploadCompleteRequest(BaseModel):
+    storage_size_bytes: int | None = Field(default=None, gt=0)
+    compression: str | None = Field(default="auto", max_length=32)
+
+
+class ObjectUploadCompleteResponse(BaseModel):
+    object_id: str
+    status: str
+    storage_key: str
+    sha256: str
+    size_bytes: int
+    storage_size_bytes: int
+    content_type: str
+    compression: str
+
+
+class ObjectDownloadResponse(BaseModel):
+    object_id: str
+    download_url: str
+    expires_at: datetime
+    content_type: str
+    size_bytes: int
+    storage_size_bytes: int
+    compression: str
+
+
 class RunRecordPublic(BaseModel):
     id: int
     workspace_id: int

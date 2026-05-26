@@ -101,6 +101,20 @@ SURFACED_CLOUD_WORKER_BATCH_LIMIT=100
 
 API 保持 5s statement timeout，worker 使用 60s statement timeout；迁移进程不设置 statement timeout。生产多实例部署时建议再加 PgBouncer transaction pooling，避免 `API workers × pool_size + worker pool` 把 Postgres 连接数打满。
 
+Cloud Sync v2 的对象上传接口走 S3/R2-compatible presigned URL。生产优先使用 R2 + CDN 域名作为 endpoint，下行 URL 不从 API 服务器转发大文件：
+
+```text
+SURFACED_CLOUD_OBJECT_STORAGE_ENDPOINT_URL=https://<cdn-or-r2-endpoint>
+SURFACED_CLOUD_OBJECT_STORAGE_BUCKET=<bucket>
+SURFACED_CLOUD_OBJECT_STORAGE_REGION=auto
+SURFACED_CLOUD_OBJECT_STORAGE_ACCESS_KEY_ID=<access-key>
+SURFACED_CLOUD_OBJECT_STORAGE_SECRET_ACCESS_KEY=<secret-key>
+SURFACED_CLOUD_OBJECT_STORAGE_FORCE_PATH_STYLE=false
+SURFACED_CLOUD_OBJECT_STORAGE_WORKSPACE_QUOTA_BYTES=107374182400
+```
+
+对象策略固定为：`<=32KB` 内联、`32KB-5MB` 单 PUT、`>5MB` multipart，storage key 为 `<workspace_id>/<sha[:2]>/<sha[2:4]>/<sha>`。`sha256` 始终是未压缩内容 hash，`storage_size_bytes` 记录实际存储大小。
+
 生产环境必须把 `.env` 里的 `SURFACED_CLOUD_SECRET_KEY` 和 `POSTGRES_PASSWORD` 改成高强度随机值。
 测试完成后，可以把 `.env` 里的 `SURFACED_CLOUD_DOCS_ENABLED` 改成 `false`，然后重启服务以关闭公网 Swagger 文档。
 
@@ -121,6 +135,14 @@ API 保持 5s statement timeout，worker 使用 60s statement timeout；迁移�
 - `POST /api/v1/admin/tasks/{task_id}/members`
 - `DELETE /api/v1/admin/tasks/{task_id}/members/operator`
 - `POST /api/v1/sync/events`
+- `GET /api/v2/capabilities`
+- `POST /api/v2/sync/batches`
+- `POST /api/v2/sync/state-delta`
+- `POST /api/v2/objects/uploads`
+- `POST /api/v2/objects/uploads/{session_id}/parts:presign`
+- `POST /api/v2/objects/uploads/{session_id}/parts`
+- `POST /api/v2/objects/uploads/{session_id}:complete`
+- `POST /api/v2/objects/{object_id}:download`
 - `GET /api/v1/tasks/{task_id}/article-reference-ranking`
 - `GET /api/v1/tasks/{task_id}/run-records`
 - `GET /api/v1/updates/manifest`

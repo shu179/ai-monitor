@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     db_pool_timeout_seconds: int = 30
     db_statement_timeout_ms: int = 5000
     worker_db_statement_timeout_ms: int = 60000
+    object_storage_endpoint_url: str = ""
+    object_storage_bucket: str = ""
+    object_storage_region: str = "auto"
+    object_storage_access_key_id: str = ""
+    object_storage_secret_access_key: str = ""
+    object_storage_force_path_style: bool = False
+    object_storage_workspace_quota_bytes: int = 100 * 1024 * 1024 * 1024
 
     @computed_field
     @property
