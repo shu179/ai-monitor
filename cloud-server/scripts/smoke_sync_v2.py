@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -51,6 +52,7 @@ def main() -> int:
                 "keyword": "cloud-sync-v2",
                 "brand": "SmokeBrand",
                 "mode": "smoke",
+                "executed_at": datetime.now(timezone.utc).isoformat(),
                 "result": {"success": True, "rank": 1},
             },
         )
