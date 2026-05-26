@@ -18,5 +18,4 @@ COPY alembic.ini /app/alembic.ini
 
 EXPOSE 8080
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
-
+CMD ["sh", "-c", "gunicorn app.main:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8080 --workers ${SURFACED_CLOUD_API_WORKERS:-2} --timeout ${SURFACED_CLOUD_API_WORKER_TIMEOUT_SECONDS:-60}"]

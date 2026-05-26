@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Float,
     Index,
     Integer,
     String,
@@ -346,3 +347,287 @@ class SyncEvent(Base):
         Index("idx_sync_events_workspace_id", "workspace_id", "id"),
         UniqueConstraint("workspace_id", "idempotency_key", name="uq_sync_events_workspace_idempotency"),
     )
+
+
+class WorkspaceChangeSequence(Base):
+    __tablename__ = "workspace_change_sequences"
+
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True)
+    stream: Mapped[str] = mapped_column(String(32), primary_key=True)
+    seq: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class WorkspaceChangeLog(Base):
+    __tablename__ = "workspace_change_log"
+
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True)
+    stream: Mapped[str] = mapped_column(String(32), primary_key=True)
+    seq: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    ref_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        primary_key=True,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("idx_workspace_change_log_lookup", "workspace_id", "stream", "seq"),
+        {"postgresql_partition_by": "RANGE (created_at)"},
+    )
+
+
+class CloudIdempotencyKey(Base):
+    __tablename__ = "cloud_idempotency_keys"
+
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True)
+    scope: Mapped[str] = mapped_column(String(64), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SyncBatch(Base):
+    __tablename__ = "sync_batches"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="accepted", server_default="accepted", nullable=False)
+    accepted_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    rejected_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "idempotency_key", name="uq_sync_batches_workspace_idempotency"),
+        Index("idx_sync_batches_workspace_status", "workspace_id", "status", "created_at"),
+    )
+
+
+class SyncBatchItem(Base):
+    __tablename__ = "sync_batch_items"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        primary_key=True,
+        server_default=func.now(),
+    )
+    batch_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    stream: Mapped[str] = mapped_column(String(32), nullable=False)
+    partition_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    virtual_shard: Mapped[int] = mapped_column(Integer, nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", server_default="pending", nullable=False)
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    leased_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "idempotency_key",
+            "created_at",
+            name="uq_sync_batch_items_workspace_idempotency_partitioned",
+        ),
+        Index("idx_sync_batch_items_claim", "status", "virtual_shard", "created_at", "id"),
+        Index("idx_sync_batch_items_workspace_status", "workspace_id", "status", "created_at"),
+        Index("idx_sync_batch_items_partition_order", "workspace_id", "partition_key", "seq"),
+        {"postgresql_partition_by": "RANGE (created_at)"},
+    )
+
+
+class SyncWorkerShardLease(Base):
+    __tablename__ = "sync_worker_shard_leases"
+
+    virtual_shard: Mapped[int] = mapped_column(Integer, primary_key=True)
+    worker_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    leased_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_sync_worker_shard_leases_worker", "worker_id", "leased_until"),
+        Index("idx_sync_worker_shard_leases_expiry", "leased_until"),
+    )
+
+
+class WorkspaceRateLimit(Base):
+    __tablename__ = "workspace_rate_limits"
+
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True)
+    bucket: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tokens: Mapped[float] = mapped_column(Float, nullable=False)
+    capacity: Mapped[float] = mapped_column(Float, nullable=False)
+    refill_rate_per_second: Mapped[float] = mapped_column(Float, nullable=False)
+    last_refill_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SyncDeadLetter(Base):
+    __tablename__ = "sync_dead_letters"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    item_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    item_created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    batch_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    partition_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    last_error: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (Index("idx_sync_dead_letters_workspace_created", "workspace_id", "created_at"),)
+
+
+class DeadLetterAttempt(Base):
+    __tablename__ = "dead_letter_attempts"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    dead_letter_id: Mapped[int] = mapped_column(ForeignKey("sync_dead_letters.id", ondelete="CASCADE"), nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    error: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (Index("idx_dead_letter_attempts_dead_letter", "dead_letter_id", "created_at"),)
+
+
+class ObjectManifest(Base):
+    __tablename__ = "object_manifests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    storage_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    storage_key: Mapped[str] = mapped_column(Text, nullable=False)
+    compression: Mapped[str] = mapped_column(String(32), default="none", server_default="none", nullable=False)
+    ref_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    deleted_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "sha256", name="uq_object_manifests_workspace_sha256"),
+        Index("idx_object_manifests_workspace_status", "workspace_id", "status", "created_at"),
+    )
+
+
+class ObjectUploadSession(Base):
+    __tablename__ = "object_upload_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    storage_provider_upload_id: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    part_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    parts_total: Mapped[int] = mapped_column(Integer, nullable=False)
+    parts_completed: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "sha256", "size_bytes", name="uq_object_upload_sessions_workspace_object"),
+        Index("idx_object_upload_sessions_status_expires", "status", "expires_at"),
+    )
+
+
+class ObjectUploadPart(Base):
+    __tablename__ = "object_upload_parts"
+
+    session_id: Mapped[str] = mapped_column(ForeignKey("object_upload_sessions.id", ondelete="CASCADE"), primary_key=True)
+    part_number: Mapped[int] = mapped_column(Integer, primary_key=True)
+    etag: Mapped[str | None] = mapped_column(Text)
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentCommand(Base):
+    __tablename__ = "agent_commands"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        primary_key=True,
+        server_default=func.now(),
+    )
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    target_device_id: Mapped[str | None] = mapped_column(String(256))
+    target_role: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), default="pending", server_default="pending", nullable=False)
+    visibility_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}", nullable=False)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "idempotency_key",
+            "created_at",
+            name="uq_agent_commands_workspace_idempotency_partitioned",
+        ),
+        Index("idx_agent_commands_dispatch", "workspace_id", "target_device_id", "status", "visibility_until"),
+        {"postgresql_partition_by": "RANGE (created_at)"},
+    )
+
+
+class AgentResultChunk(Base):
+    __tablename__ = "agent_result_chunks"
+
+    command_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True)
+    payload_json: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}", nullable=False)
+    is_final: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (Index("idx_agent_result_chunks_created", "created_at"),)
+
+
+class ArticleVersion(Base):
+    __tablename__ = "article_versions"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    article_id: Mapped[int] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    inline_text: Mapped[str | None] = mapped_column(Text)
+    content_object_id: Mapped[str | None] = mapped_column(String(36))
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("article_id", "version", name="uq_article_versions_article_version"),
+        Index("idx_article_versions_workspace_article", "workspace_id", "article_id", "version"),
+    )
+
+
+class ArticlesMigrationState(Base):
+    __tablename__ = "articles_migration_state"
+
+    article_id: Mapped[int] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", server_default="pending", nullable=False)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (Index("idx_articles_migration_state_status", "status", "updated_at"),)

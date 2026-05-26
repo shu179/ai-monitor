@@ -43,6 +43,27 @@ alembic upgrade head
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 ```
 
+### Cloud Sync v2 smoke test
+
+在一次性测试库上验证 v1 `/sync/events` 已经合流到 v2 队列、worker 能消费、旧 `sync_events` 镜像和 `workspace_change_log` 都会写入：
+
+```bash
+cd cloud-server
+docker compose up -d postgres
+alembic upgrade head
+SURFACED_CLOUD_ALLOW_SMOKE=1 python -m scripts.smoke_sync_v2
+```
+
+也可以通过 pytest 入口运行同一条链路：
+
+```bash
+SURFACED_CLOUD_RUN_POSTGRES_SMOKE=1 \
+SURFACED_CLOUD_ALLOW_SMOKE=1 \
+python -m pytest tests/test_sync_v2_postgres_smoke.py -q
+```
+
+这条 smoke 会直接向当前 `SURFACED_CLOUD_DATABASE_URL` 指向的数据库写入临时 workspace/user/task/run 记录，只能用于可丢弃的本地或测试库。
+
 打开：
 
 ```text
@@ -63,8 +84,22 @@ cd cloud-server
 cp .env.example .env
 # 修改 .env 中的 SECRET_KEY、POSTGRES_PASSWORD、数据库地址等
 docker compose up -d --build
-docker compose exec api alembic upgrade head
 ```
+
+`docker compose` 会先运行一次 `migrate` 服务执行 `alembic upgrade head`，成功后再启动 `api` 和 `worker`。`api` 默认用 gunicorn + uvicorn worker 多进程运行，`worker` 独立消费 Cloud Sync v2 队列，避免后台 materialize 抢占 API 进程。
+
+关键运行参数：
+
+```text
+SURFACED_CLOUD_API_WORKERS=2
+SURFACED_CLOUD_DB_POOL_SIZE=5
+SURFACED_CLOUD_DB_MAX_OVERFLOW=10
+SURFACED_CLOUD_DB_STATEMENT_TIMEOUT_MS=5000
+SURFACED_CLOUD_WORKER_DB_STATEMENT_TIMEOUT_MS=60000
+SURFACED_CLOUD_WORKER_BATCH_LIMIT=100
+```
+
+API 保持 5s statement timeout，worker 使用 60s statement timeout；迁移进程不设置 statement timeout。生产多实例部署时建议再加 PgBouncer transaction pooling，避免 `API workers × pool_size + worker pool` 把 Postgres 连接数打满。
 
 生产环境必须把 `.env` 里的 `SURFACED_CLOUD_SECRET_KEY` 和 `POSTGRES_PASSWORD` 改成高强度随机值。
 测试完成后，可以把 `.env` 里的 `SURFACED_CLOUD_DOCS_ENABLED` 改成 `false`，然后重启服务以关闭公网 Swagger 文档。

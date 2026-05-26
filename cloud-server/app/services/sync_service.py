@@ -25,6 +25,13 @@ from app.models import (
 from app.schemas import SyncEventIn
 from app.core.security import utc_now
 from app.services.article_classification_service import sync_article_classification_state
+from app.services.change_log_service import (
+    STREAM_ARTICLES,
+    STREAM_PROFILE,
+    STREAM_REFERENCES,
+    STREAM_RUNS,
+    record_workspace_change,
+)
 from app.sync_event_types import (
     EVENT_ARTICLE_REFERENCE,
     EVENT_ARTICLE_TASK_LINKS,
@@ -377,50 +384,40 @@ def _task_to_visible_payload(task: BrandTask, access_level: str) -> dict:
 
 
 def accept_sync_events(db: Session, user: User, events: list[SyncEventIn]) -> tuple[int, int]:
-    accepted = 0
-    duplicates = 0
-    for event in events:
-        payload = _sanitize_sync_event_payload(event.event_type, event.payload)
-        materialized_event = SyncEventIn(
-            event_type=event.event_type,
-            idempotency_key=event.idempotency_key,
-            payload=payload,
-        )
-        stmt = (
-            insert(SyncEvent)
-            .values(
-                workspace_id=user.workspace_id,
-                user_id=user.id,
-                event_type=event.event_type,
-                idempotency_key=event.idempotency_key,
-                payload_json=payload,
-            )
-            .on_conflict_do_nothing(index_elements=["workspace_id", "idempotency_key"])
-            .returning(SyncEvent.id)
-        )
-        inserted_id = db.scalar(stmt)
-        if inserted_id is None:
-            duplicates += 1
-            continue
-        accepted += 1
-        _materialize_known_event(db, user, materialized_event)
-    db.commit()
-    return accepted, duplicates
+    from app.services.sync_v2_service import accept_legacy_sync_events_as_batch
+
+    return accept_legacy_sync_events_as_batch(db, user, events)
 
 
 def _materialize_known_event(db: Session, user: User, event: SyncEventIn) -> None:
     if event.event_type == EVENT_RUN_RECORD:
         _materialize_run_record(db, user, event)
+        _record_materialized_change(db, user, stream=STREAM_RUNS, kind="run.record", ref_id=event.idempotency_key)
     elif event.event_type == EVENT_ARTICLE_UPSERT:
         _materialize_article_upsert(db, user, event)
+        _record_materialized_change(db, user, stream=STREAM_ARTICLES, kind="article.upsert", ref_id=event.idempotency_key)
     elif event.event_type == EVENT_ARTICLE_TASK_LINKS:
         _materialize_article_task_links(db, user, event)
+        _record_materialized_change(db, user, stream=STREAM_ARTICLES, kind="article.link", ref_id=event.idempotency_key)
     elif event.event_type == EVENT_ARTICLE_REFERENCE:
         _materialize_article_reference_event(db, user, event)
+        _record_materialized_change(db, user, stream=STREAM_REFERENCES, kind="article.reference", ref_id=event.idempotency_key)
     elif event.event_type == EVENT_PROFILE_UPDATE:
         _materialize_profile_update(user, event)
+        _record_materialized_change(db, user, stream=STREAM_PROFILE, kind="profile.update", ref_id=event.idempotency_key)
     elif event.event_type == EVENT_TASK_DAY_STATUS:
         _validate_task_day_status_event(db, user, event)
+        _record_materialized_change(db, user, stream=STREAM_RUNS, kind="task.day_status", ref_id=event.idempotency_key)
+
+
+def _record_materialized_change(db: Session, user: User, *, stream: str, kind: str, ref_id: str) -> None:
+    record_workspace_change(
+        db,
+        workspace_id=user.workspace_id,
+        stream=stream,
+        kind=kind,
+        ref_id=ref_id,
+    )
 
 
 def _materialize_profile_update(user: User, event: SyncEventIn) -> None:

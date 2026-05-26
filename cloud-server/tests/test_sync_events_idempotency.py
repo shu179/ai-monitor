@@ -19,6 +19,7 @@ from app.services.sync_service import (  # noqa: E402
     _materialize_run_record,
     accept_sync_events,
 )
+from app.services.sync_v2_worker import _mirror_legacy_sync_event  # noqa: E402
 from app.sync_event_types import (  # noqa: E402
     EVENT_ARTICLE_REFERENCE,
     EVENT_RUN_RECORD,
@@ -56,33 +57,35 @@ def _extract_on_conflict_columns(stmt) -> list[str]:
 class AcceptSyncEventsIdempotencyTests(unittest.TestCase):
     """Verify that idempotency keys are scoped per workspace."""
 
-    def _mock_db(self, insert_results: list[int | None]) -> MagicMock:
+    def _mock_db(self, insert_results: list[int | str | None]) -> MagicMock:
         """Return a mock Session whose scalar() returns values from *insert_results* in order."""
         db = MagicMock()
         db.scalar.side_effect = insert_results
         return db
 
-    @patch("app.services.sync_service._materialize_known_event")
-    def test_same_workspace_duplicate_is_rejected(self, _mat) -> None:
-        """Two events with the same key in the same workspace: second is a duplicate."""
+    def test_same_workspace_duplicate_is_rejected(self) -> None:
+        """Two events with the same key in the same workspace: second is queued once."""
         user = _make_user(workspace_id=10)
         events = [_make_event("run:rec-001"), _make_event("run:rec-001")]
-        db = self._mock_db([42, None])  # first accepted, second rejected
+        db = self._mock_db([None, "run:rec-001", None])  # no existing batch; second event key is duplicate
+        db.execute.return_value.scalar_one.return_value = 0
 
         accepted, duplicates = accept_sync_events(db, user, events)
 
         self.assertEqual(accepted, 1)
         self.assertEqual(duplicates, 1)
-        _mat.assert_called_once()
+        self.assertEqual(db.add.call_count, 2)  # batch + one item
+        db.commit.assert_called_once()
 
-    @patch("app.services.sync_service._materialize_known_event")
-    def test_different_workspace_same_key_both_accepted(self, _mat) -> None:
+    def test_different_workspace_same_key_both_accepted(self) -> None:
         """Same idempotency_key in different workspaces should both be accepted."""
         user_a = _make_user(workspace_id=10, user_id=1)
         user_b = _make_user(workspace_id=20, user_id=2)
         events = [_make_event("run:rec-001")]
-        db_a = self._mock_db([42])
-        db_b = self._mock_db([43])
+        db_a = self._mock_db([None, "run:rec-001"])
+        db_b = self._mock_db([None, "run:rec-001"])
+        db_a.execute.return_value.scalar_one.return_value = 0
+        db_b.execute.return_value.scalar_one.return_value = 0
 
         acc_a, dup_a = accept_sync_events(db_a, user_a, events)
         acc_b, dup_b = accept_sync_events(db_b, user_b, events)
@@ -91,10 +94,8 @@ class AcceptSyncEventsIdempotencyTests(unittest.TestCase):
         self.assertEqual(dup_a, 0)
         self.assertEqual(acc_b, 1)
         self.assertEqual(dup_b, 0)
-        self.assertEqual(_mat.call_count, 2)
 
-    @patch("app.services.sync_service._materialize_known_event")
-    def test_mixed_accepted_and_duplicate_counts(self, _mat) -> None:
+    def test_mixed_accepted_and_duplicate_counts(self) -> None:
         """Batch with a mix of new and duplicate keys returns correct counts."""
         user = _make_user(workspace_id=10)
         events = [
@@ -104,23 +105,35 @@ class AcceptSyncEventsIdempotencyTests(unittest.TestCase):
             _make_event("run:cccc-001"),
             _make_event("run:bbbb-001"),  # duplicate
         ]
-        # Insert results: first 3 unique accepted, last 2 are duplicates
-        db = self._mock_db([101, 102, None, 103, None])
+        # First scalar is existing batch lookup; remaining scalar calls reserve event keys.
+        db = self._mock_db([None, "run:aaaa-001", "run:bbbb-001", None, "run:cccc-001", None])
+        db.execute.return_value.scalar_one.return_value = 0
 
         accepted, duplicates = accept_sync_events(db, user, events)
 
         self.assertEqual(accepted, 3)
         self.assertEqual(duplicates, 2)
-        self.assertEqual(_mat.call_count, 3)
 
-    @patch("app.services.sync_service._materialize_known_event")
-    def test_sync_events_insert_conflict_target_is_workspace_scoped(self, _mat) -> None:
-        """Verify the INSERT ON CONFLICT targets (workspace_id, idempotency_key)."""
+    def test_legacy_events_reserve_v2_idempotency_workspace_scoped(self) -> None:
+        """V1 now queues into v2 and reserves item idempotency per workspace."""
         user = _make_user(workspace_id=10)
         events = [_make_event("run:rec-999")]
-        db = self._mock_db([1])
+        db = self._mock_db([None, "run:rec-999"])
+        db.execute.return_value.scalar_one.return_value = 0
 
         accept_sync_events(db, user, events)
+
+        stmt = db.scalar.call_args_list[1].args[0]
+        conflict_cols = _extract_on_conflict_columns(stmt)
+        self.assertEqual(conflict_cols, ["workspace_id", "scope", "idempotency_key"])
+
+    def test_worker_mirror_sync_event_conflict_target_is_workspace_scoped(self) -> None:
+        db = MagicMock()
+        db.scalar.return_value = 1
+        user = _make_user(workspace_id=10)
+        event = _make_event("run:rec-999")
+
+        self.assertTrue(_mirror_legacy_sync_event(db, user=user, event=event))  # type: ignore[arg-type]
 
         stmt = db.scalar.call_args.args[0]
         conflict_cols = _extract_on_conflict_columns(stmt)

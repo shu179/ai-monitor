@@ -187,6 +187,52 @@ class SyncChangesResponse(BaseModel):
     reference_changed: bool
 
 
+class CloudCapabilityResponse(BaseModel):
+    capabilities: list[str]
+    limits: dict[str, int]
+    ttl_seconds: dict[str, int]
+
+
+class SyncBatchEventIn(SyncEventIn):
+    stream: str | None = Field(default=None, max_length=32)
+    partition_key: str | None = Field(default=None, max_length=256)
+    seq: int | None = Field(default=None, ge=0)
+
+
+class SyncBatchRequest(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    events: list[SyncBatchEventIn] = Field(default_factory=list, max_length=500)
+
+
+class SyncBatchResponse(BaseModel):
+    batch_id: str
+    accepted: int
+    duplicates: int
+    rejected: int
+    pending_materialization: int
+    retry_after_seconds: int = 0
+    queue_depth_hint: int = 0
+
+
+class StateDeltaRequest(BaseModel):
+    device_id: str | None = Field(default=None, max_length=256)
+    cursors: dict[str, int] = Field(default_factory=dict, max_length=32)
+    limit: int = Field(default=500, ge=1, le=1000)
+    priority: list[str] = Field(default_factory=list, max_length=16)
+    reset_token: str | None = Field(default=None, max_length=256)
+    bootstrap_cursor: str | None = Field(default=None, max_length=256)
+
+
+class StateDeltaResponse(BaseModel):
+    changes: list[dict[str, Any]] = Field(default_factory=list)
+    next_cursors: dict[str, int] = Field(default_factory=dict)
+    has_more: bool = False
+    object_refs: list[dict[str, Any]] = Field(default_factory=list)
+    reset_required: bool = False
+    reset_token: str | None = None
+    retry_after_seconds: int = 0
+
+
 class RunRecordPublic(BaseModel):
     id: int
     workspace_id: int

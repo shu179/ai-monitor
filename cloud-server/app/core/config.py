@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     public_update_base_url: str = ""
     access_token_minutes: int = 20
     refresh_token_days: int = 30
+    db_pool_size: int = 5
+    db_max_overflow: int = 10
+    db_pool_recycle_seconds: int = 1800
+    db_pool_timeout_seconds: int = 30
+    db_statement_timeout_ms: int = 5000
+    worker_db_statement_timeout_ms: int = 60000
 
     @computed_field
     @property

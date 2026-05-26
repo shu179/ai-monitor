@@ -1,6 +1,7 @@
 alembic>=1.13.2
 email-validator>=2.2.0
 fastapi>=0.111.0
+gunicorn>=22.0.0
 httpx>=0.27.0
 psycopg[binary]>=3.2.1
 pydantic-settings>=2.3.4
