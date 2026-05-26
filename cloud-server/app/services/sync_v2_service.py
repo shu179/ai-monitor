@@ -279,56 +279,40 @@ def consume_workspace_rate_limit(
             text("SELECT pg_advisory_xact_lock(:lock_key)"),
             {"lock_key": workspace_bucket_advisory_lock_key(safe_workspace_id, safe_bucket)},
         )
-        row = (
+        refreshed = (
             db.execute(
                 text(
                     """
-                    WITH refreshed AS (
-                        INSERT INTO workspace_rate_limits (
-                            workspace_id,
-                            bucket,
-                            tokens,
-                            capacity,
-                            refill_rate_per_second,
-                            last_refill_at,
-                            updated_at
-                        )
-                        VALUES (
-                            :workspace_id,
-                            :bucket,
-                            :capacity,
-                            :capacity,
-                            :refill_rate_per_second,
-                            now(),
-                            now()
-                        )
-                        ON CONFLICT (workspace_id, bucket) DO UPDATE
-                        SET tokens = LEAST(
-                                workspace_rate_limits.capacity,
-                                workspace_rate_limits.tokens
-                                  + EXTRACT(EPOCH FROM (now() - workspace_rate_limits.last_refill_at))
-                                    * workspace_rate_limits.refill_rate_per_second
-                            ),
-                            capacity = EXCLUDED.capacity,
-                            refill_rate_per_second = EXCLUDED.refill_rate_per_second,
-                            last_refill_at = now(),
-                            updated_at = now()
-                        RETURNING tokens, capacity, refill_rate_per_second
-                    ),
-                    spent AS (
-                        UPDATE workspace_rate_limits
-                        SET tokens = tokens - :cost,
-                            updated_at = now()
-                        WHERE workspace_id = :workspace_id
-                          AND bucket = :bucket
-                          AND (SELECT tokens FROM refreshed) >= :cost
-                        RETURNING tokens
+                    INSERT INTO workspace_rate_limits (
+                        workspace_id,
+                        bucket,
+                        tokens,
+                        capacity,
+                        refill_rate_per_second,
+                        last_refill_at,
+                        updated_at
                     )
-                    SELECT
-                        (SELECT tokens FROM refreshed) AS available_tokens,
-                        (SELECT capacity FROM refreshed) AS capacity,
-                        (SELECT refill_rate_per_second FROM refreshed) AS refill_rate_per_second,
-                        (SELECT tokens FROM spent) AS remaining_tokens
+                    VALUES (
+                        :workspace_id,
+                        :bucket,
+                        :capacity,
+                        :capacity,
+                        :refill_rate_per_second,
+                        now(),
+                        now()
+                    )
+                    ON CONFLICT (workspace_id, bucket) DO UPDATE
+                    SET tokens = LEAST(
+                            EXCLUDED.capacity,
+                            workspace_rate_limits.tokens
+                              + EXTRACT(EPOCH FROM (now() - workspace_rate_limits.last_refill_at))
+                                * workspace_rate_limits.refill_rate_per_second
+                        ),
+                        capacity = EXCLUDED.capacity,
+                        refill_rate_per_second = EXCLUDED.refill_rate_per_second,
+                        last_refill_at = now(),
+                        updated_at = now()
+                    RETURNING tokens, capacity, refill_rate_per_second
                     """
                 ),
                 {
@@ -342,12 +326,36 @@ def consume_workspace_rate_limit(
             .mappings()
             .first()
         )
-        if not row:
+        if not refreshed:
             return _allow_rate_limit_result()
-        available = float(row.get("available_tokens") or 0)
-        remaining = row.get("remaining_tokens")
-        if remaining is not None:
-            return {"allowed": True, "retry_after_seconds": 0, "remaining_tokens": float(remaining)}
+        available = _coerce_float(refreshed.get("tokens"))
+        if available is None:
+            return _allow_rate_limit_result()
+        if available >= safe_cost:
+            spent = (
+                db.execute(
+                    text(
+                        """
+                        UPDATE workspace_rate_limits
+                        SET tokens = tokens - :cost,
+                            updated_at = now()
+                        WHERE workspace_id = :workspace_id
+                          AND bucket = :bucket
+                        RETURNING tokens
+                        """
+                    ),
+                    {
+                        "workspace_id": safe_workspace_id,
+                        "bucket": safe_bucket,
+                        "cost": safe_cost,
+                    },
+                )
+                .mappings()
+                .first()
+            )
+            spent_tokens = _coerce_float(spent.get("tokens")) if spent else None
+            remaining = spent_tokens if spent_tokens is not None else available - safe_cost
+            return {"allowed": True, "retry_after_seconds": 0, "remaining_tokens": remaining}
         retry_after = max(1, math.ceil((safe_cost - available) / safe_refill_rate))
         return {"allowed": False, "retry_after_seconds": retry_after, "remaining_tokens": available}
     except Exception:
@@ -359,6 +367,20 @@ def consume_workspace_rate_limit(
 
 def _allow_rate_limit_result() -> dict[str, Any]:
     return {"allowed": True, "retry_after_seconds": 0, "remaining_tokens": None}
+
+
+def _coerce_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    try:
+        text = str(value).strip()
+        if not text or text.startswith("<"):
+            return None
+        return float(text)
+    except Exception:
+        return None
 
 
 def _retry_after_for_queue_depth(pending_count: int) -> int:

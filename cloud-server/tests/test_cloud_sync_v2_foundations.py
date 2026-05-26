@@ -168,8 +168,12 @@ class SyncV2ServiceTests(unittest.TestCase):
         db.execute.side_effect = [
             MagicMock(),
             MagicMock(mappings=MagicMock(return_value=MagicMock(first=MagicMock(return_value={
-                "available_tokens": 100.0,
-                "remaining_tokens": 90.0,
+                "tokens": 100.0,
+                "capacity": 100.0,
+                "refill_rate_per_second": 10.0,
+            })))),
+            MagicMock(mappings=MagicMock(return_value=MagicMock(first=MagicMock(return_value={
+                "tokens": 90.0,
             })))),
         ]
 
