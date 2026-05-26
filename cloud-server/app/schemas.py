@@ -309,6 +309,64 @@ class ObjectDownloadResponse(BaseModel):
     compression: str
 
 
+class AgentCommandCreateRequest(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    payload_json: dict[str, Any] = Field(default_factory=dict)
+    target_device_id: str | None = Field(default=None, max_length=256)
+    target_role: str | None = Field(default=None, max_length=64)
+
+
+class AgentCommandPublic(BaseModel):
+    id: str
+    workspace_id: int
+    target_device_id: str | None = None
+    target_role: str | None = None
+    status: str
+    visibility_until: datetime | None = None
+    idempotency_key: str
+    payload_json: dict[str, Any]
+    cancel_requested_at: datetime | None = None
+    expires_at: datetime
+    created_at: datetime
+
+
+class AgentCommandClaimRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=256)
+    target_role: str | None = Field(default=None, max_length=64)
+    last_seen_command_id: str | None = Field(default=None, max_length=36)
+
+
+class AgentCommandClaimResponse(BaseModel):
+    command: AgentCommandPublic | None = None
+
+
+class AgentHeartbeatRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=256)
+
+
+class AgentResultChunkRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=256)
+    seq: int = Field(ge=0)
+    payload_json: dict[str, Any] = Field(default_factory=dict)
+    is_final: bool = False
+    final_status: Literal["completed", "failed", "cancelled"] | None = None
+
+
+class AgentResultChunkAck(BaseModel):
+    command_id: str
+    seq: int
+    is_final: bool
+    status: str
+
+
+class AgentResultChunkPublic(BaseModel):
+    command_id: str
+    seq: int
+    payload_json: dict[str, Any]
+    is_final: bool
+    created_at: str
+
+
 class RunRecordPublic(BaseModel):
     id: int
     workspace_id: int
