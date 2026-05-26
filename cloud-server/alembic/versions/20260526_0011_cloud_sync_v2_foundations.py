@@ -1,7 +1,7 @@
 """add cloud sync v2 foundation tables
 
 Revision ID: 0011_cloud_sync_v2_foundations
-Revises: 0010_workspace_idempotency
+Revises: 0010_workspace_idempotency, 0010_hot_path_indexes
 Create Date: 2026-05-26 00:00:00
 """
 
@@ -14,7 +14,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0011_cloud_sync_v2_foundations"
-down_revision: Union[str, None] = "0010_workspace_idempotency"
+down_revision: Union[str, Sequence[str], None] = ("0010_workspace_idempotency", "0010_hot_path_indexes")
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

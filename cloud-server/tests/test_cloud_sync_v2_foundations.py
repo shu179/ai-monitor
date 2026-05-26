@@ -326,6 +326,7 @@ class SyncV2WorkerSqlTests(unittest.TestCase):
 class MigrationDefinitionTests(unittest.TestCase):
     def test_partitioned_primary_keys_include_created_at(self) -> None:
         migration = (ROOT / "alembic/versions/20260526_0011_cloud_sync_v2_foundations.py").read_text()
+        self.assertIn('"0010_workspace_idempotency", "0010_hot_path_indexes"', migration)
         self.assertIn("PRIMARY KEY (workspace_id, stream, seq, created_at)", migration)
         self.assertIn("PRIMARY KEY (id, created_at)", migration)
         self.assertIn("PARTITION BY RANGE (created_at)", migration)
