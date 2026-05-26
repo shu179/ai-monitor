@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Header, HTTPException, Response, status
+from fastapi import APIRouter, Header, HTTPException, Request, Response, status
+from fastapi.responses import FileResponse
+from sqlalchemy import select
 
 from app.api.deps import CurrentUser, DbSession
+from app.models import ObjectManifest
 from app.schemas import (
     CloudCapabilityResponse,
     ObjectDownloadResponse,
@@ -25,7 +28,9 @@ from app.services.object_storage_service import (
     create_object_download,
     create_object_upload,
     presign_object_upload_parts,
+    read_local_object,
     record_object_upload_part,
+    store_local_object_upload_content,
 )
 from app.services.sync_v2_service import (
     SyncBackpressureError,
@@ -188,3 +193,41 @@ def object_download(object_id: str, current_user: CurrentUser, db: DbSession) ->
         return ObjectDownloadResponse(**create_object_download(db, current_user, object_id=object_id))
     except ObjectStorageError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.put("/objects/uploads/{session_id}/content", response_model=ObjectUploadCompleteResponse)
+async def object_upload_content(
+    session_id: str,
+    request: Request,
+    current_user: CurrentUser,
+    db: DbSession,
+) -> ObjectUploadCompleteResponse:
+    try:
+        return ObjectUploadCompleteResponse(
+            **await store_local_object_upload_content(
+                db,
+                current_user,
+                session_id=session_id,
+                chunks=request.stream(),
+            )
+        )
+    except ObjectStorageError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.get("/objects/{object_id}/content")
+def object_download_content(object_id: str, current_user: CurrentUser, db: DbSession) -> FileResponse:
+    manifest = db.scalar(
+        select(ObjectManifest).where(
+            ObjectManifest.workspace_id == current_user.workspace_id,
+            ObjectManifest.id == str(object_id),
+            ObjectManifest.status == "active",
+        )
+    )
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="object not found")
+    try:
+        path = read_local_object(manifest)
+    except ObjectStorageError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return FileResponse(path, media_type=str(manifest.content_type), filename=str(manifest.sha256))

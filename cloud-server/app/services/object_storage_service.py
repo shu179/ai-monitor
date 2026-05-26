@@ -3,9 +3,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import math
+import os
 import re
+import shutil
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 from uuid import uuid4
@@ -26,7 +30,11 @@ ALREADY_EXISTS_STRATEGY = "already_exists"
 SINGLE_PUT_STRATEGY = "single_put"
 MULTIPART_STRATEGY = "multipart"
 MAX_PARTS_TO_PRESIGN = 100
-DEFAULT_WORKSPACE_OBJECT_QUOTA_BYTES = 100 * 1024 * 1024 * 1024
+LOCAL_STORAGE_PROVIDER_PREFIX = "local:"
+DEFAULT_TOTAL_OBJECT_QUOTA_BYTES = 10 * 1024 * 1024 * 1024
+DEFAULT_WORKSPACE_OBJECT_QUOTA_BYTES = 5 * 1024 * 1024 * 1024
+DEFAULT_MAX_FILE_BYTES = 512 * 1024 * 1024
+DEFAULT_MIN_FREE_BYTES = 8 * 1024 * 1024 * 1024
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ALLOWED_CONTENT_TYPES = {
@@ -110,8 +118,18 @@ def create_object_upload(
         )
 
     client = object_storage_client()
-    client.require_configured()
-    _enforce_workspace_quota(db, workspace_id=user.workspace_id, incoming_storage_size_bytes=safe_storage_size_bytes)
+    if client.is_local:
+        if safe_storage_size_bytes != safe_size_bytes:
+            raise ObjectStorageError("local object storage requires storage_size_bytes to equal size_bytes")
+        safe_compression = "none"
+        strategy = SINGLE_PUT_STRATEGY
+
+    _enforce_object_limits(
+        db,
+        workspace_id=user.workspace_id,
+        incoming_storage_size_bytes=safe_storage_size_bytes,
+        local_backend=client.is_local,
+    )
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=TTL_SECONDS["upload_presigned_url"])
     upload_session = _get_or_reset_upload_session(
@@ -130,10 +148,7 @@ def create_object_upload(
     db.refresh(upload_session)
 
     if strategy == SINGLE_PUT_STRATEGY:
-        upload_url = client.presign_put_object(
-            storage_key,
-            expires_seconds=TTL_SECONDS["upload_presigned_url"],
-        )
+        upload_url = client.upload_url(str(upload_session.id), storage_key, expires_seconds=TTL_SECONDS["upload_presigned_url"])
         return _upload_response(
             strategy=SINGLE_PUT_STRATEGY,
             sha256=safe_sha256,
@@ -163,6 +178,54 @@ def create_object_upload(
         expires_at=expires_at,
         part_size_bytes=int(upload_session.part_size_bytes),
         parts_total=int(upload_session.parts_total),
+    )
+
+
+async def store_local_object_upload_content(
+    db: Session,
+    user: User,
+    *,
+    session_id: str,
+    chunks: AsyncIterator[bytes],
+) -> dict[str, Any]:
+    upload_session = _load_upload_session(db, user, session_id=session_id, allow_single_put=True)
+    if not _is_local_upload_session(upload_session):
+        raise ObjectStorageError("upload session is not local-backed")
+    expected_size = int(upload_session.size_bytes)
+    if expected_size > _max_file_bytes():
+        raise ObjectStorageQuotaExceeded("object exceeds local max file size")
+    storage_key = object_storage_key(user.workspace_id, str(upload_session.sha256))
+    path = local_object_path(storage_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + f".tmp-{uuid4().hex}")
+    digest = hashlib.sha256()
+    actual_size = 0
+    try:
+        with tmp_path.open("wb") as handle:
+            async for chunk in chunks:
+                if not chunk:
+                    continue
+                actual_size += len(chunk)
+                if actual_size > expected_size:
+                    raise ObjectStorageError(f"upload size exceeds expected {expected_size}")
+                if actual_size > _max_file_bytes():
+                    raise ObjectStorageQuotaExceeded("object exceeds local max file size")
+                digest.update(chunk)
+                handle.write(chunk)
+        if actual_size != expected_size:
+            raise ObjectStorageError(f"upload size mismatch: expected {expected_size}, got {actual_size}")
+        if digest.hexdigest() != str(upload_session.sha256):
+            raise ObjectStorageError("upload sha256 mismatch")
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+    return complete_object_upload(
+        db,
+        user,
+        session_id=session_id,
+        storage_size_bytes=actual_size,
+        compression="none",
     )
 
 
@@ -277,6 +340,12 @@ def complete_object_upload(
     )
     storage_key = object_storage_key(user.workspace_id, str(upload_session.sha256))
     client = object_storage_client()
+    if _is_local_upload_session(upload_session):
+        path = local_object_path(storage_key)
+        if not path.exists() or not path.is_file():
+            raise ObjectStorageNotFound("local object file not found")
+        if path.stat().st_size != safe_storage_size_bytes:
+            raise ObjectStorageError("local object size mismatch")
     if int(upload_session.parts_total) > 1:
         parts = list(
             db.scalars(
@@ -341,12 +410,10 @@ def create_object_download(db: Session, user: User, *, object_id: str) -> dict[s
         raise ObjectStorageNotFound("object not found")
     client = object_storage_client()
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=TTL_SECONDS["download_presigned_url"])
+    download_url = client.download_url(str(manifest.id), str(manifest.storage_key), expires_seconds=TTL_SECONDS["download_presigned_url"])
     return {
         "object_id": str(manifest.id),
-        "download_url": client.presign_get_object(
-            str(manifest.storage_key),
-            expires_seconds=TTL_SECONDS["download_presigned_url"],
-        ),
+        "download_url": download_url,
         "expires_at": expires_at,
         "content_type": str(manifest.content_type),
         "size_bytes": int(manifest.size_bytes),
@@ -395,10 +462,66 @@ def normalize_compression(value: str | None, *, content_type: str, size_bytes: i
 
 
 def object_storage_client(settings: Settings | None = None) -> "S3CompatibleObjectStorageClient":
-    return S3CompatibleObjectStorageClient(settings or get_settings())
+    resolved_settings = settings or get_settings()
+    if _s3_configured(resolved_settings):
+        return S3CompatibleObjectStorageClient(resolved_settings)
+    return LocalDiskObjectStorageClient(resolved_settings)
+
+
+def local_object_path(storage_key: str, settings: Settings | None = None) -> Path:
+    resolved_settings = settings or get_settings()
+    root = Path(str(resolved_settings.object_storage_local_dir or "/opt/surfaced/object-data")).resolve()
+    path = (root / str(storage_key).strip("/")).resolve()
+    if root not in path.parents and path != root:
+        raise ObjectStorageError("invalid local object path")
+    return path
+
+
+def read_local_object(manifest: ObjectManifest) -> Path:
+    path = local_object_path(str(manifest.storage_key))
+    if not path.exists() or not path.is_file():
+        raise ObjectStorageNotFound("local object file not found")
+    return path
+
+
+class LocalDiskObjectStorageClient:
+    is_local = True
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.base_url = str(settings.object_storage_local_base_url or "").rstrip("/")
+
+    def require_configured(self) -> None:
+        Path(str(self.settings.object_storage_local_dir or "/opt/surfaced/object-data")).mkdir(parents=True, exist_ok=True)
+
+    def upload_url(self, session_id: str, key: str, *, expires_seconds: int) -> str:
+        del key, expires_seconds
+        if self.base_url:
+            return f"{self.base_url}/api/v2/objects/uploads/{quote(str(session_id), safe='')}/content"
+        return f"/api/v2/objects/uploads/{quote(str(session_id), safe='')}/content"
+
+    def download_url(self, object_id: str, key: str, *, expires_seconds: int) -> str:
+        del key, expires_seconds
+        if self.base_url:
+            return f"{self.base_url}/api/v2/objects/{quote(str(object_id), safe='')}/content"
+        return f"/api/v2/objects/{quote(str(object_id), safe='')}/content"
+
+    def create_multipart_upload(self, key: str, *, content_type: str) -> str:
+        del key, content_type
+        raise ObjectStorageUnavailable("local object storage does not support multipart")
+
+    def presign_upload_part(self, key: str, *, upload_id: str, part_number: int, expires_seconds: int) -> str:
+        del key, upload_id, part_number, expires_seconds
+        raise ObjectStorageUnavailable("local object storage does not support multipart")
+
+    def complete_multipart_upload(self, key: str, *, upload_id: str, parts: list[dict[str, Any]]) -> None:
+        del key, upload_id, parts
+        raise ObjectStorageUnavailable("local object storage does not support multipart")
 
 
 class S3CompatibleObjectStorageClient:
+    is_local = False
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.endpoint_url = str(settings.object_storage_endpoint_url or "").rstrip("/")
@@ -416,9 +539,17 @@ class S3CompatibleObjectStorageClient:
         self.require_configured()
         return self._presign("PUT", key, expires_seconds=expires_seconds)
 
+    def upload_url(self, session_id: str, key: str, *, expires_seconds: int) -> str:
+        del session_id
+        return self.presign_put_object(key, expires_seconds=expires_seconds)
+
     def presign_get_object(self, key: str, *, expires_seconds: int) -> str:
         self.require_configured()
         return self._presign("GET", key, expires_seconds=expires_seconds)
+
+    def download_url(self, object_id: str, key: str, *, expires_seconds: int) -> str:
+        del object_id
+        return self.presign_get_object(key, expires_seconds=expires_seconds)
 
     def presign_upload_part(self, key: str, *, upload_id: str, part_number: int, expires_seconds: int) -> str:
         self.require_configured()
@@ -624,6 +755,8 @@ def _get_or_reset_upload_session(
         )
     )
     provider_upload_id = f"single:{uuid4()}"
+    if client.is_local:
+        provider_upload_id = f"{LOCAL_STORAGE_PROVIDER_PREFIX}{uuid4()}"
     if strategy == MULTIPART_STRATEGY:
         provider_upload_id = client.create_multipart_upload(storage_key, content_type=content_type)
     expires_at = now + timedelta(seconds=TTL_SECONDS["multipart_upload_session"])
@@ -677,8 +810,29 @@ def _load_upload_session(
     return upload_session
 
 
-def _enforce_workspace_quota(db: Session, *, workspace_id: int, incoming_storage_size_bytes: int) -> None:
-    quota = int(get_settings().object_storage_workspace_quota_bytes or DEFAULT_WORKSPACE_OBJECT_QUOTA_BYTES)
+def _enforce_object_limits(
+    db: Session,
+    *,
+    workspace_id: int,
+    incoming_storage_size_bytes: int,
+    local_backend: bool,
+) -> None:
+    settings = get_settings()
+    incoming_size = int(incoming_storage_size_bytes)
+    if local_backend:
+        if incoming_size > _max_file_bytes(settings):
+            raise ObjectStorageQuotaExceeded("object exceeds local max file size")
+        _enforce_local_disk_headroom(incoming_size, settings=settings)
+        total_quota = int(settings.object_storage_total_quota_bytes or DEFAULT_TOTAL_OBJECT_QUOTA_BYTES)
+        if total_quota > 0:
+            total_used = db.scalar(
+                select(func.coalesce(func.sum(ObjectManifest.storage_size_bytes), 0)).where(
+                    ObjectManifest.status == OBJECT_MANIFEST_STATUS_ACTIVE,
+                )
+            )
+            if int(total_used or 0) + incoming_size > total_quota:
+                raise ObjectStorageQuotaExceeded("server object storage quota exceeded")
+    quota = int(settings.object_storage_workspace_quota_bytes or DEFAULT_WORKSPACE_OBJECT_QUOTA_BYTES)
     if quota <= 0:
         return
     used = db.scalar(
@@ -687,8 +841,35 @@ def _enforce_workspace_quota(db: Session, *, workspace_id: int, incoming_storage
             ObjectManifest.status == OBJECT_MANIFEST_STATUS_ACTIVE,
         )
     )
-    if int(used or 0) + int(incoming_storage_size_bytes) > quota:
+    if int(used or 0) + incoming_size > quota:
         raise ObjectStorageQuotaExceeded("workspace object storage quota exceeded")
+
+
+def _enforce_local_disk_headroom(incoming_size: int, *, settings: Settings) -> None:
+    root = Path(str(settings.object_storage_local_dir or "/opt/surfaced/object-data"))
+    root.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(root)
+    min_free = int(settings.object_storage_min_free_bytes or DEFAULT_MIN_FREE_BYTES)
+    if usage.free - int(incoming_size) < min_free:
+        raise ObjectStorageQuotaExceeded("server disk free space is below object storage safety threshold")
+
+
+def _is_local_upload_session(upload_session: ObjectUploadSession) -> bool:
+    return str(upload_session.storage_provider_upload_id or "").startswith(LOCAL_STORAGE_PROVIDER_PREFIX)
+
+
+def _max_file_bytes(settings: Settings | None = None) -> int:
+    resolved_settings = settings or get_settings()
+    return int(resolved_settings.object_storage_max_file_bytes or DEFAULT_MAX_FILE_BYTES)
+
+
+def _s3_configured(settings: Settings) -> bool:
+    return bool(
+        str(settings.object_storage_endpoint_url or "").strip()
+        and str(settings.object_storage_bucket or "").strip()
+        and str(settings.object_storage_access_key_id or "").strip()
+        and str(settings.object_storage_secret_access_key or "").strip()
+    )
 
 
 def _upload_response(

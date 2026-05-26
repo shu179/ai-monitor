@@ -54,7 +54,12 @@ class Settings(BaseSettings):
     object_storage_access_key_id: str = ""
     object_storage_secret_access_key: str = ""
     object_storage_force_path_style: bool = False
-    object_storage_workspace_quota_bytes: int = 100 * 1024 * 1024 * 1024
+    object_storage_local_dir: str = "/opt/surfaced/object-data"
+    object_storage_local_base_url: str = ""
+    object_storage_total_quota_bytes: int = 10 * 1024 * 1024 * 1024
+    object_storage_workspace_quota_bytes: int = 5 * 1024 * 1024 * 1024
+    object_storage_max_file_bytes: int = 512 * 1024 * 1024
+    object_storage_min_free_bytes: int = 8 * 1024 * 1024 * 1024
 
     @computed_field
     @property

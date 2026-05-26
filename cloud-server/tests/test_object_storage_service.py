@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -14,10 +15,12 @@ from app.services.object_storage_service import (  # noqa: E402
     INLINE_STRATEGY,
     MULTIPART_STRATEGY,
     SINGLE_PUT_STRATEGY,
-    ObjectStorageUnavailable,
+    ObjectStorageQuotaExceeded,
     S3CompatibleObjectStorageClient,
+    LocalDiskObjectStorageClient,
     normalize_compression,
     object_storage_key,
+    store_local_object_upload_content,
     upload_strategy_for_size,
 )
 from app.services.sync_v2_service import LIMITS  # noqa: E402
@@ -81,35 +84,41 @@ class ObjectUploadFlowTests(unittest.TestCase):
         self.assertIsNone(result["session_id"])
         db.commit.assert_not_called()
 
-    @patch("app.services.object_storage_service.object_storage_client")
-    def test_non_inline_upload_requires_storage_config_before_writing_session(self, client_factory) -> None:
+    def test_non_inline_upload_falls_back_to_local_disk_session(self) -> None:
         from app.services.object_storage_service import create_object_upload
 
-        client = MagicMock()
-        client.require_configured.side_effect = ObjectStorageUnavailable("object storage is not configured")
-        client_factory.return_value = client
         db = MagicMock()
+        session_holder: dict[str, object] = {}
         db.scalar.return_value = None
+        db.add.side_effect = lambda obj: session_holder.setdefault("session", obj)
+        db.refresh.side_effect = lambda _obj: None
         user = SimpleNamespace(workspace_id=7)
 
-        with self.assertRaises(ObjectStorageUnavailable):
-            create_object_upload(
-                db,
-                user,  # type: ignore[arg-type]
-                sha256=SHA,
-                size_bytes=LIMITS["inline_blob_max_bytes"] + 1,
-                content_type="application/octet-stream",
-            )
+        with (
+            patch("app.services.object_storage_service.object_storage_client") as client_factory,
+            patch("app.services.object_storage_service._enforce_object_limits"),
+        ):
+            client_factory.return_value = LocalDiskObjectStorageClient(_settings_with_local_dir("/tmp/object-data"))
+            result = create_object_upload(
+                    db,
+                    user,  # type: ignore[arg-type]
+                    sha256=SHA,
+                    size_bytes=LIMITS["inline_blob_max_bytes"] + 1,
+                    content_type="application/octet-stream",
+                )
 
-        db.add.assert_not_called()
-        db.commit.assert_not_called()
+        self.assertEqual(result["strategy"], SINGLE_PUT_STRATEGY)
+        self.assertIn(f"/api/v2/objects/uploads/{result['session_id']}/content", result["upload"]["url"])
+        self.assertTrue(str(session_holder["session"].storage_provider_upload_id).startswith("local:"))
+        db.commit.assert_called_once()
 
-    @patch("app.services.object_storage_service._enforce_workspace_quota")
+    @patch("app.services.object_storage_service._enforce_object_limits")
     @patch("app.services.object_storage_service.object_storage_client")
     def test_multipart_upload_records_session_and_presigns_parts(self, client_factory, _quota) -> None:
         from app.services.object_storage_service import create_object_upload, presign_object_upload_parts
 
         client = MagicMock()
+        client.is_local = False
         client.create_multipart_upload.return_value = "provider-upload-1"
         client.presign_upload_part.side_effect = lambda _key, upload_id, part_number, expires_seconds: (
             f"https://upload.example/part-{part_number}?uploadId={upload_id}&expires={expires_seconds}"
@@ -201,6 +210,76 @@ class ObjectUploadFlowTests(unittest.TestCase):
         self.assertEqual(added_manifest.compression, "zstd")
         db.commit.assert_called_once()
 
+    def test_local_upload_stream_writes_file_and_completes_manifest(self) -> None:
+        from app.models import ObjectUploadSession
+
+        body = b"hello local object"
+        sha = __import__("hashlib").sha256(body).hexdigest()
+        user = SimpleNamespace(workspace_id=7)
+        upload_session = ObjectUploadSession(
+            id="session-1",
+            workspace_id=7,
+            sha256=sha,
+            size_bytes=len(body),
+            content_type="application/octet-stream",
+            storage_provider_upload_id="local:upload-1",
+            status="initiated",
+            part_size_bytes=LIMITS["multipart_part_bytes"],
+            parts_total=1,
+            parts_completed=0,
+            expires_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+            + __import__("datetime").timedelta(minutes=10),
+        )
+        db = MagicMock()
+        db.scalar.side_effect = [upload_session, upload_session, None]
+        db.refresh.side_effect = lambda _obj: None
+
+        async def chunks():
+            yield body[:5]
+            yield body[5:]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings_with_local_dir(tmp)
+            with patch("app.services.object_storage_service.get_settings", return_value=settings):
+                result = __import__("asyncio").run(
+                    store_local_object_upload_content(
+                        db,
+                        user,  # type: ignore[arg-type]
+                        session_id="session-1",
+                        chunks=chunks(),
+                    )
+                )
+
+            expected_path = Path(tmp) / f"7/{sha[:2]}/{sha[2:4]}/{sha}"
+            self.assertEqual(expected_path.read_bytes(), body)
+            self.assertEqual(result["status"], "active")
+
+    def test_local_disk_headroom_rejects_when_below_threshold(self) -> None:
+        from app.services.object_storage_service import _enforce_local_disk_headroom
+
+        settings = _settings_with_local_dir("/tmp/object-data")
+        settings.object_storage_min_free_bytes = 999_999_999_999_999
+
+        with self.assertRaises(ObjectStorageQuotaExceeded):
+            _enforce_local_disk_headroom(1, settings=settings)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _settings_with_local_dir(path: str):
+    return SimpleNamespace(
+        object_storage_endpoint_url="",
+        object_storage_bucket="",
+        object_storage_region="auto",
+        object_storage_access_key_id="",
+        object_storage_secret_access_key="",
+        object_storage_force_path_style=False,
+        object_storage_local_dir=path,
+        object_storage_local_base_url="",
+        object_storage_total_quota_bytes=10 * 1024 * 1024 * 1024,
+        object_storage_workspace_quota_bytes=5 * 1024 * 1024 * 1024,
+        object_storage_max_file_bytes=512 * 1024 * 1024,
+        object_storage_min_free_bytes=8 * 1024 * 1024 * 1024,
+    )

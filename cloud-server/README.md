@@ -115,6 +115,18 @@ SURFACED_CLOUD_OBJECT_STORAGE_WORKSPACE_QUOTA_BYTES=107374182400
 
 对象策略固定为：`<=32KB` 内联、`32KB-5MB` 单 PUT、`>5MB` multipart，storage key 为 `<workspace_id>/<sha[:2]>/<sha[2:4]>/<sha>`。`sha256` 始终是未压缩内容 hash，`storage_size_bytes` 记录实际存储大小。
 
+如果暂时不接 R2/COS/S3，服务会自动回退到服务器本地磁盘对象存储。当前小盘服务器推荐保守上限：
+
+```text
+SURFACED_CLOUD_OBJECT_STORAGE_LOCAL_DIR=/opt/surfaced/object-data
+SURFACED_CLOUD_OBJECT_STORAGE_TOTAL_QUOTA_BYTES=10737418240
+SURFACED_CLOUD_OBJECT_STORAGE_WORKSPACE_QUOTA_BYTES=5368709120
+SURFACED_CLOUD_OBJECT_STORAGE_MAX_FILE_BYTES=536870912
+SURFACED_CLOUD_OBJECT_STORAGE_MIN_FREE_BYTES=8589934592
+```
+
+这组默认值表示对象总量最多 10GB、单 workspace 最多 5GB、单文件最多 512MB，并且上传后磁盘剩余空间低于 8GB 时直接拒绝。`docker-compose.yml` 会把 `/opt/surfaced/object-data` 挂进 API 和 worker 容器，避免容器重建后对象文件丢失。本地磁盘模式只支持服务端直传单 PUT，不启用 multipart；后续接 R2/COS 时再切回 presigned multipart。
+
 生产环境必须把 `.env` 里的 `SURFACED_CLOUD_SECRET_KEY` 和 `POSTGRES_PASSWORD` 改成高强度随机值。
 测试完成后，可以把 `.env` 里的 `SURFACED_CLOUD_DOCS_ENABLED` 改成 `false`，然后重启服务以关闭公网 Swagger 文档。
 

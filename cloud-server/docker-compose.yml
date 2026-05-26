@@ -21,6 +21,8 @@ services:
         condition: service_completed_successfully
     ports:
       - "8080:8080"
+    volumes:
+      - /opt/surfaced/object-data:/opt/surfaced/object-data
 
   worker:
     build: .
@@ -33,6 +35,8 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    volumes:
+      - /opt/surfaced/object-data:/opt/surfaced/object-data
 
   postgres:
     image: postgres:16-alpine
