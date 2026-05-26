@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import random
 import threading
 import time
@@ -17,6 +18,20 @@ from .cloud_session_store import CloudSessionChangedError, CloudSessionStore, cl
 from .time_utils import local_now
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except Exception:
+        return int(default)
+
+
 class CloudPlatformAutoSync:
     """Background sync loop for the account-based Surfaced cloud platform."""
 
@@ -28,6 +43,8 @@ class CloudPlatformAutoSync:
         session_store: CloudSessionStore | None = None,
         outbox: CloudOutbox | None = None,
         upload_retry_interval_seconds: float = 5.0,
+        upload_burst_interval_seconds: float = 1.0,
+        upload_burst_pending_threshold: int = 100,
         pull_interval_seconds: float = 300.0,
         idle_interval_seconds: float = 1.0,
         event_stream_enabled: bool = True,
@@ -42,6 +59,14 @@ class CloudPlatformAutoSync:
         self._session_store = session_store or CloudSessionStore()
         self._outbox = outbox or CloudOutbox()
         self._upload_retry_interval_seconds = max(5.0, float(upload_retry_interval_seconds or 20.0))
+        self._upload_burst_interval_seconds = max(
+            0.1,
+            _env_float("AIBRANDMONITOR_CLOUD_UPLOAD_BURST_INTERVAL_SECONDS", upload_burst_interval_seconds),
+        )
+        self._upload_burst_pending_threshold = max(
+            1,
+            _env_int("AIBRANDMONITOR_CLOUD_UPLOAD_BURST_PENDING_THRESHOLD", upload_burst_pending_threshold),
+        )
         self._pull_interval_seconds = max(30.0, float(pull_interval_seconds or 300.0))
         self._idle_interval_seconds = max(0.2, float(idle_interval_seconds or 1.0))
         self._event_stream_enabled = bool(event_stream_enabled)
@@ -155,6 +180,11 @@ class CloudPlatformAutoSync:
             delay = random.uniform(max(0.1, delay - spread), delay + spread)
         return max(0.1, min(self._event_reconnect_max_seconds, delay))
 
+    def _effective_retry_interval(self, *, pending_count: int) -> float:
+        if int(pending_count or 0) >= self._upload_burst_pending_threshold:
+            return self._upload_burst_interval_seconds
+        return self._upload_retry_interval_seconds
+
     def _finish_startup_recovery(
         self,
         recovery_result: dict[str, Any] | None,
@@ -228,7 +258,8 @@ class CloudPlatformAutoSync:
 
                 active_outbox = self._outbox.bind_to_session(session)
                 stats = active_outbox.stats()
-                has_pending_upload = int(stats.get("pending") or 0) + int(stats.get("failed") or 0) > 0
+                pending_count = int(stats.get("pending") or 0) + int(stats.get("failed") or 0)
+                has_pending_upload = pending_count > 0
                 upload_result: dict[str, Any] | None = None
                 if first_sync_for_login:
                     self._last_upload_started_at = now
@@ -239,7 +270,7 @@ class CloudPlatformAutoSync:
                 elif has_pending_upload and (
                     upload_wake_requested
                     or self._last_upload_started_at <= 0
-                    or now - self._last_upload_started_at >= self._upload_retry_interval_seconds
+                    or now - self._last_upload_started_at >= self._effective_retry_interval(pending_count=pending_count)
                 ):
                     self._last_upload_started_at = now
                     try:

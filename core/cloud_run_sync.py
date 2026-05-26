@@ -603,15 +603,38 @@ def flush_cloud_outbox(
     store = session_store or CloudSessionStore()
     session = store.load()
     queue = (outbox or CloudOutbox()).bind_to_session(session)
+    initial_stats = queue.stats()
+    pending_before = int(initial_stats.get("pending") or 0) + int(initial_stats.get("failed") or 0)
+
+    def finish(result: dict[str, Any], *, batch_size: int, http_status: int | str | None) -> dict[str, Any]:
+        final_stats = result.get("outbox") if isinstance(result.get("outbox"), dict) else queue.stats()
+        _log_cloud_outbox_flush(
+            started_at=started_at,
+            batch_size=batch_size,
+            pending_before=pending_before,
+            pending_after=int((final_stats or {}).get("pending") or 0) + int((final_stats or {}).get("failed") or 0),
+            failed_count=int((final_stats or {}).get("failed") or 0),
+            http_status=http_status,
+        )
+        return result
+
     base_url = str(session.get("base_url") or "").strip()
     access_token = str(session.get("access_token") or "").strip()
     refresh_token = str(session.get("refresh_token") or "").strip()
     if not base_url or not access_token:
-        return {"ok": False, "message": "未登录云端", "outbox": queue.stats(), "metrics": _flush_metrics(started_at, 0, 0)}
+        return finish(
+            {"ok": False, "message": "未登录云端", "outbox": queue.stats(), "metrics": _flush_metrics(started_at, 0, 0)},
+            batch_size=0,
+            http_status=None,
+        )
 
     pending = queue.pending(limit=limit)
     if not pending:
-        return {"ok": True, "message": "没有待上传数据", "outbox": queue.stats(), "metrics": _flush_metrics(started_at, 0, 0)}
+        return finish(
+            {"ok": True, "message": "没有待上传数据", "outbox": queue.stats(), "metrics": _flush_metrics(started_at, 0, 0)},
+            batch_size=0,
+            http_status=None,
+        )
     pending, obsolete_profile_keys = _collapse_profile_update_events(pending)
     if obsolete_profile_keys:
         queue.mark_sent(obsolete_profile_keys)
@@ -654,9 +677,17 @@ def flush_cloud_outbox(
                     queue.mark_failed(event_keys, "未登录云端")
                     outbox_stats = queue.stats()
                     _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
-                    return {"ok": False, "message": "未登录云端", "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)}
+                    return finish(
+                        {"ok": False, "message": "未登录云端", "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)},
+                        batch_size=len(events),
+                        http_status=401,
+                    )
             except CloudSessionChangedError as changed_exc:
-                return {"ok": False, "message": str(changed_exc), "outbox": queue.stats(), "metrics": _flush_metrics(started_at, len(events), 0)}
+                return finish(
+                    {"ok": False, "message": str(changed_exc), "outbox": queue.stats(), "metrics": _flush_metrics(started_at, len(events), 0)},
+                    batch_size=len(events),
+                    http_status=401,
+                )
             except CloudClientError as refresh_exc:
                 if refresh_exc.status_code == 401:
                     store.clear_if_current(
@@ -683,7 +714,11 @@ def flush_cloud_outbox(
                 queue.mark_failed(event_keys, str(refresh_exc))
                 outbox_stats = queue.stats()
                 _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
-                return {"ok": False, "message": str(refresh_exc), "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)}
+                return finish(
+                    {"ok": False, "message": str(refresh_exc), "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)},
+                    batch_size=len(events),
+                    http_status=refresh_exc.status_code,
+                )
             try:
                 response = target_client.post_events(refreshed_access_token, events)
             except CloudClientError as refresh_exc:
@@ -712,7 +747,11 @@ def flush_cloud_outbox(
                 queue.mark_failed(event_keys, str(refresh_exc))
                 outbox_stats = queue.stats()
                 _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
-                return {"ok": False, "message": str(refresh_exc), "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)}
+                return finish(
+                    {"ok": False, "message": str(refresh_exc), "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)},
+                    batch_size=len(events),
+                    http_status=refresh_exc.status_code,
+                )
         else:
             record_consecutive_failure(
                 failure_key,
@@ -722,22 +761,65 @@ def flush_cloud_outbox(
             queue.mark_failed(event_keys, str(exc))
             outbox_stats = queue.stats()
             _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
-            return {"ok": False, "message": str(exc), "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)}
+            return finish(
+                {"ok": False, "message": str(exc), "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)},
+                batch_size=len(events),
+                http_status=exc.status_code,
+            )
 
     queue.mark_sent(event_keys)
     clear_consecutive_failure(failure_key)
     outbox_stats = queue.stats()
     _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
-    return {
-        "ok": True,
-        "message": "上传完成",
-        "response": response if isinstance(response, dict) else {},
-        "outbox": outbox_stats,
-        "metrics": _flush_metrics(started_at, len(events), int((response or {}).get("accepted") or 0) if isinstance(response, dict) else 0),
-    }
+    response_status = _cloud_response_status(response)
+    return finish(
+        {
+            "ok": True,
+            "message": "上传完成",
+            "response": response if isinstance(response, dict) else {},
+            "outbox": outbox_stats,
+            "metrics": _flush_metrics(started_at, len(events), int((response or {}).get("accepted") or 0) if isinstance(response, dict) else 0),
+        },
+        batch_size=len(events),
+        http_status=response_status,
+    )
 
 
 _OUTBOX_BACKLOG_THRESHOLD = 100
+
+
+def _cloud_response_status(response: Any) -> int:
+    if isinstance(response, dict):
+        for key in ("http_status", "status_code", "status"):
+            value = response.get(key)
+            try:
+                if value is not None:
+                    return int(value)
+            except Exception:
+                continue
+    return 200
+
+
+def _log_cloud_outbox_flush(
+    *,
+    started_at: float,
+    batch_size: int,
+    pending_before: int,
+    pending_after: int,
+    failed_count: int,
+    http_status: int | str | None,
+) -> None:
+    elapsed_ms = max(0, int(round((time.monotonic() - started_at) * 1000)))
+    status_text = "none" if http_status is None else str(http_status)
+    print(
+        "[CloudOutbox] flush "
+        f"batch_size={max(0, int(batch_size or 0))} "
+        f"elapsed_ms={elapsed_ms} "
+        f"pending_before={max(0, int(pending_before or 0))} "
+        f"pending_after={max(0, int(pending_after or 0))} "
+        f"failed_count={max(0, int(failed_count or 0))} "
+        f"http_status={status_text}"
+    )
 
 
 def _maybe_warn_outbox_backlog(stats: dict[str, Any], base_url: str, identity: dict[str, Any]) -> None:

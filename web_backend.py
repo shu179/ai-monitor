@@ -2072,6 +2072,14 @@ class AppRuntime:
         self._cloud_platform_auto_sync = CloudPlatformAutoSync(
             pull_tasks=lambda force=False: self.pull_cloud_tasks({"force": force}),
             recover_upload_candidates=lambda: self._recover_cloud_run_history_uploads(),
+            upload_burst_interval_seconds=_safe_float(
+                os.environ.get("AIBRANDMONITOR_CLOUD_UPLOAD_BURST_INTERVAL_SECONDS"),
+                1.0,
+            ),
+            upload_burst_pending_threshold=_safe_int(
+                os.environ.get("AIBRANDMONITOR_CLOUD_UPLOAD_BURST_PENDING_THRESHOLD"),
+                100,
+            ),
             logger=lambda message: print(redact_secret_text(message)),
         )
         self._isolate_ordinary_cloud_account_config(CloudSessionStore().load())
