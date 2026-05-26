@@ -46,6 +46,7 @@ try:
 except Exception:
     certifi = None  # type: ignore[assignment]
 
+AIHOT_DAILY_PUBLIC_URL = "https://aihot.virxact.com/api/public/daily"
 AIHOT_DAILY_FEED_URL = "https://aihot.virxact.com/feed/daily.xml"
 AIHOT_DAILY_FEED_CACHE_SECONDS = 30 * 60
 AIHOT_DAILY_FEED_MAX_BYTES = 1024 * 1024
@@ -7770,6 +7771,47 @@ return changedCount
         except Exception:
             return None
 
+    def _parse_aihot_daily_json(self, data: Any) -> dict:
+        if not isinstance(data, dict):
+            raise ValueError("日报接口返回格式异常")
+
+        feed_date = str(data.get("date") or "").strip()
+        updated_raw = str(data.get("generatedAt") or data.get("windowEnd") or "").strip()
+        items: list[dict[str, str]] = []
+
+        for section in data.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            section_label = str(section.get("label") or "").strip()
+            for entry in section.get("items") or []:
+                if not isinstance(entry, dict):
+                    continue
+                title = str(entry.get("title") or "").strip()
+                summary = str(entry.get("summary") or "").strip()
+                link = str(entry.get("sourceUrl") or entry.get("url") or "").strip()
+                source_name = str(entry.get("sourceName") or "").strip()
+                if not title:
+                    continue
+                items.append(
+                    {
+                        "title": title,
+                        "link": link,
+                        "summary": summary,
+                        "content": summary,
+                        "author": source_name or section_label,
+                        "publishedAt": "",
+                    }
+                )
+
+        return {
+            "ok": True,
+            "title": "AI 热点日报",
+            "feedUrl": AIHOT_DAILY_PUBLIC_URL,
+            "updatedAt": self._format_feed_datetime(updated_raw),
+            "date": feed_date,
+            "items": items,
+        }
+
     def _parse_aihot_daily_feed(self, xml_text: str) -> dict:
         root = ElementTree.fromstring(xml_text.encode("utf-8"))
         channel = root.find("channel")
@@ -7817,6 +7859,21 @@ return changedCount
             "items": items,
         }
 
+    def _fetch_aihot_daily_rss_feed(self) -> dict:
+        request = Request(
+            AIHOT_DAILY_FEED_URL,
+            headers={
+                "User-Agent": f"{APP_NAME}/1.0 (+https://localhost; RSS reader)",
+                "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
+            },
+        )
+        with urlopen(request, timeout=8, context=self._aihot_ssl_context()) as response:
+            content_type = str(response.headers.get("Content-Type") or "")
+            if "xml" not in content_type.lower():
+                raise ValueError(f"订阅源返回了非 RSS 内容：{content_type or '未知内容类型'}")
+            xml_text = response.read(AIHOT_DAILY_FEED_MAX_BYTES).decode("utf-8", errors="replace")
+        return self._parse_aihot_daily_feed(xml_text)
+
     def get_aihot_daily_feed(self) -> dict:
         now = time.time()
         with self._aihot_daily_feed_lock:
@@ -7827,25 +7884,25 @@ return changedCount
             last_modified = self._aihot_daily_feed_last_modified
         try:
             headers = {
-                "User-Agent": f"{APP_NAME}/1.0 (+https://localhost; RSS reader)",
-                "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
+                "User-Agent": f"{APP_NAME}/1.0 (+https://localhost; daily digest reader)",
+                "Accept": "application/json, */*;q=0.5",
             }
             if etag:
                 headers["If-None-Match"] = etag
             if last_modified:
                 headers["If-Modified-Since"] = last_modified
             request = Request(
-                AIHOT_DAILY_FEED_URL,
+                AIHOT_DAILY_PUBLIC_URL,
                 headers=headers,
             )
             with urlopen(request, timeout=8, context=self._aihot_ssl_context()) as response:
                 content_type = str(response.headers.get("Content-Type") or "")
-                if "xml" not in content_type.lower():
-                    raise ValueError(f"订阅源返回了非 RSS 内容：{content_type or '未知内容类型'}")
-                xml_text = response.read(AIHOT_DAILY_FEED_MAX_BYTES).decode("utf-8", errors="replace")
+                if "json" not in content_type.lower():
+                    raise ValueError(f"日报接口返回了非 JSON 内容：{content_type or '未知内容类型'}")
+                raw_text = response.read(AIHOT_DAILY_FEED_MAX_BYTES).decode("utf-8", errors="replace")
                 response_etag = str(response.headers.get("ETag") or "").strip()
                 response_last_modified = str(response.headers.get("Last-Modified") or "").strip()
-            payload = self._parse_aihot_daily_feed(xml_text)
+            payload = self._parse_aihot_daily_json(json.loads(raw_text))
             with self._aihot_daily_feed_lock:
                 self._aihot_daily_feed_etag = response_etag
                 self._aihot_daily_feed_last_modified = response_last_modified
@@ -7853,26 +7910,32 @@ return changedCount
             if cached_payload:
                 payload = cached_payload
             else:
-                payload = {
-                    "ok": False,
-                    "title": "AI 热点日报",
-                    "feedUrl": AIHOT_DAILY_FEED_URL,
-                    "updatedAt": "",
-                    "items": [],
-                    "message": f"订阅读取失败：HTTP {exc.code}",
-                }
+                try:
+                    payload = self._fetch_aihot_daily_rss_feed()
+                except Exception:
+                    payload = {
+                        "ok": False,
+                        "title": "AI 热点日报",
+                        "feedUrl": AIHOT_DAILY_PUBLIC_URL,
+                        "updatedAt": "",
+                        "items": [],
+                        "message": f"日报读取失败：HTTP {exc.code}",
+                    }
         except Exception as exc:
             if cached_payload:
                 payload = cached_payload
             else:
-                payload = {
-                    "ok": False,
-                    "title": "AI 热点日报",
-                    "feedUrl": AIHOT_DAILY_FEED_URL,
-                    "updatedAt": "",
-                    "items": [],
-                    "message": f"订阅读取失败：{exc}",
-                }
+                try:
+                    payload = self._fetch_aihot_daily_rss_feed()
+                except Exception:
+                    payload = {
+                        "ok": False,
+                        "title": "AI 热点日报",
+                        "feedUrl": AIHOT_DAILY_PUBLIC_URL,
+                        "updatedAt": "",
+                        "items": [],
+                        "message": f"日报读取失败：{exc}",
+                    }
         with self._aihot_daily_feed_lock:
             if payload.get("ok"):
                 self._aihot_daily_feed_cache = dict(payload)
