@@ -2504,6 +2504,7 @@ class AppRuntime:
             self._article_cloud_enqueue_thread.start()
 
     def _run_cloud_articles_snapshot_worker(self) -> None:
+        time.sleep(float(os.environ.get("AIBRANDMONITOR_CLOUD_ARTICLES_SNAPSHOT_STARTUP_DELAY_SECONDS", "5")))
         while True:
             with self._article_cloud_enqueue_lock:
                 if not self._article_cloud_enqueue_requested:

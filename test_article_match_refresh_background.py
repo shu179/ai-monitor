@@ -34,6 +34,7 @@ class ArticleMatchRefreshBackgroundTests(unittest.TestCase):
         self._original_backend = os.environ.get(article_store.ARTICLE_STORE_BACKEND_ENV)
         self._original_batch_size = os.environ.get(article_store.ARTICLE_MATCH_REFRESH_BATCH_SIZE_ENV)
         self._original_sleep = os.environ.get(article_store.ARTICLE_MATCH_REFRESH_SLEEP_SECONDS_ENV)
+        self._original_startup_delay = os.environ.get(article_store.ARTICLE_MATCH_REFRESH_STARTUP_DELAY_SECONDS_ENV)
         self._original_paths = {
             "ARTICLES_FILE": article_store.ARTICLES_FILE,
             "DOMAIN_OVERRIDES_FILE": article_store.DOMAIN_OVERRIDES_FILE,
@@ -57,6 +58,7 @@ class ArticleMatchRefreshBackgroundTests(unittest.TestCase):
         # Use small batch and no sleep for tests
         os.environ[article_store.ARTICLE_MATCH_REFRESH_BATCH_SIZE_ENV] = "50"
         os.environ[article_store.ARTICLE_MATCH_REFRESH_SLEEP_SECONDS_ENV] = "0"
+        os.environ[article_store.ARTICLE_MATCH_REFRESH_STARTUP_DELAY_SECONDS_ENV] = "0"
 
     def tearDown(self) -> None:
         article_store.wait_for_article_store_backend_migration(timeout=2.0)
@@ -74,6 +76,10 @@ class ArticleMatchRefreshBackgroundTests(unittest.TestCase):
             os.environ.pop(article_store.ARTICLE_MATCH_REFRESH_SLEEP_SECONDS_ENV, None)
         else:
             os.environ[article_store.ARTICLE_MATCH_REFRESH_SLEEP_SECONDS_ENV] = self._original_sleep
+        if self._original_startup_delay is None:
+            os.environ.pop(article_store.ARTICLE_MATCH_REFRESH_STARTUP_DELAY_SECONDS_ENV, None)
+        else:
+            os.environ[article_store.ARTICLE_MATCH_REFRESH_STARTUP_DELAY_SECONDS_ENV] = self._original_startup_delay
         article_store.ARTICLES_FILE = self._original_paths["ARTICLES_FILE"]
         article_store.DOMAIN_OVERRIDES_FILE = self._original_paths["DOMAIN_OVERRIDES_FILE"]
         article_store.DOMAIN_MEDIA_NAMES_FILE = self._original_paths["DOMAIN_MEDIA_NAMES_FILE"]

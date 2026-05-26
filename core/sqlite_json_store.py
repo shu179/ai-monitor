@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .sqlite_tuning import apply_runtime_pragmas
+from .sqlite_tuning import apply_runtime_pragmas, perform_startup_maintenance
 
 
 MISSING = object()
@@ -18,6 +18,7 @@ class SQLiteJsonDocumentStore:
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
+        self._startup_maintenance_done = False
 
     def load(self, key: str, default: Any = MISSING) -> Any:
         normalized_key = self._normalize_key(key)
@@ -126,6 +127,12 @@ class SQLiteJsonDocumentStore:
                 )
                 """
             )
+            if not self._startup_maintenance_done:
+                try:
+                    perform_startup_maintenance(conn, self.db_path)
+                    self._startup_maintenance_done = True
+                except Exception:
+                    pass
         except BaseException:
             conn.close()
             raise

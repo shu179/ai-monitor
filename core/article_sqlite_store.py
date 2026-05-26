@@ -12,7 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .sqlite_tuning import apply_runtime_pragmas
+from .sqlite_tuning import apply_runtime_pragmas, perform_startup_maintenance
+from .sqlite_tuning import apply_runtime_pragmas, perform_startup_maintenance
 from .time_utils import local_now, local_today, parse_local_date
 
 
@@ -134,6 +135,10 @@ class ArticleSQLiteStore:
                 """,
                 (str(SCHEMA_VERSION),),
             )
+            try:
+                perform_startup_maintenance(conn, self.db_path)
+            except Exception:
+                pass
 
     def import_from_json(self, articles_path: str | Path, *, replace: bool = True) -> dict[str, int]:
         path = Path(articles_path)

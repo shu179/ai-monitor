@@ -62,6 +62,7 @@ ARTICLE_STORE_SQLITE_COOLDOWN_SECONDS = 60.0
 
 ARTICLE_MATCH_REFRESH_BATCH_SIZE_ENV = "AIBRANDMONITOR_ARTICLE_MATCH_REFRESH_BATCH_SIZE"
 ARTICLE_MATCH_REFRESH_SLEEP_SECONDS_ENV = "AIBRANDMONITOR_ARTICLE_MATCH_REFRESH_SLEEP_SECONDS"
+ARTICLE_MATCH_REFRESH_STARTUP_DELAY_SECONDS_ENV = "AIBRANDMONITOR_ARTICLE_MATCH_REFRESH_STARTUP_DELAY_SECONDS"
 DEFAULT_MATCH_REFRESH_BATCH_SIZE = 200
 DEFAULT_MATCH_REFRESH_SLEEP_SECONDS = 0.02
 
@@ -6026,6 +6027,14 @@ def _match_refresh_sleep_seconds() -> float:
     return max(0.0, min(0.5, value))
 
 
+def _match_refresh_startup_delay_seconds(env_name: str = ARTICLE_MATCH_REFRESH_STARTUP_DELAY_SECONDS_ENV) -> float:
+    try:
+        value = float(os.environ.get(env_name, "3"))
+    except Exception:
+        value = 3.0
+    return max(0.0, value)
+
+
 def _write_match_refresh_meta(store, **kwargs) -> None:
     for key, value in kwargs.items():
         store.set_meta(f"match_refresh_{key}", str(value or ""))
@@ -6099,6 +6108,7 @@ def get_article_match_refresh_status() -> dict[str, object]:
 
 
 def _run_article_match_refresh_worker(config: dict, reason: str) -> None:
+    time.sleep(_match_refresh_startup_delay_seconds(ARTICLE_MATCH_REFRESH_STARTUP_DELAY_SECONDS_ENV))
     store = None
     try:
         compiled = compile_article_matcher(config)

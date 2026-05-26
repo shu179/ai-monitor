@@ -11,7 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from .sqlite_tuning import apply_runtime_pragmas
+from .sqlite_tuning import apply_runtime_pragmas, perform_startup_maintenance
+from .sqlite_tuning import apply_runtime_pragmas, perform_startup_maintenance
 from .time_utils import local_now, local_today, parse_local_date
 
 
@@ -190,6 +191,10 @@ class ArticleHistorySQLiteStore:
                 """,
                 (str(SCHEMA_VERSION),),
             )
+            try:
+                perform_startup_maintenance(conn, self.db_path)
+            except Exception:
+                pass
 
     def import_articles(
         self,

@@ -139,6 +139,7 @@ def enqueue_cloud_articles(
     *,
     outbox: CloudOutbox | None = None,
     max_articles: int = 5000,
+    batch_size: int = 200,
 ) -> dict[str, int]:
     target_outbox = outbox or CloudOutbox()
     scanned = 0
@@ -153,8 +154,21 @@ def enqueue_cloud_articles(
             continue
         candidates += 1
         events_to_enqueue.extend(events)
+    safe_batch_size = max(1, int(batch_size or 200))
+    enqueue_result = {"created": 0, "requested": 0, "dropped": {"total": 0, "active": 0, "sent": 0}}
     try:
-        enqueue_result = target_outbox.enqueue_many(events_to_enqueue)
+        for index in range(0, len(events_to_enqueue), safe_batch_size):
+            batch = events_to_enqueue[index:index + safe_batch_size]
+            batch_result = target_outbox.enqueue_many(batch)
+            enqueue_result["created"] = int(enqueue_result.get("created") or 0) + int(batch_result.get("created") or 0)
+            enqueue_result["requested"] = int(enqueue_result.get("requested") or 0) + int(batch_result.get("requested") or 0)
+            dropped = batch_result.get("dropped") if isinstance(batch_result.get("dropped"), dict) else {}
+            aggregate_dropped = enqueue_result.get("dropped") if isinstance(enqueue_result.get("dropped"), dict) else {}
+            for key in ("total", "active", "sent"):
+                aggregate_dropped[key] = int(aggregate_dropped.get(key) or 0) + int((dropped or {}).get(key) or 0)
+            enqueue_result["dropped"] = aggregate_dropped
+            if index + safe_batch_size < len(events_to_enqueue):
+                time.sleep(0.5)
     except Exception:
         enqueue_result = {"created": 0, "requested": len(events_to_enqueue), "dropped": {"total": 0, "active": 0, "sent": 0}}
     dropped = enqueue_result.get("dropped") if isinstance(enqueue_result.get("dropped"), dict) else {}
