@@ -856,6 +856,300 @@ class ArticleTableImportTests(unittest.TestCase):
         self.assertEqual(articles[0].get("url"), "https://m.redhongan.com/p/200044.html")
         self.assertEqual(articles[0].get("raw_url"), original_url)
 
+    def test_import_within_batch_merges_same_article_with_two_media_forms(self) -> None:
+        """同一篇腾讯系账号文章用两种媒体名写法出现两行，应该合并成一条，链接得保留。"""
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "发布网址/拒稿理由", "媒体名称", "发布时间"])
+        # 第一行有链接，写成"腾讯网（无线昆明）"
+        worksheet.append([
+            "品牌A 腾讯账号统一文章",
+            "https://page.om.qq.com/page/Same-Article-Url-1",
+            "腾讯网（无线昆明）",
+            "2026-04-30 17:50:05",
+        ])
+        # 第二行没链接，写成"无线昆明（腾讯新闻）"
+        worksheet.append([
+            "品牌A 腾讯账号统一文章",
+            "",
+            "无线昆明（腾讯新闻）",
+            "2026-04-30",
+        ])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+
+        result = service.import_articles_from_file("两种写法.xlsx", output.getvalue())
+
+        self.assertTrue(result["ok"])
+        articles = article_store.get_articles()
+        self.assertEqual(len(articles), 1, msg=f"应合并为一条，实际：{articles}")
+        article = articles[0]
+        self.assertEqual(article.get("title"), "品牌A 腾讯账号统一文章")
+        self.assertTrue(article.get("url"), msg="链接应被保留")
+        self.assertEqual(
+            article_store.normalize_article_url(article.get("url")),
+            "https://page.om.qq.com/page/Same-Article-Url-1",
+        )
+        self.assertEqual(result["duplicate_count"], 1)
+
+    def test_import_within_batch_url_row_and_no_url_row_dedupes(self) -> None:
+        """同一篇文章在表格里出现两次，一次有链接一次没，导入后只应有一条且链接保留。"""
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "发布链接", "媒体名称", "发布时间"])
+        worksheet.append([
+            "品牌A 红安重复报道",
+            "https://m.redhongan.com/p/200044.html?timestamp=1778468821795",
+            "红安网",
+            "2026-05-11 13:30:00",
+        ])
+        worksheet.append([
+            "品牌A 红安重复报道",
+            "",
+            "红安网",
+            "2026-05-11",
+        ])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+
+        result = service.import_articles_from_file("红安重复.xlsx", output.getvalue())
+
+        self.assertTrue(result["ok"])
+        articles = article_store.get_articles()
+        self.assertEqual(len(articles), 1)
+        article = articles[0]
+        self.assertEqual(article.get("url"), "https://m.redhongan.com/p/200044.html")
+        self.assertEqual(article.get("raw_url"), "https://m.redhongan.com/p/200044.html?timestamp=1778468821795")
+        self.assertEqual(result["duplicate_count"], 1)
+
+    def test_import_cross_batch_keeps_existing_url_when_new_row_has_none(self) -> None:
+        """先导入一份带链接的文章，再导入同标题/媒体/日期但没有链接的版本，原链接不能被覆盖丢掉。"""
+        original_url = "https://m.redhongan.com/p/200044.html?timestamp=1778468821795"
+        article_store.add_article({
+            "url": "https://m.redhongan.com/p/200044.html",
+            "raw_url": original_url,
+            "title": "品牌A 红安报道",
+            "media_name": "红安网",
+            "media_type": "authority",
+            "published_at": "2026-05-11",
+            "ts": "2026-05-11",
+            "matched_tasks": ["品牌A"],
+        })
+
+        from openpyxl import Workbook
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "发布链接", "媒体名称", "发布时间"])
+        worksheet.append(["品牌A 红安报道", "", "红安网", "2026-05-11"])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+
+        result = service.import_articles_from_file("红安补全.xlsx", output.getvalue())
+
+        articles = article_store.get_articles()
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(articles), 1, msg="不能新增重复条目")
+        self.assertEqual(articles[0].get("url"), "https://m.redhongan.com/p/200044.html")
+        self.assertEqual(articles[0].get("raw_url"), original_url)
+
+    def test_import_within_batch_same_media_dedupes_url_loss(self) -> None:
+        """同标题、同媒体名两行，先没链接后有链接 / 先有链接后没链接 — 都应合并并保留链接。"""
+        from openpyxl import Workbook
+
+        for ordering in ("url_first", "url_second"):
+            with self.subTest(ordering=ordering):
+                article_store.ARTICLES_FILE.unlink(missing_ok=True)
+                workbook = Workbook()
+                worksheet = workbook.active
+                worksheet.append(["文章标题", "文章链接", "媒体名称", "发布时间"])
+                rows = [
+                    ("品牌A 同标题同媒体", "https://example.com/dup-source", "示例媒体", "2026-05-08 12:15:04"),
+                    ("品牌A 同标题同媒体", "", "示例媒体", "2026-05-08"),
+                ]
+                if ordering == "url_second":
+                    rows = list(reversed(rows))
+                for row in rows:
+                    worksheet.append(list(row))
+                output = BytesIO()
+                workbook.save(output)
+                service, _ = _article_import_service()
+
+                result = service.import_articles_from_file(f"同名重复-{ordering}.xlsx", output.getvalue())
+
+                articles = article_store.get_articles()
+                self.assertTrue(result["ok"])
+                self.assertEqual(len(articles), 1)
+                self.assertEqual(
+                    article_store.normalize_article_url(articles[0].get("url")),
+                    "https://example.com/dup-source",
+                )
+
+    def test_import_cleans_up_preexisting_orphan_duplicate_with_no_url(self) -> None:
+        """库里上一版代码留下的孤儿副本（同一篇文章存了带 URL 和不带 URL 两条），
+        再次导入这条文章时应该自动合并掉那条没 URL 的副本。"""
+        article_store.add_article({
+            "url": "http://redsh.com/pinpai/20260525/222352.shtml",
+            "raw_url": "http://www.redsh.com/pinpai/20260525/222352.shtml",
+            "title": "循香而至——香水品牌推荐",
+            "media_name": "红商网",
+            "media_type": "selfmedia",
+            "published_at": "2026-05-26",
+            "ts": "2026-05-26",
+        })
+        article_store.add_article({
+            "url": "",
+            "title": "循香而至——香水品牌推荐",
+            "media_name": "红商网",
+            "media_type": "selfmedia",
+            "published_at": "2026-05-26",
+            "ts": "2026-05-26",
+        })
+        self.assertEqual(len(article_store.get_articles()), 2)
+
+        from openpyxl import Workbook
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "文章链接", "媒体名称", "发布时间"])
+        worksheet.append([
+            "循香而至——香水品牌推荐",
+            "http://www.redsh.com/pinpai/20260525/222352.shtml",
+            "红商网（官方）",
+            "2026-05-26 08:23:49",
+        ])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+        result = service.import_articles_from_file("再次导入.xlsx", output.getvalue())
+
+        articles = article_store.get_articles()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["merged_duplicate_count"], 1)
+        self.assertEqual(len(articles), 1, msg=f"应合并到 1 条；得到：{articles}")
+        self.assertEqual(articles[0]["url"], "http://redsh.com/pinpai/20260525/222352.shtml")
+        self.assertEqual(
+            articles[0]["raw_url"],
+            "http://www.redsh.com/pinpai/20260525/222352.shtml",
+        )
+
+    def test_import_cleans_up_preexisting_orphan_duplicate_with_different_url(self) -> None:
+        """更刁钻的场景：两条副本都带 URL（但其中一条 URL 已经失效或写错），
+        导入到这篇文章时也应该合并到一条，且保留"正在被表格用到的那条 URL"。"""
+        article_store.add_article({
+            "url": "http://redsh.com/pinpai/20260525/222352.shtml",
+            "raw_url": "http://www.redsh.com/pinpai/20260525/222352.shtml",
+            "title": "循香而至——香水品牌推荐",
+            "media_name": "红商网",
+            "media_type": "selfmedia",
+            "published_at": "2026-05-26",
+            "ts": "2026-05-26",
+        })
+        # 一个 URL 不一样、看起来还像样的孤儿副本（来自之前版本的脏数据）
+        article_store.add_article({
+            "url": "http://redsh.com/legacy/old-url",
+            "title": "循香而至——香水品牌推荐",
+            "media_name": "红商网",
+            "media_type": "selfmedia",
+            "published_at": "2026-05-26",
+            "ts": "2026-05-26",
+        })
+
+        from openpyxl import Workbook
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "文章链接", "媒体名称", "发布时间"])
+        worksheet.append([
+            "循香而至——香水品牌推荐",
+            "http://www.redsh.com/pinpai/20260525/222352.shtml",
+            "红商网",
+            "2026-05-26",
+        ])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+        result = service.import_articles_from_file("再导.xlsx", output.getvalue())
+
+        articles = article_store.get_articles()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["merged_duplicate_count"], 1)
+        self.assertEqual(len(articles), 1)
+        self.assertEqual(articles[0]["url"], "http://redsh.com/pinpai/20260525/222352.shtml")
+
+    def test_import_treats_hyperlink_marker_url_as_dirty_and_cleans_up(self) -> None:
+        """旧版本曾把 cell_text 的 HYPERLINK marker 直接塞进 url 字段，
+        这种"看起来有 URL 但点不开"的脏数据，应被识别为没 URL，让 anchor 选到正常那条。"""
+        # 正常那条
+        good = article_store.add_article({
+            "url": "http://redsh.com/pinpai/20260525/222352.shtml",
+            "raw_url": "http://www.redsh.com/pinpai/20260525/222352.shtml",
+            "title": "循香而至——香水品牌推荐",
+            "media_name": "红商网",
+            "media_type": "selfmedia",
+            "published_at": "2026-05-26",
+            "ts": "2026-05-26",
+        })
+        # 脏的那条 — url 字段是 marker 残留，点不开
+        bad = article_store.add_article({
+            "url": "已发布\x1eHYPERLINK:http://www.redsh.com/pinpai/20260525/222352.shtml",
+            "title": "循香而至——香水品牌推荐",
+            "media_name": "红商网",
+            "media_type": "selfmedia",
+            "published_at": "2026-05-26",
+            "ts": "2026-05-26",
+        })
+        self.assertEqual(len(article_store.get_articles()), 2)
+
+        from openpyxl import Workbook
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "文章链接", "媒体名称", "发布时间"])
+        worksheet.append([
+            "循香而至——香水品牌推荐",
+            "http://www.redsh.com/pinpai/20260525/222352.shtml",
+            "红商网（官方）",
+            "2026-05-26 08:23:49",
+        ])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+        result = service.import_articles_from_file("脏url清理.xlsx", output.getvalue())
+
+        articles = article_store.get_articles()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["merged_duplicate_count"], 1)
+        self.assertEqual(len(articles), 1)
+        # 留下来的必须是 good，url 干净可点
+        self.assertEqual(articles[0]["id"], good["id"])
+        self.assertEqual(articles[0]["url"], "http://redsh.com/pinpai/20260525/222352.shtml")
+        self.assertNotIn("\x1e", articles[0]["url"])
+
+    def test_import_does_not_collapse_two_different_articles_same_title_different_date(self) -> None:
+        """两条不同日期但同标题的合规文章不能被错误合并。"""
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["文章标题", "文章链接", "媒体名称", "发布时间"])
+        worksheet.append(["品牌A 同标题不同日期", "https://example.com/a", "示例媒体", "2026-05-08"])
+        worksheet.append(["品牌A 同标题不同日期", "https://example.com/b", "示例媒体", "2026-05-09"])
+        output = BytesIO()
+        workbook.save(output)
+        service, _ = _article_import_service()
+
+        result = service.import_articles_from_file("不同日期.xlsx", output.getvalue())
+
+        articles = article_store.get_articles()
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(articles), 2)
+        urls = sorted(article.get("url") for article in articles)
+        self.assertEqual(urls, ["https://example.com/a", "https://example.com/b"])
+
     def test_import_existing_url_preserves_deleted_task_classification(self) -> None:
         article_store.add_article({
             "url": "https://example.com/deleted-task",

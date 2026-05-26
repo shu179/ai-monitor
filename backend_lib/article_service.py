@@ -7,6 +7,7 @@ import json
 import os
 import re
 import tempfile
+import unicodedata
 from collections.abc import Callable
 from datetime import date
 from pathlib import Path
@@ -38,6 +39,7 @@ from core.article_store import (
     resolve_article_display_url,
     resolve_article_export_keywords,
     resolve_article_source,
+    resolve_media_name,
     save_domain_media_name,
     undo_article_import_batch,
     update_article_export_keyword_cache,
@@ -275,6 +277,168 @@ def _article_url_fingerprint(article: dict[str, Any]) -> str:
     return "|".join([title, source, published])
 
 
+def _normalize_article_import_title(value: Any) -> str:
+    raw = str(value or "")
+    if not raw.strip():
+        return ""
+    folded = unicodedata.normalize("NFKC", raw)
+    return re.sub(r"\s+", " ", folded.strip()).lower()
+
+
+_ARTICLE_IMPORT_MEDIA_CANONICAL_OVERRIDES = {
+    # 用户表格里同一篇腾讯系账号文章可能写成 "腾讯网（无线昆明）" 或 "无线昆明（腾讯新闻）"，
+    # 经过 _split_article_import_platform_account 后 platform 部分会落在 "腾讯网" 或 "腾讯新闻"，
+    # 这里统一折叠到 "腾讯新闻"，让两种写法落入同一个 match key、不再被当成两条独立文章。
+    "腾讯网": "腾讯新闻",
+}
+
+
+def _canonicalize_article_import_media_name(value: Any) -> str:
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not raw:
+        return ""
+    stripped = _strip_article_import_media_qualifier(raw)
+    bracket_match = re.fullmatch(r"(.+?)[（(【\[]([^（）()【】\[\]]+)[）)】\]]", stripped)
+    if bracket_match:
+        outer = bracket_match.group(1).strip()
+        inner = bracket_match.group(2).strip()
+        inner_platform = _resolve_article_import_platform_label(inner)
+        outer_platform = _resolve_article_import_platform_label(outer)
+        if inner_platform:
+            stripped = inner_platform
+        elif outer_platform:
+            stripped = outer_platform
+        else:
+            stripped = outer
+    label = _resolve_article_import_platform_label(stripped)
+    if label:
+        stripped = label
+    stripped = _ARTICLE_IMPORT_MEDIA_CANONICAL_OVERRIDES.get(stripped, stripped)
+    try:
+        resolved = resolve_media_name(stripped) or stripped
+    except Exception:
+        resolved = stripped
+    resolved = _ARTICLE_IMPORT_MEDIA_CANONICAL_OVERRIDES.get(resolved, resolved)
+    return resolved.lower()
+
+
+def _article_import_match_key(article: dict[str, Any]) -> tuple[str, str, str] | None:
+    """Cross-form fingerprint: 同一篇文章无论写成"腾讯网（无线昆明）"还是"无线昆明（腾讯新闻）"都落到同一 key。"""
+    title = _normalize_article_import_title(article.get("title"))
+    if not title:
+        return None
+    media_canon = _canonicalize_article_import_media_name(
+        article.get("media_name") or article.get("source") or article.get("platform") or ""
+    )
+    date_text = str(
+        article.get("published_at") or article.get("published") or article.get("ts") or ""
+    ).strip()[:10]
+    return (title, media_canon, date_text)
+
+
+def _article_import_loose_key(article: dict[str, Any]) -> tuple[str, str] | None:
+    """Fallback key: only title + date. Used to attach a URL-less new row to an existing record
+    when the media name is written differently (e.g., 腾讯网 vs 腾讯新闻 而又没有 URL 可以对齐)。"""
+    title = _normalize_article_import_title(article.get("title"))
+    if not title:
+        return None
+    date_text = str(
+        article.get("published_at") or article.get("published") or article.get("ts") or ""
+    ).strip()[:10]
+    if not date_text:
+        return None
+    return (title, date_text)
+
+
+_ARTICLE_IMPORT_URL_DIRTY_MARKERS = ("\x1eHYPERLINK:", "\x1e")
+
+
+def _looks_like_dirty_url(value: Any) -> bool:
+    """旧版本代码偶尔会把 cell_text 里的 HYPERLINK 标记直接塞进 url 字段，
+    或者写入了一段不像 URL 的脏文本——这种 URL 实际上点不开，应该当作"没 URL"处理。"""
+    text = str(value or "").strip()
+    if not text:
+        return True
+    if any(marker in text for marker in _ARTICLE_IMPORT_URL_DIRTY_MARKERS):
+        return True
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text):
+        return True
+    return False
+
+
+def _merge_article_import_fields(base: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    """Fill empty fields on ``base`` from ``incoming`` (existing data 不会被覆盖). Returns True if anything changed."""
+    changed = False
+    _fill_keys = (
+        "url",
+        "raw_url",
+        "title",
+        "platform",
+        "media_name",
+        "media_type",
+        "account_name",
+        "excerpt",
+        "published_at",
+        "ts",
+        "price",
+        "imported_from_sheet",
+        "imported_from_row",
+    )
+    for key in _fill_keys:
+        base_value = base.get(key)
+        if key in ("url", "raw_url"):
+            has_base = not _looks_like_dirty_url(base_value)
+        elif isinstance(base_value, str):
+            has_base = bool(base_value.strip())
+        else:
+            has_base = base_value not in (None, "", 0)
+        if has_base:
+            continue
+        incoming_value = incoming.get(key)
+        if key in ("url", "raw_url"):
+            has_incoming = not _looks_like_dirty_url(incoming_value)
+        elif isinstance(incoming_value, str):
+            has_incoming = bool(incoming_value.strip())
+        else:
+            has_incoming = incoming_value not in (None, "")
+        if has_incoming:
+            base[key] = incoming_value
+            changed = True
+    return changed
+
+
+def _pick_best_existing_anchor(
+    articles: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Given multiple existing articles that share a strong fingerprint (URL 或 canonical key),
+    return ``(anchor, duplicates)`` — anchor is the one we keep (has URL/most fields filled),
+    其它就是要合并并删除的孤儿重复。"""
+    if len(articles) <= 1:
+        return articles[0] if articles else None, []  # type: ignore[return-value]
+
+    def _score(article: dict[str, Any]) -> tuple[int, int, int, int, str]:
+        raw_stored = str(article.get("url") or "").strip()
+        # 把脏 URL（如 \x1eHYPERLINK: marker、半截字符串）当作"没有 URL"，
+        # 这样脏数据的副本会被排到后面，更新发生在干净的那条上。
+        url_ok = bool(raw_stored) and not _looks_like_dirty_url(raw_stored)
+        normalized = normalize_article_url(raw_stored) if url_ok else ""
+        raw_url_field = str(article.get("raw_url") or "").strip()
+        raw_url_ok = bool(raw_url_field) and not _looks_like_dirty_url(raw_url_field)
+        title_len = len(str(article.get("title") or ""))
+        excerpt_len = len(str(article.get("excerpt") or ""))
+        # 越好排越前；用 article id 作为最后的 deterministic tie-breaker。
+        return (
+            1 if normalized else 0,
+            1 if raw_url_ok else 0,
+            title_len,
+            excerpt_len,
+            str(article.get("id") or ""),
+        )
+
+    sorted_articles = sorted(articles, key=_score, reverse=True)
+    return sorted_articles[0], sorted_articles[1:]
+
+
 def _hydrate_article_urls_from_fingerprints(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
     url_by_fingerprint: dict[str, str] = {}
     for article in articles:
@@ -355,16 +519,28 @@ def _normalize_article_import_batch(batch: Any) -> dict[str, Any] | None:
         before = item.get("before") if isinstance(item.get("before"), dict) else None
         if article_id and before:
             updated_articles.append({"id": article_id, "before": before})
+    merged_duplicate_articles = []
+    for item in batch.get("merged_duplicate_articles") or []:
+        if not isinstance(item, dict):
+            continue
+        article_id = str(item.get("id") or item.get("article_id") or "").strip()
+        before = item.get("before") if isinstance(item.get("before"), dict) else None
+        if article_id and before:
+            merged_duplicate_articles.append({"id": article_id, "before": before})
     return {
         "id": import_id,
         "file_name": str(batch.get("file_name") or "").strip(),
         "article_ids": article_ids,
         "updated_articles": updated_articles,
+        "merged_duplicate_articles": merged_duplicate_articles,
         "status": status,
         "created_at": str(batch.get("created_at") or "").strip(),
         "added_count": int(batch.get("added_count") or len(article_ids)),
         "updated_count": int(batch.get("updated_count") or len(updated_articles)),
         "duplicate_count": int(batch.get("duplicate_count") or 0),
+        "merged_duplicate_count": int(
+            batch.get("merged_duplicate_count") or len(merged_duplicate_articles)
+        ),
         "skipped_count": int(batch.get("skipped_count") or 0),
     }
 
@@ -984,26 +1160,117 @@ class ArticleService:
             updated_articles: list[dict[str, Any]] = []
             duplicate_count = 0
             skipped_count = 0
-            seen_keys: set[str] = set()
             existing_articles = [
                 article
                 for article in get_articles()
                 if isinstance(article, dict)
             ]
-            existing_by_url = {
-                normalize_article_url(str(article.get("url") or "")): article
-                for article in existing_articles
-                if normalize_article_url(str(article.get("url") or ""))
-            }
-            existing_missing_url_by_fingerprint = {
-                fingerprint: article
-                for article in existing_articles
-                if not normalize_article_url(str(article.get("url") or ""))
-                for fingerprint in [_article_url_fingerprint(article)]
-                if fingerprint
-            }
+            existing_by_url: dict[str, list[dict[str, Any]]] = {}
+            existing_by_match_key: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+            existing_by_title_date: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for article in existing_articles:
+                normalized_existing_url = normalize_article_url(str(article.get("url") or ""))
+                if normalized_existing_url:
+                    existing_by_url.setdefault(normalized_existing_url, []).append(article)
+                match_key = _article_import_match_key(article)
+                if match_key:
+                    existing_by_match_key.setdefault(match_key, []).append(article)
+                loose_key = _article_import_loose_key(article)
+                if loose_key:
+                    existing_by_title_date.setdefault(loose_key, []).append(article)
+
             pending_upserts: list[dict[str, Any]] = []
             pending_kinds: list[str] = []
+            pending_idx_by_url: dict[str, int] = {}
+            pending_idx_by_match_key: dict[tuple[str, str, str], int] = {}
+            pending_idx_by_loose_key: dict[tuple[str, str], list[int]] = {}
+            pending_idx_by_existing_id: dict[str, int] = {}
+            pending_existing_before: dict[str, dict[str, Any]] = {}
+            # 导入时顺手清理那些"上一版本代码留在库里、跟当前行属于同一篇文章"的孤儿副本。
+            # consumed_existing_ids 用来防止同一个旧记录被多行重复领用，
+            # duplicate_articles_to_delete 保存最终要删的那些 article。
+            consumed_existing_ids: set[str] = set()
+            duplicate_articles_to_delete: dict[str, dict[str, Any]] = {}
+
+            def _filter_consumed(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                return [
+                    article
+                    for article in candidates
+                    if str(article.get("id") or "") not in consumed_existing_ids
+                ]
+
+            def _claim_existing_match(
+                seed_candidates: list[dict[str, Any]],
+            ) -> dict[str, Any] | None:
+                """从一组候选里挑出"主锚"，把同主体的其余条目登记成要删的重复。
+                还会沿着锚的 normalized_url 和 canonical match_key 在所有索引里扩展，
+                把另一个索引里那条没链接的孤儿也一起合并掉——例如 redsh.com 222352 这种情况
+                库里既有"带 URL 的旧版本"也有"丢了 URL 的旧版本"，只看 URL 索引会漏掉后者。
+                同时把锚的非空字段吸收一遍重复条目的内容，避免误删信息。
+                """
+                live = {
+                    str(article.get("id") or ""): article
+                    for article in _filter_consumed(seed_candidates)
+                    if str(article.get("id") or "")
+                }
+                if not live:
+                    return None
+
+                changed = True
+                while changed:
+                    changed = False
+                    for article in list(live.values()):
+                        article_url = normalize_article_url(str(article.get("url") or ""))
+                        if article_url:
+                            for sibling in existing_by_url.get(article_url, []):
+                                sib_id = str(sibling.get("id") or "")
+                                if (
+                                    sib_id
+                                    and sib_id not in live
+                                    and sib_id not in consumed_existing_ids
+                                ):
+                                    live[sib_id] = sibling
+                                    changed = True
+                        article_match_key = _article_import_match_key(article)
+                        if article_match_key:
+                            for sibling in existing_by_match_key.get(article_match_key, []):
+                                sib_id = str(sibling.get("id") or "")
+                                if (
+                                    sib_id
+                                    and sib_id not in live
+                                    and sib_id not in consumed_existing_ids
+                                ):
+                                    live[sib_id] = sibling
+                                    changed = True
+
+                anchor, duplicates = _pick_best_existing_anchor(list(live.values()))
+                if anchor is None:
+                    return None
+                anchor_id = str(anchor.get("id") or "")
+                if anchor_id:
+                    consumed_existing_ids.add(anchor_id)
+                for dup in duplicates:
+                    dup_id = str(dup.get("id") or "")
+                    if not dup_id or dup_id == anchor_id:
+                        continue
+                    # 把重复条目里 anchor 还没有的字段补给 anchor，再登记删除。
+                    _merge_article_import_fields(anchor, dup)
+                    consumed_existing_ids.add(dup_id)
+                    duplicate_articles_to_delete.setdefault(dup_id, dup)
+                return anchor
+
+            def _register_pending_keys(idx: int, article: dict[str, Any]) -> None:
+                normalized_pending_url = normalize_article_url(str(article.get("url") or ""))
+                if normalized_pending_url:
+                    pending_idx_by_url.setdefault(normalized_pending_url, idx)
+                pending_match_key = _article_import_match_key(article)
+                if pending_match_key:
+                    pending_idx_by_match_key.setdefault(pending_match_key, idx)
+                pending_loose_key = _article_import_loose_key(article)
+                if pending_loose_key:
+                    bucket = pending_idx_by_loose_key.setdefault(pending_loose_key, [])
+                    if idx not in bucket:
+                        bucket.append(idx)
 
             mutable_import_fields = (
                 "url",
@@ -1036,14 +1303,6 @@ class ArticleService:
 
                 raw_url = str(raw_item.get("url") or "").strip()
                 normalized_url = normalize_article_url(raw_url) if raw_url else ""
-                row_key = normalized_url or "|".join([
-                    title,
-                    str(raw_item.get("media_name") or "").strip(),
-                    str(raw_item.get("published_at") or "").strip(),
-                ])
-                is_duplicate_import_row = row_key in seen_keys
-                if not is_duplicate_import_row:
-                    seen_keys.add(row_key)
 
                 raw_media_name = str(raw_item.get("media_name") or "").strip()
                 account_name = str(raw_item.get("account_name") or "").strip()
@@ -1123,23 +1382,159 @@ class ArticleService:
                 if raw_item.get("price") is not None:
                     draft_article["price"] = raw_item["price"]
 
-                existing_article = existing_by_url.get(normalized_url) if normalized_url else None
-                if existing_article is None:
-                    existing_article = existing_missing_url_by_fingerprint.get(_article_url_fingerprint(draft_article))
-                if existing_article is None and is_duplicate_import_row:
+                draft_match_key = _article_import_match_key(draft_article)
+                draft_loose_key = _article_import_loose_key(draft_article)
+
+                def _pick_existing_loose() -> dict[str, Any] | None:
+                    if not draft_loose_key:
+                        return None
+                    candidates = _filter_consumed(existing_by_title_date.get(draft_loose_key) or [])
+                    if not candidates:
+                        return None
+                    # 当新行没 URL 时，可以让任意现存记录接收它；当新行有 URL 但现存没 URL 时，
+                    # 也允许把缺失链接的旧记录补全。其他情况坚持要么命中 URL、要么命中规范 key，避免误合并。
+                    if not normalized_url:
+                        return candidates[0]
+                    for candidate in candidates:
+                        if not normalize_article_url(str(candidate.get("url") or "")):
+                            return candidate
+                    return None
+
+                def _pick_pending_loose() -> int | None:
+                    if not draft_loose_key:
+                        return None
+                    bucket = pending_idx_by_loose_key.get(draft_loose_key) or []
+                    if not bucket:
+                        return None
+                    if not normalized_url:
+                        return bucket[0]
+                    for idx in bucket:
+                        if not normalize_article_url(str(pending_upserts[idx].get("url") or "")):
+                            return idx
+                    return None
+
+                target_kind: str | None = None
+                target_value: Any = None
+                if normalized_url and normalized_url in pending_idx_by_url:
+                    target_kind, target_value = "pending", pending_idx_by_url[normalized_url]
+                elif normalized_url and existing_by_url.get(normalized_url):
+                    anchor = _claim_existing_match(existing_by_url[normalized_url])
+                    if anchor is not None:
+                        target_kind, target_value = "existing", anchor
+                if target_kind is None and draft_match_key:
+                    if draft_match_key in pending_idx_by_match_key:
+                        target_kind, target_value = "pending", pending_idx_by_match_key[draft_match_key]
+                    elif existing_by_match_key.get(draft_match_key):
+                        anchor = _claim_existing_match(existing_by_match_key[draft_match_key])
+                        if anchor is not None:
+                            target_kind, target_value = "existing", anchor
+                if target_kind is None:
+                    pending_loose_idx = _pick_pending_loose()
+                    if pending_loose_idx is not None:
+                        target_kind, target_value = "pending", pending_loose_idx
+                    else:
+                        existing_loose = _pick_existing_loose()
+                        if existing_loose is not None:
+                            target_kind, target_value = "existing", existing_loose
+
+                def _finalize_analysis(
+                    candidate: dict[str, Any],
+                    historical_source: dict[str, Any] | None,
+                ) -> dict[str, Any]:
+                    analyzed = analyze_article_matches(
+                        str(candidate.get("title") or ""),
+                        config,
+                        article=candidate,
+                        compiled_matcher=compiled_matcher,
+                    )
+                    analyzed = _merge_article_import_matches(
+                        analyzed,
+                        config,
+                        raw_item,
+                        original_name,
+                        import_match_plan=import_match_plan,
+                    )
+                    if historical_source is not None:
+                        analyzed = _merge_preserved_historical_task_matches(
+                            analyzed,
+                            historical_source,
+                            config,
+                        )
+                    candidate["matched_tasks"] = analyzed.get("matched_tasks") or []
+                    candidate["match_reasons"] = analyzed.get("match_reasons") or {}
+                    candidate["unmatched_reason"] = analyzed.get("unmatched_reason", "") or ""
+                    return _with_article_export_keyword_cache(
+                        candidate,
+                        config,
+                        keyword_plan=export_keyword_plan,
+                        config_signature=export_keyword_config_signature,
+                    )
+
+                if target_kind == "pending":
+                    idx = target_value
+                    merged = pending_upserts[idx]
+                    _merge_article_import_fields(merged, draft_article)
+                    # 时间信息：如果新行有更具体的发布时间，就替换原值。
+                    if published_at:
+                        existing_published = str(merged.get("published_at") or "").strip()
+                        if not existing_published or len(published_at) > len(existing_published):
+                            merged["published_at"] = published_at
+                            merged["ts"] = published_at
+                    merged["last_table_import_at"] = now_text
+                    merged["last_table_import_file"] = original_name
+                    merged["import_batch_id"] = import_id
+                    merged["import_status"] = "pending"
+                    historical = None
+                    if pending_kinds[idx] == "update":
+                        existing_id = str(merged.get("id") or "").strip()
+                        if existing_id and existing_id in pending_existing_before:
+                            historical = pending_existing_before[existing_id]
+                    pending_upserts[idx] = _finalize_analysis(merged, historical)
+                    _register_pending_keys(idx, pending_upserts[idx])
                     duplicate_count += 1
                     continue
-                if existing_article:
+
+                if target_kind == "existing":
+                    existing_article = target_value
+                    article_id = str(existing_article.get("id") or "").strip()
+                    if article_id and article_id in pending_idx_by_existing_id:
+                        idx = pending_idx_by_existing_id[article_id]
+                        merged = pending_upserts[idx]
+                        _merge_article_import_fields(merged, draft_article)
+                        if published_at:
+                            merged["published_at"] = published_at
+                            merged["ts"] = published_at
+                        merged["last_table_import_at"] = now_text
+                        merged["last_table_import_file"] = original_name
+                        merged["import_batch_id"] = import_id
+                        merged["import_status"] = "pending"
+                        pending_upserts[idx] = _finalize_analysis(
+                            merged,
+                            pending_existing_before.get(article_id),
+                        )
+                        _register_pending_keys(idx, pending_upserts[idx])
+                        duplicate_count += 1
+                        continue
+
                     candidate_article = dict(existing_article)
+                    existing_url = str(existing_article.get("url") or "").strip()
                     candidate_article.update({
-                        "url": normalized_url or raw_url or str(existing_article.get("url") or ""),
-                        "raw_url": raw_url or str(existing_article.get("raw_url") or ""),
                         "title": title or str(existing_article.get("title") or ""),
                         "last_table_import_at": now_text,
                         "last_table_import_file": original_name,
                         "import_batch_id": import_id,
                         "import_status": "pending",
                     })
+                    # URL：只在原记录缺链接、或新行带的是与原归一化结果一致的更完整 URL 时才覆盖，
+                    # 避免出现"导入红安网把链接覆盖成空"或者无意覆盖原链接的情况。
+                    if not existing_url and (normalized_url or raw_url):
+                        candidate_article["url"] = normalized_url or raw_url
+                    elif normalized_url and existing_url:
+                        if normalize_article_url(existing_url) == normalized_url:
+                            candidate_article["url"] = normalized_url
+                    existing_raw_url = str(existing_article.get("raw_url") or "").strip()
+                    if raw_url and (not existing_raw_url or normalize_article_url(existing_raw_url) == normalize_article_url(raw_url)):
+                        candidate_article["raw_url"] = raw_url
                     if raw_media_name or url_media_name:
                         candidate_article.update({
                             "platform": media_name,
@@ -1155,71 +1550,27 @@ class ArticleService:
                         candidate_article["ts"] = published_at
                     if draft_article.get("excerpt"):
                         candidate_article["excerpt"] = draft_article["excerpt"]
-                    candidate_analysis = analyze_article_matches(
-                        str(candidate_article.get("title") or ""),
-                        config,
-                        article=candidate_article,
-                        compiled_matcher=compiled_matcher,
-                    )
-                    candidate_analysis = _merge_article_import_matches(
-                        candidate_analysis,
-                        config,
-                        raw_item,
-                        original_name,
-                        import_match_plan=import_match_plan,
-                    )
-                    candidate_analysis = _merge_preserved_historical_task_matches(
-                        candidate_analysis,
-                        existing_article,
-                        config,
-                    )
-                    candidate_article["matched_tasks"] = candidate_analysis.get("matched_tasks") or []
-                    candidate_article["match_reasons"] = candidate_analysis.get("match_reasons") or {}
-                    candidate_article["unmatched_reason"] = candidate_analysis.get("unmatched_reason", "") or ""
-                    candidate_article = _with_article_export_keyword_cache(
-                        candidate_article,
-                        config,
-                        keyword_plan=export_keyword_plan,
-                        config_signature=export_keyword_config_signature,
-                    )
+                    candidate_article = _finalize_analysis(candidate_article, existing_article)
                     if not values_changed(existing_article, candidate_article):
                         duplicate_count += 1
                         continue
-                    candidate_article["id"] = str(existing_article.get("id") or "").strip()
-                    updated_articles.append({
-                        "id": str(existing_article.get("id") or "").strip(),
-                        "before": copy.deepcopy(existing_article),
-                    })
+                    candidate_article["id"] = article_id
                     pending_upserts.append(candidate_article)
                     pending_kinds.append("update")
+                    new_idx = len(pending_upserts) - 1
+                    pending_idx_by_existing_id[article_id] = new_idx
+                    pending_existing_before[article_id] = copy.deepcopy(existing_article)
+                    _register_pending_keys(new_idx, candidate_article)
                     continue
 
-                analyzed = analyze_article_matches(
-                    title,
-                    config,
-                    article=draft_article,
-                    compiled_matcher=compiled_matcher,
-                )
-                analyzed = _merge_article_import_matches(
-                    analyzed,
-                    config,
-                    raw_item,
-                    original_name,
-                    import_match_plan=import_match_plan,
-                )
-                draft_article.update({
-                    "matched_tasks": analyzed.get("matched_tasks") or [],
-                    "match_reasons": analyzed.get("match_reasons") or {},
-                    "unmatched_reason": analyzed.get("unmatched_reason", "") or "",
-                })
-                draft_article = _with_article_export_keyword_cache(
-                    draft_article,
-                    config,
-                    keyword_plan=export_keyword_plan,
-                    config_signature=export_keyword_config_signature,
-                )
+                draft_article = _finalize_analysis(draft_article, None)
                 pending_upserts.append(draft_article)
                 pending_kinds.append("create")
+                new_idx = len(pending_upserts) - 1
+                _register_pending_keys(new_idx, draft_article)
+
+            for existing_id, before_snapshot in pending_existing_before.items():
+                updated_articles.append({"id": existing_id, "before": before_snapshot})
 
             if pending_upserts:
                 stored_articles = bulk_upsert_articles(pending_upserts)
@@ -1230,7 +1581,30 @@ class ArticleService:
                             imported_ids.append(article_id)
                     imported_articles.append(article)
 
-            if not imported_ids and not updated_articles:
+            # 把跟主锚同主体的孤儿副本删掉。`exclude_url=False` 避免把这些 URL 放进排除列表，
+            # 否则用户下次导入同一篇文章会被静默过滤。这里也记下被删的快照，方便后续审计。
+            merged_duplicate_snapshots: list[dict[str, Any]] = []
+            if duplicate_articles_to_delete:
+                from core.article_store import delete_article as _delete_article
+                anchor_ids = {
+                    str(item.get("id") or "").strip()
+                    for item in pending_upserts
+                    if str(item.get("id") or "").strip()
+                }
+                for dup_id, snapshot in duplicate_articles_to_delete.items():
+                    if not dup_id or dup_id in anchor_ids:
+                        continue
+                    try:
+                        removed = _delete_article(dup_id, exclude_url=False)
+                    except Exception:
+                        removed = None
+                    if removed is not None:
+                        merged_duplicate_snapshots.append({
+                            "id": dup_id,
+                            "before": copy.deepcopy(removed),
+                        })
+
+            if not imported_ids and not updated_articles and not merged_duplicate_snapshots:
                 return {
                     "ok": False,
                     "message": f"表格已识别 {len(raw_items)} 行，但没有新增或更新文章（重复 {duplicate_count} 行，跳过 {skipped_count} 行）",
@@ -1246,11 +1620,13 @@ class ArticleService:
                 "file_name": original_name,
                 "article_ids": imported_ids,
                 "updated_articles": updated_articles,
+                "merged_duplicate_articles": merged_duplicate_snapshots,
                 "status": "pending",
                 "created_at": local_now().isoformat(timespec="seconds"),
                 "added_count": len(imported_ids),
                 "updated_count": len(updated_articles),
                 "duplicate_count": duplicate_count,
+                "merged_duplicate_count": len(merged_duplicate_snapshots),
                 "skipped_count": skipped_count,
             }
             with self._lock:
@@ -1264,6 +1640,7 @@ class ArticleService:
                 "message": (
                     f"已导入 {len(imported_ids)} 篇文章"
                     f"{f'，更新 {len(updated_articles)} 篇' if updated_articles else ''}"
+                    f"{f'，清理重复 {len(merged_duplicate_snapshots)} 篇' if merged_duplicate_snapshots else ''}"
                     "，完成品牌归类，等待确认"
                 ),
                 "import_id": import_id,
@@ -1271,6 +1648,7 @@ class ArticleService:
                 "added_count": len(imported_ids),
                 "updated_count": len(updated_articles),
                 "duplicate_count": duplicate_count,
+                "merged_duplicate_count": len(merged_duplicate_snapshots),
                 "skipped_count": skipped_count,
                 "articles": [_article_to_api(article) for article in imported_articles[:20]],
                 "details": details,
