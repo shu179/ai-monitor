@@ -90,6 +90,8 @@ def state_delta(payload: StateDeltaRequest, current_user: CurrentUser, db: DbSes
             current_user,
             cursors=payload.cursors,
             limit=payload.limit,
+            reset_token=payload.reset_token,
+            bootstrap_cursor=payload.bootstrap_cursor,
         )
     )
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -10,7 +12,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.models import CloudIdempotencyKey, SyncBatch, SyncBatchItem, User
+from app.models import CloudIdempotencyKey, SyncBatch, SyncBatchItem, User, WorkspaceChangeLog
 from app.schemas import SyncBatchEventIn, SyncEventIn
 from app.services.change_log_service import (
     STREAM_ARTICLES,
@@ -35,6 +37,7 @@ LIMITS = {
     "inline_blob_max_bytes": 32 * 1024,
     "single_put_max_bytes": 5 * 1024 * 1024,
     "multipart_part_bytes": 8 * 1024 * 1024,
+    "state_delta_reset_page_max_items": 500,
     "virtual_shards": 1024,
 }
 TTL_SECONDS = {
@@ -48,6 +51,7 @@ TTL_SECONDS = {
     "agent_result_chunks_after_completion": 30 * 24 * 60 * 60,
 }
 DEFAULT_RETRY_AFTER_SECONDS = 0
+RESET_RETRY_AFTER_SECONDS = 5
 MAX_VIRTUAL_SHARDS = LIMITS["virtual_shards"]
 QUEUE_BACKPRESSURE_PENDING_THRESHOLD = 5_000
 QUEUE_BACKPRESSURE_RETRY_AFTER_SECONDS = 10
@@ -209,9 +213,30 @@ def build_state_delta(
     *,
     cursors: dict[str, int],
     limit: int = 500,
+    reset_token: str | None = None,
+    bootstrap_cursor: str | None = None,
 ) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit or 500), 1000))
+    if reset_token:
+        return build_state_reset_page(
+            db,
+            user,
+            reset_token=reset_token,
+            bootstrap_cursor=bootstrap_cursor,
+            limit=safe_limit,
+        )
     current = compact_change_snapshot(db, user.workspace_id)
+    stale_streams = _stale_cursor_streams(db, workspace_id=user.workspace_id, cursors=cursors)
+    if stale_streams:
+        return {
+            "changes": [],
+            "next_cursors": dict(cursors or {}),
+            "has_more": True,
+            "object_refs": [],
+            "reset_required": True,
+            "reset_token": make_reset_token(user.workspace_id, stale_streams),
+            "retry_after_seconds": RESET_RETRY_AFTER_SECONDS,
+        }
     changes: list[dict[str, Any]] = []
     next_cursors: dict[str, int] = {}
     has_more = False
@@ -242,6 +267,60 @@ def build_state_delta(
         "reset_required": False,
         "reset_token": None,
         "retry_after_seconds": DEFAULT_RETRY_AFTER_SECONDS,
+    }
+
+
+def build_state_reset_page(
+    db: Session,
+    user: User,
+    *,
+    reset_token: str,
+    bootstrap_cursor: str | None = None,
+    limit: int = 500,
+) -> dict[str, Any]:
+    token_payload = parse_reset_token(reset_token)
+    if int(token_payload.get("workspace_id") or 0) != int(user.workspace_id):
+        return {
+            "changes": [],
+            "next_cursors": {},
+            "has_more": False,
+            "object_refs": [],
+            "reset_required": True,
+            "reset_token": make_reset_token(user.workspace_id, ["tasks", "runs", "articles"]),
+            "retry_after_seconds": RESET_RETRY_AFTER_SECONDS,
+        }
+    streams = [str(item) for item in token_payload.get("streams", []) if str(item)]
+    cursor_payload = parse_bootstrap_cursor(bootstrap_cursor)
+    index = max(0, int(cursor_payload.get("index") or 0))
+    if index >= len(streams):
+        return {
+            "changes": [],
+            "next_cursors": compact_change_snapshot(db, user.workspace_id),
+            "has_more": False,
+            "object_refs": [],
+            "reset_required": False,
+            "reset_token": None,
+            "retry_after_seconds": DEFAULT_RETRY_AFTER_SECONDS,
+        }
+    stream = streams[index]
+    current = compact_change_snapshot(db, user.workspace_id)
+    return {
+        "changes": [
+            {
+                "stream": stream,
+                "seq": int(current.get(stream) or 0),
+                "kind": f"{stream}.reset_required",
+                "ref_id": f"bootstrap:{stream}",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "bootstrap_cursor": make_bootstrap_cursor(index + 1),
+            }
+        ],
+        "next_cursors": {stream: int(current.get(stream) or 0)},
+        "has_more": index + 1 < len(streams),
+        "object_refs": [],
+        "reset_required": False,
+        "reset_token": reset_token if index + 1 < len(streams) else None,
+        "retry_after_seconds": RESET_RETRY_AFTER_SECONDS if index + 1 < len(streams) else DEFAULT_RETRY_AFTER_SECONDS,
     }
 
 
@@ -399,6 +478,37 @@ def throttle_headers(*, retry_after_seconds: int, queue_depth_hint: int, throttl
     return headers
 
 
+def make_reset_token(workspace_id: int, streams: list[str]) -> str:
+    payload = {
+        "v": 1,
+        "workspace_id": int(workspace_id),
+        "streams": [str(item)[:32] for item in streams if str(item).strip()],
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return _encode_cursor_payload(payload)
+
+
+def parse_reset_token(value: str | None) -> dict[str, Any]:
+    payload = _decode_cursor_payload(value)
+    if int(payload.get("v") or 0) != 1:
+        return {}
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        return {}
+    return payload
+
+
+def make_bootstrap_cursor(index: int) -> str:
+    return _encode_cursor_payload({"v": 1, "index": max(0, int(index or 0))})
+
+
+def parse_bootstrap_cursor(value: str | None) -> dict[str, Any]:
+    payload = _decode_cursor_payload(value)
+    if int(payload.get("v") or 0) != 1:
+        return {"index": 0}
+    return payload
+
+
 def _reserve_idempotency_key(db: Session, workspace_id: int, *, scope: str, idempotency_key: str) -> bool:
     stmt = (
         insert(CloudIdempotencyKey)
@@ -454,6 +564,45 @@ def _ordered_streams(cursors: dict[str, int], current: dict[str, int]) -> list[s
             if text and text not in streams:
                 streams.append(text)
     return streams
+
+
+def _stale_cursor_streams(db: Session, *, workspace_id: int, cursors: dict[str, int]) -> list[str]:
+    stale: list[str] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=TTL_SECONDS["change_log_retention"])
+    for stream, seq in (cursors or {}).items():
+        safe_stream = str(stream or "").strip()
+        safe_seq = int(seq or 0)
+        if not safe_stream or safe_seq <= 0:
+            continue
+        first_available = db.scalar(
+            select(func.min(WorkspaceChangeLog.seq))
+            .where(
+                WorkspaceChangeLog.workspace_id == int(workspace_id),
+                WorkspaceChangeLog.stream == safe_stream,
+                WorkspaceChangeLog.created_at >= cutoff,
+            )
+        )
+        if first_available is not None and safe_seq < int(first_available):
+            stale.append(safe_stream)
+    return stale
+
+
+def _encode_cursor_payload(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_cursor_payload(value: str | None) -> dict[str, Any]:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return {}
+    try:
+        padding = "=" * (-len(text_value) % 4)
+        decoded = base64.urlsafe_b64decode((text_value + padding).encode("ascii"))
+        payload = json.loads(decoded.decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
 
 
 def _legacy_batch_key(workspace_id: int, events: list[SyncEventIn]) -> str:

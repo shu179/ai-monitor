@@ -31,7 +31,12 @@ from app.services.sync_v2_service import (  # noqa: E402
     _partition_key_for_event,
     _reserve_idempotency_key,
     _retry_after_for_queue_depth,
+    build_state_delta,
     consume_workspace_rate_limit,
+    make_bootstrap_cursor,
+    make_reset_token,
+    parse_bootstrap_cursor,
+    parse_reset_token,
     shard_advisory_lock_key,
     throttle_headers,
     workspace_bucket_advisory_lock_key,
@@ -200,6 +205,46 @@ class SyncV2ServiceTests(unittest.TestCase):
         self.assertTrue(_reserve_idempotency_key(db, 3, scope="sync_batch_item", idempotency_key="event-key-001"))
         stmt = db.scalar.call_args.args[0]
         self.assertIn("ON CONFLICT", str(stmt.compile()).upper())
+
+    def test_reset_token_and_bootstrap_cursor_roundtrip(self) -> None:
+        token = make_reset_token(7, ["articles", "runs"])
+        self.assertEqual(parse_reset_token(token)["workspace_id"], 7)
+        self.assertEqual(parse_reset_token(token)["streams"], ["articles", "runs"])
+
+        cursor = make_bootstrap_cursor(3)
+        self.assertEqual(parse_bootstrap_cursor(cursor)["index"], 3)
+
+    @patch("app.services.sync_v2_service._stale_cursor_streams", return_value=["articles"])
+    @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"articles": 10})
+    def test_state_delta_returns_reset_required_for_stale_cursor(self, _snapshot, _stale) -> None:
+        db = MagicMock()
+        user = SimpleNamespace(workspace_id=7)
+
+        result = build_state_delta(db, user, cursors={"articles": 1})  # type: ignore[arg-type]
+
+        self.assertTrue(result["reset_required"])
+        self.assertTrue(result["has_more"])
+        self.assertEqual(parse_reset_token(result["reset_token"])["streams"], ["articles"])
+
+    @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"articles": 10, "runs": 3})
+    def test_state_delta_reset_token_pages_bootstrap_streams(self, _snapshot) -> None:
+        db = MagicMock()
+        user = SimpleNamespace(workspace_id=7)
+        token = make_reset_token(7, ["articles", "runs"])
+
+        first = build_state_delta(db, user, cursors={}, reset_token=token)  # type: ignore[arg-type]
+        second = build_state_delta(
+            db,
+            user,  # type: ignore[arg-type]
+            cursors={},
+            reset_token=token,
+            bootstrap_cursor=first["changes"][0]["bootstrap_cursor"],
+        )
+
+        self.assertEqual(first["changes"][0]["stream"], "articles")
+        self.assertTrue(first["has_more"])
+        self.assertEqual(second["changes"][0]["stream"], "runs")
+        self.assertFalse(second["has_more"])
 
 
 class SyncV2WorkerSqlTests(unittest.TestCase):
