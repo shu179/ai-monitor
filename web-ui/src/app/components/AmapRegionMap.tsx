@@ -13,6 +13,8 @@ const WHEEL_ZOOM_THRESHOLD = 40;
 const WHEEL_ZOOM_STEP = 0.35;
 const GEOCODE_CACHE_KEY = "dashboard.amap.regionGeocodeCache.v1";
 const AMAP_BRANDING_SELECTOR = ".amap-logo, .amap-copyright";
+const AMAP_VISUAL_STYLE = "amap://styles/whitesmoke";
+const AMAP_VISUAL_FEATURES = ["bg", "point", "road", "building"];
 
 type AmapRegionMapProps = {
   mapType: RegionMapType;
@@ -96,6 +98,11 @@ function hideAmapBranding(root: ParentNode = document) {
   });
 }
 
+function applyAmapVisualStyle(map: any) {
+  map?.setMapStyle?.(AMAP_VISUAL_STYLE);
+  map?.setFeatures?.(AMAP_VISUAL_FEATURES);
+}
+
 function buildFallbackNodes(mapType: RegionMapType, labels: string[]) {
   const sourceNodes = getRegionNodes(mapType);
   if (!labels.length) {
@@ -163,7 +170,8 @@ export function AmapRegionMap({
             zoom: mapType === "domestic" ? CHINA_OVERVIEW_ZOOM : 1.45,
             center: mapType === "domestic" ? CHINA_CENTER : [42, 24],
             viewMode: "2D",
-            mapStyle: "amap://styles/whitesmoke",
+            mapStyle: AMAP_VISUAL_STYLE,
+            features: AMAP_VISUAL_FEATURES,
             showOversea: true,
             vectorMapForeign: "Chinese_Simplified",
             showLabel: false,
@@ -179,6 +187,7 @@ export function AmapRegionMap({
           });
         }
 
+        applyAmapVisualStyle(mapRef.current);
         setLoadState("ready");
         window.requestAnimationFrame(() => hideAmapBranding());
       })
@@ -192,6 +201,13 @@ export function AmapRegionMap({
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (loadState !== "ready" || !mapRef.current) {
+      return;
+    }
+    applyAmapVisualStyle(mapRef.current);
+  }, [loadState]);
 
   useEffect(() => {
     const AMap = window.AMap;
