@@ -310,6 +310,10 @@ class AppCloudRuntimeSupport:
         request_payload = payload if isinstance(payload, dict) else {}
         if normalized in {"cloud.status", "status"}:
             return self.get_cloud_status()
+        if normalized in {"cloud.current_status", "current_status"}:
+            return self.current_cloud_status()
+        if normalized in {"cloud.status_from_session", "status_from_session"}:
+            return self.cloud_status_from_session(request_payload.get("session"))
         if normalized in {"cloud.flush_outbox", "flush_outbox"}:
             return self.flush_cloud_outbox(request_payload)
         if normalized in {"cloud.logout", "logout"}:
@@ -319,12 +323,18 @@ class AppCloudRuntimeSupport:
         if normalized in {"cloud.schedule_article_snapshot", "schedule_article_snapshot"}:
             self.schedule_article_snapshot()
             return {"ok": True, "message": "文章云端同步已调度"}
+        if normalized in {"cloud.run_article_snapshot_worker", "run_article_snapshot_worker"}:
+            self.run_article_snapshot_worker()
+            return {"ok": True, "message": "文章云端同步 worker 已退出"}
         if normalized in {"cloud.enqueue_article_snapshot", "enqueue_article_snapshot"}:
             self.enqueue_article_snapshot(request_payload.get("config"))
             return {"ok": True, "message": "文章云端同步快照已触发"}
         if normalized in {"cloud.schedule_article_snapshot_retry", "schedule_article_snapshot_retry"}:
             self.schedule_article_snapshot_retry(delay_seconds=request_payload.get("delay_seconds"))
             return {"ok": True, "message": "文章云端同步重试已调度"}
+        if normalized in {"cloud.run_article_snapshot_retry", "run_article_snapshot_retry"}:
+            self.run_article_snapshot_retry(_safe_float(request_payload.get("delay_seconds"), 0.0))
+            return {"ok": True, "message": "文章云端同步重试 worker 已退出"}
         if normalized in {"cloud.validate_session", "validate_session"}:
             self.validate_cloud_session_if_needed(force=bool(request_payload.get("force")))
             return self.current_cloud_status()
@@ -627,3 +637,10 @@ def _safe_int(value: Any, default: int) -> int:
         return int(value)
     except Exception:
         return int(default)
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)

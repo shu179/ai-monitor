@@ -2484,7 +2484,7 @@ class AppRuntime:
         self._cloud_runtime_command("cloud.schedule_article_snapshot")
 
     def _run_cloud_articles_snapshot_worker(self) -> None:
-        self._ensure_cloud_runtime_support().run_article_snapshot_worker()
+        self._cloud_runtime_command("cloud.run_article_snapshot_worker")
 
     def _enqueue_cloud_articles_snapshot(self, config: dict[str, Any] | None = None) -> None:
         self._cloud_runtime_command("cloud.enqueue_article_snapshot", {"config": config})
@@ -2493,7 +2493,7 @@ class AppRuntime:
         self._cloud_runtime_command("cloud.schedule_article_snapshot_retry", {"delay_seconds": delay_seconds})
 
     def _run_cloud_articles_snapshot_retry(self, delay_seconds: float) -> None:
-        self._ensure_cloud_runtime_support().run_article_snapshot_retry(delay_seconds)
+        self._cloud_runtime_command("cloud.run_article_snapshot_retry", {"delay_seconds": delay_seconds})
 
     def _get_cloud_article_upload_snapshot(
         self,
@@ -4216,10 +4216,10 @@ return changedCount
         return self._cloud_runtime_command("cloud.status")
 
     def _current_cloud_status(self) -> dict[str, Any]:
-        return self._ensure_cloud_runtime_support().current_cloud_status()
+        return self._cloud_runtime_command("cloud.current_status")
 
     def _cloud_status_from_session(self, session: dict[str, Any] | None) -> dict[str, Any]:
-        return self._ensure_cloud_runtime_support().cloud_status_from_session(session)
+        return self._cloud_runtime_command("cloud.status_from_session", {"session": session})
 
     def _cloud_request_with_refresh(self, operation) -> tuple[bool, Any, str]:
         return self._ensure_cloud_runtime_support().cloud_request_with_refresh(operation)

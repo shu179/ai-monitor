@@ -726,12 +726,16 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         runtime = AppRuntime.__new__(AppRuntime)
         runtime._cloud_runtime_command = Mock(side_effect=[
             {"ok": True, "cloud": {"loggedIn": True}},
+            {"ok": True, "cloud": {"loggedIn": True, "savedAt": "now"}},
+            {"ok": True, "cloud": {"loggedIn": False}},
             {"ok": True, "message": "已退出云端"},
             {"ok": True, "metrics": {"event_count": 2}},
             {"ok": True, "run_records": {"queued": 1}},
         ])  # type: ignore[method-assign]
 
         self.assertEqual(runtime.get_cloud_status(), {"ok": True, "cloud": {"loggedIn": True}})
+        self.assertEqual(runtime._current_cloud_status(), {"ok": True, "cloud": {"loggedIn": True, "savedAt": "now"}})  # noqa: SLF001
+        self.assertEqual(runtime._cloud_status_from_session({"access_token": "token"}), {"ok": True, "cloud": {"loggedIn": False}})  # noqa: SLF001
         self.assertEqual(runtime.logout_cloud({}), {"ok": True, "message": "已退出云端"})
         self.assertEqual(runtime.flush_cloud_outbox({"limit": 7}), {"ok": True, "metrics": {"event_count": 2}})
         self.assertEqual(runtime._recover_cloud_run_history_uploads(), {"ok": True, "run_records": {"queued": 1}})  # noqa: SLF001
@@ -740,6 +744,8 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
             runtime._cloud_runtime_command.call_args_list,
             [
                 unittest.mock.call("cloud.status"),
+                unittest.mock.call("cloud.current_status"),
+                unittest.mock.call("cloud.status_from_session", {"session": {"access_token": "token"}}),
                 unittest.mock.call("cloud.logout"),
                 unittest.mock.call("cloud.flush_outbox", {"limit": 7}),
                 unittest.mock.call("cloud.recover_uploads"),

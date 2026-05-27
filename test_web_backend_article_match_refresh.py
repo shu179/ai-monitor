@@ -71,15 +71,19 @@ class WebBackendArticleMatchRefreshTests(unittest.TestCase):
         runtime._cloud_runtime_command = Mock(return_value={"ok": True})  # type: ignore[method-assign]
 
         runtime._schedule_cloud_articles_snapshot()
+        runtime._run_cloud_articles_snapshot_worker()
         runtime._enqueue_cloud_articles_snapshot(_config())
         runtime._schedule_cloud_articles_snapshot_retry(delay_seconds=2.5)
+        runtime._run_cloud_articles_snapshot_retry(1.25)
 
         self.assertEqual(
             runtime._cloud_runtime_command.call_args_list,
             [
                 unittest.mock.call("cloud.schedule_article_snapshot"),
+                unittest.mock.call("cloud.run_article_snapshot_worker"),
                 unittest.mock.call("cloud.enqueue_article_snapshot", {"config": _config()}),
                 unittest.mock.call("cloud.schedule_article_snapshot_retry", {"delay_seconds": 2.5}),
+                unittest.mock.call("cloud.run_article_snapshot_retry", {"delay_seconds": 1.25}),
             ],
         )
 

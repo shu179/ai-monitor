@@ -319,6 +319,21 @@ def test_app_cloud_runtime_support_command_flushes_outbox_with_payload_limit():
     flush_outbox.assert_called_once_with(limit=333)
 
 
+def test_app_cloud_runtime_support_command_returns_current_status_variants():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+    support.current_cloud_status = Mock(return_value={"ok": True, "cloud": {"loggedIn": True}})
+    support.cloud_status_from_session = Mock(return_value={"ok": True, "cloud": {"loggedIn": False}})
+
+    current = support.handle_command("cloud.current_status")
+    from_session = support.handle_command("cloud.status_from_session", {"session": {"access_token": "token"}})
+
+    assert current == {"ok": True, "cloud": {"loggedIn": True}}
+    assert from_session == {"ok": True, "cloud": {"loggedIn": False}}
+    support.current_cloud_status.assert_called_once_with()
+    support.cloud_status_from_session.assert_called_once_with({"access_token": "token"})
+
+
 def test_app_cloud_runtime_support_command_schedules_article_snapshot():
     owner = _support_owner()
     started: list[object] = []
@@ -343,6 +358,21 @@ def test_app_cloud_runtime_support_command_schedules_article_snapshot():
     assert owner._article_cloud_enqueue_requested is True
     assert len(started) == 1
     assert started[0].kwargs["name"] == "cloud-article-snapshot-enqueue"
+
+
+def test_app_cloud_runtime_support_command_runs_article_snapshot_worker_variants():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+    support.run_article_snapshot_worker = Mock()
+    support.run_article_snapshot_retry = Mock()
+
+    worker_result = support.handle_command("cloud.run_article_snapshot_worker")
+    retry_result = support.handle_command("cloud.run_article_snapshot_retry", {"delay_seconds": "1.5"})
+
+    assert worker_result == {"ok": True, "message": "文章云端同步 worker 已退出"}
+    assert retry_result == {"ok": True, "message": "文章云端同步重试 worker 已退出"}
+    support.run_article_snapshot_worker.assert_called_once_with()
+    support.run_article_snapshot_retry.assert_called_once_with(1.5)
 
 
 def test_app_cloud_runtime_support_command_enqueues_article_snapshot_with_config():
