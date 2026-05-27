@@ -36,10 +36,13 @@ def claim_sync_batch_items(
     safe_shards = [int(item) for item in shard_ids if int(item) >= 0]
     if not safe_shards:
         return []
+    active_shards = list_pending_sync_item_shards(db, shard_ids=safe_shards, limit=max(1, int(limit or 100)))
+    if not active_shards:
+        return []
     owned_shards = renew_sync_worker_shard_leases(
         db,
         worker_id=worker_id,
-        shard_ids=safe_shards,
+        shard_ids=active_shards,
         lease_seconds=lease_seconds,
     )
     if not owned_shards:
@@ -101,6 +104,32 @@ def claim_sync_batch_items(
         },
     )
     return [dict(row._mapping) for row in rows]
+
+
+def list_pending_sync_item_shards(db: Session, *, shard_ids: list[int], limit: int = 100) -> list[int]:
+    safe_shards = [int(item) for item in shard_ids if int(item) >= 0]
+    if not safe_shards:
+        return []
+    rows = db.execute(
+        text(
+            """
+            SELECT DISTINCT item.virtual_shard
+            FROM sync_batch_items AS item
+            WHERE item.virtual_shard = ANY(:shard_ids)
+              AND (
+                item.status = 'pending'
+                OR (item.status = 'in_progress' AND item.leased_until < now())
+              )
+            ORDER BY item.virtual_shard
+            LIMIT :limit
+            """
+        ),
+        {
+            "shard_ids": safe_shards,
+            "limit": max(1, int(limit or 100)),
+        },
+    )
+    return [int(row[0]) for row in rows]
 
 
 def renew_sync_worker_shard_leases(

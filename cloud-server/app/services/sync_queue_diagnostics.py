@@ -99,13 +99,27 @@ def build_sync_queue_report(db: Session) -> dict[str, Any]:
         )
     ).first()
     counts = {str(row.status): int(row.count or 0) for row in status_rows}
+    pending_count = int(counts.get("pending") or 0)
+    in_progress_count = int(counts.get("in_progress") or 0)
+    dead_letter_count = int(counts.get("dead_letter") or 0)
+    expired_count = int(in_progress_expired or 0)
+    active_leases = int(getattr(shard_rows, "active", 0) or 0)
+    worker_state = _worker_state(
+        pending=pending_count,
+        in_progress=in_progress_count,
+        active_leases=active_leases,
+    )
     return {
-        "status": _status(counts=counts, expired_in_progress=int(in_progress_expired or 0)),
+        "status": _status(
+            dead_letter=dead_letter_count,
+            expired_in_progress=expired_count,
+            worker_state=worker_state,
+        ),
         "counts": {
-            "pending": int(counts.get("pending") or 0),
-            "in_progress": int(counts.get("in_progress") or 0),
+            "pending": pending_count,
+            "in_progress": in_progress_count,
             "done": int(counts.get("done") or 0),
-            "dead_letter": int(counts.get("dead_letter") or 0),
+            "dead_letter": dead_letter_count,
         },
         "oldest_pending_age_seconds": int(pending_age or 0),
         "oldest_in_progress_age_seconds": int(in_progress_age or 0),
@@ -115,10 +129,11 @@ def build_sync_queue_report(db: Session) -> dict[str, Any]:
             "avg": int(getattr(recent_done_latency, "avg_ms", 0) or 0),
             "max": int(getattr(recent_done_latency, "max_ms", 0) or 0),
         },
-        "expired_in_progress": int(in_progress_expired or 0),
+        "expired_in_progress": expired_count,
+        "worker_state": worker_state,
         "shard_leases": {
             "total": int(getattr(shard_rows, "total", 0) or 0),
-            "active": int(getattr(shard_rows, "active", 0) or 0),
+            "active": active_leases,
             "expired": int(getattr(shard_rows, "expired", 0) or 0),
         },
         "queue_by_workspace": [
@@ -156,6 +171,7 @@ def format_sync_queue_report(report: dict[str, Any]) -> str:
         f"oldest_pending_age_seconds={report['oldest_pending_age_seconds']}",
         f"oldest_in_progress_age_seconds={report['oldest_in_progress_age_seconds']}",
         f"expired_in_progress={report['expired_in_progress']}",
+        f"worker_state={report['worker_state']}",
         "recent_done_latency_ms="
         f"window={latency['window_seconds']} "
         f"completed={latency['completed']} "
@@ -193,7 +209,19 @@ def format_sync_queue_report(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _status(*, counts: dict[str, int], expired_in_progress: int) -> str:
-    if int(counts.get("dead_letter") or 0) or int(expired_in_progress or 0):
+def _worker_state(*, pending: int, in_progress: int, active_leases: int) -> str:
+    if int(active_leases or 0) > 0:
+        return "active"
+    if int(pending or 0) > 0:
+        return "stalled_no_active_worker"
+    if int(in_progress or 0) > 0:
+        return "stalled_in_progress_no_active_worker"
+    return "idle"
+
+
+def _status(*, dead_letter: int, expired_in_progress: int, worker_state: str) -> str:
+    if int(dead_letter or 0) or int(expired_in_progress or 0):
+        return "warn"
+    if worker_state in {"stalled_no_active_worker", "stalled_in_progress_no_active_worker"}:
         return "warn"
     return "ok"

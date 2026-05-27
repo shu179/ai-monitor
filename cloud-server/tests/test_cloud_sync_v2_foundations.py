@@ -51,6 +51,7 @@ from app.services.sync_v2_worker import (  # noqa: E402
     _mirror_legacy_sync_event,
     _release_item_for_retry,
     claim_sync_batch_items,
+    list_pending_sync_item_shards,
     process_sync_batch_items_once,
     renew_sync_worker_shard_leases,
 )
@@ -260,10 +261,13 @@ class SyncV2WorkerSqlTests(unittest.TestCase):
     @patch("app.services.sync_v2_worker.renew_sync_worker_shard_leases", return_value=[1, 2])
     def test_claim_uses_cte_not_update_limit_and_matches_created_at(self, _renew) -> None:
         db = MagicMock()
-        db.execute.return_value = []
+        db.execute.side_effect = [
+            [(1,), (2,)],
+            [],
+        ]
         claim_sync_batch_items(db, worker_id="w1", shard_ids=[1, 2], limit=10)
 
-        sql = str(db.execute.call_args.args[0]).lower()
+        sql = str(db.execute.call_args_list[1].args[0]).lower()
         self.assertIn("with candidates as", sql)
         self.assertIn("for update of item skip locked", sql)
         self.assertIn("limit :limit", sql)
@@ -272,6 +276,26 @@ class SyncV2WorkerSqlTests(unittest.TestCase):
         self.assertIn("virtual_shard = any", sql)
         self.assertIn("not exists", sql)
         self.assertIn("prior.seq < item.seq", sql)
+
+    @patch("app.services.sync_v2_worker.renew_sync_worker_shard_leases")
+    def test_claim_skips_shard_lease_when_queue_has_no_pending_items(self, renew) -> None:
+        db = MagicMock()
+        db.execute.return_value = []
+        claim_sync_batch_items(db, worker_id="w1", shard_ids=[1, 2], limit=10)
+
+        renew.assert_not_called()
+
+    def test_pending_shard_probe_is_distinct_and_limited(self) -> None:
+        db = MagicMock()
+        db.execute.return_value = [(7,), (9,)]
+
+        self.assertEqual(list_pending_sync_item_shards(db, shard_ids=[7, 9], limit=10), [7, 9])
+
+        sql = str(db.execute.call_args.args[0]).lower()
+        self.assertIn("select distinct item.virtual_shard", sql)
+        self.assertIn("status = 'pending'", sql)
+        self.assertIn("leased_until < now()", sql)
+        self.assertIn("limit :limit", sql)
 
     def test_renew_shard_leases_uses_advisory_lock_and_visible_lease_rows(self) -> None:
         db = MagicMock()

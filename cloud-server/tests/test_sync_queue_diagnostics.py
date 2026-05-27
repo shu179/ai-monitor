@@ -34,8 +34,10 @@ class SyncQueueDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "ok")
         self.assertEqual(report["counts"]["done"], 10)
+        self.assertEqual(report["worker_state"], "active")
         text = format_sync_queue_report(report)
         self.assertIn("status=ok", text)
+        self.assertIn("worker_state=active", text)
         self.assertIn("recent_done_latency_ms=", text)
         self.assertIn("queue_by_workspace: none", text)
 
@@ -71,6 +73,7 @@ class SyncQueueDiagnosticsTests(unittest.TestCase):
         report = build_sync_queue_report(db)
 
         self.assertEqual(report["status"], "warn")
+        self.assertEqual(report["worker_state"], "active")
         self.assertEqual(report["expired_in_progress"], 2)
         self.assertEqual(report["oldest_in_progress_age_seconds"], 90)
         self.assertEqual(report["recent_done_latency_ms"]["max"], 120)
@@ -80,6 +83,49 @@ class SyncQueueDiagnosticsTests(unittest.TestCase):
         self.assertIn("oldest_in_progress_age_seconds=90", text)
         self.assertIn("dead_letters_by_workspace:", text)
         self.assertIn("workspace=7", text)
+
+    def test_report_treats_empty_queue_with_expired_leases_as_idle(self) -> None:
+        db = _db(
+            status_rows=[],
+            pending_age=None,
+            expired=0,
+            workspace_rows=[],
+            in_progress_age=None,
+            recent_done_latency=SimpleNamespace(completed=0, avg_ms=0, max_ms=0),
+            dead_letters=[],
+            shard_row=SimpleNamespace(total=1024, active=0, expired=1024),
+        )
+
+        report = build_sync_queue_report(db)
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["worker_state"], "idle")
+        self.assertIn("worker_state=idle", format_sync_queue_report(report))
+
+    def test_report_warns_when_pending_work_has_no_active_worker(self) -> None:
+        db = _db(
+            status_rows=[SimpleNamespace(status="pending", count=8)],
+            pending_age=15,
+            expired=0,
+            workspace_rows=[
+                SimpleNamespace(
+                    workspace_id=7,
+                    pending=8,
+                    in_progress=0,
+                    dead_letter=0,
+                    oldest_age_seconds=15,
+                )
+            ],
+            in_progress_age=None,
+            recent_done_latency=SimpleNamespace(completed=0, avg_ms=0, max_ms=0),
+            dead_letters=[],
+            shard_row=SimpleNamespace(total=1024, active=0, expired=1024),
+        )
+
+        report = build_sync_queue_report(db)
+
+        self.assertEqual(report["status"], "warn")
+        self.assertEqual(report["worker_state"], "stalled_no_active_worker")
 
 
 def _db(*, status_rows, pending_age, expired, dead_letters, workspace_rows, in_progress_age, recent_done_latency, shard_row):
