@@ -168,6 +168,15 @@ SURFACED_CLOUD_ALLOW_SMOKE=1 python -m scripts.smoke_object_storage --base-url h
 
 `shadow_reconcile` 是只读影子核对工具，会对照实体表、`workspace_change_log`、`article_versions` 和 `articles_migration_state`，输出行数、cursor 覆盖、关键表摘要和迁移尾巴。v1/v2 合流、正文迁移或服务器升级后，先跑 `--strict`，确认没有 `missing_change_log` 或 `payload_migration_incomplete` 再切流。
 
+本地磁盘备份：
+
+```bash
+SURFACED_CLOUD_ALLOW_BACKUP=1 python -m scripts.backup_postgres --output-dir /opt/surfaced/backups --retain-days 7
+python -m scripts.backup_postgres --dry-run
+```
+
+`backup_postgres` 调用 `pg_dump --no-owner --no-acl`，默认 gzip 到 `/opt/surfaced/backups` 并清理超过保留天数的 `.sql/.sql.gz`。这只是 40GB 单机阶段的最小可用备份；上生产后仍建议把备份异步复制到 R2/COS 或云数据库 PITR。
+
 存量 `articles.payload_json` 正文迁移：
 
 ```bash

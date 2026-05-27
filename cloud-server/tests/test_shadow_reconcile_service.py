@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import MagicMock
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+os.environ.setdefault("SURFACED_CLOUD_SECRET_KEY", "test-secret-key-for-shadow-reconcile")
 
 from app.services.shadow_reconcile_service import build_shadow_reconcile_report, format_shadow_reconcile_report  # noqa: E402
 
