@@ -27,6 +27,11 @@ AGENT_COMMAND_STATUS_CANCELLED = "cancelled"
 AGENT_COMMAND_VISIBILITY_SECONDS = 60
 MAX_AGENT_PAYLOAD_BYTES = 256 * 1024
 MAX_AGENT_CHUNK_BYTES = 256 * 1024
+AGENT_COMMAND_ACTIVE_STATUSES = (
+    AGENT_COMMAND_STATUS_PENDING,
+    AGENT_COMMAND_STATUS_DELIVERED,
+    AGENT_COMMAND_STATUS_RUNNING,
+)
 
 
 class AgentCommandError(RuntimeError):
@@ -94,20 +99,39 @@ def claim_agent_command(
     last_seen_command_id: str | None = None,
     visibility_seconds: int = AGENT_COMMAND_VISIBILITY_SECONDS,
 ) -> dict[str, Any] | None:
-    del last_seen_command_id
     safe_device_id = _safe_text(device_id, limit=256)
     if not safe_device_id:
         raise AgentCommandError("device_id is required")
+    safe_target_role = _safe_optional_text(target_role, limit=64)
+    safe_last_seen_command_id = _safe_optional_text(last_seen_command_id, limit=36)
     now = datetime.now(timezone.utc)
+    if safe_last_seen_command_id:
+        command = _claim_agent_command_after_seen(
+            db,
+            user,
+            device_id=safe_device_id,
+            target_role=safe_target_role,
+            last_seen_command_id=safe_last_seen_command_id,
+            now=now,
+        )
+        if command is None:
+            return None
+        return _deliver_agent_command(
+            db,
+            user,
+            command=command,
+            device_id=safe_device_id,
+            visibility_seconds=visibility_seconds,
+        )
     command = db.scalar(
         select(AgentCommand)
         .where(
             AgentCommand.workspace_id == user.workspace_id,
-            AgentCommand.status == AGENT_COMMAND_STATUS_PENDING,
+            AgentCommand.status.in_(AGENT_COMMAND_ACTIVE_STATUSES),
             AgentCommand.expires_at > now,
             or_(AgentCommand.visibility_until.is_(None), AgentCommand.visibility_until <= now),
             or_(AgentCommand.target_device_id.is_(None), AgentCommand.target_device_id == safe_device_id),
-            or_(AgentCommand.target_role.is_(None), AgentCommand.target_role == _safe_optional_text(target_role, limit=64)),
+            or_(AgentCommand.target_role.is_(None), AgentCommand.target_role == safe_target_role),
         )
         .order_by(AgentCommand.created_at.asc(), AgentCommand.id.asc())
         .with_for_update(skip_locked=True)
@@ -115,9 +139,66 @@ def claim_agent_command(
     )
     if command is None:
         return None
+    return _deliver_agent_command(
+        db,
+        user,
+        command=command,
+        device_id=safe_device_id,
+        visibility_seconds=visibility_seconds,
+    )
+
+
+def _claim_agent_command_after_seen(
+    db: Session,
+    user: User,
+    *,
+    device_id: str,
+    target_role: str | None,
+    last_seen_command_id: str,
+    now: datetime,
+) -> AgentCommand | None:
+    seen = db.scalar(
+        select(AgentCommand).where(
+            AgentCommand.workspace_id == user.workspace_id,
+            AgentCommand.id == last_seen_command_id,
+        )
+    )
+    conditions = [
+        AgentCommand.workspace_id == user.workspace_id,
+        AgentCommand.status.in_(AGENT_COMMAND_ACTIVE_STATUSES),
+        AgentCommand.expires_at > now,
+        or_(AgentCommand.target_device_id.is_(None), AgentCommand.target_device_id == device_id),
+        or_(AgentCommand.target_role.is_(None), AgentCommand.target_role == target_role),
+    ]
+    if seen is not None and seen.created_at is not None:
+        conditions.append(
+            or_(
+                AgentCommand.created_at > seen.created_at,
+                and_(AgentCommand.created_at == seen.created_at, AgentCommand.id > str(seen.id)),
+            )
+        )
+    return db.scalar(
+        select(AgentCommand)
+        .where(*conditions)
+        .order_by(AgentCommand.created_at.asc(), AgentCommand.id.asc())
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+
+
+def _deliver_agent_command(
+    db: Session,
+    user: User,
+    *,
+    command: AgentCommand,
+    device_id: str,
+    visibility_seconds: int,
+) -> dict[str, Any]:
     command.status = AGENT_COMMAND_STATUS_DELIVERED
-    command.target_device_id = command.target_device_id or safe_device_id
-    command.visibility_until = now + timedelta(seconds=max(1, int(visibility_seconds or AGENT_COMMAND_VISIBILITY_SECONDS)))
+    command.target_device_id = command.target_device_id or device_id
+    command.visibility_until = datetime.now(timezone.utc) + timedelta(
+        seconds=max(1, int(visibility_seconds or AGENT_COMMAND_VISIBILITY_SECONDS))
+    )
     record_workspace_change(
         db,
         workspace_id=user.workspace_id,

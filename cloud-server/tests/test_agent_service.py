@@ -92,6 +92,74 @@ class AgentServiceTests(unittest.TestCase):
         db.commit.assert_called_once()
 
     @patch("app.services.agent_service.record_workspace_change", return_value=3)
+    def test_claim_agent_command_reclaims_expired_delivered_command(self, _change) -> None:
+        now = datetime.now(timezone.utc)
+        command = AgentCommand(
+            id="command-1",
+            workspace_id=7,
+            target_device_id="mac-1",
+            target_role=None,
+            status="delivered",
+            visibility_until=now - timedelta(seconds=1),
+            idempotency_key="agent-key-1",
+            payload_json={"action": "retry"},
+            expires_at=now + timedelta(minutes=5),
+            created_at=now,
+        )
+        db = MagicMock()
+        db.scalar.return_value = command
+        user = SimpleNamespace(workspace_id=7)
+
+        result = claim_agent_command(db, user, device_id="mac-1")  # type: ignore[arg-type]
+
+        self.assertEqual(result["id"], "command-1")
+        self.assertEqual(command.status, "delivered")
+        self.assertGreater(command.visibility_until, now)
+        db.commit.assert_called_once()
+
+    @patch("app.services.agent_service.record_workspace_change", return_value=4)
+    def test_claim_agent_command_reconnect_uses_last_seen_cursor(self, _change) -> None:
+        now = datetime.now(timezone.utc)
+        seen = AgentCommand(
+            id="command-1",
+            workspace_id=7,
+            target_device_id="mac-1",
+            target_role=None,
+            status="running",
+            visibility_until=now + timedelta(seconds=30),
+            idempotency_key="agent-key-1",
+            payload_json={"action": "old"},
+            expires_at=now + timedelta(minutes=5),
+            created_at=now - timedelta(seconds=10),
+        )
+        next_command = AgentCommand(
+            id="command-2",
+            workspace_id=7,
+            target_device_id="mac-1",
+            target_role=None,
+            status="pending",
+            visibility_until=now,
+            idempotency_key="agent-key-2",
+            payload_json={"action": "new"},
+            expires_at=now + timedelta(minutes=5),
+            created_at=now,
+        )
+        db = MagicMock()
+        db.scalar.side_effect = [seen, next_command]
+        user = SimpleNamespace(workspace_id=7)
+
+        result = claim_agent_command(
+            db,
+            user,  # type: ignore[arg-type]
+            device_id="mac-1",
+            last_seen_command_id="command-1",
+        )
+
+        self.assertEqual(result["id"], "command-2")
+        self.assertEqual(next_command.status, "delivered")
+        db.commit.assert_called_once()
+
+    @patch("app.services.agent_service.record_workspace_change", return_value=3)
     def test_append_final_result_chunk_marks_completed(self, _change) -> None:
         now = datetime.now(timezone.utc)
         command = AgentCommand(
