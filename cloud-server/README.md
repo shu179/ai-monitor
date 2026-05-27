@@ -164,6 +164,18 @@ SURFACED_CLOUD_ALLOW_SMOKE=1 python -m scripts.smoke_object_storage --base-url h
 
 `storage_doctor` 是只读检查，会输出磁盘剩余、对象目录占用、DB manifest 占用、workspace 占用、缺失文件和孤儿文件。`smoke_object_storage` 会创建一次性 smoke 用户，并通过真实 HTTP 路径完成申请上传、PUT、下载和 sha256 比对；没有 `SURFACED_CLOUD_ALLOW_SMOKE=1` 时会拒绝运行。上传被拒绝时，服务端日志会打印 `[ObjectStorage] reject_upload reason=...`，用于区分单文件超限、workspace 超限、总量超限和磁盘安全水位不足。
 
+存量 `articles.payload_json` 正文迁移：
+
+```bash
+# 单批试跑
+SURFACED_CLOUD_ALLOW_ARTICLE_MIGRATION=1 python -m scripts.migrate_article_payloads --once --limit 100
+
+# 循环跑到没有候选文章
+SURFACED_CLOUD_ALLOW_ARTICLE_MIGRATION=1 python -m scripts.migrate_article_payloads --limit 500 --json
+```
+
+迁移会把 `payload_json` 中的正文候选字段写入 `article_versions`；小正文内联，大正文写入本地对象存储并记录 `content_object_id/content_sha256`。迁移是可恢复的，进度写入 `articles_migration_state`，本阶段不会清空原 `articles.payload_json`，旧读路径仍作为 fallback。
+
 生产环境必须把 `.env` 里的 `SURFACED_CLOUD_SECRET_KEY` 和 `POSTGRES_PASSWORD` 改成高强度随机值。
 测试完成后，可以把 `.env` 里的 `SURFACED_CLOUD_DOCS_ENABLED` 改成 `false`，然后重启服务以关闭公网 Swagger 文档。
 
