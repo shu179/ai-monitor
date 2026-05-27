@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from jwt import InvalidTokenError
 from sqlalchemy import select
@@ -19,6 +21,7 @@ from app.schemas import (
     AgentResultChunkRequest,
 )
 from app.services.agent_service import (
+    AgentCommandNotificationListener,
     AgentCommandError,
     append_agent_result_chunk,
     cancel_agent_command,
@@ -29,6 +32,8 @@ from app.services.agent_service import (
 )
 
 router = APIRouter()
+AGENT_WS_IDLE_HEARTBEAT_SECONDS = 20.0
+AGENT_WS_NOTIFY_WAIT_SECONDS = 1.0
 
 
 @router.post("/commands", response_model=AgentCommandPublic)
@@ -151,26 +156,84 @@ async def agent_ws(
         return
     await websocket.accept()
     try:
-        while True:
-            with SessionLocal() as db:
-                user = _load_ws_user(db, user_context)
-                if user is None:
-                    await websocket.send_json({"type": "session_revoked"})
-                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                    return
-                command = claim_agent_command(
-                    db,
-                    user,
+        with AgentCommandNotificationListener(
+            workspace_id=user_context["workspace_id"],
+            device_id=device_id,
+        ) as listener:
+            while True:
+                delivered = await _claim_and_send_agent_command(
+                    websocket,
+                    user_context=user_context,
                     device_id=device_id,
                     target_role=target_role or None,
                 )
-            await websocket.send_json({"type": "command", "command": command})
-            message = await websocket.receive_json()
-            if not isinstance(message, dict):
-                continue
-            await _handle_ws_message(message, user_context=user_context, device_id=device_id, websocket=websocket)
+                if delivered == "session_revoked":
+                    return
+                await _wait_for_agent_ws_activity(
+                    websocket,
+                    listener=listener,
+                    user_context=user_context,
+                    device_id=device_id,
+                    send_heartbeat=delivered is None,
+                )
     except WebSocketDisconnect:
         return
+
+
+async def _claim_and_send_agent_command(
+    websocket: WebSocket,
+    *,
+    user_context: dict[str, int],
+    device_id: str,
+    target_role: str | None,
+) -> str | None:
+    with SessionLocal() as db:
+        user = _load_ws_user(db, user_context)
+        if user is None:
+            await websocket.send_json({"type": "session_revoked"})
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return "session_revoked"
+        command = claim_agent_command(
+            db,
+            user,
+            device_id=device_id,
+            target_role=target_role,
+        )
+    if command:
+        await websocket.send_json({"type": "command", "command": command})
+        return "command"
+    return None
+
+
+async def _wait_for_agent_ws_activity(
+    websocket: WebSocket,
+    *,
+    listener: AgentCommandNotificationListener,
+    user_context: dict[str, int],
+    device_id: str,
+    send_heartbeat: bool,
+) -> None:
+    receive_task = asyncio.create_task(websocket.receive_json())
+    notify_task = asyncio.create_task(asyncio.to_thread(listener.wait, timeout_seconds=AGENT_WS_NOTIFY_WAIT_SECONDS))
+    done, pending = await asyncio.wait(
+        {receive_task, notify_task},
+        timeout=AGENT_WS_IDLE_HEARTBEAT_SECONDS,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+    if receive_task in done:
+        message = receive_task.result()
+        if isinstance(message, dict):
+            await _handle_ws_message(message, user_context=user_context, device_id=device_id, websocket=websocket)
+        return
+    if notify_task in done:
+        payloads = notify_task.result()
+        if not payloads and send_heartbeat:
+            await websocket.send_json({"type": "heartbeat"})
+        return
+    if send_heartbeat:
+        await websocket.send_json({"type": "heartbeat"})
 
 
 async def _handle_ws_message(message: dict, *, user_context: dict[str, int], device_id: str, websocket: WebSocket) -> None:

@@ -16,6 +16,8 @@ if str(ROOT) not in sys.path:
 from app.models import AgentCommand  # noqa: E402
 from app.services.agent_service import (  # noqa: E402
     AGENT_COMMAND_NOTIFY_CHANNEL,
+    AgentCommandNotificationListener,
+    _decode_agent_command_notify_payload,
     agent_command_notify_payload,
     append_agent_result_chunk,
     claim_agent_command,
@@ -29,6 +31,17 @@ class AgentServiceTests(unittest.TestCase):
 
         self.assertEqual(payload, {"workspace_id": 7, "device_id": "mac-1"})
         self.assertLess(len(json.dumps(payload)), 8000)
+
+    def test_notify_payload_decoder_rejects_non_json(self) -> None:
+        self.assertEqual(_decode_agent_command_notify_payload("not-json"), {})
+
+    def test_notify_listener_routes_workspace_and_device(self) -> None:
+        listener = AgentCommandNotificationListener(workspace_id=7, device_id="mac-1")
+
+        self.assertTrue(listener._payload_matches_device({"workspace_id": 7, "device_id": "mac-1"}))
+        self.assertTrue(listener._payload_matches_device({"workspace_id": 7, "device_id": ""}))
+        self.assertFalse(listener._payload_matches_device({"workspace_id": 8, "device_id": "mac-1"}))
+        self.assertFalse(listener._payload_matches_device({"workspace_id": 7, "device_id": "mac-2"}))
 
     @patch("app.services.agent_service.record_workspace_change", return_value=1)
     def test_create_agent_command_reserves_idempotency_and_notifies(self, _change) -> None:
