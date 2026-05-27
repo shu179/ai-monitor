@@ -108,6 +108,30 @@ class CloudStateDeltaInboxTests(unittest.TestCase):
         self.assertEqual(diagnostics["by_status"], {"applied": 1, "failed": 1})
         self.assertEqual(diagnostics["failed"][0]["last_error"], "boom")
 
+    def test_process_state_delta_inbox_uses_dependency_stream_order(self) -> None:
+        applied: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+            inbox.record_changes(
+                identity_key="account-a",
+                changes=[
+                    {"stream": "runs", "seq": 1, "kind": "run.changed", "ref_id": "run:1"},
+                    {"stream": "tasks", "seq": 1, "kind": "task.changed", "ref_id": "task:1"},
+                ],
+            )
+
+            result = process_state_delta_inbox(
+                inbox=inbox,
+                appliers={
+                    "runs": lambda item: applied.append(str(item["stream"])),
+                    "tasks": lambda item: applied.append(str(item["stream"])),
+                },
+                limit=10,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(applied, ["tasks", "runs"])
+
     def test_process_state_delta_inbox_applies_registered_streams_only(self) -> None:
         applied: list[dict] = []
         with tempfile.TemporaryDirectory() as tmp:

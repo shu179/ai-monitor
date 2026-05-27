@@ -14,6 +14,16 @@ from .time_utils import local_now
 
 
 DEFAULT_CLOUD_STATE_DELTA_INBOX_PATH = resolve_app_path("user_data/cloud_state_delta_inbox.sqlite3")
+STATE_DELTA_APPLY_STREAM_ORDER = (
+    "profile",
+    "tasks",
+    "runs",
+    "articles",
+    "references",
+    "answers",
+    "assets",
+    "agent_status",
+)
 
 
 class CloudStateDeltaInbox:
@@ -115,6 +125,16 @@ class CloudStateDeltaInbox:
             placeholders = ",".join("?" for _ in safe_streams)
             where_sql += f" AND stream IN ({placeholders})"
             params.extend(safe_streams)
+        order_sql = "stream ASC, seq ASC, id ASC"
+        order_params: list[Any] = []
+        if safe_streams:
+            order_sql = (
+                "CASE "
+                + " ".join(f"WHEN stream = ? THEN {index}" for index, _stream in enumerate(safe_streams))
+                + f" ELSE {len(safe_streams)} END, seq ASC, id ASC"
+            )
+            order_params.extend(safe_streams)
+        params.extend(order_params)
         params.append(safe_limit)
         with self._connection() as conn:
             rows = conn.execute(
@@ -124,7 +144,7 @@ class CloudStateDeltaInbox:
                        updated_at, last_error
                 FROM state_delta_inbox
                 WHERE {where_sql}
-                ORDER BY stream ASC, seq ASC, id ASC
+                ORDER BY {order_sql}
                 LIMIT ?
                 """,
                 tuple(params),
@@ -358,10 +378,10 @@ def process_state_delta_inbox(
     applier_map = dict(appliers or {})
     requested_streams = [str(stream or "").strip() for stream in (streams or []) if str(stream or "").strip()]
     if requested_streams:
-        claim_streams = [stream for stream in requested_streams if stream in applier_map]
+        claim_streams = _ordered_state_delta_streams(stream for stream in requested_streams if stream in applier_map)
         skipped_no_applier = len([stream for stream in requested_streams if stream not in applier_map])
     else:
-        claim_streams = sorted(applier_map.keys())
+        claim_streams = _ordered_state_delta_streams(applier_map.keys())
         skipped_no_applier = 0
     if not claim_streams:
         return {
@@ -408,6 +428,14 @@ def process_state_delta_inbox(
         "skipped_no_applier": skipped_no_applier,
         "streams": by_stream,
     }
+
+
+def _ordered_state_delta_streams(streams: Any) -> list[str]:
+    raw = [str(stream or "").strip() for stream in streams or [] if str(stream or "").strip()]
+    seen: set[str] = set()
+    unique = [stream for stream in raw if not (stream in seen or seen.add(stream))]
+    priority = {stream: index for index, stream in enumerate(STATE_DELTA_APPLY_STREAM_ORDER)}
+    return sorted(unique, key=lambda stream: (priority.get(stream, len(priority)), stream))
 
 
 def _safe_ids(ids: list[int] | tuple[int, ...] | set[int]) -> list[int]:

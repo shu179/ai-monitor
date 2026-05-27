@@ -10,7 +10,12 @@ import core.history as history_module
 from core.cloud_client import CloudClientError
 from core.cloud_session_store import CloudSessionStore
 from core.cloud_task_sync import _cloud_run_record_to_history_entry
-from core.cloud_task_sync import merge_cloud_tasks_into_config, pull_cloud_tasks_into_config
+from core.cloud_task_sync import (
+    merge_cloud_run_record_entity_into_config,
+    merge_cloud_task_day_status_entity_into_config,
+    merge_cloud_tasks_into_config,
+    pull_cloud_tasks_into_config,
+)
 from core.time_utils import local_today
 
 
@@ -204,6 +209,116 @@ class SyncChangesTaskConfigClient(FakeTaskClient):
 
 
 class CloudTaskSyncTests(unittest.TestCase):
+    def test_merge_run_record_state_delta_entity_imports_history(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_history_dir = history_module.HISTORY_DIR
+            original_state_path = daily_task_state_module.STATE_PATH
+            history_module.HISTORY_DIR = Path(tmpdir) / "logs" / "history"
+            daily_task_state_module.STATE_PATH = Path(tmpdir) / "user_data" / "daily_task_status.json"
+            try:
+                config = {
+                    "tasks": [
+                        {
+                            "task_id": "cloud_9",
+                            "name": "趋势品牌",
+                            "brand": "趋势品牌",
+                            "cloud_task_id": 9,
+                            "cloud_workspace_id": 1,
+                            "cloud_base_url": "https://api.example.com",
+                            "keywords": [{"keyword": "趋势品牌", "brand": "趋势品牌", "platforms": ["doubao"]}],
+                        }
+                    ]
+                }
+                entity = {
+                    "type": "run_record",
+                    "id": 12,
+                    "workspace_id": 1,
+                    "task_id": 9,
+                    "platform": "doubao",
+                    "keyword": "趋势品牌",
+                    "brand": "趋势品牌",
+                    "mode": "browser",
+                    "result_json": {"rank": 1, "success": True, "highlight_count": 2},
+                    "idempotency_key": "run:cloud-record-12",
+                    "executed_at": "2026-05-03T08:00:00Z",
+                }
+
+                summary = merge_cloud_run_record_entity_into_config(
+                    config,
+                    entity,
+                    cloud_user={"workspace_id": 1},
+                    base_url="https://api.example.com",
+                )
+
+                self.assertEqual(summary["imported"], 1)
+                self.assertEqual(summary["cursor_updates"], 1)
+                self.assertEqual(config["tasks"][0]["cloud_last_run_record_synced_id"], 12)
+                records = history_module.get_records("趋势品牌", task_id="cloud_9")
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["id"], "cloud:run:cloud-record-12")
+                status = daily_task_state_module.get_task_day_status(
+                    config["tasks"][0],
+                    target_date=date(2026, 5, 3),
+                )
+                self.assertEqual(status["brand_status"], "success")
+            finally:
+                history_module.HISTORY_DIR = original_history_dir
+                daily_task_state_module.STATE_PATH = original_state_path
+
+    def test_merge_task_day_status_state_delta_entity_updates_task_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_state_path = daily_task_state_module.STATE_PATH
+            daily_task_state_module.STATE_PATH = Path(tmpdir) / "user_data" / "daily_task_status.json"
+            try:
+                config = {
+                    "tasks": [
+                        {
+                            "task_id": "cloud_9",
+                            "name": "趋势品牌",
+                            "brand": "趋势品牌",
+                            "cloud_task_id": 9,
+                            "cloud_workspace_id": 1,
+                            "cloud_base_url": "https://api.example.com",
+                        }
+                    ]
+                }
+                today_text = local_today().isoformat()
+                entity = {
+                    "type": "task_day_status",
+                    "id": 21,
+                    "workspace_id": 1,
+                    "task_id": 9,
+                    "task_day": today_text,
+                    "status": "success",
+                    "source": "dashboard_force_send",
+                    "message": "看板无视失败后已发送 1 张成功截图",
+                    "brands": ["趋势品牌"],
+                    "completed_keywords": ["趋势品牌"],
+                    "detected_platforms": ["doubao"],
+                    "actual_screenshot_count": 1,
+                    "notification_success": True,
+                    "forced_ignore_failure": True,
+                }
+
+                summary = merge_cloud_task_day_status_entity_into_config(
+                    config,
+                    entity,
+                    cloud_user={"workspace_id": 1},
+                    base_url="https://api.example.com",
+                )
+
+                self.assertEqual(summary["applied"], 1)
+                self.assertEqual(summary["cursor_updates"], 1)
+                self.assertEqual(config["tasks"][0]["cloud_last_task_day_status_synced_id"], 21)
+                status = daily_task_state_module.get_task_day_status(
+                    config["tasks"][0],
+                    target_date=local_today(),
+                )
+                self.assertEqual(status["brand_status"], "sent")
+                self.assertTrue(status["official_extra"]["forced_ignore_failure"])
+            finally:
+                daily_task_state_module.STATE_PATH = original_state_path
+
     def test_merge_adds_cloud_task_and_normalizes_keyword_shape(self):
         config = {"tasks": []}
         summary = merge_cloud_tasks_into_config(

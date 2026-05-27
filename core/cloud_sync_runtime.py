@@ -24,7 +24,11 @@ from core.cloud_run_sync import (
 )
 from core.cloud_state_delta import CloudStateDeltaStore, pull_cloud_state_delta
 from core.cloud_state_delta_inbox import CloudStateDeltaInbox, process_state_delta_inbox
-from core.cloud_task_sync import merge_cloud_tasks_into_config
+from core.cloud_task_sync import (
+    merge_cloud_run_record_entity_into_config,
+    merge_cloud_task_day_status_entity_into_config,
+    merge_cloud_tasks_into_config,
+)
 from core.cloud_session_store import (
     CloudSessionChangedError,
     CloudSessionStore,
@@ -674,6 +678,7 @@ class AppCloudRuntimeSupport:
         appliers: dict[str, Callable[[dict[str, Any]], Any]] = {
             "profile": self._apply_profile_state_delta,
             "tasks": self._apply_task_state_delta,
+            "runs": self._apply_run_state_delta,
         }
         appliers.update(custom_appliers or {})
         return appliers
@@ -761,6 +766,46 @@ class AppCloudRuntimeSupport:
             + int(summary.get("deleted_backups") or 0)
             + int(summary.get("deleted_pending") or 0)
         )
+        if changed:
+            self._save_runtime_config(config)
+            self._invalidate_owner_task_views()
+
+    def _apply_run_state_delta(self, item: dict[str, Any]) -> None:
+        entity = item.get("entity") if isinstance(item.get("entity"), dict) else {}
+        if str(item.get("stream") or "") != "runs":
+            raise ValueError("state-delta runs item has invalid stream")
+        entity_type = str(entity.get("type") or "").strip()
+        if entity_type not in {"run_record", "task_day_status"}:
+            raise ValueError("state-delta runs item has invalid shape")
+        workspace_id = _safe_int(entity.get("workspace_id") or entity.get("workspaceId"), 0)
+        session = self._session_store_factory().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        current_workspace_id = _safe_int(user.get("workspace_id"), 0)
+        if workspace_id > 0 and current_workspace_id and workspace_id != current_workspace_id:
+            raise ValueError("runs state-delta 与当前云端工作区不匹配")
+
+        config = self._load_runtime_config()
+        common_kwargs = {
+            "cloud_user": user,
+            "base_url": str(session.get("base_url") or ""),
+        }
+        if entity_type == "run_record":
+            summary = merge_cloud_run_record_entity_into_config(config, entity, **common_kwargs)
+            changed = (
+                int(summary.get("imported") or 0)
+                + int(summary.get("cursor_updates") or 0)
+                + int(summary.get("state_updated") or 0)
+                + int(summary.get("backfilled") or 0)
+            )
+        else:
+            summary = merge_cloud_task_day_status_entity_into_config(config, entity, **common_kwargs)
+            changed = (
+                int(summary.get("applied") or 0)
+                + int(summary.get("cursor_updates") or 0)
+                + int(summary.get("state_updated") or 0)
+            )
+        if int(summary.get("failed") or 0):
+            raise ValueError(str(summary.get("error") or "runs state-delta apply failed"))
         if changed:
             self._save_runtime_config(config)
             self._invalidate_owner_task_views()

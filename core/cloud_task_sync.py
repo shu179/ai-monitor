@@ -646,6 +646,144 @@ def pull_cloud_task_day_status_events_into_state(
     return summary
 
 
+def merge_cloud_run_record_entity_into_config(
+    config: dict[str, Any],
+    entity: dict[str, Any],
+    *,
+    cloud_user: dict[str, Any] | None = None,
+    base_url: str = "",
+) -> dict[str, Any]:
+    """Apply one state-delta run_record entity to local history/config."""
+    started_at = time.perf_counter()
+    summary = _empty_run_summary()
+    summary["mode"] = "state_delta"
+    summary["request_count"] = 0
+    if not isinstance(entity, dict) or str(entity.get("type") or "") != "run_record":
+        summary["failed"] += 1
+        summary["error"] = "invalid run_record entity"
+        summary["duration_ms"] = _elapsed_ms(started_at)
+        return summary
+
+    cloud_task_id = _normalize_int(entity.get("task_id") or entity.get("taskId"))
+    workspace_id = _normalize_int(entity.get("workspace_id") or entity.get("workspaceId"))
+    expected_workspace_id = _normalize_int((cloud_user or {}).get("workspace_id"))
+    if workspace_id is not None and expected_workspace_id is not None and workspace_id != expected_workspace_id:
+        summary["failed"] += 1
+        summary["error"] = "run_record workspace mismatch"
+        summary["duration_ms"] = _elapsed_ms(started_at)
+        return summary
+    if cloud_task_id is None:
+        summary["failed"] += 1
+        summary["error"] = "run_record missing task_id"
+        summary["duration_ms"] = _elapsed_ms(started_at)
+        return summary
+
+    local_task = _find_local_cloud_task(
+        config,
+        cloud_task_id=cloud_task_id,
+        base_url=base_url,
+        workspace_id=workspace_id or expected_workspace_id,
+    )
+    if local_task is None:
+        summary["failed"] += 1
+        summary["error"] = f"local cloud task {cloud_task_id} not found"
+        summary["duration_ms"] = _elapsed_ms(started_at)
+        return summary
+
+    previous_cursor = _normalize_int(
+        local_task.get("cloud_last_run_record_synced_id")
+        or local_task.get("cloudLastRunRecordSyncedId")
+    )
+    record_id = _normalize_int(entity.get("id"))
+    if record_id is not None and previous_cursor and record_id <= previous_cursor:
+        summary["tasks"] = 1
+        summary["fetched"] = 1
+        summary["duration_ms"] = _elapsed_ms(started_at)
+        return summary
+
+    _merge_cloud_run_records_for_task(
+        summary,
+        local_task=local_task,
+        cloud_task={
+            "id": cloud_task_id,
+            "workspace_id": workspace_id,
+            "name": local_task.get("name"),
+            "brand": local_task.get("brand"),
+        },
+        cloud_task_id=cloud_task_id,
+        previous_cursor=previous_cursor,
+        backfill=False,
+        run_records=[entity],
+    )
+    summary["duration_ms"] = _elapsed_ms(started_at)
+    return summary
+
+
+def merge_cloud_task_day_status_entity_into_config(
+    config: dict[str, Any],
+    entity: dict[str, Any],
+    *,
+    cloud_user: dict[str, Any] | None = None,
+    base_url: str = "",
+) -> dict[str, Any]:
+    """Apply one state-delta task_day_status entity to local task state/config."""
+    started_at = time.perf_counter()
+    summary = _empty_task_day_status_summary()
+    if not isinstance(entity, dict) or str(entity.get("type") or "") != "task_day_status":
+        summary["failed"] += 1
+        summary["error"] = "invalid task_day_status entity"
+        summary["duration_ms"] = _elapsed_ms(started_at)
+        return summary
+
+    cloud_task_id = _normalize_int(entity.get("task_id") or entity.get("taskId"))
+    workspace_id = _normalize_int(entity.get("workspace_id") or entity.get("workspaceId"))
+    expected_workspace_id = _normalize_int((cloud_user or {}).get("workspace_id"))
+    if workspace_id is not None and expected_workspace_id is not None and workspace_id != expected_workspace_id:
+        summary["failed"] += 1
+        summary["error"] = "task_day_status workspace mismatch"
+        summary["duration_ms"] = _elapsed_ms(started_at)
+        return summary
+    if cloud_task_id is None:
+        summary["failed"] += 1
+        summary["error"] = "task_day_status missing task_id"
+        summary["duration_ms"] = _elapsed_ms(started_at)
+        return summary
+
+    local_task = _find_local_cloud_task(
+        config,
+        cloud_task_id=cloud_task_id,
+        base_url=base_url,
+        workspace_id=workspace_id or expected_workspace_id,
+    )
+    if local_task is None:
+        summary["failed"] += 1
+        summary["error"] = f"local cloud task {cloud_task_id} not found"
+        summary["duration_ms"] = _elapsed_ms(started_at)
+        return summary
+
+    previous_cursor = _normalize_int(
+        local_task.get("cloud_last_task_day_status_synced_id")
+        or local_task.get("cloudLastTaskDayStatusSyncedId")
+    ) or 0
+    event_id = _normalize_int(entity.get("id"))
+    summary["tasks"] = 1
+    summary["fetched"] = 1
+    if event_id is not None and previous_cursor and event_id <= previous_cursor:
+        summary["duration_ms"] = _elapsed_ms(started_at)
+        return summary
+
+    if _apply_cloud_task_day_status_event(local_task, entity):
+        summary["applied"] += 1
+        summary["state_updated"] += 1
+    max_event_id = max(previous_cursor, event_id or 0)
+    if max_event_id and max_event_id != previous_cursor:
+        local_task["cloud_last_task_day_status_synced_id"] = max_event_id
+        local_task["cloud_task_day_status_synced_at"] = local_now().isoformat(timespec="seconds")
+        summary["cursor_updates"] += 1
+    summary["duration_ms"] = _elapsed_ms(started_at)
+    return summary
+
+
 def _apply_cloud_task_day_status_event(local_task: dict[str, Any], event: dict[str, Any]) -> bool:
     status = str(event.get("status") or "").strip()
     if status not in {"success", "sent"}:
@@ -929,6 +1067,23 @@ def _iter_local_tasks_and_deleted_backups(config: dict[str, Any]) -> list[dict[s
         if isinstance(task, dict):
             tasks.append(task)
     return tasks
+
+
+def _find_local_cloud_task(
+    config: dict[str, Any],
+    *,
+    cloud_task_id: int,
+    base_url: str,
+    workspace_id: int | None,
+) -> dict[str, Any] | None:
+    for task in _iter_local_tasks_and_deleted_backups(config):
+        task_cloud_id = _normalize_int(task.get("cloud_task_id") or task.get("cloudTaskId"))
+        if task_cloud_id != cloud_task_id:
+            continue
+        if not _same_cloud_scope(task, base_url=base_url, workspace_id=workspace_id):
+            continue
+        return task
+    return None
 
 
 def merge_cloud_tasks_into_config(

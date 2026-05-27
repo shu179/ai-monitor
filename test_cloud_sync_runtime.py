@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import threading
 import tempfile
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
+import core.daily_task_state as daily_task_state_module
+import core.history as history_module
 from core.cloud_client import CloudClientError
 from core.cloud_state_delta_inbox import CloudStateDeltaInbox
 from core.cloud_sync_runtime import (
@@ -142,6 +145,7 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
     process_kwargs = process_inbox.call_args.kwargs
     assert callable(process_kwargs["appliers"]["profile"])
     assert callable(process_kwargs["appliers"]["tasks"])
+    assert callable(process_kwargs["appliers"]["runs"])
     assert process_kwargs["limit"] == 20
     assert process_kwargs["streams"] == ["tasks"]
     assert process_kwargs["include_failed"] is False
@@ -396,6 +400,127 @@ def test_app_cloud_runtime_support_rejects_task_state_delta_for_other_workspace(
 
         with patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox):
             result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["tasks"]})
+            diagnostics = inbox.diagnostics()
+
+    assert result["ok"] is False
+    assert result["state_delta_inbox"]["failed"] == 1
+    assert "工作区不匹配" in diagnostics["failed"][0]["last_error"]
+    owner.save_config.assert_not_called()
+
+
+def test_app_cloud_runtime_support_applies_run_record_state_delta_to_history():
+    owner = _support_owner()
+    config = {
+        "tasks": [
+            {
+                "task_id": "cloud_9",
+                "name": "趋势品牌",
+                "brand": "趋势品牌",
+                "cloud_task_id": 9,
+                "cloud_workspace_id": 3,
+                "cloud_base_url": "https://api.example.com",
+                "keywords": [{"keyword": "趋势品牌", "brand": "趋势品牌", "platforms": ["doubao"]}],
+            }
+        ]
+    }
+    owner.load_config.return_value = config
+    owner.save_config = Mock()
+    owner._invalidate_tasks_full_cache = Mock()
+    owner._refresh_monitoring_runtime = Mock()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original_history_dir = history_module.HISTORY_DIR
+        original_state_path = daily_task_state_module.STATE_PATH
+        history_module.HISTORY_DIR = Path(tmp) / "logs" / "history"
+        daily_task_state_module.STATE_PATH = Path(tmp) / "user_data" / "daily_task_status.json"
+        try:
+            inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+            inbox.record_changes(
+                identity_key="https://api.example.com|3|2",
+                changes=[
+                    {
+                        "stream": "runs",
+                        "seq": 1,
+                        "kind": "run_record.upsert",
+                        "ref_id": "12",
+                        "entity": {
+                            "type": "run_record",
+                            "id": 12,
+                            "workspace_id": 3,
+                            "task_id": 9,
+                            "platform": "doubao",
+                            "keyword": "趋势品牌",
+                            "brand": "趋势品牌",
+                            "mode": "browser",
+                            "result_json": {"rank": 1, "success": True},
+                            "idempotency_key": "run:cloud-record-12",
+                            "executed_at": "2026-05-03T08:00:00Z",
+                        },
+                    }
+                ],
+            )
+
+            with patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox):
+                result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["runs"]})
+
+            records = history_module.get_records("趋势品牌", task_id="cloud_9")
+            status = daily_task_state_module.get_task_day_status(
+                owner.save_config.call_args.args[0]["tasks"][0],
+                target_date=date(2026, 5, 3),
+            )
+        finally:
+            history_module.HISTORY_DIR = original_history_dir
+            daily_task_state_module.STATE_PATH = original_state_path
+
+    assert result["ok"] is True
+    assert result["state_delta_inbox"]["applied"] == 1
+    saved_config = owner.save_config.call_args.args[0]
+    assert saved_config["tasks"][0]["cloud_last_run_record_synced_id"] == 12
+    assert len(records) == 1
+    assert records[0]["id"] == "cloud:run:cloud-record-12"
+    assert status["brand_status"] == "success"
+    owner._invalidate_tasks_full_cache.assert_called_once()
+    owner._refresh_monitoring_runtime.assert_called_once_with(restart_scheduler=True)
+
+
+def test_app_cloud_runtime_support_rejects_run_state_delta_for_other_workspace():
+    owner = _support_owner()
+    owner.load_config.return_value = {"tasks": []}
+    owner.save_config = Mock()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+        inbox.record_changes(
+            identity_key="https://api.example.com|3|2",
+            changes=[
+                {
+                    "stream": "runs",
+                    "seq": 1,
+                    "kind": "run_record.upsert",
+                    "ref_id": "12",
+                    "entity": {"type": "run_record", "id": 12, "workspace_id": 99, "task_id": 9},
+                }
+            ],
+        )
+
+        with patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox):
+            result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["runs"]})
             diagnostics = inbox.diagnostics()
 
     assert result["ok"] is False
