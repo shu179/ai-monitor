@@ -14,8 +14,11 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     Article,
+    ArticleReferenceEvent,
     ArticleTaskLink,
     ArticleVersion,
+    AgentCommand,
+    AgentResultChunk,
     BrandTask,
     CloudIdempotencyKey,
     ObjectManifest,
@@ -32,6 +35,7 @@ from app.models import (
 from app.schemas import SyncBatchEventIn, SyncEventIn
 from app.services.change_log_service import (
     STREAM_ARTICLES,
+    STREAM_AGENT_STATUS,
     STREAM_PROFILE,
     STREAM_REFERENCES,
     STREAM_RUNS,
@@ -311,6 +315,7 @@ def build_state_reset_page(
     cursor_payload = parse_bootstrap_cursor(bootstrap_cursor)
     index = max(0, int(cursor_payload.get("index") or 0))
     after_id = max(0, int(cursor_payload.get("after_id") or 0))
+    after_key = str(cursor_payload.get("after_key") or "").strip()
     if index >= len(streams):
         return {
             "changes": [],
@@ -323,11 +328,12 @@ def build_state_reset_page(
         }
     current = compact_change_snapshot(db, user.workspace_id)
     stream = streams[index]
-    page = _build_reset_stream_page(db, user, stream=stream, after_id=after_id, limit=limit)
+    page = _build_reset_stream_page(db, user, stream=stream, after_id=after_id, after_key=after_key, limit=limit)
     next_index = index + 1 if not page["has_more"] else index
     next_after_id = 0 if not page["has_more"] else int(page["next_after_id"])
+    next_after_key = "" if not page["has_more"] else str(page.get("next_after_key") or "")
     has_more = page["has_more"] or next_index < len(streams)
-    next_cursor = make_bootstrap_cursor(next_index, after_id=next_after_id) if has_more else None
+    next_cursor = make_bootstrap_cursor(next_index, after_id=next_after_id, after_key=next_after_key) if has_more else None
     next_cursors = {stream: int(current.get(stream) or 0)}
     return {
         "changes": page["changes"],
@@ -356,7 +362,15 @@ def count_pending_materialization(db: Session, *, workspace_id: int) -> int:
         return 0
 
 
-def _build_reset_stream_page(db: Session, user: User, *, stream: str, after_id: int, limit: int) -> dict[str, Any]:
+def _build_reset_stream_page(
+    db: Session,
+    user: User,
+    *,
+    stream: str,
+    after_id: int,
+    after_key: str,
+    limit: int,
+) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit or LIMITS["state_delta_reset_page_max_items"]), int(LIMITS["state_delta_reset_page_max_items"])))
     object_refs_by_id: dict[str, dict[str, Any]] = {}
     if stream == STREAM_TASKS:
@@ -365,6 +379,10 @@ def _build_reset_stream_page(db: Session, user: User, *, stream: str, after_id: 
         rows = _reset_run_record_entities(db, user, after_id=after_id, limit=safe_limit + 1)
     elif stream == STREAM_ARTICLES:
         rows = _reset_article_entities(db, user, after_id=after_id, limit=safe_limit + 1, object_refs_by_id=object_refs_by_id)
+    elif stream == STREAM_REFERENCES:
+        rows = _reset_reference_entities(db, user, after_id=after_id, limit=safe_limit + 1)
+    elif stream == STREAM_AGENT_STATUS:
+        rows = _reset_agent_status_entities(db, user, after_key=after_key, limit=safe_limit + 1)
     elif stream == STREAM_PROFILE:
         rows = [_state_delta_profile_entity(user)] if after_id <= 0 else []
     else:
@@ -372,17 +390,21 @@ def _build_reset_stream_page(db: Session, user: User, *, stream: str, after_id: 
     page_rows = rows[:safe_limit]
     has_more = len(rows) > safe_limit
     next_after_id = _reset_entity_cursor(page_rows[-1]) if page_rows else after_id
-    changes = [
-        {
-            "stream": stream,
-            "seq": next_after_id,
-            "kind": f"{stream}.bootstrap",
-            "ref_id": f"bootstrap:{stream}:{next_after_id}",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "entity": row,
-        }
-        for row in page_rows
-    ]
+    next_after_key = _reset_entity_key(page_rows[-1]) if page_rows else after_key
+    changes = []
+    for row in page_rows:
+        row_cursor = _reset_entity_cursor(row)
+        row_key = _reset_entity_key(row)
+        changes.append(
+            {
+                "stream": stream,
+                "seq": row_cursor,
+                "kind": f"{stream}.bootstrap",
+                "ref_id": f"bootstrap:{stream}:{row_key or row_cursor}",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "entity": row,
+            }
+        )
     if not changes and not has_more:
         changes.append(
             {
@@ -399,6 +421,7 @@ def _build_reset_stream_page(db: Session, user: User, *, stream: str, after_id: 
         "object_refs": list(object_refs_by_id.values()),
         "has_more": has_more,
         "next_after_id": next_after_id,
+        "next_after_key": next_after_key,
     }
 
 
@@ -466,6 +489,38 @@ def _reset_article_entities(
     ]
 
 
+def _reset_reference_entities(db: Session, user: User, *, after_id: int, limit: int) -> list[dict[str, Any]]:
+    visible_task_ids = _visible_task_ids_for_state_delta(db, user)
+    if not visible_task_ids:
+        return []
+    rows = db.scalars(
+        select(ArticleReferenceEvent)
+        .where(
+            ArticleReferenceEvent.workspace_id == user.workspace_id,
+            ArticleReferenceEvent.id > int(after_id or 0),
+            ArticleReferenceEvent.task_id.in_(visible_task_ids),
+        )
+        .order_by(ArticleReferenceEvent.id.asc())
+        .limit(limit)
+    )
+    return [_article_reference_entity(row) for row in rows]
+
+
+def _reset_agent_status_entities(db: Session, user: User, *, after_key: str, limit: int) -> list[dict[str, Any]]:
+    query = select(AgentCommand).where(
+        AgentCommand.workspace_id == user.workspace_id,
+        AgentCommand.created_at.is_not(None),
+    )
+    after_created_at, after_id = _parse_agent_cursor_key(after_key)
+    if after_created_at is not None:
+        query = query.where(
+            (AgentCommand.created_at > after_created_at)
+            | ((AgentCommand.created_at == after_created_at) & (AgentCommand.id > after_id))
+        )
+    rows = db.scalars(query.order_by(AgentCommand.created_at.asc(), AgentCommand.id.asc()).limit(limit))
+    return [_agent_command_status_entity(db, row) for row in rows]
+
+
 def _visible_task_ids_for_state_delta(db: Session, user: User) -> list[int]:
     retention_clause = (
         (BrandTask.deleted_at.is_(None))
@@ -530,6 +585,30 @@ def _reset_entity_cursor(entity: dict[str, Any]) -> int:
         return 0
 
 
+def _reset_entity_key(entity: dict[str, Any]) -> str:
+    if entity.get("type") == "agent_command_status":
+        return _agent_cursor_key(entity)
+    return str(entity.get("id") or entity.get("command_id") or "")
+
+
+def _agent_cursor_key(entity: dict[str, Any]) -> str:
+    return f"{str(entity.get('created_at') or '')}|{str(entity.get('id') or '')}"[:128]
+
+
+def _parse_agent_cursor_key(value: str) -> tuple[datetime | None, str]:
+    text_value = str(value or "").strip()
+    if "|" not in text_value:
+        return None, ""
+    created_at_text, command_id = text_value.split("|", 1)
+    try:
+        created_at = datetime.fromisoformat(created_at_text)
+    except ValueError:
+        return None, ""
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at.astimezone(timezone.utc), command_id[:36]
+
+
 def _enrich_state_delta_changes(db: Session, user: User, changes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     object_refs_by_id: dict[str, dict[str, Any]] = {}
     enriched: list[dict[str, Any]] = []
@@ -559,8 +638,12 @@ def _entity_for_state_delta_change(
         return _state_delta_run_record_entity(db, user, ref_id)
     if kind == "task.day_status":
         return _state_delta_task_day_status_entity(db, user, ref_id)
+    if kind == "article.reference":
+        return _state_delta_article_reference_entity(db, user, ref_id)
     if kind in {"article.upsert", "article.link"}:
         return _state_delta_article_entity(db, user, ref_id, object_refs_by_id)
+    if kind.startswith("agent."):
+        return _state_delta_agent_status_entity(db, user, ref_id)
     if kind == "profile.update":
         return _state_delta_profile_entity(user)
     return None
@@ -606,6 +689,36 @@ def _state_delta_task_day_status_entity(db: Session, user: User, ref_id: str) ->
     payload["idempotency_key"] = str(event.idempotency_key or "")
     payload["created_at"] = _iso_datetime(event.created_at)
     return payload
+
+
+def _state_delta_article_reference_entity(db: Session, user: User, ref_id: str) -> dict[str, Any] | None:
+    reference = db.scalar(
+        select(ArticleReferenceEvent).where(
+            ArticleReferenceEvent.workspace_id == user.workspace_id,
+            ArticleReferenceEvent.idempotency_key == ref_id,
+        )
+    )
+    if reference is None:
+        return None
+    return _article_reference_entity(reference)
+
+
+def _article_reference_entity(reference: ArticleReferenceEvent) -> dict[str, Any]:
+    return {
+        "type": "article_reference",
+        "id": int(reference.id),
+        "workspace_id": int(reference.workspace_id),
+        "task_id": int(reference.task_id),
+        "article_id": int(reference.article_id) if reference.article_id is not None else None,
+        "normalized_url": str(reference.normalized_url or ""),
+        "url_hash": str(reference.url_hash or ""),
+        "platform": str(reference.platform or ""),
+        "record_day": str(reference.record_day or ""),
+        "source_record_key": str(reference.source_record_key or ""),
+        "idempotency_key": str(reference.idempotency_key or ""),
+        "event_json": dict(reference.event_json or {}),
+        "created_at": _iso_datetime(reference.created_at),
+    }
 
 
 def _state_delta_article_entity(
@@ -733,6 +846,54 @@ def _article_content_ref(
         "content_type": content_type,
         "compression": compression,
         "storage_size_bytes": storage_size_bytes,
+    }
+
+
+def _state_delta_agent_status_entity(db: Session, user: User, ref_id: str) -> dict[str, Any] | None:
+    command = db.scalar(
+        select(AgentCommand).where(
+            AgentCommand.workspace_id == user.workspace_id,
+            AgentCommand.id == str(ref_id),
+        )
+    )
+    if command is None:
+        return None
+    return _agent_command_status_entity(db, command)
+
+
+def _agent_command_status_entity(db: Session, command: AgentCommand) -> dict[str, Any]:
+    chunks = [
+        _agent_result_chunk_entity(chunk)
+        for chunk in db.scalars(
+            select(AgentResultChunk)
+            .where(AgentResultChunk.command_id == str(command.id))
+            .order_by(AgentResultChunk.seq.asc())
+            .limit(100)
+        )
+    ]
+    return {
+        "type": "agent_command_status",
+        "id": str(command.id),
+        "workspace_id": int(command.workspace_id),
+        "target_device_id": command.target_device_id,
+        "target_role": command.target_role,
+        "status": str(command.status or ""),
+        "visibility_until": _iso_datetime(command.visibility_until),
+        "idempotency_key": str(command.idempotency_key or ""),
+        "cancel_requested_at": _iso_datetime(command.cancel_requested_at),
+        "expires_at": _iso_datetime(command.expires_at),
+        "created_at": _iso_datetime(command.created_at),
+        "result_chunks": chunks,
+    }
+
+
+def _agent_result_chunk_entity(chunk: AgentResultChunk) -> dict[str, Any]:
+    return {
+        "command_id": str(chunk.command_id),
+        "seq": int(chunk.seq),
+        "payload_json": dict(chunk.payload_json or {}),
+        "is_final": bool(chunk.is_final),
+        "created_at": _iso_datetime(chunk.created_at),
     }
 
 
@@ -953,8 +1114,13 @@ def parse_reset_token(value: str | None) -> dict[str, Any]:
     return payload
 
 
-def make_bootstrap_cursor(index: int, *, after_id: int = 0) -> str:
-    return _encode_cursor_payload({"v": 1, "index": max(0, int(index or 0)), "after_id": max(0, int(after_id or 0))})
+def make_bootstrap_cursor(index: int, *, after_id: int = 0, after_key: str = "") -> str:
+    return _encode_cursor_payload({
+        "v": 1,
+        "index": max(0, int(index or 0)),
+        "after_id": max(0, int(after_id or 0)),
+        "after_key": str(after_key or "")[:128],
+    })
 
 
 def parse_bootstrap_cursor(value: str | None) -> dict[str, Any]:

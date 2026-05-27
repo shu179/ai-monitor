@@ -168,6 +168,89 @@ class StateDeltaPayloadTests(unittest.TestCase):
         self.assertEqual(result["changes"][0]["ref_id"], "missing")
         self.assertNotIn("entity", result["changes"][0])
 
+    @patch("app.services.sync_v2_service._stale_cursor_streams", return_value=[])
+    @patch("app.services.sync_v2_service.list_workspace_changes")
+    @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"references": 1})
+    def test_state_delta_includes_reference_entity(self, _snapshot, list_changes, _stale) -> None:
+        list_changes.return_value = [
+            {
+                "stream": "references",
+                "seq": 1,
+                "kind": "article.reference",
+                "ref_id": "ref-001",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }
+        ]
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        db = MagicMock()
+        db.scalar.return_value = SimpleNamespace(
+            id=31,
+            workspace_id=7,
+            task_id=5,
+            article_id=21,
+            normalized_url="https://example.test/a",
+            url_hash="a" * 64,
+            platform="douyin",
+            record_day="2026-01-01",
+            source_record_key="record-1",
+            idempotency_key="ref-001",
+            event_json={"rank": 1},
+            created_at=now,
+        )
+
+        result = build_state_delta(db, _user(), cursors={"references": 0})
+
+        entity = result["changes"][0]["entity"]
+        self.assertEqual(entity["type"], "article_reference")
+        self.assertEqual(entity["id"], 31)
+        self.assertEqual(entity["event_json"], {"rank": 1})
+
+    @patch("app.services.sync_v2_service._stale_cursor_streams", return_value=[])
+    @patch("app.services.sync_v2_service.list_workspace_changes")
+    @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"agent_status": 1})
+    def test_state_delta_includes_agent_status_without_executable_payload(self, _snapshot, list_changes, _stale) -> None:
+        list_changes.return_value = [
+            {
+                "stream": "agent_status",
+                "seq": 1,
+                "kind": "agent.command.completed",
+                "ref_id": "command-001",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }
+        ]
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        command = SimpleNamespace(
+            id="command-001",
+            workspace_id=7,
+            target_device_id="mac-1",
+            target_role=None,
+            status="completed",
+            visibility_until=None,
+            idempotency_key="agent-key-1",
+            payload_json={"action": "should-not-be-in-delta"},
+            cancel_requested_at=None,
+            expires_at=now,
+            created_at=now,
+        )
+        chunk = SimpleNamespace(
+            command_id="command-001",
+            seq=0,
+            payload_json={"text": "done"},
+            is_final=True,
+            created_at=now,
+        )
+        db = MagicMock()
+        db.scalar.return_value = command
+        db.scalars.return_value = [chunk]
+
+        result = build_state_delta(db, _user(), cursors={"agent_status": 0})
+
+        entity = result["changes"][0]["entity"]
+        self.assertEqual(entity["type"], "agent_command_status")
+        self.assertEqual(entity["status"], "completed")
+        self.assertEqual(entity["result_chunks"][0]["payload_json"], {"text": "done"})
+        self.assertNotIn("payload_json", entity)
+
     @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"runs": 10})
     def test_reset_bootstrap_pages_run_records_by_after_id(self, _snapshot) -> None:
         now = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -219,6 +302,48 @@ class StateDeltaPayloadTests(unittest.TestCase):
         self.assertEqual(result["changes"][0]["kind"], "profile.bootstrap")
         self.assertEqual(result["changes"][0]["entity"]["display_name"], "Shu")
         self.assertFalse(result["has_more"])
+
+    @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"agent_status": 10})
+    def test_reset_bootstrap_pages_agent_status_by_cursor_key(self, _snapshot) -> None:
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = [
+            SimpleNamespace(
+                id="command-001",
+                workspace_id=7,
+                target_device_id="mac-1",
+                target_role=None,
+                status="completed",
+                visibility_until=None,
+                idempotency_key="agent-key-1",
+                payload_json={"action": "hidden"},
+                cancel_requested_at=None,
+                expires_at=now,
+                created_at=now,
+            ),
+            SimpleNamespace(
+                id="command-002",
+                workspace_id=7,
+                target_device_id="mac-1",
+                target_role=None,
+                status="running",
+                visibility_until=now,
+                idempotency_key="agent-key-2",
+                payload_json={"action": "hidden"},
+                cancel_requested_at=None,
+                expires_at=now,
+                created_at=now,
+            ),
+        ]
+        db = MagicMock()
+        db.scalars.side_effect = [rows, [], []]
+        token = make_reset_token(7, ["agent_status"])
+
+        result = build_state_delta(db, _user(), cursors={}, reset_token=token, limit=1)
+
+        self.assertEqual(result["changes"][0]["entity"]["id"], "command-001")
+        self.assertTrue(result["has_more"])
+        cursor = parse_bootstrap_cursor(result["bootstrap_cursor"])
+        self.assertIn("command-001", cursor["after_key"])
 
 
 def _user(**overrides):
