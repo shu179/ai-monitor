@@ -489,6 +489,32 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         self.assertEqual(updates_by_id["local-existing"], 1)
         self.assertEqual(updates_by_id["local-new"], 100)
 
+    def test_list_cloud_admin_tasks_routes_runtime_command_boundary_and_applies_local_updates(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]
+        runtime._cloud_task_ensure_snapshots = Mock(return_value=[{"local_task_id": "task-1"}])  # type: ignore[method-assign]
+        runtime._apply_cloud_task_local_updates = Mock()  # type: ignore[method-assign]
+        runtime._cloud_runtime_command = Mock(return_value={  # type: ignore[method-assign]
+            "ok": True,
+            "payload": {
+                "tasks": [{"id": 1, "task_key": "task-1"}],
+                "local_updates": [{"local_task_id": "task-1", "task": {"id": 1}}],
+            },
+        })
+
+        with patch("web_backend.CloudSessionStore", return_value=FakeCloudSessionStore()):
+            result = runtime.list_cloud_admin_tasks()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tasks"][0]["id"], 1)
+        runtime._cloud_runtime_command.assert_called_once_with(  # type: ignore[attr-defined]
+            "cloud.list_admin_tasks_with_local_sync",
+            {"local_snapshots": [{"local_task_id": "task-1"}]},
+        )
+        runtime._apply_cloud_task_local_updates.assert_called_once_with(  # type: ignore[attr-defined]
+            [{"local_task_id": "task-1", "task": {"id": 1}}]
+        )
+
     def test_update_cloud_admin_user_preserves_custom_viewer_task_ids(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]

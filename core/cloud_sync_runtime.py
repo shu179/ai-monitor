@@ -314,6 +314,8 @@ class AppCloudRuntimeSupport:
             return self.current_cloud_status()
         if normalized in {"cloud.status_from_session", "status_from_session"}:
             return self.cloud_status_from_session(request_payload.get("session"))
+        if normalized in {"cloud.list_admin_tasks_with_local_sync", "list_admin_tasks_with_local_sync"}:
+            return self._run_cloud_task_sync_request(request_payload)
         if normalized in {"cloud.list_admin_users", "list_admin_users"}:
             return self._run_cloud_api_request("list_admin_users", request_payload)
         if normalized in {"cloud.list_admin_article_classification_jobs", "list_admin_article_classification_jobs"}:
@@ -616,6 +618,19 @@ class AppCloudRuntimeSupport:
             if operation_name == "restore_admin_task":
                 return client.restore_admin_task(token, _safe_int(payload.get("task_id") or payload.get("taskId"), 0))
             raise ValueError(f"unsupported cloud api request: {operation_name}")
+
+        ok, response_payload, message = self.cloud_request_with_refresh(operation)
+        return {"ok": bool(ok), "payload": response_payload, "message": message}
+
+    def _run_cloud_task_sync_request(self, request_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = request_payload if isinstance(request_payload, dict) else {}
+        local_snapshots = payload.get("local_snapshots") if isinstance(payload.get("local_snapshots"), list) else []
+
+        def operation(client: Any, token: str) -> Any:
+            ensure_local = getattr(self._owner, "_ensure_local_admin_tasks_in_cloud", None)
+            if not callable(ensure_local):
+                raise RuntimeError("cloud task sync helper unavailable")
+            return ensure_local(client, token, local_snapshots)
 
         ok, response_payload, message = self.cloud_request_with_refresh(operation)
         return {"ok": bool(ok), "payload": response_payload, "message": message}

@@ -4236,11 +4236,10 @@ return changedCount
         if str(user.get("role") or "").strip() != "admin":
             return {"ok": False, "message": "当前云端账号不是管理员", "tasks": [], "cloud": self.get_cloud_status().get("cloud")}
         local_snapshots = self._cloud_task_ensure_snapshots()
-
-        def operation(client: SurfacedCloudClient, token: str) -> dict[str, Any]:
-            return self._ensure_local_admin_tasks_in_cloud(client, token, local_snapshots)
-
-        ok, payload, message = self._cloud_request_with_refresh(operation)
+        ok, payload, message = self._cloud_runtime_payload_command(
+            "cloud.list_admin_tasks_with_local_sync",
+            {"local_snapshots": local_snapshots},
+        )
         if not ok:
             return {"ok": False, "message": message or "云端任务获取失败", "tasks": [], "cloud": self.get_cloud_status().get("cloud")}
         if isinstance(payload, dict):

@@ -389,6 +389,25 @@ def test_app_cloud_runtime_support_command_updates_admin_user_with_payload():
     }
 
 
+def test_app_cloud_runtime_support_command_runs_admin_task_sync_with_local_snapshots():
+    owner = _support_owner()
+    owner._ensure_local_admin_tasks_in_cloud = Mock(return_value={"tasks": [{"id": 1}], "local_updates": []})
+    support = AppCloudRuntimeSupport(owner=owner)
+
+    class FakeClient:
+        pass
+
+    support.cloud_request_with_refresh = Mock(side_effect=lambda operation: (True, operation(FakeClient(), "access-token"), ""))
+
+    result = support.handle_command(
+        "cloud.list_admin_tasks_with_local_sync",
+        {"local_snapshots": [{"local_task_id": "task-1"}]},
+    )
+
+    assert result == {"ok": True, "payload": {"tasks": [{"id": 1}], "local_updates": []}, "message": ""}
+    owner._ensure_local_admin_tasks_in_cloud.assert_called_once()
+
+
 def test_app_cloud_runtime_support_command_schedules_article_snapshot():
     owner = _support_owner()
     started: list[object] = []
