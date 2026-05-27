@@ -497,6 +497,7 @@ POST_JSON_RUNTIME_METHODS = {
     "/api/cloud/flush-outbox": "flush_cloud_outbox",
     "/api/cloud/pull-tasks": "pull_cloud_tasks",
     "/api/cloud/pull-state-delta": "pull_cloud_state_delta",
+    "/api/cloud/process-state-delta-inbox": "process_cloud_state_delta_inbox",
     "/api/cloud/admin/create-user": "create_cloud_admin_user",
     "/api/cloud/admin/update-user": "update_cloud_admin_user",
     "/api/cloud/admin/delete-user": "delete_cloud_admin_user",
@@ -4916,6 +4917,9 @@ return changedCount
 
     def pull_cloud_state_delta(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._cloud_runtime_command("cloud.pull_state_delta", payload)
+
+    def process_cloud_state_delta_inbox(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._cloud_runtime_command("cloud.process_state_delta_inbox", payload)
 
     def _recover_cloud_run_history_uploads(self) -> dict[str, Any]:
         return self._cloud_runtime_command("cloud.recover_uploads")

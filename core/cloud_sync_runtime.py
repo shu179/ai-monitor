@@ -23,7 +23,7 @@ from core.cloud_run_sync import (
     flush_cloud_outbox,
 )
 from core.cloud_state_delta import CloudStateDeltaStore, pull_cloud_state_delta
-from core.cloud_state_delta_inbox import CloudStateDeltaInbox
+from core.cloud_state_delta_inbox import CloudStateDeltaInbox, process_state_delta_inbox
 from core.cloud_session_store import (
     CloudSessionChangedError,
     CloudSessionStore,
@@ -132,6 +132,7 @@ class AppCloudRuntimeSupport:
         account_profile_dir_getter: Callable[[dict[str, Any] | None], Any] = account_profile_dir_from_session,
         account_space_ensurer: Callable[..., Any] = ensure_account_space,
         has_pending_profile_update: Callable[[dict[str, Any]], bool] | None = None,
+        state_delta_appliers: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
         article_snapshot_startup_delay_seconds: float = 5.0,
         article_deferred_retry_seconds: float = 2.0,
     ) -> None:
@@ -149,6 +150,7 @@ class AppCloudRuntimeSupport:
         self._account_profile_dir_getter = account_profile_dir_getter
         self._account_space_ensurer = account_space_ensurer
         self._has_pending_profile_update = has_pending_profile_update or self._default_has_pending_profile_update
+        self._state_delta_appliers = dict(state_delta_appliers or {})
         self._article_snapshot_startup_delay_seconds = float(article_snapshot_startup_delay_seconds or 0.0)
         self._article_deferred_retry_seconds = float(article_deferred_retry_seconds or 0.0)
         self._stop_event = threading.Event()
@@ -409,6 +411,8 @@ class AppCloudRuntimeSupport:
             return self.pull_cloud_state_delta(request_payload)
         if normalized in {"cloud.state_delta_diagnostics", "state_delta_diagnostics"}:
             return self.cloud_state_delta_diagnostics(request_payload)
+        if normalized in {"cloud.process_state_delta_inbox", "process_state_delta_inbox"}:
+            return self.process_cloud_state_delta_inbox(request_payload)
         if normalized in {"cloud.logout", "logout"}:
             return self.logout_cloud_account()
         if normalized in {"cloud.recover_uploads", "recover_uploads"}:
@@ -457,6 +461,8 @@ class AppCloudRuntimeSupport:
             return self.pull_cloud_state_delta(request_payload)
         if normalized in {"cloud.state_delta_diagnostics", "state_delta_diagnostics"}:
             return self.cloud_state_delta_diagnostics(request_payload)
+        if normalized in {"cloud.process_state_delta_inbox", "process_state_delta_inbox"}:
+            return self.process_cloud_state_delta_inbox(request_payload)
         delegate = getattr(self, "handle_command_for_main", None)
         if callable(delegate):
             return delegate(normalized, request_payload)
@@ -647,6 +653,17 @@ class AppCloudRuntimeSupport:
             failed_limit=_safe_int(request_payload.get("failed_limit") or request_payload.get("failedLimit"), 10)
         )
         return {"ok": True, "state_delta": diagnostics, "inbox": inbox_diagnostics}
+
+    def process_cloud_state_delta_inbox(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        streams = request_payload.get("streams") if isinstance(request_payload.get("streams"), list) else []
+        result = process_state_delta_inbox(
+            appliers=self._state_delta_appliers,
+            limit=_safe_int(request_payload.get("limit"), 100),
+            streams=[str(stream) for stream in streams],
+            include_failed=bool(request_payload.get("include_failed") or request_payload.get("includeFailed")),
+        )
+        return {"ok": bool(result.get("ok")), "state_delta_inbox": result}
 
     def cloud_request_with_refresh(self, operation: Callable[[Any, str], Any]) -> tuple[bool, Any, str]:
         store = self._session_store_factory()

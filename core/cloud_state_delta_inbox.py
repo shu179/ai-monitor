@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .app_paths import resolve_app_path
 from .local_account_space import account_scoped_path
@@ -88,6 +89,105 @@ class CloudStateDeltaInbox:
             "duplicates": duplicates,
             "streams": streams,
         }
+
+    def claim_pending(
+        self,
+        *,
+        limit: int = 100,
+        streams: list[str] | tuple[str, ...] | set[str] | None = None,
+        include_failed: bool = False,
+        applying_timeout_seconds: float = 300.0,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit or 100), 1000))
+        safe_streams = [str(stream or "").strip() for stream in (streams or []) if str(stream or "").strip()]
+        conditions = ["status = 'pending'"]
+        params: list[Any] = []
+        if include_failed:
+            conditions.append("status = 'failed'")
+        if applying_timeout_seconds and float(applying_timeout_seconds) > 0:
+            cutoff = (local_now() - timedelta(seconds=max(1.0, float(applying_timeout_seconds)))).isoformat(
+                timespec="seconds"
+            )
+            conditions.append("(status = 'applying' AND updated_at <= ?)")
+            params.append(cutoff)
+        where_sql = "(" + " OR ".join(conditions) + ")"
+        if safe_streams:
+            placeholders = ",".join("?" for _ in safe_streams)
+            where_sql += f" AND stream IN ({placeholders})"
+            params.extend(safe_streams)
+        params.append(safe_limit)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, identity_key, stream, seq, ref_id, kind, attempts,
+                       change_json, entity_json, object_refs_json, first_seen_at,
+                       updated_at, last_error
+                FROM state_delta_inbox
+                WHERE {where_sql}
+                ORDER BY stream ASC, seq ASC, id ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+            ids = [int(row[0] or 0) for row in rows if int(row[0] or 0) > 0]
+            if ids:
+                now = local_now().isoformat(timespec="seconds")
+                placeholders = ",".join("?" for _ in ids)
+                conn.execute(
+                    f"""
+                    UPDATE state_delta_inbox
+                    SET status = 'applying',
+                        attempts = attempts + 1,
+                        updated_at = ?,
+                        last_error = ''
+                    WHERE id IN ({placeholders})
+                    """,
+                    (now, *ids),
+                )
+        items = [_inbox_item_from_row(row) for row in rows]
+        for item in items:
+            item["status"] = "applying"
+            item["attempts"] = int(item.get("attempts") or 0) + 1
+        return items
+
+    def mark_applied(self, ids: list[int] | tuple[int, ...] | set[int]) -> int:
+        safe_ids = _safe_ids(ids)
+        if not safe_ids:
+            return 0
+        now = local_now().isoformat(timespec="seconds")
+        with self._connection() as conn:
+            placeholders = ",".join("?" for _ in safe_ids)
+            cursor = conn.execute(
+                f"""
+                UPDATE state_delta_inbox
+                SET status = 'applied',
+                    updated_at = ?,
+                    last_error = ''
+                WHERE id IN ({placeholders})
+                """,
+                (now, *safe_ids),
+            )
+        return int(cursor.rowcount or 0)
+
+    def mark_failed(self, ids: list[int] | tuple[int, ...] | set[int], message: str) -> int:
+        safe_ids = _safe_ids(ids)
+        if not safe_ids:
+            return 0
+        now = local_now().isoformat(timespec="seconds")
+        safe_message = str(message or "state-delta inbox processing failed").strip()[:1000]
+        with self._connection() as conn:
+            placeholders = ",".join("?" for _ in safe_ids)
+            cursor = conn.execute(
+                f"""
+                UPDATE state_delta_inbox
+                SET status = 'failed',
+                    updated_at = ?,
+                    last_error = ?
+                WHERE id IN ({placeholders})
+                """,
+                (now, safe_message, *safe_ids),
+            )
+        return int(cursor.rowcount or 0)
 
     def diagnostics(self, *, failed_limit: int = 10) -> dict[str, Any]:
         with self._connection() as conn:
@@ -244,6 +344,108 @@ def _object_refs_for_change(
             elif str(raw or "").strip():
                 object_ids.add(str(raw or "").strip())
     return [refs_by_id[object_id] for object_id in sorted(object_ids) if object_id in refs_by_id]
+
+
+def process_state_delta_inbox(
+    *,
+    inbox: CloudStateDeltaInbox | None = None,
+    appliers: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
+    limit: int = 100,
+    streams: list[str] | tuple[str, ...] | set[str] | None = None,
+    include_failed: bool = False,
+) -> dict[str, Any]:
+    target_inbox = inbox or CloudStateDeltaInbox()
+    applier_map = dict(appliers or {})
+    requested_streams = [str(stream or "").strip() for stream in (streams or []) if str(stream or "").strip()]
+    if requested_streams:
+        claim_streams = [stream for stream in requested_streams if stream in applier_map]
+        skipped_no_applier = len([stream for stream in requested_streams if stream not in applier_map])
+    else:
+        claim_streams = sorted(applier_map.keys())
+        skipped_no_applier = 0
+    if not claim_streams:
+        return {
+            "ok": True,
+            "claimed": 0,
+            "applied": 0,
+            "failed": 0,
+            "skipped_no_applier": skipped_no_applier,
+            "streams": {},
+        }
+    items = target_inbox.claim_pending(
+        limit=limit,
+        streams=claim_streams,
+        include_failed=include_failed,
+    )
+    applied = 0
+    failed = 0
+    by_stream: dict[str, dict[str, int]] = {}
+    for item in items:
+        stream = str(item.get("stream") or "")
+        applier = applier_map.get(stream)
+        by_stream.setdefault(stream, {"claimed": 0, "applied": 0, "failed": 0})
+        by_stream[stream]["claimed"] += 1
+        if not callable(applier):
+            target_inbox.mark_failed([int(item.get("id") or 0)], f"no state-delta applier registered for {stream}")
+            failed += 1
+            by_stream[stream]["failed"] += 1
+            continue
+        try:
+            applier(item)
+        except Exception as exc:
+            target_inbox.mark_failed([int(item.get("id") or 0)], str(exc))
+            failed += 1
+            by_stream[stream]["failed"] += 1
+            continue
+        target_inbox.mark_applied([int(item.get("id") or 0)])
+        applied += 1
+        by_stream[stream]["applied"] += 1
+    return {
+        "ok": failed == 0,
+        "claimed": len(items),
+        "applied": applied,
+        "failed": failed,
+        "skipped_no_applier": skipped_no_applier,
+        "streams": by_stream,
+    }
+
+
+def _safe_ids(ids: list[int] | tuple[int, ...] | set[int]) -> list[int]:
+    safe_ids: list[int] = []
+    for raw_id in ids or []:
+        try:
+            item_id = int(raw_id or 0)
+        except Exception:
+            item_id = 0
+        if item_id > 0:
+            safe_ids.append(item_id)
+    return safe_ids
+
+
+def _inbox_item_from_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
+    return {
+        "id": int(row[0] or 0),
+        "identity_key": str(row[1] or ""),
+        "stream": str(row[2] or ""),
+        "seq": int(row[3] or 0),
+        "ref_id": str(row[4] or ""),
+        "kind": str(row[5] or ""),
+        "attempts": int(row[6] or 0),
+        "change": _loads_json(row[7], {}),
+        "entity": _loads_json(row[8], {}),
+        "object_refs": _loads_json(row[9], []),
+        "first_seen_at": str(row[10] or ""),
+        "updated_at": str(row[11] or ""),
+        "last_error": str(row[12] or ""),
+    }
+
+
+def _loads_json(value: Any, default: Any) -> Any:
+    try:
+        loaded = json.loads(str(value or ""))
+    except Exception:
+        return default
+    return loaded if isinstance(loaded, type(default)) else default
 
 
 def _row_public(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:

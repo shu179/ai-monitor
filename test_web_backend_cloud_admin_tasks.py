@@ -885,6 +885,7 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
             {"ok": True, "message": "已退出云端"},
             {"ok": True, "metrics": {"event_count": 2}},
             {"ok": True, "state_delta": {"changes": 3}},
+            {"ok": True, "state_delta_inbox": {"applied": 1}},
             {"ok": True, "run_records": {"queued": 1}},
         ])  # type: ignore[method-assign]
 
@@ -896,6 +897,10 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         self.assertEqual(runtime.logout_cloud({}), {"ok": True, "message": "已退出云端"})
         self.assertEqual(runtime.flush_cloud_outbox({"limit": 7}), {"ok": True, "metrics": {"event_count": 2}})
         self.assertEqual(runtime.pull_cloud_state_delta({"limit": 50}), {"ok": True, "state_delta": {"changes": 3}})
+        self.assertEqual(
+            runtime.process_cloud_state_delta_inbox({"limit": 20}),
+            {"ok": True, "state_delta_inbox": {"applied": 1}},
+        )
         self.assertEqual(runtime._recover_cloud_run_history_uploads(), {"ok": True, "run_records": {"queued": 1}})  # noqa: SLF001
 
         self.assertEqual(
@@ -909,6 +914,7 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
                 unittest.mock.call("cloud.logout"),
                 unittest.mock.call("cloud.flush_outbox", {"limit": 7}),
                 unittest.mock.call("cloud.pull_state_delta", {"limit": 50}),
+                unittest.mock.call("cloud.process_state_delta_inbox", {"limit": 20}),
                 unittest.mock.call("cloud.recover_uploads"),
             ],
         )

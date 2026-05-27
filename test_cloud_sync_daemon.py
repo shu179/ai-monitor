@@ -79,6 +79,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertIn("cloud.outbox_diagnostics", DAEMON_SUPPORTED_COMMANDS)
         self.assertIn("cloud.pull_state_delta", DAEMON_SUPPORTED_COMMANDS)
         self.assertIn("cloud.state_delta_diagnostics", DAEMON_SUPPORTED_COMMANDS)
+        self.assertIn("cloud.process_state_delta_inbox", DAEMON_SUPPORTED_COMMANDS)
 
     def test_app_runtime_cloud_command_uses_transport_client(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)

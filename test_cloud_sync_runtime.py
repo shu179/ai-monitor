@@ -123,6 +123,7 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
 
     with (
         patch("core.cloud_sync_runtime.pull_cloud_state_delta", return_value={"ok": True, "changes": 3}) as pull_delta,
+        patch("core.cloud_sync_runtime.process_state_delta_inbox", return_value={"ok": True, "applied": 1}) as process_inbox,
         patch("core.cloud_sync_runtime.CloudStateDeltaStore") as store_cls,
         patch("core.cloud_sync_runtime.CloudStateDeltaInbox") as inbox_cls,
     ):
@@ -130,10 +131,18 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
         inbox_cls.return_value.diagnostics.return_value = {"by_status": {"pending": 1}}
 
         pull_result = support.handle_command("cloud.pull_state_delta", {"limit": 50, "max_pages": 2})
+        process_result = support.handle_command("cloud.process_state_delta_inbox", {"limit": 20, "streams": ["tasks"]})
         diagnostics = support.handle_command("cloud.state_delta_diagnostics")
 
     assert pull_result == {"ok": True, "state_delta": {"ok": True, "changes": 3}, "message": ""}
     pull_delta.assert_called_once_with(limit=50, max_pages=2)
+    assert process_result == {"ok": True, "state_delta_inbox": {"ok": True, "applied": 1}}
+    process_inbox.assert_called_once_with(
+        appliers={},
+        limit=20,
+        streams=["tasks"],
+        include_failed=False,
+    )
     assert diagnostics == {
         "ok": True,
         "state_delta": {"cursors": {"tasks": 2}},
