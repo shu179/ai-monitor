@@ -19,8 +19,8 @@ DEFAULT_BACKUP_DIR = Path("/opt/surfaced/backups")
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Create a local pg_dump backup for Surfaced Cloud.")
-    parser.add_argument("--output-dir", default=str(DEFAULT_BACKUP_DIR))
-    parser.add_argument("--retain-days", type=int, default=7)
+    parser.add_argument("--output-dir", default=os.environ.get("SURFACED_CLOUD_BACKUP_DIR", str(DEFAULT_BACKUP_DIR)))
+    parser.add_argument("--retain-days", type=int, default=int(os.environ.get("SURFACED_CLOUD_BACKUP_RETAIN_DAYS", "7") or 7))
     parser.add_argument("--no-gzip", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
