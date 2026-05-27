@@ -191,16 +191,17 @@ class ObjectUploadFlowTests(unittest.TestCase):
             + __import__("datetime").timedelta(minutes=10),
         )
         db = MagicMock()
-        db.scalar.side_effect = [upload_session, None]
+        db.scalar.side_effect = [upload_session, None, 0, 0]
         db.refresh.side_effect = lambda _obj: None
 
-        result = complete_object_upload(
-            db,
-            user,  # type: ignore[arg-type]
-            session_id="session-1",
-            storage_size_bytes=900,
-            compression="zstd",
-        )
+        with patch("app.services.object_storage_service.get_settings", return_value=_settings_with_local_dir("/tmp/object-data")):
+            result = complete_object_upload(
+                db,
+                user,  # type: ignore[arg-type]
+                session_id="session-1",
+                storage_size_bytes=900,
+                compression="zstd",
+            )
 
         self.assertEqual(result["status"], "active")
         self.assertEqual(result["storage_key"], f"7/{SHA[:2]}/{SHA[2:4]}/{SHA}")
@@ -209,6 +210,50 @@ class ObjectUploadFlowTests(unittest.TestCase):
         self.assertEqual(added_manifest.sha256, SHA)
         self.assertEqual(added_manifest.compression, "zstd")
         db.commit.assert_called_once()
+
+    @patch("app.services.object_storage_service.object_storage_client")
+    def test_complete_upload_rechecks_quota_before_manifest(self, client_factory) -> None:
+        from app.models import ObjectUploadSession
+        from app.services.object_storage_service import complete_object_upload
+
+        client = MagicMock()
+        client.is_local = False
+        client_factory.return_value = client
+        user = SimpleNamespace(workspace_id=7)
+        upload_session = ObjectUploadSession(
+            id="session-1",
+            workspace_id=7,
+            sha256=SHA,
+            size_bytes=1024,
+            content_type="text/plain",
+            storage_provider_upload_id="single-upload",
+            status="initiated",
+            part_size_bytes=LIMITS["multipart_part_bytes"],
+            parts_total=1,
+            parts_completed=0,
+            expires_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+            + __import__("datetime").timedelta(minutes=10),
+        )
+        db = MagicMock()
+        db.scalar.side_effect = [
+            upload_session,
+            None,
+            10 * 1024 * 1024 * 1024,
+            0,
+        ]
+
+        with patch("app.services.object_storage_service.get_settings", return_value=_settings_with_local_dir("/tmp/object-data")):
+            with self.assertRaises(ObjectStorageQuotaExceeded):
+                complete_object_upload(
+                    db,
+                    user,  # type: ignore[arg-type]
+                    session_id="session-1",
+                    storage_size_bytes=900,
+                    compression="zstd",
+                )
+
+        self.assertEqual(db.add.call_count, 0)
+        db.commit.assert_not_called()
 
     def test_local_upload_stream_writes_file_and_completes_manifest(self) -> None:
         from app.models import ObjectUploadSession
@@ -231,7 +276,7 @@ class ObjectUploadFlowTests(unittest.TestCase):
             + __import__("datetime").timedelta(minutes=10),
         )
         db = MagicMock()
-        db.scalar.side_effect = [upload_session, upload_session, None]
+        db.scalar.side_effect = [upload_session, upload_session, None, 0, 0]
         db.refresh.side_effect = lambda _obj: None
 
         async def chunks():

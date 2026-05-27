@@ -16,12 +16,12 @@ from urllib.parse import quote, urlencode, urlsplit
 from uuid import uuid4
 
 import httpx
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.models import ObjectManifest, ObjectUploadPart, ObjectUploadSession, User
-from app.services.sync_v2_service import LIMITS, TTL_SECONDS
+from app.services.sync_v2_service import LIMITS, TTL_SECONDS, workspace_bucket_advisory_lock_key
 
 OBJECT_UPLOAD_STATUS_INITIATED = "initiated"
 OBJECT_UPLOAD_STATUS_COMPLETED = "completed"
@@ -345,12 +345,14 @@ def complete_object_upload(
     )
     storage_key = object_storage_key(user.workspace_id, str(upload_session.sha256))
     client = object_storage_client()
+    local_path: Path | None = None
     if _is_local_upload_session(upload_session):
         path = local_object_path(storage_key)
         if not path.exists() or not path.is_file():
             raise ObjectStorageNotFound("local object file not found")
         if path.stat().st_size != safe_storage_size_bytes:
             raise ObjectStorageError("local object size mismatch")
+        local_path = path
     if int(upload_session.parts_total) > 1:
         parts = list(
             db.scalars(
@@ -367,6 +369,7 @@ def complete_object_upload(
             parts=[{"part_number": int(part.part_number), "etag": str(part.etag or "")} for part in parts],
         )
 
+    _lock_object_quota(db, workspace_id=user.workspace_id)
     manifest = db.scalar(
         select(ObjectManifest).where(
             ObjectManifest.workspace_id == user.workspace_id,
@@ -375,19 +378,30 @@ def complete_object_upload(
         )
     )
     if manifest is None:
-        manifest = ObjectManifest(
-            id=str(uuid4()),
-            workspace_id=user.workspace_id,
-            sha256=str(upload_session.sha256),
-            size_bytes=int(upload_session.size_bytes),
-            storage_size_bytes=safe_storage_size_bytes,
-            content_type=safe_content_type,
-            storage_key=storage_key,
-            compression=safe_compression,
-            ref_count=0,
-            status=OBJECT_MANIFEST_STATUS_ACTIVE,
-        )
-        db.add(manifest)
+        try:
+            _enforce_object_limits(
+                db,
+                workspace_id=user.workspace_id,
+                incoming_storage_size_bytes=safe_storage_size_bytes,
+                local_backend=client.is_local,
+            )
+            manifest = ObjectManifest(
+                id=str(uuid4()),
+                workspace_id=user.workspace_id,
+                sha256=str(upload_session.sha256),
+                size_bytes=int(upload_session.size_bytes),
+                storage_size_bytes=safe_storage_size_bytes,
+                content_type=safe_content_type,
+                storage_key=storage_key,
+                compression=safe_compression,
+                ref_count=0,
+                status=OBJECT_MANIFEST_STATUS_ACTIVE,
+            )
+            db.add(manifest)
+        except ObjectStorageQuotaExceeded:
+            if local_path is not None:
+                local_path.unlink(missing_ok=True)
+            raise
     upload_session.status = OBJECT_UPLOAD_STATUS_COMPLETED
     db.commit()
     db.refresh(manifest)
@@ -865,6 +879,19 @@ def _enforce_object_limits(
             used_bytes=int(used or 0),
             limit_bytes=quota,
         )
+
+
+def _lock_object_quota(db: Session, *, workspace_id: int) -> None:
+    """Serialize final object quota checks across concurrent upload completions."""
+    try:
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": workspace_bucket_advisory_lock_key(int(workspace_id), "object_storage")},
+        )
+    except Exception:
+        # SQLite and mocked unit sessions do not support advisory locks. The
+        # aggregate quota checks still run; production Postgres gets the lock.
+        return
 
 
 def _enforce_local_disk_headroom(incoming_size: int, *, settings: Settings) -> None:
