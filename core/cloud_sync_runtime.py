@@ -314,6 +314,26 @@ class AppCloudRuntimeSupport:
             return self.current_cloud_status()
         if normalized in {"cloud.status_from_session", "status_from_session"}:
             return self.cloud_status_from_session(request_payload.get("session"))
+        if normalized in {"cloud.list_admin_users", "list_admin_users"}:
+            return self._run_cloud_api_request("list_admin_users", request_payload)
+        if normalized in {"cloud.list_admin_article_classification_jobs", "list_admin_article_classification_jobs"}:
+            return self._run_cloud_api_request("list_admin_article_classification_jobs", request_payload)
+        if normalized in {"cloud.resolve_admin_article_classification_job", "resolve_admin_article_classification_job"}:
+            return self._run_cloud_api_request("resolve_admin_article_classification_job", request_payload)
+        if normalized in {"cloud.ignore_admin_article_classification_job", "ignore_admin_article_classification_job"}:
+            return self._run_cloud_api_request("ignore_admin_article_classification_job", request_payload)
+        if normalized in {"cloud.create_admin_user", "create_admin_user"}:
+            return self._run_cloud_api_request("create_admin_user", request_payload)
+        if normalized in {"cloud.update_admin_user", "update_admin_user"}:
+            return self._run_cloud_api_request("update_admin_user", request_payload)
+        if normalized in {"cloud.delete_admin_user", "delete_admin_user"}:
+            return self._run_cloud_api_request("delete_admin_user", request_payload)
+        if normalized in {"cloud.update_admin_task", "update_admin_task"}:
+            return self._run_cloud_api_request("update_admin_task", request_payload)
+        if normalized in {"cloud.delete_admin_task", "delete_admin_task"}:
+            return self._run_cloud_api_request("delete_admin_task", request_payload)
+        if normalized in {"cloud.restore_admin_task", "restore_admin_task"}:
+            return self._run_cloud_api_request("restore_admin_task", request_payload)
         if normalized in {"cloud.flush_outbox", "flush_outbox"}:
             return self.flush_cloud_outbox(request_payload)
         if normalized in {"cloud.logout", "logout"}:
@@ -556,6 +576,49 @@ class AppCloudRuntimeSupport:
                     user_id=refreshed_identity["user_id"],
                 )
             return False, None, str(retry_exc)
+
+    def _run_cloud_api_request(self, operation_name: str, request_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = request_payload if isinstance(request_payload, dict) else {}
+        body = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+
+        def operation(client: Any, token: str) -> Any:
+            if operation_name == "list_admin_users":
+                return client.list_admin_users(token)
+            if operation_name == "list_admin_article_classification_jobs":
+                return client.list_admin_article_classification_jobs(
+                    token,
+                    status=str(payload.get("status") or "unresolved").strip() or "unresolved",
+                    limit=_safe_int(payload.get("limit"), 200),
+                )
+            if operation_name == "resolve_admin_article_classification_job":
+                return client.resolve_admin_article_classification_job(
+                    token,
+                    _safe_int(payload.get("job_id") or payload.get("jobId"), 0),
+                    task_id=_safe_int(payload.get("task_id") or payload.get("taskId"), 0),
+                    reason=str(payload.get("reason") or "").strip(),
+                )
+            if operation_name == "ignore_admin_article_classification_job":
+                return client.ignore_admin_article_classification_job(
+                    token,
+                    _safe_int(payload.get("job_id") or payload.get("jobId"), 0),
+                    reason=str(payload.get("reason") or "").strip(),
+                )
+            if operation_name == "create_admin_user":
+                return client.create_admin_user(token, body)
+            if operation_name == "update_admin_user":
+                return client.update_admin_user(token, _safe_int(payload.get("user_id") or payload.get("userId"), 0), body)
+            if operation_name == "delete_admin_user":
+                return client.delete_admin_user(token, _safe_int(payload.get("user_id") or payload.get("userId"), 0))
+            if operation_name == "update_admin_task":
+                return client.update_admin_task(token, _safe_int(payload.get("task_id") or payload.get("taskId"), 0), body)
+            if operation_name == "delete_admin_task":
+                return client.delete_admin_task(token, _safe_int(payload.get("task_id") or payload.get("taskId"), 0))
+            if operation_name == "restore_admin_task":
+                return client.restore_admin_task(token, _safe_int(payload.get("task_id") or payload.get("taskId"), 0))
+            raise ValueError(f"unsupported cloud api request: {operation_name}")
+
+        ok, response_payload, message = self.cloud_request_with_refresh(operation)
+        return {"ok": bool(ok), "payload": response_payload, "message": message}
 
     def _load_runtime_config(self) -> dict[str, Any]:
         if callable(getattr(self._owner, "load_config", None)):

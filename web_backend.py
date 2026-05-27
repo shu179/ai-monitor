@@ -4209,6 +4209,12 @@ return changedCount
     def _cloud_runtime_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._ensure_cloud_runtime_support().handle_command(command, payload)
 
+    def _cloud_runtime_payload_command(self, command: str, payload: dict[str, Any] | None = None) -> tuple[bool, Any, str]:
+        result = self._cloud_runtime_command(command, payload)
+        if not isinstance(result, dict):
+            return False, None, ""
+        return bool(result.get("ok")), result.get("payload"), str(result.get("message") or "")
+
     def _validate_cloud_session_if_needed(self, *, force: bool = False) -> None:
         self._cloud_runtime_command("cloud.validate_session", {"force": force})
 
@@ -4432,7 +4438,7 @@ return changedCount
         user = session.get("user") if isinstance(session.get("user"), dict) else {}
         if str(user.get("role") or "").strip() != "admin":
             return {"ok": False, "message": "当前云端账号不是管理员", "users": [], "cloud": self.get_cloud_status().get("cloud")}
-        ok, users, message = self._cloud_request_with_refresh(lambda client, token: client.list_admin_users(token))
+        ok, users, message = self._cloud_runtime_payload_command("cloud.list_admin_users")
         if not ok:
             return {"ok": False, "message": message or "云端账号获取失败", "users": [], "cloud": self.get_cloud_status().get("cloud")}
         return {"ok": True, "message": "云端账号已刷新", "users": users if isinstance(users, list) else [], "cloud": self.get_cloud_status().get("cloud")}
@@ -4442,8 +4448,9 @@ return changedCount
         user = session.get("user") if isinstance(session.get("user"), dict) else {}
         if str(user.get("role") or "").strip() != "admin":
             return {"ok": False, "message": "当前云端账号不是管理员", "jobs": [], "cloud": self.get_cloud_status().get("cloud")}
-        ok, jobs, message = self._cloud_request_with_refresh(
-            lambda client, token: client.list_admin_article_classification_jobs(token, status="unresolved", limit=200)
+        ok, jobs, message = self._cloud_runtime_payload_command(
+            "cloud.list_admin_article_classification_jobs",
+            {"status": "unresolved", "limit": 200},
         )
         if not ok:
             return {"ok": False, "message": message or "未归类文章获取失败", "jobs": [], "cloud": self.get_cloud_status().get("cloud")}
@@ -4483,8 +4490,9 @@ return changedCount
         if job_id <= 0 or task_id <= 0:
             return {"ok": False, "message": "请选择文章和归属品牌", "cloud": self.get_cloud_status().get("cloud")}
         reason = str(request_payload.get("reason") or "管理员归类未归类文章").strip()
-        ok, job, message = self._cloud_request_with_refresh(
-            lambda client, token: client.resolve_admin_article_classification_job(token, job_id, task_id=task_id, reason=reason)
+        ok, job, message = self._cloud_runtime_payload_command(
+            "cloud.resolve_admin_article_classification_job",
+            {"job_id": job_id, "task_id": task_id, "reason": reason},
         )
         if not ok:
             return {"ok": False, "message": message or "文章归类失败", "cloud": self.get_cloud_status().get("cloud")}
@@ -4507,8 +4515,9 @@ return changedCount
         if job_id <= 0:
             return {"ok": False, "message": "缺少未归类文章 ID", "cloud": self.get_cloud_status().get("cloud")}
         reason = str(request_payload.get("reason") or "管理员忽略未归类文章").strip()
-        ok, job, message = self._cloud_request_with_refresh(
-            lambda client, token: client.ignore_admin_article_classification_job(token, job_id, reason=reason)
+        ok, job, message = self._cloud_runtime_payload_command(
+            "cloud.ignore_admin_article_classification_job",
+            {"job_id": job_id, "reason": reason},
         )
         if not ok:
             return {"ok": False, "message": message or "文章忽略失败", "cloud": self.get_cloud_status().get("cloud")}
@@ -4553,9 +4562,7 @@ return changedCount
         if role == "viewer":
             create_payload["view_all_tasks"] = view_all_tasks
             create_payload["visible_task_ids"] = _normalize_cloud_task_id_list(visible_task_ids)
-        ok, created_user, message = self._cloud_request_with_refresh(
-            lambda client, token: client.create_admin_user(token, create_payload)
-        )
+        ok, created_user, message = self._cloud_runtime_payload_command("cloud.create_admin_user", {"payload": create_payload})
         if not ok:
             return {"ok": False, "message": message or "云端账号创建失败", "cloud": self.get_cloud_status().get("cloud")}
         return {
@@ -4606,8 +4613,9 @@ return changedCount
         if not update_payload:
             return {"ok": False, "message": "没有可保存的账号改动", "cloud": self.get_cloud_status().get("cloud")}
 
-        ok, updated_user, message = self._cloud_request_with_refresh(
-            lambda client, token: client.update_admin_user(token, user_id, update_payload)
+        ok, updated_user, message = self._cloud_runtime_payload_command(
+            "cloud.update_admin_user",
+            {"user_id": user_id, "payload": update_payload},
         )
         if not ok:
             return {"ok": False, "message": message or "云端账号保存失败", "cloud": self.get_cloud_status().get("cloud")}
@@ -4627,9 +4635,7 @@ return changedCount
         user_id = _safe_int(request_payload.get("user_id") or request_payload.get("userId"), 0)
         if user_id <= 0:
             return {"ok": False, "message": "缺少云端账号 ID", "cloud": self.get_cloud_status().get("cloud")}
-        ok, _payload, message = self._cloud_request_with_refresh(
-            lambda client, token: client.delete_admin_user(token, user_id)
-        )
+        ok, _payload, message = self._cloud_runtime_payload_command("cloud.delete_admin_user", {"user_id": user_id})
         if not ok:
             return {"ok": False, "message": message or "云端账号删除失败", "cloud": self.get_cloud_status().get("cloud")}
         return {"ok": True, "message": "云端账号已删除", "cloud": self.get_cloud_status().get("cloud")}
@@ -4870,8 +4876,9 @@ return changedCount
         if not update_payload:
             return {"ok": False, "message": "没有可保存的云端任务改动", "cloud": self.get_cloud_status().get("cloud")}
 
-        ok, task, message = self._cloud_request_with_refresh(
-            lambda client, token: client.update_admin_task(token, task_id, update_payload)
+        ok, task, message = self._cloud_runtime_payload_command(
+            "cloud.update_admin_task",
+            {"task_id": task_id, "payload": update_payload},
         )
         if not ok:
             return {"ok": False, "message": message or "云端任务保存失败", "cloud": self.get_cloud_status().get("cloud")}
@@ -5000,9 +5007,7 @@ return changedCount
         cloud_task_id = _safe_int(request_payload.get("task_id") or request_payload.get("taskId"), 0)
         if cloud_task_id <= 0:
             return {"ok": False, "message": "缺少云端任务 ID", "cloud": self.get_cloud_status().get("cloud")}
-        ok, _payload, message = self._cloud_request_with_refresh(
-            lambda client, token: client.delete_admin_task(token, cloud_task_id)
-        )
+        ok, _payload, message = self._cloud_runtime_payload_command("cloud.delete_admin_task", {"task_id": cloud_task_id})
         if not ok:
             return {"ok": False, "message": message or "云端任务删除失败", "cloud": self.get_cloud_status().get("cloud")}
         return {"ok": True, "message": "云端任务已软删除", "cloud": self.get_cloud_status().get("cloud")}
@@ -5016,8 +5021,9 @@ return changedCount
         cloud_task_id = _safe_int(request_payload.get("task_id") or request_payload.get("taskId"), 0)
         if cloud_task_id <= 0:
             return {"ok": False, "message": "缺少云端任务 ID", "cloud": self.get_cloud_status().get("cloud")}
-        ok, task, message = self._cloud_request_with_refresh(
-            lambda client, token: client.restore_admin_task(token, cloud_task_id)
+        ok, task, message = self._cloud_runtime_payload_command(
+            "cloud.restore_admin_task",
+            {"task_id": cloud_task_id},
         )
         if not ok:
             return {"ok": False, "message": message or "云端任务恢复失败", "cloud": self.get_cloud_status().get("cloud")}
@@ -7311,9 +7317,7 @@ return changedCount
             self._cloud_runtime_command("cloud.flush_outbox", {"limit": 10000})
         except Exception as exc:
             print(f"[WebBackend] 删除任务前上传云端 outbox 失败，将继续尝试删除: {exc}")
-        ok, _payload, message = self._cloud_request_with_refresh(
-            lambda client, token: client.delete_admin_task(token, cloud_task_id)
-        )
+        ok, _payload, message = self._cloud_runtime_payload_command("cloud.delete_admin_task", {"task_id": cloud_task_id})
         if not ok:
             return False, message or "云端任务删除失败"
         return True, ""
@@ -7324,8 +7328,9 @@ return changedCount
             return True, "", {}
         if self._current_cloud_role() != "admin":
             return False, "只有管理员账号可以恢复云端品牌任务", {}
-        ok, task, message = self._cloud_request_with_refresh(
-            lambda client, token: client.restore_admin_task(token, cloud_task_id)
+        ok, task, message = self._cloud_runtime_payload_command(
+            "cloud.restore_admin_task",
+            {"task_id": cloud_task_id},
         )
         if not ok:
             return False, message or "云端任务恢复失败", {}

@@ -334,6 +334,61 @@ def test_app_cloud_runtime_support_command_returns_current_status_variants():
     support.cloud_status_from_session.assert_called_once_with({"access_token": "token"})
 
 
+def test_app_cloud_runtime_support_command_lists_admin_users_via_cloud_request():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+
+    class FakeClient:
+        def list_admin_users(self, _token: str):
+            return [{"id": 1, "username": "operator"}]
+
+    support.cloud_request_with_refresh = Mock(side_effect=lambda operation: (True, operation(FakeClient(), "access-token"), ""))
+
+    result = support.handle_command("cloud.list_admin_users")
+
+    assert result == {"ok": True, "payload": [{"id": 1, "username": "operator"}], "message": ""}
+
+
+def test_app_cloud_runtime_support_command_resolves_article_classification_job():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+
+    class FakeClient:
+        def resolve_admin_article_classification_job(self, _token: str, job_id: int, *, task_id: int, reason: str = ""):
+            return {"job_id": job_id, "task_id": task_id, "reason": reason}
+
+    support.cloud_request_with_refresh = Mock(side_effect=lambda operation: (True, operation(FakeClient(), "access-token"), ""))
+
+    result = support.handle_command(
+        "cloud.resolve_admin_article_classification_job",
+        {"job_id": 11, "task_id": 3, "reason": "manual"},
+    )
+
+    assert result == {"ok": True, "payload": {"job_id": 11, "task_id": 3, "reason": "manual"}, "message": ""}
+
+
+def test_app_cloud_runtime_support_command_updates_admin_user_with_payload():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+
+    class FakeClient:
+        def update_admin_user(self, _token: str, user_id: int, payload: dict[str, Any]):
+            return {"user_id": user_id, "payload": payload}
+
+    support.cloud_request_with_refresh = Mock(side_effect=lambda operation: (True, operation(FakeClient(), "access-token"), ""))
+
+    result = support.handle_command(
+        "cloud.update_admin_user",
+        {"user_id": 2, "payload": {"visible_task_ids": [8, 9]}},
+    )
+
+    assert result == {
+        "ok": True,
+        "payload": {"user_id": 2, "payload": {"visible_task_ids": [8, 9]}},
+        "message": "",
+    }
+
+
 def test_app_cloud_runtime_support_command_schedules_article_snapshot():
     owner = _support_owner()
     started: list[object] = []

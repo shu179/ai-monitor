@@ -491,11 +491,22 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
 
     def test_update_cloud_admin_user_preserves_custom_viewer_task_ids(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
-        client = FakeAdminUserClient()
         runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]
-        runtime._cloud_request_with_refresh = Mock(  # type: ignore[method-assign]
-            side_effect=lambda operation: (True, operation(client, "access-token"), "")
-        )
+        runtime._cloud_runtime_command = Mock(return_value={  # type: ignore[method-assign]
+            "ok": True,
+            "payload": {
+                "id": 2,
+                "workspace_id": 1,
+                "username": "林见路",
+                "role": "viewer",
+                "display_name": "林见路",
+                "view_all_tasks": False,
+                "visible_task_ids": [8, 9],
+                "enabled": True,
+                "token_version": 1,
+                "created_at": "2026-05-06T00:00:00Z",
+            },
+        })
 
         with patch("web_backend.CloudSessionStore", return_value=FakeCloudSessionStore()):
             result = runtime.update_cloud_admin_user({
@@ -507,31 +518,65 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
             })
 
         self.assertTrue(result["ok"])
-        self.assertEqual(client.updated[0]["payload"]["visible_task_ids"], [8, 9])
         self.assertEqual(result["user"]["visible_task_ids"], [8, 9])
+        runtime._cloud_runtime_command.assert_called_once_with(  # type: ignore[attr-defined]
+            "cloud.update_admin_user",
+            {
+                "user_id": 2,
+                "payload": {
+                    "username": "林见路",
+                    "display_name": "林见路",
+                    "view_all_tasks": False,
+                    "visible_task_ids": [8, 9],
+                },
+            },
+        )
+
+    def test_list_cloud_admin_users_routes_runtime_command_boundary(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]
+        runtime._cloud_runtime_command = Mock(return_value={  # type: ignore[method-assign]
+            "ok": True,
+            "payload": [{"id": 2, "username": "operator-2"}],
+        })
+
+        with patch("web_backend.CloudSessionStore", return_value=FakeCloudSessionStore()):
+            result = runtime.list_cloud_admin_users()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["users"][0]["username"], "operator-2")
+        runtime._cloud_runtime_command.assert_called_once_with("cloud.list_admin_users", None)  # type: ignore[attr-defined]
 
     def test_list_cloud_article_classification_jobs_forwards_admin_request(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
-        client = FakeArticleClassificationClient()
         runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]
-        runtime._cloud_request_with_refresh = Mock(  # type: ignore[method-assign]
-            side_effect=lambda operation: (True, operation(client, "access-token"), "")
-        )
+        runtime._cloud_runtime_command = Mock(return_value={  # type: ignore[method-assign]
+            "ok": True,
+            "payload": [
+                {
+                    "id": 11,
+                    "article": {"title": "未归类文章"},
+                }
+            ],
+        })
 
         with patch("web_backend.CloudSessionStore", return_value=FakeCloudSessionStore()):
             result = runtime.list_cloud_article_classification_jobs()
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["jobs"][0]["article"]["title"], "未归类文章")
-        self.assertEqual(client.last_list_args, {"status": "unresolved", "limit": 200})
+        runtime._cloud_runtime_command.assert_called_once_with(  # type: ignore[attr-defined]
+            "cloud.list_admin_article_classification_jobs",
+            {"status": "unresolved", "limit": 200},
+        )
 
     def test_resolve_cloud_article_classification_job_refreshes_articles(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
-        client = FakeArticleClassificationClient()
         runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]
-        runtime._cloud_request_with_refresh = Mock(  # type: ignore[method-assign]
-            side_effect=lambda operation: (True, operation(client, "access-token"), "")
-        )
+        runtime._cloud_runtime_command = Mock(return_value={  # type: ignore[method-assign]
+            "ok": True,
+            "payload": {"id": 11, "task_id": 3},
+        })
         runtime._refresh_cloud_articles_after_classification_change = Mock(  # type: ignore[method-assign]
             return_value={"ok": True, "imported": 1}
         )
@@ -540,9 +585,77 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
             result = runtime.resolve_cloud_article_classification_job({"job_id": 11, "task_id": 3})
 
         self.assertTrue(result["ok"])
-        self.assertEqual(client.resolved[0]["job_id"], 11)
-        self.assertEqual(client.resolved[0]["task_id"], 3)
+        runtime._cloud_runtime_command.assert_called_once_with(  # type: ignore[attr-defined]
+            "cloud.resolve_admin_article_classification_job",
+            {"job_id": 11, "task_id": 3, "reason": "管理员归类未归类文章"},
+        )
         runtime._refresh_cloud_articles_after_classification_change.assert_called_once()
+
+    def test_create_cloud_admin_user_routes_runtime_command_boundary(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]
+        runtime._cloud_runtime_command = Mock(return_value={  # type: ignore[method-assign]
+            "ok": True,
+            "payload": {"id": 9, "visible_task_ids": [8, 9]},
+        })
+
+        with patch("web_backend.CloudSessionStore", return_value=FakeCloudSessionStore()):
+            result = runtime.create_cloud_admin_user({
+                "username": "viewer9",
+                "password": "Password123",
+                "role": "viewer",
+                "view_all_tasks": False,
+                "visible_task_ids": [8, 9],
+            })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["user"]["visible_task_ids"], [8, 9])
+        runtime._cloud_runtime_command.assert_called_once_with(  # type: ignore[attr-defined]
+            "cloud.create_admin_user",
+            {
+                "payload": {
+                    "username": "viewer9",
+                    "password": "Password123",
+                    "role": "viewer",
+                    "display_name": None,
+                    "email": None,
+                    "birthday": None,
+                    "hire_date": None,
+                    "view_all_tasks": False,
+                    "visible_task_ids": [8, 9],
+                },
+            },
+        )
+
+    def test_update_cloud_admin_task_routes_runtime_command_boundary(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]
+        runtime._cloud_runtime_command = Mock(return_value={  # type: ignore[method-assign]
+            "ok": True,
+            "payload": {"id": 42, "name": "Brand A"},
+        })
+
+        with patch("web_backend.CloudSessionStore", return_value=FakeCloudSessionStore()):
+            result = runtime.update_cloud_admin_task({
+                "task_id": 42,
+                "name": "Brand A",
+                "enabled": True,
+                "expected_config_version": 7,
+            })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["task"]["id"], 42)
+        runtime._cloud_runtime_command.assert_called_once_with(  # type: ignore[attr-defined]
+            "cloud.update_admin_task",
+            {
+                "task_id": 42,
+                "payload": {
+                    "name": "Brand A",
+                    "enabled": True,
+                    "expected_config_version": 7,
+                },
+            },
+        )
 
     def test_operator_article_visibility_keeps_only_current_visible_brands(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
@@ -776,27 +889,54 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
     def test_delete_cloud_task_flushes_outbox_through_runtime_support(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         runtime._current_cloud_role = Mock(return_value="admin")  # type: ignore[method-assign]
-        runtime._cloud_request_with_refresh = Mock(return_value=(True, {}, ""))  # type: ignore[method-assign]
-        runtime._cloud_runtime_command = Mock(return_value={"ok": True})  # type: ignore[method-assign]
+        runtime._cloud_runtime_command = Mock(side_effect=[  # type: ignore[method-assign]
+            {"ok": True},
+            {"ok": True, "payload": {}},
+        ])
 
         ok, message = runtime._delete_cloud_task_for_local_task({"cloud_task_id": 42})  # noqa: SLF001
 
         self.assertTrue(ok)
         self.assertEqual(message, "")
-        runtime._cloud_runtime_command.assert_called_once_with("cloud.flush_outbox", {"limit": 10000})
-        runtime._cloud_request_with_refresh.assert_called_once()
+        self.assertEqual(  # type: ignore[attr-defined]
+            runtime._cloud_runtime_command.call_args_list,
+            [
+                unittest.mock.call("cloud.flush_outbox", {"limit": 10000}),
+                unittest.mock.call("cloud.delete_admin_task", {"task_id": 42}),
+            ],
+        )
 
     def test_delete_cloud_task_continues_when_predelete_flush_fails(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         runtime._current_cloud_role = Mock(return_value="admin")  # type: ignore[method-assign]
-        runtime._cloud_request_with_refresh = Mock(return_value=(True, {}, ""))  # type: ignore[method-assign]
-        runtime._cloud_runtime_command = Mock(side_effect=RuntimeError("flush failed"))  # type: ignore[method-assign]
+        runtime._cloud_runtime_command = Mock(side_effect=[  # type: ignore[method-assign]
+            RuntimeError("flush failed"),
+            {"ok": True, "payload": {}},
+        ])
 
         ok, message = runtime._delete_cloud_task_for_local_task({"cloud_task_id": 42})  # noqa: SLF001
 
         self.assertTrue(ok)
         self.assertEqual(message, "")
-        runtime._cloud_request_with_refresh.assert_called_once()
+        self.assertEqual(runtime._cloud_runtime_command.call_count, 2)  # type: ignore[attr-defined]
+
+    def test_restore_cloud_deleted_task_routes_runtime_command_boundary(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._current_cloud_role = Mock(return_value="admin")  # type: ignore[method-assign]
+        runtime._cloud_runtime_command = Mock(return_value={  # type: ignore[method-assign]
+            "ok": True,
+            "payload": {"id": 42, "name": "Brand A"},
+        })
+
+        ok, message, task = runtime._restore_cloud_deleted_task({"cloud_task_id": 42})  # noqa: SLF001
+
+        self.assertTrue(ok)
+        self.assertEqual(message, "")
+        self.assertEqual(task["id"], 42)
+        runtime._cloud_runtime_command.assert_called_once_with(  # type: ignore[attr-defined]
+            "cloud.restore_admin_task",
+            {"task_id": 42},
+        )
 
     def test_operator_article_upload_snapshot_keeps_unmatched_candidates(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
