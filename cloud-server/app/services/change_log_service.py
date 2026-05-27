@@ -160,21 +160,65 @@ def wait_for_workspace_change_notifications(
     payload limit.
     """
     deadline = time.monotonic() + max(0.1, float(timeout_seconds or 0.1))
-    url = database_url or get_settings().database_url
-    try:
-        with psycopg.connect(url.replace("postgresql+psycopg://", "postgresql://"), autocommit=True) as conn:
-            conn.execute(f"LISTEN {CHANGE_NOTIFY_CHANNEL}")
-            while time.monotonic() < deadline:
-                remaining = max(0.0, deadline - time.monotonic())
-                for notify in conn.notifies(timeout=remaining, stop_after=1):
+    with WorkspaceChangeNotificationListener(workspace_id=workspace_id, database_url=database_url) as listener:
+        while time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            payloads = listener.wait(timeout_seconds=remaining)
+            if not payloads:
+                break
+            yield from payloads
+
+
+class WorkspaceChangeNotificationListener:
+    """Hold one Postgres LISTEN connection for an SSE stream lifecycle."""
+
+    def __init__(self, *, workspace_id: int, database_url: str | None = None) -> None:
+        self.workspace_id = int(workspace_id)
+        self.database_url = database_url
+        self._conn: Any | None = None
+
+    def __enter__(self) -> "WorkspaceChangeNotificationListener":
+        url = self.database_url or get_settings().database_url
+        try:
+            self._conn = psycopg.connect(url.replace("postgresql+psycopg://", "postgresql://"), autocommit=True)
+            self._conn.execute(f"LISTEN {CHANGE_NOTIFY_CHANNEL}")
+        except Exception:
+            self.close()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        conn = self._conn
+        self._conn = None
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception:
+            return
+
+    def wait(self, *, timeout_seconds: float) -> list[dict[str, Any]]:
+        safe_timeout = max(0.0, float(timeout_seconds or 0.0))
+        if self._conn is None:
+            if safe_timeout > 0:
+                time.sleep(safe_timeout)
+            return []
+        deadline = time.monotonic() + safe_timeout
+        while time.monotonic() <= deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                for notify in self._conn.notifies(timeout=remaining, stop_after=1):
                     payload = _decode_notify_payload(notify.payload)
-                    if int(payload.get("workspace_id") or 0) == int(workspace_id):
-                        yield payload
+                    if int(payload.get("workspace_id") or 0) == self.workspace_id:
+                        return [payload]
                     break
                 else:
-                    break
-    except Exception:
-        return
+                    return []
+            except Exception:
+                return []
+        return []
 
 
 def _notify_workspace_change(db: Session, *, workspace_id: int, stream: str, seq: int) -> None:
