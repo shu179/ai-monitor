@@ -208,7 +208,6 @@ from core.cloud_outbox import CloudOutbox
 from core.cloud_run_sync import (
     enqueue_profile_update,
     enqueue_task_day_status,
-    flush_cloud_outbox as flush_cloud_outbox_events,
 )
 from core.cloud_sync_runtime import AppCloudRuntimeSupport, LocalCloudSyncRuntime, create_local_cloud_sync_runtime
 from core.cloud_session_store import (
@@ -7318,7 +7317,7 @@ return changedCount
         if self._current_cloud_role() != "admin":
             return False, "只有管理员账号可以删除云端品牌任务"
         try:
-            flush_cloud_outbox_events(limit=10000)
+            self._ensure_cloud_runtime_support().flush_cloud_outbox({"limit": 10000})
         except Exception as exc:
             print(f"[WebBackend] 删除任务前上传云端 outbox 失败，将继续尝试删除: {exc}")
         ok, _payload, message = self._cloud_request_with_refresh(
