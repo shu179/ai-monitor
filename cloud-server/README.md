@@ -97,9 +97,12 @@ SURFACED_CLOUD_DB_MAX_OVERFLOW=10
 SURFACED_CLOUD_DB_STATEMENT_TIMEOUT_MS=5000
 SURFACED_CLOUD_WORKER_DB_STATEMENT_TIMEOUT_MS=60000
 SURFACED_CLOUD_WORKER_BATCH_LIMIT=100
+SURFACED_CLOUD_WORKER_MAINTENANCE_ENABLED=true
+SURFACED_CLOUD_WORKER_MAINTENANCE_INTERVAL_SECONDS=900
 ```
 
 API 保持 5s statement timeout，worker 使用 60s statement timeout；迁移进程不设置 statement timeout。生产多实例部署时建议再加 PgBouncer transaction pooling，避免 `API workers × pool_size + worker pool` 把 Postgres 连接数打满。
+worker 默认每 15 分钟尝试抢一个 Postgres advisory lock，只有抢到的实例会执行一次云端维护清理，包含过期 upload session、过期 change log、过期 dead letter 和本地孤儿对象文件。
 
 Cloud Sync v2 观测：
 

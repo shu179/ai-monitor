@@ -49,11 +49,13 @@ from app.services.sync_v2_worker import (  # noqa: E402
     _mark_item_dead_letter,
     _mark_item_done,
     _mirror_legacy_sync_event,
+    _run_worker_maintenance_if_due,
     _release_item_for_retry,
     claim_sync_batch_items,
     list_pending_sync_item_shards,
     process_sync_batch_items_once,
     renew_sync_worker_shard_leases,
+    run_sync_v2_worker,
 )
 
 
@@ -257,6 +259,46 @@ class SyncV2WorkerSqlTests(unittest.TestCase):
         sql = str(db.execute.call_args.args[0])
         self.assertEqual(sql, "SET statement_timeout = 60000")
         self.assertEqual(db.execute.call_args.args[1:], ())
+
+    @patch("app.services.sync_v2_worker.run_cloud_maintenance", return_value={"dry_run": False})
+    def test_worker_maintenance_runs_under_advisory_lock(self, maintenance) -> None:
+        db = MagicMock()
+        db.scalar.return_value = True
+
+        self.assertTrue(_run_worker_maintenance_if_due(db, worker_id="w1"))
+
+        maintenance.assert_called_once_with(db, dry_run=False)
+        sql_calls = "\n".join(str(call.args[0]).lower() for call in db.execute.call_args_list)
+        self.assertIn("pg_advisory_unlock", sql_calls)
+        self.assertGreaterEqual(db.commit.call_count, 1)
+
+    @patch("app.services.sync_v2_worker.run_cloud_maintenance")
+    def test_worker_maintenance_skips_when_lock_is_busy(self, maintenance) -> None:
+        db = MagicMock()
+        db.scalar.return_value = False
+
+        self.assertFalse(_run_worker_maintenance_if_due(db, worker_id="w1"))
+
+        maintenance.assert_not_called()
+
+    @patch("app.services.sync_v2_worker.process_sync_batch_items_once", return_value={"claimed": 0})
+    @patch("app.services.sync_v2_worker._run_worker_maintenance_if_due", return_value=True)
+    @patch("app.services.sync_v2_worker.time.sleep")
+    def test_run_worker_triggers_periodic_maintenance(self, _sleep, maintenance, process_once) -> None:
+        db = MagicMock()
+        db.__enter__.return_value = db
+        session_factory = MagicMock(return_value=db)
+
+        run_sync_v2_worker(
+            session_factory=session_factory,
+            worker_id="w1",
+            shard_ids=[1],
+            stop_after=1,
+            maintenance_interval_seconds=1,
+        )
+
+        maintenance.assert_called_once_with(db, worker_id="w1")
+        process_once.assert_called_once()
 
     @patch("app.services.sync_v2_worker.renew_sync_worker_shard_leases", return_value=[1, 2])
     def test_claim_uses_cte_not_update_limit_and_matches_created_at(self, _renew) -> None:

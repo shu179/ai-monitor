@@ -22,6 +22,9 @@ def main() -> None:
         poll_seconds=float(os.environ.get("SURFACED_CLOUD_WORKER_POLL_SECONDS", "1")),
         batch_limit=int(os.environ.get("SURFACED_CLOUD_WORKER_BATCH_LIMIT", "100")),
         statement_timeout_ms=int(settings.worker_db_statement_timeout_ms),
+        maintenance_interval_seconds=float(os.environ.get("SURFACED_CLOUD_WORKER_MAINTENANCE_INTERVAL_SECONDS", "900")),
+        maintenance_enabled=os.environ.get("SURFACED_CLOUD_WORKER_MAINTENANCE_ENABLED", "true").strip().lower()
+        not in {"0", "false", "no", "off"},
     )
 
 

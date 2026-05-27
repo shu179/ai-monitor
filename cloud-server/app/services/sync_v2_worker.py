@@ -10,12 +10,15 @@ from sqlalchemy.orm import Session
 
 from app.models import SyncBatch, SyncEvent, User
 from app.schemas import SyncEventIn
+from app.services.cloud_maintenance_service import run_cloud_maintenance
 from app.services.sync_service import _materialize_known_event, _sanitize_sync_event_payload
 from app.services.sync_v2_service import shard_advisory_lock_key
 
 WORKER_LEASE_SECONDS = 60
 WORKER_HEARTBEAT_SECONDS = 15
 MAX_MATERIALIZE_ATTEMPTS = 5
+DEFAULT_MAINTENANCE_INTERVAL_SECONDS = 15 * 60
+MAINTENANCE_LOCK_KEY = 910_202_605_27
 logger = logging.getLogger(__name__)
 
 
@@ -292,12 +295,19 @@ def run_sync_v2_worker(
     batch_limit: int = 100,
     stop_after: int | None = None,
     statement_timeout_ms: int | None = None,
+    maintenance_interval_seconds: float = DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
+    maintenance_enabled: bool = True,
 ) -> None:
     iterations = 0
+    last_maintenance_at = 0.0
     while True:
         with session_factory() as db:
             if statement_timeout_ms is not None:
                 _apply_statement_timeout(db, statement_timeout_ms)
+            now = time.monotonic()
+            if maintenance_enabled and now - last_maintenance_at >= max(1.0, float(maintenance_interval_seconds or 0)):
+                _run_worker_maintenance_if_due(db, worker_id=worker_id)
+                last_maintenance_at = now
             stats = process_sync_batch_items_once(
                 db,
                 worker_id=worker_id,
@@ -309,6 +319,29 @@ def run_sync_v2_worker(
             return
         if stats.get("claimed", 0) <= 0:
             time.sleep(max(0.1, float(poll_seconds or 1.0)))
+
+
+def _run_worker_maintenance_if_due(db: Session, *, worker_id: str) -> bool:
+    locked = db.scalar(
+        text("SELECT pg_try_advisory_lock(:lock_key)"),
+        {"lock_key": MAINTENANCE_LOCK_KEY},
+    )
+    if not locked:
+        return False
+    try:
+        result = run_cloud_maintenance(db, dry_run=False)
+        logger.info("[CloudSyncWorker] maintenance worker_id=%s result=%s", worker_id, result)
+        return True
+    except Exception:
+        db.rollback()
+        logger.exception("[CloudSyncWorker] maintenance failed worker_id=%s", worker_id)
+        return False
+    finally:
+        try:
+            db.execute(text("SELECT pg_advisory_unlock(:lock_key)"), {"lock_key": MAINTENANCE_LOCK_KEY})
+            db.commit()
+        except Exception:
+            db.rollback()
 
 
 def _apply_statement_timeout(db: Session, timeout_ms: int) -> None:
