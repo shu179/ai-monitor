@@ -194,10 +194,12 @@ async def store_local_object_upload_content(
     if not _is_local_upload_session(upload_session):
         raise ObjectStorageError("upload session is not local-backed")
     expected_size = int(upload_session.size_bytes)
-    if expected_size > _max_file_bytes():
+    settings = get_settings()
+    if expected_size > _max_file_bytes(settings):
         raise ObjectStorageQuotaExceeded("object exceeds local max file size")
+    _enforce_local_disk_headroom(expected_size, settings=settings)
     storage_key = object_storage_key(user.workspace_id, str(upload_session.sha256))
-    path = local_object_path(storage_key)
+    path = local_object_path(storage_key, settings=settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + f".tmp-{uuid4().hex}")
     digest = hashlib.sha256()
@@ -210,10 +212,11 @@ async def store_local_object_upload_content(
                 actual_size += len(chunk)
                 if actual_size > expected_size:
                     raise ObjectStorageError(f"upload size exceeds expected {expected_size}")
-                if actual_size > _max_file_bytes():
+                if actual_size > _max_file_bytes(settings):
                     raise ObjectStorageQuotaExceeded("object exceeds local max file size")
                 digest.update(chunk)
                 handle.write(chunk)
+                _enforce_local_disk_headroom(max(0, expected_size - actual_size), settings=settings)
         if actual_size != expected_size:
             raise ObjectStorageError(f"upload size mismatch: expected {expected_size}, got {actual_size}")
         if digest.hexdigest() != str(upload_session.sha256):

@@ -265,6 +265,60 @@ class ObjectUploadFlowTests(unittest.TestCase):
                 _enforce_local_disk_headroom(1, settings=settings)
         self.assertTrue(any("reason=disk_headroom_exceeded" in line for line in logs.output))
 
+    def test_local_upload_rechecks_headroom_while_streaming_and_cleans_tmp(self) -> None:
+        from app.models import ObjectUploadSession
+
+        body = b"hello local object"
+        sha = __import__("hashlib").sha256(body).hexdigest()
+        user = SimpleNamespace(workspace_id=7)
+        upload_session = ObjectUploadSession(
+            id="session-1",
+            workspace_id=7,
+            sha256=sha,
+            size_bytes=len(body),
+            content_type="application/octet-stream",
+            storage_provider_upload_id="local:upload-1",
+            status="initiated",
+            part_size_bytes=LIMITS["multipart_part_bytes"],
+            parts_total=1,
+            parts_completed=0,
+            expires_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+            + __import__("datetime").timedelta(minutes=10),
+        )
+        db = MagicMock()
+        db.scalar.return_value = upload_session
+
+        async def chunks():
+            yield body[:5]
+            yield body[5:]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings_with_local_dir(tmp)
+            calls = []
+
+            def fake_headroom(_incoming_size, *, settings):
+                calls.append(_incoming_size)
+                if len(calls) >= 2:
+                    raise ObjectStorageQuotaExceeded("server disk free space is below object storage safety threshold")
+
+            with (
+                patch("app.services.object_storage_service.get_settings", return_value=settings),
+                patch("app.services.object_storage_service._enforce_local_disk_headroom", side_effect=fake_headroom),
+            ):
+                with self.assertRaises(ObjectStorageQuotaExceeded):
+                    __import__("asyncio").run(
+                        store_local_object_upload_content(
+                            db,
+                            user,  # type: ignore[arg-type]
+                            session_id="session-1",
+                            chunks=chunks(),
+                        )
+                    )
+
+            self.assertGreaterEqual(len(calls), 2)
+            self.assertFalse(list(Path(tmp).rglob("*.tmp-*")))
+            self.assertFalse((Path(tmp) / f"7/{sha[:2]}/{sha[2:4]}/{sha}").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
