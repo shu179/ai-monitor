@@ -111,6 +111,21 @@ python -m scripts.sync_queue_doctor
 python -m scripts.sync_queue_doctor --json
 ```
 
+Cloud Sync v2 负载验收脚本：
+
+```bash
+# 小流量本机试跑
+SURFACED_CLOUD_ALLOW_LOAD=1 python -m scripts.load_sync_v2 --profile dev
+
+# L1: 10 tenants x 100 events/s 级别的 metadata 稳态压测近似
+SURFACED_CLOUD_ALLOW_LOAD=1 python -m scripts.load_sync_v2 --profile l1 --base-url http://127.0.0.1:8080
+
+# L2: 单 workspace 50k events 爆发接收
+SURFACED_CLOUD_ALLOW_LOAD=1 python -m scripts.load_sync_v2 --profile l2 --base-url http://127.0.0.1:8080
+```
+
+`scripts.load_sync_v2` 会输出 batch HTTP p50/p95/p99、state-delta 等待耗时、对象上传耗时、429/queue depth 和 worker queue 诊断。`l3` profile 会额外上传 5 个 1GiB 对象，只能在可丢弃测试库和磁盘余量充足的机器上执行。
+
 本地 outbox flush 会打印 `[CloudOutbox] flush trace_id=... batch_size=... elapsed_ms=... pending_before=... pending_after=... failed_count=... http_status=...`。云端 API 会把 `X-Trace-Id` 回写到响应头，并记录 `[CloudAPI] request ...` 慢请求/同步请求日志；worker 消费队列时会记录 `[CloudSyncWorker] batch ...`。`docker-compose.yml` 已给所有容器加 `json-file` 日志轮转（单文件 10MB，最多 3 个），避免小盘服务器被日志吃满。
 
 Cloud Sync v2 的对象上传接口走 S3/R2-compatible presigned URL。生产优先使用 R2 + CDN 域名作为 endpoint，下行 URL 不从 API 服务器转发大文件：
