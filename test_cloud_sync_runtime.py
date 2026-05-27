@@ -823,21 +823,45 @@ def test_app_cloud_runtime_support_applies_answer_state_delta_to_content_store()
         "refresh_token": "refresh",
         "user": {"id": 2, "workspace_id": 3, "role": "operator"},
     }
-    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+    data = b"answer object body"
+    sha256 = hashlib.sha256(data).hexdigest()
+
+    class FakeClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        def create_object_download(self, _token: str, object_id: str, *, trace_id: str = ""):
+            assert object_id == "obj-1"
+            return {
+                "object_id": object_id,
+                "download_url": "/api/v2/objects/obj-1/content",
+                "size_bytes": len(data),
+                "content_type": "text/plain",
+            }
+
+        def iter_object_content(self, _token: str, _download_url: str, *, trace_id: str = ""):
+            return iter([data])
 
     with tempfile.TemporaryDirectory() as tmp:
         inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
         content_store = CloudContentStateStore(Path(tmp) / "content.sqlite3")
+        object_cache = CloudObjectCache(Path(tmp) / "object_cache")
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            request_client_factory=FakeClient,
+            object_cache_factory=lambda: object_cache,
+        )
         inbox.record_changes(
             identity_key="https://api.example.com|3|2",
             object_refs=[
                 {
                     "object_id": "obj-1",
-                    "sha256": "a" * 64,
-                    "size_bytes": 1200,
-                    "storage_size_bytes": 450,
+                    "sha256": sha256,
+                    "size_bytes": len(data),
+                    "storage_size_bytes": len(data),
                     "content_type": "text/plain",
-                    "compression": "zstd",
+                    "compression": "none",
                     "storage_key": "3/aa/bb/object",
                 }
             ],
@@ -866,11 +890,81 @@ def test_app_cloud_runtime_support_applies_answer_state_delta_to_content_store()
             result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["answers"]})
 
         diagnostics = content_store.diagnostics(session_store.load.return_value)
+        cached_object = object_cache.cached_object({"sha256": sha256, "size_bytes": len(data)})
 
     assert result["ok"] is True
     assert result["state_delta_inbox"]["applied"] == 1
+    assert result["state_delta_inbox"]["object_cache"]["cached"] == 1
+    assert result["state_delta_inbox"]["object_cache"]["downloaded"] == 1
     assert diagnostics["answers_total"] == 1
     assert diagnostics["newest_answers"][0]["object_ref_count"] == 1
+    assert cached_object["valid"] is True
+
+
+def test_app_cloud_runtime_support_does_not_fail_inbox_when_object_cache_download_fails():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+
+    class FailingClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        def create_object_download(self, _token: str, _object_id: str, *, trace_id: str = ""):
+            raise CloudClientError("temporary object failure", status_code=503)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+        content_store = CloudContentStateStore(Path(tmp) / "content.sqlite3")
+        object_cache = CloudObjectCache(Path(tmp) / "object_cache")
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            request_client_factory=FailingClient,
+            object_cache_factory=lambda: object_cache,
+        )
+        inbox.record_changes(
+            identity_key="https://api.example.com|3|2",
+            object_refs=[
+                {
+                    "object_id": "obj-1",
+                    "sha256": "b" * 64,
+                    "size_bytes": 1200,
+                    "content_type": "text/plain",
+                }
+            ],
+            changes=[
+                {
+                    "stream": "answers",
+                    "seq": 1,
+                    "kind": "answer.upsert",
+                    "ref_id": "answer-001",
+                    "entity": {
+                        "type": "answer",
+                        "id": "answer-001",
+                        "workspace_id": 3,
+                        "content_ref": {"kind": "object", "object_id": "obj-1"},
+                    },
+                }
+            ],
+        )
+
+        with (
+            patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox),
+            patch("core.cloud_sync_runtime.CloudContentStateStore", return_value=content_store),
+        ):
+            result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["answers"]})
+
+    assert result["ok"] is True
+    assert result["state_delta_inbox"]["applied"] == 1
+    assert result["state_delta_inbox"]["failed"] == 0
+    assert result["state_delta_inbox"]["object_cache"]["failed"] == 1
+    assert "temporary object failure" in result["state_delta_inbox"]["object_cache"]["failures"][0]["message"]
 
 
 def test_app_cloud_runtime_support_applies_asset_state_delta_to_content_store():

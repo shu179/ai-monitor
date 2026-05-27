@@ -735,19 +735,54 @@ class AppCloudRuntimeSupport:
     def process_cloud_state_delta_inbox(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
         streams = request_payload.get("streams") if isinstance(request_payload.get("streams"), list) else []
+        cached_refs: list[dict[str, Any]] = []
+        appliers = dict(self._state_delta_appliers)
+        appliers["answers"] = self._wrap_content_object_cache_applier(appliers["answers"], cached_refs)
+        appliers["assets"] = self._wrap_content_object_cache_applier(appliers["assets"], cached_refs)
         result = process_state_delta_inbox(
             inbox=CloudStateDeltaInbox(),
-            appliers=self._state_delta_appliers,
+            appliers=appliers,
             limit=_safe_int(request_payload.get("limit"), 100),
             streams=[str(stream) for stream in streams],
             include_failed=bool(request_payload.get("include_failed") or request_payload.get("includeFailed")),
         )
+        if cached_refs:
+            result = dict(result)
+            result["object_cache"] = _summarize_object_cache_results(cached_refs)
         return {"ok": bool(result.get("ok")), "state_delta_inbox": result}
+
+    def _wrap_content_object_cache_applier(
+        self,
+        applier: Callable[[dict[str, Any]], Any],
+        cache_results: list[dict[str, Any]],
+    ) -> Callable[[dict[str, Any]], Any]:
+        def wrapped(item: dict[str, Any]) -> Any:
+            result = applier(item)
+            for object_ref in _object_refs_from_inbox_item(item):
+                try:
+                    cache_result = self.cache_cloud_object({"object_ref": object_ref})
+                except Exception as exc:
+                    cache_result = {"ok": False, "message": str(exc)}
+                cache_results.append(
+                    {
+                        "object_id": str(object_ref.get("object_id") or object_ref.get("objectId") or object_ref.get("id") or ""),
+                        "sha256": str(object_ref.get("sha256") or ""),
+                        "ok": bool(cache_result.get("ok")) if isinstance(cache_result, dict) else False,
+                        "downloaded": bool(cache_result.get("downloaded")) if isinstance(cache_result, dict) else False,
+                        "message": str(cache_result.get("message") or "") if isinstance(cache_result, dict) else "",
+                    }
+                )
+            return result
+
+        return wrapped
 
     def cache_cloud_object(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
         object_ref_payload = request_payload.get("object_ref") or request_payload.get("objectRef")
-        object_ref = normalize_object_ref(object_ref_payload if isinstance(object_ref_payload, dict) else request_payload)
+        try:
+            object_ref = normalize_object_ref(object_ref_payload if isinstance(object_ref_payload, dict) else request_payload)
+        except CloudObjectCacheError as exc:
+            return {"ok": False, "message": str(exc)}
         object_id = str(object_ref.get("object_id") or "").strip()
         if not object_id:
             return {"ok": False, "message": "object_id is required"}
@@ -1304,6 +1339,60 @@ def _safe_float(value: Any, default: float) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _object_refs_from_inbox_item(item: dict[str, Any]) -> list[dict[str, Any]]:
+    refs = list(item.get("object_refs") if isinstance(item.get("object_refs"), list) else [])
+    entity = item.get("entity") if isinstance(item.get("entity"), dict) else {}
+    if _looks_like_cacheable_object_ref(entity):
+        refs.append(entity)
+    if entity:
+        nested_refs = entity.get("object_refs") if isinstance(entity.get("object_refs"), list) else []
+        refs.extend(ref for ref in nested_refs if isinstance(ref, dict))
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        object_id = str(ref.get("object_id") or ref.get("objectId") or ref.get("id") or "").strip()
+        sha256 = str(ref.get("sha256") or "").strip()
+        key = object_id or sha256
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(ref)
+    return normalized
+
+
+def _looks_like_cacheable_object_ref(ref: Any) -> bool:
+    if not isinstance(ref, dict):
+        return False
+    sha256 = str(ref.get("sha256") or "").strip()
+    object_id = str(ref.get("object_id") or ref.get("objectId") or "").strip()
+    return bool(sha256 and object_id)
+
+
+def _summarize_object_cache_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    attempted = len(results)
+    cached = sum(1 for item in results if bool(item.get("ok")))
+    downloaded = sum(1 for item in results if bool(item.get("downloaded")))
+    failed = attempted - cached
+    failures = [
+        {
+            "object_id": str(item.get("object_id") or ""),
+            "sha256": str(item.get("sha256") or ""),
+            "message": str(item.get("message") or ""),
+        }
+        for item in results
+        if not bool(item.get("ok"))
+    ]
+    return {
+        "attempted": attempted,
+        "cached": cached,
+        "downloaded": downloaded,
+        "failed": failed,
+        "failures": failures[:10],
+    }
 
 
 def _cloud_sync_health_summary(
