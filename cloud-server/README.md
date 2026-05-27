@@ -107,6 +107,7 @@ worker 默认每 15 分钟尝试抢一个 Postgres advisory lock，只有抢到�
 Cloud Sync v2 观测：
 
 ```bash
+python -m scripts.deploy_check
 python -m scripts.sync_queue_doctor
 python -m scripts.sync_queue_doctor --json
 python -m scripts.shadow_reconcile
@@ -166,7 +167,7 @@ SURFACED_CLOUD_ALLOW_SMOKE=1 python -m scripts.smoke_object_storage --base-url h
 
 `storage_doctor` 是只读检查，会输出磁盘剩余、对象目录占用、DB manifest 占用、workspace 占用、缺失文件和孤儿文件。`smoke_object_storage` 会创建一次性 smoke 用户，并通过真实 HTTP 路径完成申请上传、PUT、下载和 sha256 比对；没有 `SURFACED_CLOUD_ALLOW_SMOKE=1` 时会拒绝运行。上传被拒绝时，服务端日志会打印 `[ObjectStorage] reject_upload reason=...`，用于区分单文件超限、workspace 超限、总量超限和磁盘安全水位不足。
 
-`shadow_reconcile` 是只读影子核对工具，会对照实体表、`workspace_change_log`、`article_versions` 和 `articles_migration_state`，输出行数、cursor 覆盖、关键表摘要和迁移尾巴。v1/v2 合流、正文迁移或服务器升级后，先跑 `--strict`，确认没有 `missing_change_log` 或 `payload_migration_incomplete` 再切流。
+`deploy_check` 是服务器预检，会检查 `.env`、弱密码、对象/备份目录、磁盘水位、Docker Compose 配置和 `/health`。`shadow_reconcile` 是只读影子核对工具，会对照实体表、`workspace_change_log`、`article_versions` 和 `articles_migration_state`，输出行数、cursor 覆盖、关键表摘要和迁移尾巴。v1/v2 合流、正文迁移或服务器升级后，先跑 `--strict`，确认没有 `missing_change_log` 或 `payload_migration_incomplete` 再切流。
 
 本地磁盘备份：
 
