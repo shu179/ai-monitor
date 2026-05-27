@@ -8,11 +8,24 @@ spreading web_backend.py dependencies.
 from __future__ import annotations
 
 import os
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from core.cloud_client import CloudClientError, SurfacedCloudClient
+from core.cloud_event_types import EVENT_PROFILE_UPDATE
+from core.cloud_outbox import CloudOutbox
+from core.cloud_run_sync import enqueue_cloud_articles
+from core.cloud_session_store import (
+    CloudSessionChangedError,
+    CloudSessionStore,
+    cloud_session_identity,
+    cloud_session_identity_key,
+)
 from core.cloud_platform_auto_sync import CloudPlatformAutoSync
 from core.cloud_sync import CloudSyncManager
+from core.local_account_space import current_account_config_path
 from core.sync_service import build_sync_bundle
 
 
@@ -77,3 +90,361 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, default))
     except Exception:
         return int(default)
+
+
+class AppCloudRuntimeSupport:
+    """In-process facade for cloud runtime orchestration inside AppRuntime.
+
+    Phase 3a keeps cloud sync in-process, but moves thread/session/request
+    orchestration out of web_backend.py so later daemon extraction has one
+    boundary to replace.
+    """
+
+    def __init__(
+        self,
+        *,
+        owner: Any,
+        session_store_factory: Callable[[], Any] = CloudSessionStore,
+        outbox_factory: Callable[[], Any] = CloudOutbox,
+        article_enqueue_fn: Callable[[list[dict[str, Any]], dict[str, Any]], dict[str, Any] | None] = enqueue_cloud_articles,
+        thread_factory: Callable[..., Any] = threading.Thread,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        status_client_factory: Callable[[str], Any] | None = None,
+        request_client_factory: Callable[[str], Any] | None = None,
+        auto_sync_status_getter: Callable[[], dict[str, Any]] | None = None,
+        current_account_config_path_getter: Callable[[], Any] = current_account_config_path,
+        has_pending_profile_update: Callable[[dict[str, Any]], bool] | None = None,
+        article_snapshot_startup_delay_seconds: float = 5.0,
+        article_deferred_retry_seconds: float = 2.0,
+    ) -> None:
+        self._owner = owner
+        self._session_store_factory = session_store_factory
+        self._outbox_factory = outbox_factory
+        self._article_enqueue_fn = article_enqueue_fn
+        self._thread_factory = thread_factory
+        self._sleep_fn = sleep_fn
+        self._status_client_factory = status_client_factory or self._default_status_client_factory
+        self._request_client_factory = request_client_factory or SurfacedCloudClient
+        self._auto_sync_status_getter = auto_sync_status_getter or (lambda: {})
+        self._current_account_config_path_getter = current_account_config_path_getter
+        self._has_pending_profile_update = has_pending_profile_update or self._default_has_pending_profile_update
+        self._article_snapshot_startup_delay_seconds = float(article_snapshot_startup_delay_seconds or 0.0)
+        self._article_deferred_retry_seconds = float(article_deferred_retry_seconds or 0.0)
+
+    def schedule_article_snapshot(self) -> None:
+        with self._owner._article_cloud_enqueue_lock:
+            self._owner._article_cloud_enqueue_requested = True
+            if self._owner._article_cloud_enqueue_thread and self._owner._article_cloud_enqueue_thread.is_alive():
+                return
+            self._owner._article_cloud_enqueue_thread = self._thread_factory(
+                target=self.run_article_snapshot_worker,
+                name="cloud-article-snapshot-enqueue",
+                daemon=True,
+            )
+            self._owner._article_cloud_enqueue_thread.start()
+
+    def run_article_snapshot_worker(self) -> None:
+        startup_delay_seconds = self._read_article_snapshot_startup_delay_seconds()
+        if startup_delay_seconds > 0:
+            self._sleep_fn(startup_delay_seconds)
+        while True:
+            with self._owner._article_cloud_enqueue_lock:
+                if not self._owner._article_cloud_enqueue_requested:
+                    self._owner._article_cloud_enqueue_thread = None
+                    return
+                self._owner._article_cloud_enqueue_requested = False
+            self.enqueue_article_snapshot()
+            with self._owner._article_cloud_enqueue_lock:
+                if not self._owner._article_cloud_enqueue_requested:
+                    self._owner._article_cloud_enqueue_thread = None
+                    return
+
+    def enqueue_article_snapshot(self, config: dict[str, Any] | None = None) -> None:
+        try:
+            session = self._session_store_factory().load()
+            user = session.get("user") if isinstance(session.get("user"), dict) else {}
+            role = str(user.get("role") or "").strip()
+            if role == "viewer" or not str(session.get("access_token") or "").strip():
+                return
+
+            resolved_config = config if isinstance(config, dict) else self._load_runtime_config()
+            articles, deferred_refresh = self._owner._get_cloud_article_upload_snapshot_with_refresh_state(
+                resolved_config,
+                session=session,
+            )
+            if deferred_refresh:
+                retry = getattr(self._owner, "_schedule_cloud_articles_snapshot_retry", None)
+                if callable(retry):
+                    retry()
+                else:
+                    self.schedule_article_snapshot_retry()
+                return
+            snapshot_key = (
+                cloud_session_identity_key(session),
+                self._owner._article_store_version_key(),
+                self._owner._article_cloud_task_map_key(resolved_config),
+            )
+            with self._owner._article_cloud_enqueue_lock:
+                if self._owner._last_article_cloud_enqueue_key == snapshot_key:
+                    return
+
+            result = self._article_enqueue_fn(articles, resolved_config) or {}
+            with self._owner._article_cloud_enqueue_lock:
+                self._owner._last_article_cloud_enqueue_key = snapshot_key
+            queued = int(result.get("queued") or 0)
+            if queued > 0:
+                print(f"[WebBackend] 文章云端同步已入队: articles={result.get('articles', 0)}, queued={queued}")
+        except Exception as exc:
+            print(f"[WebBackend] 文章云端同步入队失败，将等待下次本地变更重试: {exc}")
+
+    def schedule_article_snapshot_retry(self, *, delay_seconds: float | None = None) -> None:
+        delay = self._article_deferred_retry_seconds if delay_seconds is None else delay_seconds
+        try:
+            delay = max(0.0, float(delay))
+        except Exception:
+            delay = self._article_deferred_retry_seconds
+        with self._owner._article_cloud_enqueue_lock:
+            retry_thread = self._owner._article_cloud_enqueue_retry_thread
+            if retry_thread and retry_thread.is_alive():
+                return
+            retry_thread = self._thread_factory(
+                target=self.run_article_snapshot_retry,
+                args=(delay,),
+                name="cloud-article-snapshot-retry",
+                daemon=True,
+            )
+            self._owner._article_cloud_enqueue_retry_thread = retry_thread
+            retry_thread.start()
+
+    def run_article_snapshot_retry(self, delay_seconds: float) -> None:
+        try:
+            if delay_seconds > 0:
+                self._sleep_fn(delay_seconds)
+        finally:
+            with self._owner._article_cloud_enqueue_lock:
+                if self._owner._article_cloud_enqueue_retry_thread is threading.current_thread():
+                    self._owner._article_cloud_enqueue_retry_thread = None
+        schedule = getattr(self._owner, "_schedule_cloud_articles_snapshot", None)
+        if callable(schedule):
+            schedule()
+        else:
+            self.schedule_article_snapshot()
+
+    def validate_cloud_session_if_needed(self, *, force: bool = False) -> None:
+        store = self._session_store_factory()
+        session = store.load()
+        identity_key = cloud_session_identity_key(session)
+        base_url = str(session.get("base_url") or "").strip()
+        access_token = str(session.get("access_token") or "").strip()
+        refresh_token = str(session.get("refresh_token") or "").strip()
+        if not base_url or not access_token or not refresh_token:
+            return
+        if self._has_pending_profile_update(session):
+            return
+
+        now_ts = time.monotonic()
+        with self._owner._cloud_status_validation_lock:
+            if (
+                not force
+                and identity_key
+                and identity_key == self._owner._cloud_status_validated_identity
+                and now_ts - self._owner._cloud_status_validated_at < 60.0
+            ):
+                return
+            self._owner._cloud_status_validated_identity = identity_key
+            self._owner._cloud_status_validated_at = now_ts
+
+        identity = cloud_session_identity(session)
+        client = self._status_client_factory(base_url)
+        try:
+            me_payload = client.me(access_token)
+            if isinstance(me_payload, dict) and cloud_session_identity_key(store.load()) == identity_key:
+                store.update_user(me_payload)
+            with self._owner._cloud_status_validation_lock:
+                self._owner._cloud_status_validation_error = ""
+            return
+        except CloudClientError as exc:
+            if exc.status_code != 401:
+                with self._owner._cloud_status_validation_lock:
+                    self._owner._cloud_status_validation_error = str(exc)
+                return
+
+        try:
+            refreshed_session = store.refresh_login_if_current(
+                base_url=base_url,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                refresh=client.refresh,
+                workspace_id=identity["workspace_id"],
+                user_id=identity["user_id"],
+            )
+            refreshed_access_token = str(refreshed_session.get("access_token") or "").strip()
+            if refreshed_access_token:
+                try:
+                    me_payload = client.me(refreshed_access_token)
+                    if (
+                        isinstance(me_payload, dict)
+                        and cloud_session_identity_key(store.load()) == cloud_session_identity_key(refreshed_session)
+                    ):
+                        store.update_user(me_payload)
+                except CloudClientError as verify_exc:
+                    with self._owner._cloud_status_validation_lock:
+                        self._owner._cloud_status_validation_error = str(verify_exc)
+                    return
+            with self._owner._cloud_status_validation_lock:
+                self._owner._cloud_status_validation_error = ""
+        except CloudSessionChangedError as exc:
+            with self._owner._cloud_status_validation_lock:
+                self._owner._cloud_status_validation_error = str(exc)
+        except CloudClientError as refresh_exc:
+            with self._owner._cloud_status_validation_lock:
+                self._owner._cloud_status_validation_error = str(refresh_exc)
+
+    def get_cloud_status(self) -> dict[str, Any]:
+        self.validate_cloud_session_if_needed()
+        return self.current_cloud_status()
+
+    def current_cloud_status(self) -> dict[str, Any]:
+        session = self._session_store_factory().load()
+        return self.cloud_status_from_session(session)
+
+    def cloud_status_from_session(self, session: dict[str, Any] | None) -> dict[str, Any]:
+        session_payload = session if isinstance(session, dict) else {}
+        user = session_payload.get("user") if isinstance(session_payload.get("user"), dict) else {}
+        with self._owner._cloud_status_validation_lock:
+            validation_error = self._owner._cloud_status_validation_error
+        return {
+            "ok": True,
+            "cloud": {
+                "loggedIn": bool(
+                    session_payload.get("base_url")
+                    and session_payload.get("access_token")
+                    and session_payload.get("refresh_token")
+                ),
+                "baseUrl": str(session_payload.get("base_url") or ""),
+                "user": {
+                    "id": user.get("id"),
+                    "workspace_id": user.get("workspace_id"),
+                    "username": user.get("username"),
+                    "role": user.get("role"),
+                    "display_name": user.get("display_name"),
+                    "email": user.get("email"),
+                    "avatar": user.get("avatar"),
+                    "birthday": user.get("birthday"),
+                    "hire_date": user.get("hire_date"),
+                    "enabled": user.get("enabled"),
+                    "token_version": user.get("token_version"),
+                    "created_at": user.get("created_at"),
+                    "deleted_at": user.get("deleted_at"),
+                },
+                "savedAt": str(session_payload.get("saved_at") or ""),
+                "localProfile": {
+                    "configPath": str(self._current_account_config_path_getter()),
+                },
+                "outbox": self._outbox_factory().stats(),
+                "autoSync": self._auto_sync_status_getter(),
+                "validationError": validation_error,
+            },
+        }
+
+    def cloud_request_with_refresh(self, operation: Callable[[Any, str], Any]) -> tuple[bool, Any, str]:
+        store = self._session_store_factory()
+        session = store.load()
+        base_url = str(session.get("base_url") or "").strip()
+        access_token = str(session.get("access_token") or "").strip()
+        refresh_token = str(session.get("refresh_token") or "").strip()
+        if not base_url or not access_token:
+            return False, None, "未登录云端"
+        initial_identity_key = cloud_session_identity_key(session)
+        identity = cloud_session_identity(session)
+        client = self._request_client_factory(base_url)
+        try:
+            payload = operation(client, access_token)
+            if cloud_session_identity_key(store.load()) != initial_identity_key:
+                return False, None, "云端账号已切换，本次操作已中止"
+            return True, payload, ""
+        except CloudClientError as exc:
+            if exc.status_code != 401 or not refresh_token:
+                return False, None, str(exc)
+        try:
+            refreshed_session = store.refresh_login_if_current(
+                base_url=base_url,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                refresh=client.refresh,
+                workspace_id=identity["workspace_id"],
+                user_id=identity["user_id"],
+            )
+        except CloudSessionChangedError as changed_exc:
+            return False, None, str(changed_exc)
+        except CloudClientError as refresh_exc:
+            if refresh_exc.status_code == 401:
+                store.clear_if_current(
+                    base_url=base_url,
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    workspace_id=identity["workspace_id"],
+                    user_id=identity["user_id"],
+                )
+            return False, None, str(refresh_exc)
+        refreshed_access_token = str(refreshed_session.get("access_token") or "").strip()
+        if not refreshed_access_token:
+            return False, None, "未登录云端"
+        try:
+            payload = operation(client, refreshed_access_token)
+            if cloud_session_identity_key(store.load()) != initial_identity_key:
+                return False, None, "云端账号已切换，本次操作已中止"
+            return True, payload, ""
+        except CloudClientError as retry_exc:
+            refreshed_identity = cloud_session_identity(refreshed_session)
+            if retry_exc.status_code == 401:
+                store.clear_if_current(
+                    base_url=base_url,
+                    access_token=refreshed_access_token,
+                    refresh_token=str(refreshed_session.get("refresh_token") or "").strip(),
+                    workspace_id=refreshed_identity["workspace_id"],
+                    user_id=refreshed_identity["user_id"],
+                )
+            return False, None, str(retry_exc)
+
+    def _load_runtime_config(self) -> dict[str, Any]:
+        if callable(getattr(self._owner, "load_config", None)):
+            loaded = self._owner.load_config()
+            return loaded if isinstance(loaded, dict) else {}
+        config_provider = getattr(self._owner, "config_provider", None)
+        if config_provider is not None and callable(getattr(config_provider, "load", None)):
+            loaded = config_provider.load()
+            return loaded if isinstance(loaded, dict) else {}
+        return {}
+
+    def _read_article_snapshot_startup_delay_seconds(self) -> float:
+        try:
+            return max(
+                0.0,
+                float(
+                    os.environ.get(
+                        "AIBRANDMONITOR_CLOUD_ARTICLES_SNAPSHOT_STARTUP_DELAY_SECONDS",
+                        self._article_snapshot_startup_delay_seconds,
+                    )
+                ),
+            )
+        except Exception:
+            return max(0.0, self._article_snapshot_startup_delay_seconds)
+
+    @staticmethod
+    def _default_has_pending_profile_update(session: dict[str, Any]) -> bool:
+        try:
+            queue = CloudOutbox().bind_to_session(session)
+            return any(
+                str(item.get("event_type") or "") == EVENT_PROFILE_UPDATE
+                for item in queue.pending(limit=50)
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _default_status_client_factory(base_url: str) -> Any:
+        try:
+            return SurfacedCloudClient(base_url, timeout_seconds=3.0)
+        except TypeError:
+            return SurfacedCloudClient(base_url)

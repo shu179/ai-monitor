@@ -212,7 +212,7 @@ from core.cloud_run_sync import (
     enqueue_task_day_status,
     flush_cloud_outbox as flush_cloud_outbox_events,
 )
-from core.cloud_sync_runtime import LocalCloudSyncRuntime, create_local_cloud_sync_runtime
+from core.cloud_sync_runtime import AppCloudRuntimeSupport, LocalCloudSyncRuntime, create_local_cloud_sync_runtime
 from core.cloud_session_store import (
     CloudSessionChangedError,
     CloudSessionStore,
@@ -2068,7 +2068,35 @@ class AppRuntime:
         )
         self._cloud_sync_manager = self._cloud_runtime.manager
         self._cloud_platform_auto_sync = self._cloud_runtime.platform_auto_sync
+        self._cloud_runtime_support = self._build_cloud_runtime_support()
         self._isolate_ordinary_cloud_account_config(CloudSessionStore().load())
+
+    def _build_cloud_runtime_support(self) -> AppCloudRuntimeSupport:
+        return AppCloudRuntimeSupport(
+            owner=self,
+            session_store_factory=lambda: CloudSessionStore(),
+            outbox_factory=lambda: CloudOutbox(),
+            article_enqueue_fn=lambda articles, config: enqueue_cloud_articles(articles, config),
+            thread_factory=lambda *args, **kwargs: threading.Thread(*args, **kwargs),
+            sleep_fn=lambda seconds: time.sleep(seconds),
+            status_client_factory=lambda base_url: SurfacedCloudClient(base_url, timeout_seconds=3.0),
+            request_client_factory=lambda base_url: SurfacedCloudClient(base_url),
+            auto_sync_status_getter=lambda: self._cloud_platform_auto_sync.get_status()
+            if getattr(self, "_cloud_platform_auto_sync", None)
+            else {},
+            current_account_config_path_getter=lambda: current_account_config_path(),
+            has_pending_profile_update=lambda session: _has_pending_profile_update_for_session(session),
+            article_snapshot_startup_delay_seconds=5.0,
+            article_deferred_retry_seconds=CLOUD_ARTICLE_DEFERRED_REFRESH_RETRY_SECONDS,
+        )
+
+    def _ensure_cloud_runtime_support(self) -> AppCloudRuntimeSupport:
+        support = getattr(self, "_cloud_runtime_support", None)
+        if isinstance(support, AppCloudRuntimeSupport):
+            return support
+        support = self._build_cloud_runtime_support()
+        self._cloud_runtime_support = support
+        return support
 
     def _sync_loaded_config(self, config: dict[str, Any]) -> None:
         _apply_guarded_history_storage_defaults(config, session=CloudSessionStore().load())
@@ -2487,93 +2515,19 @@ class AppRuntime:
         self._schedule_cloud_articles_snapshot()
 
     def _schedule_cloud_articles_snapshot(self) -> None:
-        with self._article_cloud_enqueue_lock:
-            self._article_cloud_enqueue_requested = True
-            if self._article_cloud_enqueue_thread and self._article_cloud_enqueue_thread.is_alive():
-                return
-            self._article_cloud_enqueue_thread = threading.Thread(
-                target=self._run_cloud_articles_snapshot_worker,
-                name="cloud-article-snapshot-enqueue",
-                daemon=True,
-            )
-            self._article_cloud_enqueue_thread.start()
+        self._ensure_cloud_runtime_support().schedule_article_snapshot()
 
     def _run_cloud_articles_snapshot_worker(self) -> None:
-        time.sleep(float(os.environ.get("AIBRANDMONITOR_CLOUD_ARTICLES_SNAPSHOT_STARTUP_DELAY_SECONDS", "5")))
-        while True:
-            with self._article_cloud_enqueue_lock:
-                if not self._article_cloud_enqueue_requested:
-                    self._article_cloud_enqueue_thread = None
-                    return
-                self._article_cloud_enqueue_requested = False
-            self._enqueue_cloud_articles_snapshot()
-            with self._article_cloud_enqueue_lock:
-                if not self._article_cloud_enqueue_requested:
-                    self._article_cloud_enqueue_thread = None
-                    return
+        self._ensure_cloud_runtime_support().run_article_snapshot_worker()
 
     def _enqueue_cloud_articles_snapshot(self, config: dict[str, Any] | None = None) -> None:
-        try:
-            session = CloudSessionStore().load()
-            user = session.get("user") if isinstance(session.get("user"), dict) else {}
-            role = str(user.get("role") or "").strip()
-            if role == "viewer" or not str(session.get("access_token") or "").strip():
-                return
-
-            resolved_config = config or self.config_provider.load()
-            articles, deferred_refresh = self._get_cloud_article_upload_snapshot_with_refresh_state(
-                resolved_config,
-                session=session,
-            )
-            if deferred_refresh:
-                self._schedule_cloud_articles_snapshot_retry()
-                return
-            snapshot_key = (
-                cloud_session_identity_key(session),
-                self._article_store_version_key(),
-                self._article_cloud_task_map_key(resolved_config),
-            )
-            with self._article_cloud_enqueue_lock:
-                if self._last_article_cloud_enqueue_key == snapshot_key:
-                    return
-
-            result = enqueue_cloud_articles(articles, resolved_config)
-            with self._article_cloud_enqueue_lock:
-                self._last_article_cloud_enqueue_key = snapshot_key
-            queued = int((result or {}).get("queued") or 0)
-            if queued > 0:
-                print(f"[WebBackend] 文章云端同步已入队: articles={result.get('articles', 0)}, queued={queued}")
-        except Exception as exc:
-            print(f"[WebBackend] 文章云端同步入队失败，将等待下次本地变更重试: {exc}")
+        self._ensure_cloud_runtime_support().enqueue_article_snapshot(config)
 
     def _schedule_cloud_articles_snapshot_retry(self, *, delay_seconds: float | None = None) -> None:
-        delay = CLOUD_ARTICLE_DEFERRED_REFRESH_RETRY_SECONDS if delay_seconds is None else delay_seconds
-        try:
-            delay = max(0.0, float(delay))
-        except Exception:
-            delay = CLOUD_ARTICLE_DEFERRED_REFRESH_RETRY_SECONDS
-        with self._article_cloud_enqueue_lock:
-            retry_thread = self._article_cloud_enqueue_retry_thread
-            if retry_thread and retry_thread.is_alive():
-                return
-            retry_thread = threading.Thread(
-                target=self._run_cloud_articles_snapshot_retry,
-                args=(delay,),
-                name="cloud-article-snapshot-retry",
-                daemon=True,
-            )
-            self._article_cloud_enqueue_retry_thread = retry_thread
-            retry_thread.start()
+        self._ensure_cloud_runtime_support().schedule_article_snapshot_retry(delay_seconds=delay_seconds)
 
     def _run_cloud_articles_snapshot_retry(self, delay_seconds: float) -> None:
-        try:
-            if delay_seconds > 0:
-                time.sleep(delay_seconds)
-        finally:
-            with self._article_cloud_enqueue_lock:
-                if self._article_cloud_enqueue_retry_thread is threading.current_thread():
-                    self._article_cloud_enqueue_retry_thread = None
-        self._schedule_cloud_articles_snapshot()
+        self._ensure_cloud_runtime_support().run_article_snapshot_retry(delay_seconds)
 
     def _get_cloud_article_upload_snapshot(
         self,
@@ -4287,176 +4241,19 @@ return changedCount
         return {"ok": True, "cloud_sync": self._cloud_sync_manager.get_status()}
 
     def _validate_cloud_session_if_needed(self, *, force: bool = False) -> None:
-        store = CloudSessionStore()
-        session = store.load()
-        identity_key = cloud_session_identity_key(session)
-        base_url = str(session.get("base_url") or "").strip()
-        access_token = str(session.get("access_token") or "").strip()
-        refresh_token = str(session.get("refresh_token") or "").strip()
-        if not base_url or not access_token or not refresh_token:
-            return
-        if _has_pending_profile_update_for_session(session):
-            return
-
-        now_ts = time.monotonic()
-        with self._cloud_status_validation_lock:
-            if (
-                not force
-                and identity_key
-                and identity_key == self._cloud_status_validated_identity
-                and now_ts - self._cloud_status_validated_at < 60.0
-            ):
-                return
-            self._cloud_status_validated_identity = identity_key
-            self._cloud_status_validated_at = now_ts
-
-        identity = cloud_session_identity(session)
-        client = SurfacedCloudClient(base_url, timeout_seconds=3.0)
-        try:
-            me_payload = client.me(access_token)
-            if isinstance(me_payload, dict) and cloud_session_identity_key(store.load()) == identity_key:
-                store.update_user(me_payload)
-            with self._cloud_status_validation_lock:
-                self._cloud_status_validation_error = ""
-            return
-        except CloudClientError as exc:
-            if exc.status_code != 401:
-                with self._cloud_status_validation_lock:
-                    self._cloud_status_validation_error = str(exc)
-                return
-
-        try:
-            refreshed_session = store.refresh_login_if_current(
-                base_url=base_url,
-                access_token=access_token,
-                refresh_token=refresh_token,
-                refresh=client.refresh,
-                workspace_id=identity["workspace_id"],
-                user_id=identity["user_id"],
-            )
-            refreshed_access_token = str(refreshed_session.get("access_token") or "").strip()
-            if refreshed_access_token:
-                try:
-                    me_payload = client.me(refreshed_access_token)
-                    if isinstance(me_payload, dict) and cloud_session_identity_key(store.load()) == cloud_session_identity_key(refreshed_session):
-                        store.update_user(me_payload)
-                except CloudClientError as verify_exc:
-                    with self._cloud_status_validation_lock:
-                        self._cloud_status_validation_error = str(verify_exc)
-                    return
-            with self._cloud_status_validation_lock:
-                self._cloud_status_validation_error = ""
-        except CloudSessionChangedError as exc:
-            with self._cloud_status_validation_lock:
-                self._cloud_status_validation_error = str(exc)
-        except CloudClientError as refresh_exc:
-            # Status polling is passive; it should surface auth problems without
-            # deleting the saved login while background sync may still recover.
-            with self._cloud_status_validation_lock:
-                self._cloud_status_validation_error = str(refresh_exc)
+        self._ensure_cloud_runtime_support().validate_cloud_session_if_needed(force=force)
 
     def get_cloud_status(self) -> dict[str, Any]:
-        self._validate_cloud_session_if_needed()
-        return self._current_cloud_status()
+        return self._ensure_cloud_runtime_support().get_cloud_status()
 
     def _current_cloud_status(self) -> dict[str, Any]:
-        session = CloudSessionStore().load()
-        return self._cloud_status_from_session(session)
+        return self._ensure_cloud_runtime_support().current_cloud_status()
 
     def _cloud_status_from_session(self, session: dict[str, Any] | None) -> dict[str, Any]:
-        session_payload = session if isinstance(session, dict) else {}
-        user = session_payload.get("user") if isinstance(session_payload.get("user"), dict) else {}
-        with self._cloud_status_validation_lock:
-            validation_error = self._cloud_status_validation_error
-        return {
-            "ok": True,
-            "cloud": {
-                "loggedIn": bool(session_payload.get("base_url") and session_payload.get("access_token") and session_payload.get("refresh_token")),
-                "baseUrl": str(session_payload.get("base_url") or ""),
-                "user": {
-                    "id": user.get("id"),
-                    "workspace_id": user.get("workspace_id"),
-                    "username": user.get("username"),
-                    "role": user.get("role"),
-                    "display_name": user.get("display_name"),
-                    "email": user.get("email"),
-                    "avatar": user.get("avatar"),
-                    "birthday": user.get("birthday"),
-                    "hire_date": user.get("hire_date"),
-                    "enabled": user.get("enabled"),
-                    "token_version": user.get("token_version"),
-                    "created_at": user.get("created_at"),
-                    "deleted_at": user.get("deleted_at"),
-                },
-                "savedAt": str(session_payload.get("saved_at") or ""),
-                "localProfile": {
-                    "configPath": str(current_account_config_path()),
-                },
-                "outbox": CloudOutbox().stats(),
-                "autoSync": self._cloud_platform_auto_sync.get_status(),
-                "validationError": validation_error,
-            },
-        }
+        return self._ensure_cloud_runtime_support().cloud_status_from_session(session)
 
     def _cloud_request_with_refresh(self, operation) -> tuple[bool, Any, str]:
-        store = CloudSessionStore()
-        session = store.load()
-        base_url = str(session.get("base_url") or "").strip()
-        access_token = str(session.get("access_token") or "").strip()
-        refresh_token = str(session.get("refresh_token") or "").strip()
-        if not base_url or not access_token:
-            return False, None, "未登录云端"
-        initial_identity_key = cloud_session_identity_key(session)
-        identity = cloud_session_identity(session)
-        client = SurfacedCloudClient(base_url)
-        try:
-            payload = operation(client, access_token)
-            if cloud_session_identity_key(store.load()) != initial_identity_key:
-                return False, None, "云端账号已切换，本次操作已中止"
-            return True, payload, ""
-        except CloudClientError as exc:
-            if exc.status_code != 401 or not refresh_token:
-                return False, None, str(exc)
-        try:
-            refreshed_session = store.refresh_login_if_current(
-                base_url=base_url,
-                access_token=access_token,
-                refresh_token=refresh_token,
-                refresh=client.refresh,
-                workspace_id=identity["workspace_id"],
-                user_id=identity["user_id"],
-            )
-        except CloudSessionChangedError as changed_exc:
-            return False, None, str(changed_exc)
-        except CloudClientError as refresh_exc:
-            if refresh_exc.status_code == 401:
-                store.clear_if_current(
-                    base_url=base_url,
-                    access_token=access_token,
-                    refresh_token=refresh_token,
-                    workspace_id=identity["workspace_id"],
-                    user_id=identity["user_id"],
-                )
-            return False, None, str(refresh_exc)
-        refreshed_access_token = str(refreshed_session.get("access_token") or "").strip()
-        if not refreshed_access_token:
-            return False, None, "未登录云端"
-        try:
-            payload = operation(client, refreshed_access_token)
-            if cloud_session_identity_key(store.load()) != initial_identity_key:
-                return False, None, "云端账号已切换，本次操作已中止"
-            return True, payload, ""
-        except CloudClientError as retry_exc:
-            refreshed_identity = cloud_session_identity(refreshed_session)
-            if retry_exc.status_code == 401:
-                store.clear_if_current(
-                    base_url=base_url,
-                    access_token=refreshed_access_token,
-                    refresh_token=str(refreshed_session.get("refresh_token") or "").strip(),
-                    workspace_id=refreshed_identity["workspace_id"],
-                    user_id=refreshed_identity["user_id"],
-                )
-            return False, None, str(retry_exc)
+        return self._ensure_cloud_runtime_support().cloud_request_with_refresh(operation)
 
     def list_cloud_admin_tasks(self) -> dict[str, Any]:
         session = CloudSessionStore().load()
