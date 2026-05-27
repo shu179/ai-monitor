@@ -1367,6 +1367,7 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     assert health["summary"]["assets_cached"] == 9
     assert health["summary"]["object_cache_objects"] == 4
     assert health["summary"]["object_cache_bytes"] == 12345
+    assert health["summary"]["object_cache_max_bytes"] == 0
     assert health["summary"]["healthy"] is True
     assert health["auto_sync"] == auto_sync_status
     assert health["state_delta"] == {"cursors": {"tasks": 2}}
@@ -1466,6 +1467,31 @@ def test_app_cloud_runtime_support_cache_object_reuses_valid_cached_file():
         assert result["ok"] is True
         assert result["downloaded"] is False
         client_factory.assert_not_called()
+
+
+def test_app_cloud_runtime_support_prunes_object_cache():
+    owner = _support_owner()
+    data_a = b"a" * 10
+    data_b = b"b" * 10
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = CloudObjectCache(Path(tmp) / "cache", max_cache_bytes=12)
+        cache.cache_bytes(
+            {"object_id": "a", "sha256": hashlib.sha256(data_a).hexdigest(), "size_bytes": len(data_a)},
+            [data_a],
+        )
+        cache.cache_bytes(
+            {"object_id": "b", "sha256": hashlib.sha256(data_b).hexdigest(), "size_bytes": len(data_b)},
+            [data_b],
+        )
+        support = AppCloudRuntimeSupport(owner=owner, object_cache_factory=lambda: cache)
+
+        result = support.handle_command("cloud.prune_object_cache", {"target_bytes": 10})
+        diagnostics = cache.diagnostics()
+
+    assert result["ok"] is True
+    assert result["object_cache"]["pruned"] == 1
+    assert diagnostics["objects"] == 1
+    assert diagnostics["bytes"] == 10
 
 
 def test_app_cloud_runtime_support_command_returns_current_status_variants():

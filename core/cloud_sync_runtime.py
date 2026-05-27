@@ -462,6 +462,8 @@ class AppCloudRuntimeSupport:
             return self.cloud_sync_health(request_payload)
         if normalized in {"cloud.object_cache_diagnostics", "object_cache_diagnostics"}:
             return {"ok": True, "object_cache": self._object_cache_factory().diagnostics()}
+        if normalized in {"cloud.prune_object_cache", "prune_object_cache"}:
+            return self.prune_cloud_object_cache(request_payload)
         if normalized in {"cloud.cache_object", "cache_object"}:
             return self.cache_cloud_object(request_payload)
         if normalized in {"cloud.pull_state_delta", "pull_state_delta"}:
@@ -518,6 +520,8 @@ class AppCloudRuntimeSupport:
             return self.cloud_sync_health(request_payload)
         if normalized in {"cloud.object_cache_diagnostics", "object_cache_diagnostics"}:
             return {"ok": True, "object_cache": self._object_cache_factory().diagnostics()}
+        if normalized in {"cloud.prune_object_cache", "prune_object_cache"}:
+            return self.prune_cloud_object_cache(request_payload)
         if normalized in {"cloud.cache_object", "cache_object"}:
             return self.cache_cloud_object(request_payload)
         if normalized in {"cloud.pull_state_delta", "pull_state_delta"}:
@@ -818,6 +822,13 @@ class AppCloudRuntimeSupport:
         if not ok:
             return {"ok": False, "message": message}
         return {"ok": True, "cached": response_payload, "downloaded": True, "message": ""}
+
+    def prune_cloud_object_cache(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        target = request_payload.get("target_bytes") or request_payload.get("targetBytes")
+        target_bytes = _safe_int(target, -1)
+        result = self._object_cache_factory().prune(target_bytes=target_bytes if target_bytes >= 0 else None)
+        return {"ok": bool(result.get("ok", True)), "object_cache": result}
 
     def _build_state_delta_appliers(
         self,
@@ -1450,6 +1461,7 @@ def _cloud_sync_health_summary(
         "assets_cached": _safe_int(content_state.get("assets_total"), 0),
         "object_cache_objects": _safe_int(cache_payload.get("objects"), 0),
         "object_cache_bytes": _safe_int(cache_payload.get("bytes"), 0),
+        "object_cache_max_bytes": _safe_int(cache_payload.get("max_cache_bytes"), 0),
         "last_upload_at": str(auto_sync.get("last_upload_at") or ""),
         "last_pull_at": str(auto_sync.get("last_pull_at") or ""),
         "last_state_delta_at": str(auto_sync.get("last_state_delta_at") or ""),

@@ -1,5 +1,7 @@
 import hashlib
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -65,6 +67,36 @@ def test_cloud_object_cache_rejects_oversized_object(tmp_path: Path):
 
     with pytest.raises(CloudObjectCacheError, match="size limit"):
         cache.cache_bytes(_ref(data), [data])
+
+
+def test_cloud_object_cache_prunes_lru_objects_when_over_budget(tmp_path: Path):
+    old_data = b"old cached object"
+    new_data = b"new cached object"
+    cache = CloudObjectCache(tmp_path / "cache", max_cache_bytes=len(old_data) + 2)
+    old_result = cache.cache_bytes(_ref(old_data, object_id="old"), [old_data])
+    time.sleep(0.01)
+    new_result = cache.cache_bytes(_ref(new_data, object_id="new"), [new_data])
+
+    result = cache.prune(target_bytes=len(new_data))
+
+    assert result["pruned"] == 1
+    assert result["bytes_removed"] == len(old_data)
+    assert not Path(old_result["path"]).exists()
+    assert not Path(old_result["metadata_path"]).exists()
+    assert Path(new_result["path"]).exists()
+
+
+def test_cloud_object_cache_cached_object_refreshes_lru_mtime(tmp_path: Path):
+    data = b"touch me"
+    cache = CloudObjectCache(tmp_path / "cache")
+    result = cache.cache_bytes(_ref(data), [data])
+    path = Path(result["path"])
+    old_mtime = path.stat().st_mtime - 60
+    os.utime(path, (old_mtime, old_mtime))
+
+    cache.cached_object(_ref(data))
+
+    assert path.stat().st_mtime > old_mtime
 
 
 def test_normalize_object_ref_rejects_invalid_sha256():

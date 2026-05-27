@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -14,6 +15,8 @@ from .time_utils import local_now
 
 DEFAULT_CLOUD_OBJECT_CACHE_DIR = resolve_app_path("user_data/cloud_object_cache")
 MAX_CACHE_OBJECT_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_PRUNE_TARGET_RATIO = 0.85
 _SHA256_HEX_LENGTH = 64
 
 
@@ -30,9 +33,16 @@ class CloudObjectCache:
     foundation for future answer/image/object downsync without exposing any UI.
     """
 
-    def __init__(self, root_dir: str | Path | None = None, *, max_object_bytes: int = MAX_CACHE_OBJECT_BYTES) -> None:
+    def __init__(
+        self,
+        root_dir: str | Path | None = None,
+        *,
+        max_object_bytes: int = MAX_CACHE_OBJECT_BYTES,
+        max_cache_bytes: int | None = None,
+    ) -> None:
         self._explicit_root = Path(root_dir) if root_dir is not None else None
         self.max_object_bytes = max(1, int(max_object_bytes or MAX_CACHE_OBJECT_BYTES))
+        self.max_cache_bytes = _configured_max_cache_bytes(max_cache_bytes)
 
     @property
     def root_dir(self) -> Path:
@@ -135,6 +145,11 @@ class CloudObjectCache:
         if exists:
             expected_size = int(normalized.get("size_bytes") or 0)
             valid = expected_size <= 0 or expected_size == size
+            if valid:
+                try:
+                    os.utime(target, None)
+                except OSError:
+                    pass
         return {
             "exists": exists,
             "valid": bool(valid),
@@ -145,24 +160,79 @@ class CloudObjectCache:
         }
 
     def diagnostics(self) -> dict[str, Any]:
-        root = self.root_dir
-        total_bytes = 0
-        object_count = 0
-        if root.exists():
-            for path in root.glob("*/*/*"):
-                if not path.is_file() or path.suffix == ".json" or path.name.startswith("."):
-                    continue
-                object_count += 1
-                try:
-                    total_bytes += path.stat().st_size
-                except OSError:
-                    pass
+        entries = self._entries()
+        total_bytes = sum(entry.size_bytes for entry in entries)
         return {
-            "path": str(root),
-            "objects": object_count,
+            "path": str(self.root_dir),
+            "objects": len(entries),
             "bytes": total_bytes,
             "max_object_bytes": self.max_object_bytes,
+            "max_cache_bytes": self.max_cache_bytes,
         }
+
+    def prune(self, *, target_bytes: int | None = None) -> dict[str, Any]:
+        """Prune least-recently-used cached objects until the cache is under budget."""
+        entries = self._entries()
+        before_bytes = sum(entry.size_bytes for entry in entries)
+        max_bytes = self.max_cache_bytes
+        safe_target = int(target_bytes) if target_bytes is not None else int(max_bytes * DEFAULT_PRUNE_TARGET_RATIO)
+        safe_target = max(0, min(safe_target, max_bytes))
+        if before_bytes <= max_bytes:
+            return {
+                "ok": True,
+                "pruned": 0,
+                "bytes_removed": 0,
+                "before_bytes": before_bytes,
+                "after_bytes": before_bytes,
+                "target_bytes": safe_target,
+            }
+        after_bytes = before_bytes
+        pruned = 0
+        removed = 0
+        for entry in sorted(entries, key=lambda item: (item.mtime, item.path.name)):
+            if after_bytes <= safe_target:
+                break
+            try:
+                entry.path.unlink()
+                metadata_path = entry.path.with_suffix(".json")
+                if metadata_path.exists():
+                    metadata_path.unlink()
+                _remove_empty_parents(entry.path.parent, stop_at=self.root_dir)
+            except OSError:
+                continue
+            pruned += 1
+            removed += entry.size_bytes
+            after_bytes -= entry.size_bytes
+        return {
+            "ok": True,
+            "pruned": pruned,
+            "bytes_removed": removed,
+            "before_bytes": before_bytes,
+            "after_bytes": max(0, after_bytes),
+            "target_bytes": safe_target,
+        }
+
+    def _entries(self) -> list["_CacheEntry"]:
+        root = self.root_dir
+        entries: list[_CacheEntry] = []
+        if not root.exists():
+            return entries
+        for path in root.glob("*/*/*"):
+            if not path.is_file() or path.suffix == ".json" or path.name.startswith("."):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            entries.append(_CacheEntry(path=path, size_bytes=int(stat.st_size), mtime=float(stat.st_mtime)))
+        return entries
+
+
+@dataclass(frozen=True)
+class _CacheEntry:
+    path: Path
+    size_bytes: int
+    mtime: float
 
 
 def normalize_object_ref(object_ref: dict[str, Any]) -> dict[str, Any]:
@@ -194,6 +264,31 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def _configured_max_cache_bytes(value: int | None) -> int:
+    if value is not None:
+        return max(1, int(value))
+    raw = os.environ.get("AIBRANDMONITOR_CLOUD_OBJECT_CACHE_MAX_BYTES", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except Exception:
+            pass
+    return DEFAULT_MAX_CACHE_BYTES
+
+
+def _remove_empty_parents(path: Path, *, stop_at: Path) -> None:
+    stop = stop_at.resolve()
+    current = path
+    while True:
+        try:
+            if current.resolve() == stop:
+                return
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
