@@ -141,6 +141,7 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
     assert process_result == {"ok": True, "state_delta_inbox": {"ok": True, "applied": 1}}
     process_kwargs = process_inbox.call_args.kwargs
     assert callable(process_kwargs["appliers"]["profile"])
+    assert callable(process_kwargs["appliers"]["tasks"])
     assert process_kwargs["limit"] == 20
     assert process_kwargs["streams"] == ["tasks"]
     assert process_kwargs["include_failed"] is False
@@ -239,6 +240,168 @@ def test_app_cloud_runtime_support_rejects_profile_delta_for_other_user():
     assert result["state_delta_inbox"]["failed"] == 1
     assert "不匹配" in diagnostics["failed"][0]["last_error"]
     session_store.update_user.assert_not_called()
+
+
+def test_app_cloud_runtime_support_applies_task_state_delta_to_config():
+    owner = _support_owner()
+    config = {"tasks": []}
+    owner.load_config.return_value = config
+    owner.save_config = Mock()
+    owner._invalidate_tasks_full_cache = Mock()
+    owner._refresh_monitoring_runtime = Mock()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+        inbox.record_changes(
+            identity_key="https://api.example.com|3|2",
+            changes=[
+                {
+                    "stream": "tasks",
+                    "seq": 1,
+                    "kind": "task.updated",
+                    "ref_id": "42",
+                    "entity": {
+                        "type": "task",
+                        "id": 42,
+                        "workspace_id": 3,
+                        "task_key": "brand-demo",
+                        "name": "云端品牌",
+                        "brand": "云端品牌",
+                        "config_json": {"keywords": ["云端关键词"], "platforms": ["Kimi"]},
+                        "config_version": 2,
+                        "enabled": True,
+                        "access_level": "operate",
+                    },
+                }
+            ],
+        )
+
+        with patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox):
+            result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["tasks"]})
+
+    assert result["ok"] is True
+    assert result["state_delta_inbox"]["applied"] == 1
+    saved_config = owner.save_config.call_args.args[0]
+    task = saved_config["tasks"][0]
+    assert task["cloud_task_id"] == 42
+    assert task["cloud_config_version"] == 2
+    assert task["keywords"][0]["keyword"] == "云端关键词"
+    owner._invalidate_tasks_full_cache.assert_called_once()
+    owner._refresh_monitoring_runtime.assert_called_once_with(restart_scheduler=True)
+
+
+def test_app_cloud_runtime_support_deletes_task_state_delta_via_existing_merge_rules():
+    owner = _support_owner()
+    config = {
+        "tasks": [
+            {
+                "task_id": "cloud_42",
+                "name": "旧云端品牌",
+                "brand": "旧云端品牌",
+                "enabled": True,
+                "cloud_task_id": 42,
+                "cloud_workspace_id": 3,
+                "cloud_base_url": "https://api.example.com",
+                "cloud_access_level": "operate",
+            }
+        ]
+    }
+    owner.load_config.return_value = config
+    owner.save_config = Mock()
+    owner._invalidate_tasks_full_cache = Mock()
+    owner._refresh_monitoring_runtime = Mock()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+        inbox.record_changes(
+            identity_key="https://api.example.com|3|2",
+            changes=[
+                {
+                    "stream": "tasks",
+                    "seq": 2,
+                    "kind": "task.deleted",
+                    "ref_id": "42",
+                    "entity": {
+                        "type": "task",
+                        "id": 42,
+                        "workspace_id": 3,
+                        "task_key": "brand-demo",
+                        "name": "旧云端品牌",
+                        "brand": "旧云端品牌",
+                        "config_json": {"keywords": ["旧云端品牌"], "platforms": ["kimi"]},
+                        "config_version": 2,
+                        "enabled": True,
+                        "access_level": "operate",
+                        "deleted_at": "2026-05-28T00:00:00+08:00",
+                        "delete_expires_at": "2026-06-04T00:00:00+08:00",
+                    },
+                }
+            ],
+        )
+
+        with patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox):
+            result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["tasks"]})
+            diagnostics = inbox.diagnostics()
+
+    assert result["ok"] is True
+    saved_config = owner.save_config.call_args.args[0]
+    assert saved_config["tasks"] == []
+    assert saved_config["deleted_tasks"][0]["cloud_task_id"] == 42
+    assert diagnostics["by_status"] == {"applied": 1}
+
+
+def test_app_cloud_runtime_support_rejects_task_state_delta_for_other_workspace():
+    owner = _support_owner()
+    owner.load_config.return_value = {"tasks": []}
+    owner.save_config = Mock()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+        inbox.record_changes(
+            identity_key="https://api.example.com|3|2",
+            changes=[
+                {
+                    "stream": "tasks",
+                    "seq": 1,
+                    "kind": "task.updated",
+                    "ref_id": "42",
+                    "entity": {"type": "task", "id": 42, "workspace_id": 99},
+                }
+            ],
+        )
+
+        with patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox):
+            result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["tasks"]})
+            diagnostics = inbox.diagnostics()
+
+    assert result["ok"] is False
+    assert result["state_delta_inbox"]["failed"] == 1
+    assert "工作区不匹配" in diagnostics["failed"][0]["last_error"]
+    owner.save_config.assert_not_called()
 
 
 def test_app_cloud_runtime_support_retries_request_after_refresh():

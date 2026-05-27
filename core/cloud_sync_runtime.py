@@ -24,6 +24,7 @@ from core.cloud_run_sync import (
 )
 from core.cloud_state_delta import CloudStateDeltaStore, pull_cloud_state_delta
 from core.cloud_state_delta_inbox import CloudStateDeltaInbox, process_state_delta_inbox
+from core.cloud_task_sync import merge_cloud_tasks_into_config
 from core.cloud_session_store import (
     CloudSessionChangedError,
     CloudSessionStore,
@@ -670,7 +671,10 @@ class AppCloudRuntimeSupport:
         self,
         custom_appliers: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
     ) -> dict[str, Callable[[dict[str, Any]], Any]]:
-        appliers: dict[str, Callable[[dict[str, Any]], Any]] = {"profile": self._apply_profile_state_delta}
+        appliers: dict[str, Callable[[dict[str, Any]], Any]] = {
+            "profile": self._apply_profile_state_delta,
+            "tasks": self._apply_task_state_delta,
+        }
         appliers.update(custom_appliers or {})
         return appliers
 
@@ -711,6 +715,68 @@ class AppCloudRuntimeSupport:
             }
         )
         store.update_user(merged_user)
+
+    def _apply_task_state_delta(self, item: dict[str, Any]) -> None:
+        entity = item.get("entity") if isinstance(item.get("entity"), dict) else {}
+        if str(item.get("stream") or "") != "tasks" or str(entity.get("type") or "") != "task":
+            raise ValueError("state-delta task item has invalid shape")
+        task_id = _safe_int(entity.get("id"), 0)
+        workspace_id = _safe_int(entity.get("workspace_id"), 0)
+        if task_id <= 0 or workspace_id <= 0:
+            raise ValueError("state-delta task item is missing id/workspace_id")
+        session = self._session_store_factory().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        current_workspace_id = _safe_int(user.get("workspace_id"), 0)
+        if current_workspace_id and workspace_id != current_workspace_id:
+            raise ValueError("task state-delta 与当前云端工作区不匹配")
+        config = self._load_runtime_config()
+        deleted_at = str(entity.get("deleted_at") or "").strip()
+        delete_expires_at = str(entity.get("delete_expires_at") or "").strip()
+        if deleted_at or delete_expires_at:
+            summary = merge_cloud_tasks_into_config(
+                config,
+                [],
+                deleted_cloud_tasks=[entity],
+                cloud_user=user,
+                base_url=str(session.get("base_url") or ""),
+                match_by_name=False,
+                disable_missing=False,
+                missing_cloud_task_ids=[task_id],
+            )
+        else:
+            summary = merge_cloud_tasks_into_config(
+                config,
+                [entity],
+                cloud_user=user,
+                base_url=str(session.get("base_url") or ""),
+                match_by_name=False,
+                disable_missing=False,
+                missing_cloud_task_ids=[task_id],
+            )
+        changed = (
+            int(summary.get("added") or 0)
+            + int(summary.get("updated") or 0)
+            + int(summary.get("revoked") or 0)
+            + int(summary.get("deleted") or 0)
+            + int(summary.get("deleted_backups") or 0)
+            + int(summary.get("deleted_pending") or 0)
+        )
+        if changed:
+            self._save_runtime_config(config)
+            self._invalidate_owner_task_views()
+
+    def _save_runtime_config(self, config: dict[str, Any]) -> None:
+        save_config = getattr(self._owner, "save_config", None)
+        if callable(save_config):
+            save_config(config)
+
+    def _invalidate_owner_task_views(self) -> None:
+        invalidate_tasks = getattr(self._owner, "_invalidate_tasks_full_cache", None)
+        if callable(invalidate_tasks):
+            invalidate_tasks()
+        refresh_runtime = getattr(self._owner, "_refresh_monitoring_runtime", None)
+        if callable(refresh_runtime):
+            refresh_runtime(restart_scheduler=True)
 
     def cloud_request_with_refresh(self, operation: Callable[[Any, str], Any]) -> tuple[bool, Any, str]:
         store = self._session_store_factory()
