@@ -4311,7 +4311,7 @@ return changedCount
 
     def _cloud_runtime_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         normalized = str(command or "").strip()
-        if normalized not in DAEMON_SUPPORTED_COMMANDS:
+        if normalized not in DAEMON_SUPPORTED_COMMANDS or normalized == "cloud.logout":
             return self._ensure_cloud_runtime_support().handle_command(command, payload)
         client = self._ensure_cloud_command_client()
         result = client.send_command(normalized, payload)

@@ -169,6 +169,18 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True, "message": "local"})
         support.handle_command.assert_called_once_with("cloud.schedule_article_snapshot", None)
 
+    def test_app_runtime_logout_stays_on_main_process_support(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        support = Mock()
+        support.handle_command.return_value = {"ok": True, "message": "local logout"}
+        runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
+        runtime._cloud_command_client = Mock(send_command=Mock(side_effect=AssertionError("daemon should not be used")))
+
+        result = AppRuntime._cloud_runtime_command(runtime, "cloud.logout")
+
+        self.assertEqual(result, {"ok": True, "message": "local logout"})
+        support.handle_command.assert_called_once_with("cloud.logout", None)
+
     def test_web_app_server_start_boots_cloud_command_transport(self) -> None:
         runtime = Mock()
         http_server = Mock()

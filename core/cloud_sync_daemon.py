@@ -21,7 +21,6 @@ from typing import Any, Callable
 DAEMON_SUPPORTED_COMMANDS = frozenset(
     {
         "cloud.flush_outbox",
-        "cloud.logout",
         "cloud.list_admin_users",
         "cloud.list_admin_article_classification_jobs",
         "cloud.resolve_admin_article_classification_job",
