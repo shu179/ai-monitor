@@ -23,6 +23,7 @@ from core.cloud_run_sync import (
     flush_cloud_outbox,
 )
 from core.cloud_state_delta import CloudStateDeltaStore, pull_cloud_state_delta
+from core.cloud_state_delta_inbox import CloudStateDeltaInbox
 from core.cloud_session_store import (
     CloudSessionChangedError,
     CloudSessionStore,
@@ -639,10 +640,13 @@ class AppCloudRuntimeSupport:
         return {"ok": bool(result.get("ok")), "state_delta": result, "message": str(result.get("message") or "")}
 
     def cloud_state_delta_diagnostics(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        del payload
+        request_payload = payload if isinstance(payload, dict) else {}
         session = self._session_store_factory().load()
         diagnostics = CloudStateDeltaStore().diagnostics(session)
-        return {"ok": True, "state_delta": diagnostics}
+        inbox_diagnostics = CloudStateDeltaInbox().diagnostics(
+            failed_limit=_safe_int(request_payload.get("failed_limit") or request_payload.get("failedLimit"), 10)
+        )
+        return {"ok": True, "state_delta": diagnostics, "inbox": inbox_diagnostics}
 
     def cloud_request_with_refresh(self, operation: Callable[[Any, str], Any]) -> tuple[bool, Any, str]:
         store = self._session_store_factory()

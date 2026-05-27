@@ -15,6 +15,7 @@ from .cloud_session_store import (
     CloudSessionStore,
     cloud_session_identity_key,
 )
+from .cloud_state_delta_inbox import CloudStateDeltaInbox
 from .cloud_task_sync import _cloud_request_with_refresh
 from .file_lock import CrossProcessRLock
 from .local_account_space import account_scoped_path
@@ -159,6 +160,7 @@ def pull_cloud_state_delta(
     client: SurfacedCloudClient | None = None,
     session_store: CloudSessionStore | None = None,
     state_store: CloudStateDeltaStore | None = None,
+    inbox: CloudStateDeltaInbox | None = None,
     limit: int = 500,
     max_pages: int = 5,
 ) -> dict[str, Any]:
@@ -196,6 +198,9 @@ def pull_cloud_state_delta(
     reset_required = False
     retry_after_seconds = 0
     state_updated = False
+    inbox_store = inbox or CloudStateDeltaInbox()
+    inbox_created = 0
+    inbox_duplicates = 0
 
     try:
         while pages < pages_limit:
@@ -238,6 +243,14 @@ def pull_cloud_state_delta(
                 state_updated = True
                 break
 
+            inbox_result = inbox_store.record_changes(
+                identity_key=identity_key,
+                changes=changes,
+                object_refs=object_refs,
+            )
+            inbox_created += int(inbox_result.get("created") or 0)
+            inbox_duplicates += int(inbox_result.get("duplicates") or 0)
+
             next_cursors = response.get("next_cursors") if isinstance(response.get("next_cursors"), dict) else {}
             if next_cursors:
                 state["cursors"] = _merge_cursors(state.get("cursors"), next_cursors)
@@ -266,6 +279,8 @@ def pull_cloud_state_delta(
             has_more=has_more,
             next_retry_after_seconds=retry_after_seconds,
             state_updated=state_updated,
+            inbox_created=inbox_created,
+            inbox_duplicates=inbox_duplicates,
         )
         state["identity_key"] = identity_key
         state["last_pulled_at"] = local_now().isoformat(timespec="seconds")
@@ -273,7 +288,7 @@ def pull_cloud_state_delta(
         state["last_summary"] = summary
         delta_store.save(state)
         return summary
-    except (CloudClientError, CloudSessionChangedError) as exc:
+    except (CloudClientError, CloudSessionChangedError, Exception) as exc:
         summary = _summary(
             ok=False,
             mode=mode,
@@ -287,6 +302,8 @@ def pull_cloud_state_delta(
             has_more=has_more,
             next_retry_after_seconds=retry_after_seconds,
             state_updated=state_updated,
+            inbox_created=inbox_created,
+            inbox_duplicates=inbox_duplicates,
         )
         _save_error(delta_store, identity_key, summary)
         return summary
@@ -336,6 +353,8 @@ def _summary(
     has_more: bool = False,
     next_retry_after_seconds: int = 0,
     state_updated: bool = False,
+    inbox_created: int = 0,
+    inbox_duplicates: int = 0,
 ) -> dict[str, Any]:
     return {
         "ok": bool(ok),
@@ -350,4 +369,6 @@ def _summary(
         "next_retry_after_seconds": max(0, int(next_retry_after_seconds or 0)),
         "duration_ms": int(round((time.perf_counter() - started_at) * 1000)),
         "state_updated": bool(state_updated),
+        "inbox_created": max(0, int(inbox_created or 0)),
+        "inbox_duplicates": max(0, int(inbox_duplicates or 0)),
     }

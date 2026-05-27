@@ -124,16 +124,23 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
     with (
         patch("core.cloud_sync_runtime.pull_cloud_state_delta", return_value={"ok": True, "changes": 3}) as pull_delta,
         patch("core.cloud_sync_runtime.CloudStateDeltaStore") as store_cls,
+        patch("core.cloud_sync_runtime.CloudStateDeltaInbox") as inbox_cls,
     ):
         store_cls.return_value.diagnostics.return_value = {"cursors": {"tasks": 2}}
+        inbox_cls.return_value.diagnostics.return_value = {"by_status": {"pending": 1}}
 
         pull_result = support.handle_command("cloud.pull_state_delta", {"limit": 50, "max_pages": 2})
         diagnostics = support.handle_command("cloud.state_delta_diagnostics")
 
     assert pull_result == {"ok": True, "state_delta": {"ok": True, "changes": 3}, "message": ""}
     pull_delta.assert_called_once_with(limit=50, max_pages=2)
-    assert diagnostics == {"ok": True, "state_delta": {"cursors": {"tasks": 2}}}
+    assert diagnostics == {
+        "ok": True,
+        "state_delta": {"cursors": {"tasks": 2}},
+        "inbox": {"by_status": {"pending": 1}},
+    }
     store_cls.return_value.diagnostics.assert_called_once_with(session_store.load.return_value)
+    inbox_cls.return_value.diagnostics.assert_called_once_with(failed_limit=10)
 
 
 def test_app_cloud_runtime_support_retries_request_after_refresh():

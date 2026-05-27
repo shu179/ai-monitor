@@ -6,6 +6,7 @@ from pathlib import Path
 
 from core.cloud_state_delta import CloudStateDeltaStore, pull_cloud_state_delta
 from core.cloud_client import CloudClientError
+from core.cloud_state_delta_inbox import CloudStateDeltaInbox
 
 
 def _session(access_token: str = "access-token") -> dict:
@@ -75,6 +76,7 @@ class CloudStateDeltaTests(unittest.TestCase):
     def test_pull_updates_cursors_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = CloudStateDeltaStore(Path(tmp) / "state.json")
+            inbox_path = Path(tmp) / "inbox.sqlite3"
             client = FakeStateDeltaClient(
                 [
                     {
@@ -95,6 +97,7 @@ class CloudStateDeltaTests(unittest.TestCase):
                 client=client,
                 session_store=FakeSessionStore(_session()),
                 state_store=store,
+                inbox=CloudStateDeltaInbox(inbox_path),
                 limit=500,
                 max_pages=2,
             )
@@ -104,9 +107,12 @@ class CloudStateDeltaTests(unittest.TestCase):
         self.assertEqual(result["changes"], 2)
         self.assertEqual(result["streams"], {"tasks": 1, "articles": 1})
         self.assertEqual(result["object_refs"], 1)
+        self.assertEqual(result["inbox_created"], 2)
+        self.assertEqual(result["inbox_duplicates"], 0)
         self.assertEqual(state["cursors"], {"tasks": 1, "articles": 7})
         self.assertEqual(state["reset_token"], "")
         self.assertEqual(state["last_summary"]["changes"], 2)
+        self.assertEqual(state["last_summary"]["inbox_created"], 2)
         self.assertEqual(client.calls[0]["cursors"], {})
 
     def test_pull_saves_reset_required_token(self) -> None:
