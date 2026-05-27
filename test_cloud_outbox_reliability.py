@@ -23,6 +23,10 @@ class MarkFailedBackoffTests(unittest.TestCase):
 
             items = outbox.pending(limit=10)
             self.assertEqual(len(items), 0, "failed item should not be in pending before next_attempt_ts")
+            stats = outbox.stats(include_retry=True)
+            self.assertEqual(stats["upload_ready"], 0)
+            self.assertEqual(stats["retry_ready"], 0)
+            self.assertGreaterEqual(stats["next_retry_after_seconds"], 50)
 
             # Read raw file to inspect fields
             with open(Path(tmpdir) / "outbox.json") as f:
@@ -52,6 +56,9 @@ class MarkFailedBackoffTests(unittest.TestCase):
             items = outbox.pending(limit=10)
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0]["idempotency_key"], "evt-1")
+            stats = outbox.stats(include_retry=True)
+            self.assertEqual(stats["retry_ready"], 1)
+            self.assertEqual(stats["upload_ready"], 1)
 
     def test_failed_without_next_attempt_ts_is_immediately_pending(self):
         """Old failed events without next_attempt_ts should be returned by pending()."""

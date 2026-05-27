@@ -207,6 +207,19 @@ class CloudPlatformAutoSync:
             return self._upload_burst_interval_seconds
         return self._upload_retry_interval_seconds
 
+    @staticmethod
+    def _upload_ready_count(stats: dict[str, Any]) -> int:
+        """Return events that can actually be sent now, excluding backoff-waiting failures."""
+        if "upload_ready" in stats:
+            try:
+                return max(0, int(stats.get("upload_ready") or 0))
+            except Exception:
+                return 0
+        try:
+            return max(0, int(stats.get("pending") or 0))
+        except Exception:
+            return 0
+
     def _refresh_upload_backpressure_status(self, now: float | None = None) -> bool:
         current = time.monotonic() if now is None else float(now)
         if self._upload_backpressure_until_at <= 0:
@@ -319,20 +332,22 @@ class CloudPlatformAutoSync:
                         recovery_result = {"ok": False, "message": f"历史运行数据恢复失败：{exc}"}
 
                 active_outbox = self._outbox.bind_to_session(session)
-                stats = active_outbox.stats()
+                stats = active_outbox.stats(include_retry=True)
                 pending_count = int(stats.get("pending") or 0) + int(stats.get("failed") or 0)
+                upload_ready_count = self._upload_ready_count(stats)
                 has_pending_upload = pending_count > 0
+                has_upload_ready = upload_ready_count > 0
                 upload_result: dict[str, Any] | None = None
                 had_upload_backpressure = self._upload_backpressure_until_at > 0
                 upload_backpressure_active = self._refresh_upload_backpressure_status(now)
                 upload_backpressure_expired = had_upload_backpressure and not upload_backpressure_active
-                if first_sync_for_login:
+                if first_sync_for_login and has_upload_ready:
                     self._last_upload_started_at = now
                     try:
                         upload_result = flush_cloud_outbox(outbox=active_outbox, limit=500)
                     except Exception as exc:
                         upload_result = {"ok": False, "message": f"运行数据恢复上传失败：{exc}", "metrics": {}}
-                elif has_pending_upload and not upload_backpressure_active and (
+                elif has_pending_upload and has_upload_ready and not upload_backpressure_active and (
                     upload_wake_requested
                     or upload_backpressure_expired
                     or self._last_upload_started_at <= 0

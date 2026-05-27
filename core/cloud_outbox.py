@@ -249,14 +249,35 @@ class CloudOutbox:
             except Exception:
                 pass
 
-    def stats(self) -> dict[str, int]:
+    def stats(self, *, include_retry: bool = False) -> dict[str, int]:
         with self._lock:
             items = self._load_locked()
+        now = time.time()
+        next_retry_ts: float | None = None
         stats: dict[str, int] = {"total": len(items), "pending": 0, "failed": 0, "sent": 0, "dead_letter": 0}
+        retry_ready = 0
         for item in items:
             status = str(item.get("status") or "pending")
             if status in stats:
                 stats[status] += 1
+            if status != "failed":
+                continue
+            if _is_retry_ready(item, now):
+                retry_ready += 1
+                continue
+            item_next_retry_ts = _next_attempt_ts(item)
+            if item_next_retry_ts is None:
+                continue
+            if next_retry_ts is None or item_next_retry_ts < next_retry_ts:
+                next_retry_ts = item_next_retry_ts
+        if include_retry:
+            stats["retry_ready"] = retry_ready
+            stats["upload_ready"] = int(stats.get("pending") or 0) + retry_ready
+            stats["next_retry_after_seconds"] = (
+                int(max(0.0, next_retry_ts - now) + 0.999)
+                if next_retry_ts is not None
+                else 0
+            )
         return stats
 
     def _load_locked(self) -> list[dict[str, Any]]:
@@ -403,13 +424,20 @@ def _outbox_status(item: dict[str, Any]) -> str:
 
 def _is_retry_ready(item: dict[str, Any], now: float) -> bool:
     """Check if a failed item is ready for retry. Treats bad/missing next_attempt_ts as ready."""
-    next_ts = item.get("next_attempt_ts")
+    next_ts = _next_attempt_ts(item)
     if next_ts is None:
         return True
+    return next_ts <= now
+
+
+def _next_attempt_ts(item: dict[str, Any]) -> float | None:
+    next_ts = item.get("next_attempt_ts")
+    if next_ts is None:
+        return None
     try:
-        return float(next_ts) <= now
+        return float(next_ts)
     except (TypeError, ValueError):
-        return True
+        return None
 
 
 def _empty_dropped() -> dict[str, Any]:

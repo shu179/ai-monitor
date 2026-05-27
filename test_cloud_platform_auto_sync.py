@@ -241,6 +241,52 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             self.assertEqual(outbox.stats()["sent"], 1)
             self.assertEqual(manager.get_status()["upload_backpressure_until"], "")
 
+    def test_failed_outbox_waiting_for_backoff_does_not_trigger_empty_flush(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.example.com",
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+                }
+            )
+            outbox = CloudOutbox(Path(tmpdir) / "outbox.json")
+            outbox.enqueue(
+                event_type="run_record",
+                idempotency_key="run:waiting-backoff",
+                payload={"task_id": 1, "result": {"rank": 1, "success": True}},
+            )
+            outbox.mark_failed(["run:waiting-backoff"], "timeout")
+            flush_calls: list[float] = []
+
+            def fake_flush(**_kwargs):
+                flush_calls.append(time.monotonic())
+                return {"ok": True, "outbox": outbox.stats(), "metrics": {"event_count": 0}}
+
+            with patch("core.cloud_platform_auto_sync.flush_cloud_outbox", side_effect=fake_flush):
+                manager = CloudPlatformAutoSync(
+                    session_store=store,
+                    outbox=outbox,
+                    pull_tasks=lambda: {"ok": True},
+                    upload_retry_interval_seconds=5,
+                    upload_burst_interval_seconds=0.1,
+                    upload_burst_pending_threshold=1,
+                    pull_interval_seconds=3600,
+                    idle_interval_seconds=0.2,
+                    event_stream_enabled=False,
+                    logger=lambda _message: None,
+                )
+                manager.start()
+                try:
+                    time.sleep(0.8)
+                finally:
+                    manager.stop()
+
+            self.assertEqual(flush_calls, [])
+            self.assertEqual(outbox.stats()["failed"], 1)
+
     def test_initial_login_recovers_local_candidates_before_upload(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = CloudSessionStore(Path(tmpdir) / "session.json")
