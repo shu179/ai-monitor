@@ -10,6 +10,23 @@ class APIMessage(BaseModel):
     message: str
 
 
+class CloudOpsReportResponse(BaseModel):
+    report: dict[str, Any]
+    text: str
+
+
+class CloudMaintenanceRequest(BaseModel):
+    dry_run: bool = True
+
+
+class CloudMaintenanceResponse(BaseModel):
+    dry_run: bool
+    expired_upload_sessions: dict[str, int]
+    dead_letters: dict[str, int]
+    change_log: dict[str, int]
+    orphan_files: dict[str, int]
+
+
 class UserPublic(BaseModel):
     id: int
     workspace_id: int

@@ -8,6 +8,9 @@ from app.schemas import (
     AssignTaskRequest,
     ArticleClassificationJobPublic,
     BrandTaskPublic,
+    CloudMaintenanceRequest,
+    CloudMaintenanceResponse,
+    CloudOpsReportResponse,
     CreateTaskRequest,
     CreateUserRequest,
     IgnoreArticleClassificationRequest,
@@ -36,6 +39,9 @@ from app.services.admin_service import (
     update_workspace_user,
     workspace_user_public_payload,
 )
+from app.services.cloud_maintenance_service import run_cloud_maintenance
+from app.services.object_storage_diagnostics import build_object_storage_report, format_object_storage_report
+from app.services.sync_queue_diagnostics import build_sync_queue_report, format_sync_queue_report
 
 router = APIRouter()
 
@@ -43,6 +49,26 @@ router = APIRouter()
 @router.get("/users", response_model=list[UserPublic])
 def users(admin: AdminUser, db: DbSession) -> list[dict]:
     return list_workspace_users(db, admin)
+
+
+@router.get("/ops/sync-queue", response_model=CloudOpsReportResponse)
+def sync_queue_doctor(admin: AdminUser, db: DbSession) -> CloudOpsReportResponse:
+    del admin
+    report = build_sync_queue_report(db)
+    return CloudOpsReportResponse(report=report, text=format_sync_queue_report(report))
+
+
+@router.get("/ops/object-storage", response_model=CloudOpsReportResponse)
+def object_storage_doctor(admin: AdminUser, db: DbSession) -> CloudOpsReportResponse:
+    del admin
+    report = build_object_storage_report(db)
+    return CloudOpsReportResponse(report=report, text=format_object_storage_report(report))
+
+
+@router.post("/ops/maintenance", response_model=CloudMaintenanceResponse)
+def cloud_maintenance(payload: CloudMaintenanceRequest, admin: AdminUser, db: DbSession) -> CloudMaintenanceResponse:
+    del admin
+    return CloudMaintenanceResponse(**run_cloud_maintenance(db, dry_run=payload.dry_run))
 
 
 @router.post("/users", response_model=UserPublic, status_code=status.HTTP_201_CREATED)
