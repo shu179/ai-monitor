@@ -130,6 +130,16 @@ class FakeBinarySession(FakeSession):
         return FakeBinaryResponse()
 
 
+class FakeUploadSession(FakeSession):
+    def request(self, method: str, url: str, **kwargs):
+        captured = {"method": method, "url": url, **kwargs}
+        data = kwargs.get("data")
+        if data is not None:
+            captured["body"] = b"".join(data)
+        self.calls.append(captured)
+        return FakeResponse()
+
+
 class FakeTimeoutSession(FakeSession):
     def request(self, method: str, url: str, **kwargs):
         self.calls.append({"method": method, "url": url, **kwargs})
@@ -389,6 +399,81 @@ class CloudClientTests(unittest.TestCase):
         self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
         self.assertEqual(session.calls[0]["headers"]["X-Trace-Id"], "object.trace")
         self.assertEqual(session.calls[0]["headers"]["X-Cloud-Capability"], "sync-v2,batch-v2,object-v1,state-delta-v1")
+
+    def test_create_object_upload_posts_v2_payload_and_headers(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.create_object_upload(
+            "access-token",
+            sha256="a" * 64,
+            size_bytes=123,
+            content_type="text/plain",
+            storage_size_bytes=120,
+            compression="zstd",
+            trace_id="upload.trace!",
+        )
+
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v2/objects/uploads")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+        self.assertEqual(session.calls[0]["headers"]["X-Trace-Id"], "upload.trace")
+        self.assertEqual(session.calls[0]["headers"]["X-Cloud-Capability"], "sync-v2,batch-v2,object-v1,state-delta-v1")
+        self.assertEqual(
+            session.calls[0]["json"],
+            {
+                "sha256": "a" * 64,
+                "size_bytes": 123,
+                "content_type": "text/plain",
+                "storage_size_bytes": 120,
+                "compression": "zstd",
+            },
+        )
+
+    def test_upload_object_content_resolves_relative_url_with_authorization(self):
+        session = FakeUploadSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.upload_object_content(
+            "access-token",
+            "/api/v2/objects/uploads/session-1/content",
+            [b"hello", b"", b" world"],
+            content_type="text/plain",
+            headers={"X-Part": "1"},
+            trace_id="upload.1",
+        )
+
+        self.assertEqual(session.calls[0]["method"], "PUT")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v2/objects/uploads/session-1/content")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+        self.assertEqual(session.calls[0]["headers"]["Content-Type"], "text/plain")
+        self.assertEqual(session.calls[0]["headers"]["X-Part"], "1")
+        self.assertEqual(session.calls[0]["headers"]["X-Trace-Id"], "upload.1")
+        self.assertEqual(session.calls[0]["body"], b"hello world")
+
+    def test_upload_object_content_external_presigned_url_omits_authorization(self):
+        session = FakeUploadSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.upload_object_content("access-token", "https://storage.example.com/upload?sig=1", [b"body"])
+
+        self.assertEqual(session.calls[0]["url"], "https://storage.example.com/upload?sig=1")
+        self.assertNotIn("Authorization", session.calls[0]["headers"])
+        self.assertEqual(session.calls[0]["body"], b"body")
+
+    def test_complete_object_upload_posts_v2_request(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.complete_object_upload("access-token", "session-1", storage_size_bytes=123, compression="none")
+
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v2/objects/uploads/session-1:complete")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+        self.assertEqual(
+            session.calls[0]["json"],
+            {"storage_size_bytes": 123, "compression": "none"},
+        )
 
     def test_iter_object_content_resolves_relative_url_with_authorization(self):
         session = FakeBinarySession()

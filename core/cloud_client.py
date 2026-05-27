@@ -251,6 +251,110 @@ class SurfacedCloudClient:
         )
         return response if isinstance(response, dict) else {}
 
+    def create_object_upload(
+        self,
+        access_token: str,
+        *,
+        sha256: str,
+        size_bytes: int,
+        content_type: str,
+        storage_size_bytes: int | None = None,
+        compression: str = "auto",
+        trace_id: str = "",
+    ) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            "/api/v2/objects/uploads",
+            access_token=access_token,
+            json_body={
+                "sha256": str(sha256 or "").strip(),
+                "size_bytes": int(size_bytes or 0),
+                "content_type": str(content_type or "").strip(),
+                "storage_size_bytes": int(storage_size_bytes) if storage_size_bytes is not None else None,
+                "compression": str(compression or "auto").strip() or "auto",
+            },
+            trace_id=trace_id,
+            extra_headers={"X-Cloud-Capability": DEFAULT_CLOUD_CAPABILITY_HEADER},
+        )
+        return response if isinstance(response, dict) else {}
+
+    def upload_object_content(
+        self,
+        access_token: str,
+        upload_url: str,
+        chunks: Iterable[bytes],
+        *,
+        content_type: str = "application/octet-stream",
+        headers: dict[str, Any] | None = None,
+        trace_id: str = "",
+        read_timeout_seconds: float = 120.0,
+    ) -> dict[str, Any]:
+        safe_url = _resolve_transfer_url(self.base_url, upload_url)
+        if not safe_url:
+            raise CloudClientError("upload_url is required")
+        request_headers = {
+            "Accept": "application/json",
+            "Content-Type": str(content_type or "application/octet-stream").strip() or "application/octet-stream",
+        }
+        token = str(access_token or "").strip()
+        if token and _should_authorize_transfer_url(self.base_url, safe_url, upload_url):
+            request_headers["Authorization"] = f"Bearer {token}"
+        safe_trace_id = normalize_trace_id(trace_id)
+        if safe_trace_id:
+            request_headers["X-Trace-Id"] = safe_trace_id
+        for key, value in (headers or {}).items():
+            header_name = str(key or "").strip()
+            header_value = str(value or "").strip()
+            if header_name and header_value:
+                request_headers[header_name] = header_value
+
+        try:
+            response = self._session.request(
+                "PUT",
+                safe_url,
+                headers=request_headers,
+                data=_iter_bytes(chunks),
+                timeout=(min(10.0, self.timeout_seconds), max(30.0, float(read_timeout_seconds or 120.0))),
+            )
+        except requests.RequestException as exc:
+            raise CloudClientError(_format_request_exception("云端对象上传", exc)) from exc
+
+        body = _decode_response_body(response)
+        if response.status_code >= 400:
+            message = _extract_error_message(body) or f"云端对象上传失败：HTTP {response.status_code}"
+            raise CloudClientError(
+                message,
+                status_code=response.status_code,
+                response_body=body,
+                **_extract_backpressure_metadata(response, body),
+            )
+        return body if isinstance(body, dict) else {}
+
+    def complete_object_upload(
+        self,
+        access_token: str,
+        session_id: str,
+        *,
+        storage_size_bytes: int | None = None,
+        compression: str = "auto",
+        trace_id: str = "",
+    ) -> dict[str, Any]:
+        safe_session_id = str(session_id or "").strip()
+        if not safe_session_id:
+            raise CloudClientError("session_id is required")
+        response = self._request(
+            "POST",
+            f"/api/v2/objects/uploads/{safe_session_id}:complete",
+            access_token=access_token,
+            json_body={
+                "storage_size_bytes": int(storage_size_bytes) if storage_size_bytes is not None else None,
+                "compression": str(compression or "auto").strip() or "auto",
+            },
+            trace_id=trace_id,
+            extra_headers={"X-Cloud-Capability": DEFAULT_CLOUD_CAPABILITY_HEADER},
+        )
+        return response if isinstance(response, dict) else {}
+
     def iter_object_content(
         self,
         access_token: str,
@@ -260,12 +364,12 @@ class SurfacedCloudClient:
         chunk_size: int = 1024 * 1024,
         read_timeout_seconds: float = 120.0,
     ) -> Iterator[bytes]:
-        safe_url = _resolve_download_url(self.base_url, download_url)
+        safe_url = _resolve_transfer_url(self.base_url, download_url)
         if not safe_url:
             raise CloudClientError("download_url is required")
         headers = {"Accept": "application/octet-stream"}
         token = str(access_token or "").strip()
-        if token and _should_authorize_download_url(self.base_url, safe_url, download_url):
+        if token and _should_authorize_transfer_url(self.base_url, safe_url, download_url):
             headers["Authorization"] = f"Bearer {token}"
         safe_trace_id = normalize_trace_id(trace_id)
         if safe_trace_id:
@@ -785,8 +889,8 @@ def _header_value(headers: Any, key: str) -> Any:
     return None
 
 
-def _resolve_download_url(base_url: str, download_url: str) -> str:
-    text = str(download_url or "").strip()
+def _resolve_transfer_url(base_url: str, transfer_url: str) -> str:
+    text = str(transfer_url or "").strip()
     if not text:
         return ""
     parsed = urlparse(text)
@@ -799,7 +903,7 @@ def _resolve_download_url(base_url: str, download_url: str) -> str:
     return urljoin(f"{base_url}/", text)
 
 
-def _should_authorize_download_url(base_url: str, resolved_url: str, raw_url: str) -> bool:
+def _should_authorize_transfer_url(base_url: str, resolved_url: str, raw_url: str) -> bool:
     raw_text = str(raw_url or "").strip()
     if not raw_text:
         return False
@@ -809,6 +913,12 @@ def _should_authorize_download_url(base_url: str, resolved_url: str, raw_url: st
     base = urlparse(base_url)
     target = urlparse(resolved_url)
     return bool(base.scheme and base.netloc and base.scheme == target.scheme and base.netloc == target.netloc)
+
+
+def _iter_bytes(chunks: Iterable[bytes]) -> Iterator[bytes]:
+    for chunk in chunks:
+        if chunk:
+            yield bytes(chunk)
 
 
 def _parse_retry_after(value: Any) -> float | None:
