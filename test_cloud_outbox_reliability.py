@@ -152,6 +152,25 @@ class DeadLetterTests(unittest.TestCase):
             self.assertEqual(stats["pending"], 1)
             self.assertEqual(stats["total"], 2)
 
+    def test_diagnostics_reports_failures_without_payloads(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outbox = CloudOutbox(Path(tmpdir) / "outbox.json")
+            outbox.enqueue(event_type="run", idempotency_key="evt-1", payload={"token": "secret", "n": 1})
+            outbox.mark_failed(["evt-1"], "timeout")
+
+            diagnostics = outbox.diagnostics()
+
+            self.assertEqual(diagnostics["path"], str(Path(tmpdir) / "outbox.json"))
+            self.assertEqual(diagnostics["stats"]["failed"], 1)
+            self.assertEqual(diagnostics["stats"]["upload_ready"], 0)
+            failed = diagnostics["failed"][0]
+            self.assertEqual(failed["idempotency_key"], "evt-1")
+            self.assertEqual(failed["event_type"], "run")
+            self.assertEqual(failed["last_error"], "timeout")
+            self.assertGreaterEqual(failed["next_attempt_after_seconds"], 50)
+            self.assertNotIn("payload", failed)
+            self.assertNotIn("secret", json.dumps(diagnostics))
+
 
 class SafeCompactionTests(unittest.TestCase):
     def test_compaction_only_drops_sent_items(self):

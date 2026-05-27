@@ -253,6 +253,55 @@ class CloudOutbox:
         with self._lock:
             items = self._load_locked()
         now = time.time()
+        return self._stats_from_items(items, now, include_retry=include_retry)
+
+    def diagnostics(self, *, failed_limit: int = 10) -> dict[str, Any]:
+        """Return local outbox health details without exposing event payloads."""
+        safe_limit = min(max(int(failed_limit or 10), 0), 100)
+        with self._lock:
+            items = self._load_locked()
+        now = time.time()
+        failed_items = [
+            self._diagnostic_item(item, now)
+            for item in items
+            if _outbox_status(item) == "failed"
+        ][:safe_limit]
+        dead_letter_items = [
+            self._diagnostic_item(item, now)
+            for item in items
+            if _outbox_status(item) == "dead_letter"
+        ][:safe_limit]
+        return {
+            "path": str(self.path),
+            "stats": self._stats_from_items(items, now, include_retry=True),
+            "failed": failed_items,
+            "dead_letter": dead_letter_items,
+            "sample_limit": safe_limit,
+        }
+
+    @staticmethod
+    def _diagnostic_item(item: dict[str, Any], now: float) -> dict[str, Any]:
+        next_ts = _next_attempt_ts(item)
+        next_after = 0
+        if next_ts is not None:
+            next_after = int(max(0.0, next_ts - now) + 0.999)
+        return {
+            "idempotency_key": str(item.get("idempotency_key") or ""),
+            "event_type": str(item.get("event_type") or ""),
+            "status": _outbox_status(item),
+            "attempts": _safe_int(item.get("attempts"), 0),
+            "last_error": str(item.get("last_error") or ""),
+            "next_attempt_at": str(item.get("next_attempt_at") or ""),
+            "next_attempt_after_seconds": next_after,
+            "retry_ready": _is_retry_ready(item, now) if _outbox_status(item) == "failed" else False,
+            "updated_at": str(item.get("updated_at") or ""),
+            "created_at": str(item.get("created_at") or ""),
+            "dead_lettered_at": str(item.get("dead_lettered_at") or ""),
+            "dead_letter_reason": str(item.get("dead_letter_reason") or ""),
+        }
+
+    @staticmethod
+    def _stats_from_items(items: list[dict[str, Any]], now: float, *, include_retry: bool = False) -> dict[str, int]:
         next_retry_ts: float | None = None
         stats: dict[str, int] = {"total": len(items), "pending": 0, "failed": 0, "sent": 0, "dead_letter": 0}
         retry_ready = 0
@@ -451,6 +500,13 @@ def _failure_retry_delay(attempts: int, *, retry_after_seconds: float | None = N
     except Exception:
         pass
     return _backoff_delay(attempts)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _outbox_sort_key(item: dict[str, Any]) -> str:

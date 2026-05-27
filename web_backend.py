@@ -441,6 +441,7 @@ GET_EXACT_RUNTIME_METHODS = {
     "/api/settings": "get_settings",
     "/api/todos": "get_todos",
     "/api/cloud/status": "get_cloud_status",
+    "/api/cloud/outbox-diagnostics": "get_cloud_outbox_diagnostics",
     "/api/cloud/admin/tasks": "list_cloud_admin_tasks",
     "/api/cloud/admin/users": "list_cloud_admin_users",
     "/api/cloud/admin/article-classification-jobs": "list_cloud_article_classification_jobs",
@@ -4342,6 +4343,9 @@ return changedCount
 
     def get_cloud_status(self) -> dict[str, Any]:
         return self._cloud_runtime_command("cloud.status")
+
+    def get_cloud_outbox_diagnostics(self) -> dict[str, Any]:
+        return self._cloud_runtime_command("cloud.outbox_diagnostics")
 
     def _current_cloud_status(self) -> dict[str, Any]:
         return self._cloud_runtime_command("cloud.current_status")

@@ -76,6 +76,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
 
     def test_run_cloud_sync_command_daemon_exports_supported_command_list(self) -> None:
         self.assertIn("cloud.flush_outbox", DAEMON_SUPPORTED_COMMANDS)
+        self.assertIn("cloud.outbox_diagnostics", DAEMON_SUPPORTED_COMMANDS)
 
     def test_app_runtime_cloud_command_uses_transport_client(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)

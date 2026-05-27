@@ -109,6 +109,7 @@ def test_app_cloud_runtime_support_cloud_status_uses_injected_status_and_outbox(
 
     assert result["cloud"]["loggedIn"] is True
     assert result["cloud"]["outbox"] == {"pending": 2, "failed": 1}
+    outbox.stats.assert_called_once_with(include_retry=True)
     assert result["cloud"]["autoSync"] == auto_sync_status
     assert result["cloud"]["validationError"] == "stale token"
     assert result["cloud"]["localProfile"]["configPath"] == "/tmp/config.yaml"
@@ -326,6 +327,33 @@ def test_app_cloud_runtime_support_command_flushes_outbox_with_payload_limit():
     flush_outbox.assert_called_once_with(limit=333)
 
 
+def test_app_cloud_runtime_support_command_returns_outbox_diagnostics():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {"base_url": "https://api.surfacedlab.com", "user": {"id": 3}}
+    bound_outbox = MagicMock()
+    bound_outbox.diagnostics.return_value = {
+        "path": "/tmp/outbox.json",
+        "stats": {"failed": 1, "upload_ready": 0},
+        "failed": [{"idempotency_key": "evt-1"}],
+        "dead_letter": [],
+    }
+    outbox = MagicMock()
+    outbox.bind_to_session.return_value = bound_outbox
+    support = AppCloudRuntimeSupport(
+        owner=owner,
+        session_store_factory=lambda: session_store,
+        outbox_factory=lambda: outbox,
+    )
+
+    result = support.handle_command("cloud.outbox_diagnostics", {"failedLimit": "7"})
+
+    assert result["ok"] is True
+    assert result["outbox"]["stats"]["failed"] == 1
+    outbox.bind_to_session.assert_called_once_with(session_store.load.return_value)
+    bound_outbox.diagnostics.assert_called_once_with(failed_limit=7)
+
+
 def test_app_cloud_runtime_support_command_returns_current_status_variants():
     owner = _support_owner()
     support = AppCloudRuntimeSupport(owner=owner)
@@ -365,6 +393,18 @@ def test_app_cloud_runtime_support_daemon_handle_command_delegates_to_main_handl
 
     assert result == {"ok": True, "message": "main"}
     support.handle_command_for_main.assert_called_once_with("cloud.logout", {})
+
+
+def test_app_cloud_runtime_support_daemon_handles_outbox_diagnostics_locally():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+    support.cloud_outbox_diagnostics = Mock(return_value={"ok": True, "outbox": {"stats": {"failed": 1}}})
+    support.handle_command_for_main = Mock(side_effect=AssertionError("main process should not be used"))  # type: ignore[attr-defined]
+
+    result = support.daemon_handle_command("cloud.outbox_diagnostics", {"failed_limit": 3})
+
+    assert result == {"ok": True, "outbox": {"stats": {"failed": 1}}}
+    support.cloud_outbox_diagnostics.assert_called_once_with({"failed_limit": 3})
 
 
 def test_app_cloud_runtime_support_command_resolves_article_classification_job():

@@ -25,6 +25,7 @@ DAEMON_SUPPORTED_COMMANDS = frozenset(
         "cloud.status_from_session",
         "cloud.validate_session",
         "cloud.flush_outbox",
+        "cloud.outbox_diagnostics",
         "cloud.list_admin_users",
         "cloud.list_admin_article_classification_jobs",
         "cloud.resolve_admin_article_classification_job",

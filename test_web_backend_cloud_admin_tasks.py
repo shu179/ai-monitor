@@ -878,6 +878,7 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         runtime = AppRuntime.__new__(AppRuntime)
         runtime._cloud_runtime_command = Mock(side_effect=[
             {"ok": True, "cloud": {"loggedIn": True}},
+            {"ok": True, "outbox": {"stats": {"failed": 1}}},
             {"ok": True, "cloud": {"loggedIn": True, "savedAt": "now"}},
             {"ok": True, "cloud": {"loggedIn": False}},
             {"ok": True, "message": "已退出云端"},
@@ -886,6 +887,7 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         ])  # type: ignore[method-assign]
 
         self.assertEqual(runtime.get_cloud_status(), {"ok": True, "cloud": {"loggedIn": True}})
+        self.assertEqual(runtime.get_cloud_outbox_diagnostics(), {"ok": True, "outbox": {"stats": {"failed": 1}}})
         self.assertEqual(runtime._current_cloud_status(), {"ok": True, "cloud": {"loggedIn": True, "savedAt": "now"}})  # noqa: SLF001
         self.assertEqual(runtime._cloud_status_from_session({"access_token": "token"}), {"ok": True, "cloud": {"loggedIn": False}})  # noqa: SLF001
         self.assertEqual(runtime.logout_cloud({}), {"ok": True, "message": "已退出云端"})
@@ -896,6 +898,7 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
             runtime._cloud_runtime_command.call_args_list,
             [
                 unittest.mock.call("cloud.status"),
+                unittest.mock.call("cloud.outbox_diagnostics"),
                 unittest.mock.call("cloud.current_status"),
                 unittest.mock.call("cloud.status_from_session", {"session": {"access_token": "token"}}),
                 unittest.mock.call("cloud.logout"),

@@ -357,6 +357,14 @@ class AppCloudRuntimeSupport:
         limit = _safe_int(request_payload.get("limit", 100), 100)
         return self._flush_outbox_fn(limit=limit)
 
+    def cloud_outbox_diagnostics(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        failed_limit = _safe_int(request_payload.get("failed_limit", request_payload.get("failedLimit", 10)), 10)
+        session = self._session_store_factory().load()
+        outbox = self._outbox_factory().bind_to_session(session)
+        diagnostics = outbox.diagnostics(failed_limit=failed_limit)
+        return {"ok": True, "outbox": diagnostics}
+
     def handle_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Handle a cloud-sync runtime command through the future daemon boundary."""
         normalized = str(command or "").strip()
@@ -393,6 +401,8 @@ class AppCloudRuntimeSupport:
             return self._run_cloud_api_request("restore_admin_task", request_payload)
         if normalized in {"cloud.flush_outbox", "flush_outbox"}:
             return self.flush_cloud_outbox(request_payload)
+        if normalized in {"cloud.outbox_diagnostics", "outbox_diagnostics"}:
+            return self.cloud_outbox_diagnostics(request_payload)
         if normalized in {"cloud.logout", "logout"}:
             return self.logout_cloud_account()
         if normalized in {"cloud.recover_uploads", "recover_uploads"}:
@@ -435,6 +445,8 @@ class AppCloudRuntimeSupport:
         if normalized in {"cloud.validate_session", "validate_session"}:
             self.validate_cloud_session_if_needed(force=bool(request_payload.get("force")))
             return self._daemon_current_cloud_status()
+        if normalized in {"cloud.outbox_diagnostics", "outbox_diagnostics"}:
+            return self.cloud_outbox_diagnostics(request_payload)
         delegate = getattr(self, "handle_command_for_main", None)
         if callable(delegate):
             return delegate(normalized, request_payload)
@@ -603,7 +615,7 @@ class AppCloudRuntimeSupport:
                 "localProfile": {
                     "configPath": str(self._current_account_config_path_getter()),
                 },
-                "outbox": self._outbox_factory().stats(),
+                "outbox": self._outbox_factory().stats(include_retry=True),
                 "autoSync": self._auto_sync_status_getter(),
                 "validationError": validation_error,
             },
