@@ -1200,6 +1200,81 @@ def test_app_cloud_runtime_support_command_returns_outbox_diagnostics():
     bound_outbox.diagnostics.assert_called_once_with(failed_limit=7)
 
 
+def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.surfacedlab.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+    bound_outbox = MagicMock()
+    bound_outbox.diagnostics.return_value = {
+        "path": "/tmp/outbox.json",
+        "stats": {
+            "pending": 2,
+            "failed": 1,
+            "dead_letter": 0,
+            "upload_ready": 3,
+            "next_retry_after_seconds": 12,
+        },
+        "failed": [],
+        "dead_letter": [],
+    }
+    outbox = MagicMock()
+    outbox.bind_to_session.return_value = bound_outbox
+    auto_sync_status = {
+        "running": True,
+        "event_stream_connected": True,
+        "upload_backpressure_until": "2026-05-28T10:00:00",
+        "upload_backpressure_retry_after_seconds": 8.5,
+        "upload_backpressure_queue_depth_hint": 400,
+        "upload_backpressure_bucket": "sync_metadata",
+        "last_upload_at": "2026-05-28T09:59:00",
+        "last_pull_at": "2026-05-28T09:59:03",
+        "last_state_delta_at": "2026-05-28T09:59:04",
+    }
+    support = AppCloudRuntimeSupport(
+        owner=owner,
+        session_store_factory=lambda: session_store,
+        outbox_factory=lambda: outbox,
+        auto_sync_status_getter=lambda: auto_sync_status,
+    )
+
+    with (
+        patch("core.cloud_sync_runtime.CloudStateDeltaStore") as store_cls,
+        patch("core.cloud_sync_runtime.CloudStateDeltaInbox") as inbox_cls,
+        patch("core.cloud_sync_runtime.CloudAgentStatusStore") as agent_status_store_cls,
+        patch("core.cloud_sync_runtime.CloudContentStateStore") as content_state_store_cls,
+    ):
+        store_cls.return_value.diagnostics.return_value = {"cursors": {"tasks": 2}}
+        inbox_cls.return_value.diagnostics.return_value = {"by_status": {"pending": 5, "applied": 8}}
+        agent_status_store_cls.return_value.diagnostics.return_value = {"total": 2}
+        content_state_store_cls.return_value.diagnostics.return_value = {"answers_total": 7, "assets_total": 9}
+
+        result = support.handle_command("cloud.sync_health", {"failedLimit": "3"})
+
+    assert result["ok"] is True
+    health = result["sync_health"]
+    assert health["summary"]["logged_in"] is True
+    assert health["summary"]["upload_backpressure_active"] is True
+    assert health["summary"]["upload_backpressure_queue_depth_hint"] == 400
+    assert health["summary"]["outbox_pending"] == 2
+    assert health["summary"]["outbox_failed"] == 1
+    assert health["summary"]["outbox_upload_ready"] == 3
+    assert health["summary"]["next_retry_after_seconds"] == 12
+    assert health["summary"]["inbox_pending"] == 5
+    assert health["summary"]["agent_status_total"] == 2
+    assert health["summary"]["answers_cached"] == 7
+    assert health["summary"]["assets_cached"] == 9
+    assert health["summary"]["healthy"] is True
+    assert health["auto_sync"] == auto_sync_status
+    assert health["state_delta"] == {"cursors": {"tasks": 2}}
+    bound_outbox.diagnostics.assert_called_once_with(failed_limit=3)
+    inbox_cls.return_value.diagnostics.assert_called_once_with(failed_limit=3)
+
+
 def test_app_cloud_runtime_support_command_returns_current_status_variants():
     owner = _support_owner()
     support = AppCloudRuntimeSupport(owner=owner)

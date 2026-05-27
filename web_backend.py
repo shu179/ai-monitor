@@ -442,6 +442,7 @@ GET_EXACT_RUNTIME_METHODS = {
     "/api/todos": "get_todos",
     "/api/cloud/status": "get_cloud_status",
     "/api/cloud/outbox-diagnostics": "get_cloud_outbox_diagnostics",
+    "/api/cloud/sync-health": "get_cloud_sync_health",
     "/api/cloud/state-delta-diagnostics": "get_cloud_state_delta_diagnostics",
     "/api/cloud/admin/tasks": "list_cloud_admin_tasks",
     "/api/cloud/admin/users": "list_cloud_admin_users",
@@ -4359,6 +4360,9 @@ return changedCount
 
     def get_cloud_outbox_diagnostics(self) -> dict[str, Any]:
         return self._cloud_runtime_command("cloud.outbox_diagnostics")
+
+    def get_cloud_sync_health(self) -> dict[str, Any]:
+        return self._cloud_runtime_command("cloud.sync_health")
 
     def get_cloud_state_delta_diagnostics(self) -> dict[str, Any]:
         return self._cloud_runtime_command("cloud.state_delta_diagnostics")

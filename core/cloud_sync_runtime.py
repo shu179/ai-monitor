@@ -384,6 +384,36 @@ class AppCloudRuntimeSupport:
         diagnostics = outbox.diagnostics(failed_limit=failed_limit)
         return {"ok": True, "outbox": diagnostics}
 
+    def cloud_sync_health(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        failed_limit = _safe_int(request_payload.get("failed_limit", request_payload.get("failedLimit", 10)), 10)
+        session = self._session_store_factory().load()
+        outbox = self._outbox_factory().bind_to_session(session).diagnostics(failed_limit=failed_limit)
+        state_delta = CloudStateDeltaStore().diagnostics(session)
+        inbox = CloudStateDeltaInbox().diagnostics(failed_limit=failed_limit)
+        agent_status = CloudAgentStatusStore().diagnostics(session)
+        content_state = CloudContentStateStore().diagnostics(session)
+        auto_sync = self._safe_auto_sync_status()
+        return {
+            "ok": True,
+            "sync_health": {
+                "summary": _cloud_sync_health_summary(
+                    session=session,
+                    auto_sync=auto_sync,
+                    outbox=outbox,
+                    inbox=inbox,
+                    agent_status=agent_status,
+                    content_state=content_state,
+                ),
+                "auto_sync": auto_sync,
+                "outbox": outbox,
+                "state_delta": state_delta,
+                "inbox": inbox,
+                "agent_status": agent_status,
+                "content_state": content_state,
+            },
+        }
+
     def handle_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Handle a cloud-sync runtime command through the future daemon boundary."""
         normalized = str(command or "").strip()
@@ -422,6 +452,8 @@ class AppCloudRuntimeSupport:
             return self.flush_cloud_outbox(request_payload)
         if normalized in {"cloud.outbox_diagnostics", "outbox_diagnostics"}:
             return self.cloud_outbox_diagnostics(request_payload)
+        if normalized in {"cloud.sync_health", "sync_health"}:
+            return self.cloud_sync_health(request_payload)
         if normalized in {"cloud.pull_state_delta", "pull_state_delta"}:
             return self.pull_cloud_state_delta(request_payload)
         if normalized in {"cloud.state_delta_diagnostics", "state_delta_diagnostics"}:
@@ -472,6 +504,8 @@ class AppCloudRuntimeSupport:
             return self._daemon_current_cloud_status()
         if normalized in {"cloud.outbox_diagnostics", "outbox_diagnostics"}:
             return self.cloud_outbox_diagnostics(request_payload)
+        if normalized in {"cloud.sync_health", "sync_health"}:
+            return self.cloud_sync_health(request_payload)
         if normalized in {"cloud.pull_state_delta", "pull_state_delta"}:
             return self.pull_cloud_state_delta(request_payload)
         if normalized in {"cloud.state_delta_diagnostics", "state_delta_diagnostics"}:
@@ -495,10 +529,17 @@ class AppCloudRuntimeSupport:
         result = self.cloud_status_from_session(session)
         if isinstance(result, dict) and isinstance(result.get("cloud"), dict):
             cloud = dict(result["cloud"])
-            cloud["autoSync"] = self._auto_sync_status_getter()
+            cloud["autoSync"] = self._safe_auto_sync_status()
             result = dict(result)
             result["cloud"] = cloud
         return result
+
+    def _safe_auto_sync_status(self) -> dict[str, Any]:
+        try:
+            status = self._auto_sync_status_getter()
+        except Exception as exc:
+            return {"last_error": f"autoSync status unavailable: {exc}"}
+        return dict(status) if isinstance(status, dict) else {}
 
     def login_cloud_account_space(
         self,
@@ -647,7 +688,7 @@ class AppCloudRuntimeSupport:
                     "configPath": str(self._current_account_config_path_getter()),
                 },
                 "outbox": self._outbox_factory().stats(include_retry=True),
-                "autoSync": self._auto_sync_status_getter(),
+                "autoSync": self._safe_auto_sync_status(),
                 "validationError": validation_error,
             },
         }
@@ -1209,3 +1250,68 @@ def _safe_float(value: Any, default: float) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _cloud_sync_health_summary(
+    *,
+    session: dict[str, Any] | None,
+    auto_sync: dict[str, Any],
+    outbox: dict[str, Any],
+    inbox: dict[str, Any],
+    agent_status: dict[str, Any],
+    content_state: dict[str, Any],
+) -> dict[str, Any]:
+    session_payload = session if isinstance(session, dict) else {}
+    outbox_stats = outbox.get("stats") if isinstance(outbox.get("stats"), dict) else {}
+    inbox_by_status = inbox.get("by_status") if isinstance(inbox.get("by_status"), dict) else {}
+    pending_outbox = _safe_int(outbox_stats.get("pending"), 0)
+    failed_outbox = _safe_int(outbox_stats.get("failed"), 0)
+    dead_letter = _safe_int(outbox_stats.get("dead_letter"), 0)
+    upload_ready = _safe_int(outbox_stats.get("upload_ready"), pending_outbox)
+    pending_inbox = _safe_int(inbox_by_status.get("pending"), 0)
+    failed_inbox = _safe_int(inbox_by_status.get("failed"), 0)
+    applied_inbox = _safe_int(inbox_by_status.get("applied"), 0)
+    backpressure_until = str(auto_sync.get("upload_backpressure_until") or "")
+    last_error = str(auto_sync.get("last_error") or auto_sync.get("last_state_delta_error") or "")
+    return {
+        "logged_in": bool(
+            session_payload.get("base_url")
+            and session_payload.get("access_token")
+            and session_payload.get("refresh_token")
+        ),
+        "auto_sync_running": bool(auto_sync.get("running")),
+        "event_stream_connected": bool(auto_sync.get("event_stream_connected")),
+        "upload_backpressure_active": bool(backpressure_until),
+        "upload_backpressure_until": backpressure_until,
+        "upload_backpressure_retry_after_seconds": _safe_float(
+            auto_sync.get("upload_backpressure_retry_after_seconds"),
+            0.0,
+        ),
+        "upload_backpressure_queue_depth_hint": _safe_int(
+            auto_sync.get("upload_backpressure_queue_depth_hint"),
+            0,
+        ),
+        "upload_backpressure_bucket": str(auto_sync.get("upload_backpressure_bucket") or ""),
+        "outbox_pending": pending_outbox,
+        "outbox_failed": failed_outbox,
+        "outbox_dead_letter": dead_letter,
+        "outbox_upload_ready": upload_ready,
+        "next_retry_after_seconds": _safe_int(outbox_stats.get("next_retry_after_seconds"), 0),
+        "inbox_pending": pending_inbox,
+        "inbox_failed": failed_inbox,
+        "inbox_applied": applied_inbox,
+        "agent_status_total": _safe_int(agent_status.get("total"), 0),
+        "answers_cached": _safe_int(content_state.get("answers_total"), 0),
+        "assets_cached": _safe_int(content_state.get("assets_total"), 0),
+        "last_upload_at": str(auto_sync.get("last_upload_at") or ""),
+        "last_pull_at": str(auto_sync.get("last_pull_at") or ""),
+        "last_state_delta_at": str(auto_sync.get("last_state_delta_at") or ""),
+        "last_error": last_error,
+        "healthy": not any(
+            [
+                dead_letter > 0,
+                failed_inbox > 0,
+                bool(last_error),
+            ]
+        ),
+    }

@@ -26,6 +26,7 @@ DAEMON_SUPPORTED_COMMANDS = frozenset(
         "cloud.validate_session",
         "cloud.flush_outbox",
         "cloud.outbox_diagnostics",
+        "cloud.sync_health",
         "cloud.pull_state_delta",
         "cloud.state_delta_diagnostics",
         "cloud.process_state_delta_inbox",
