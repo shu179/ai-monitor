@@ -68,11 +68,15 @@ class CloudPlatformAutoSync:
         event_reconnect_seconds: float = 5.0,
         event_reconnect_max_seconds: float = 30.0,
         event_reconnect_jitter_ratio: float = 0.2,
+        pull_state_delta: Callable[..., dict[str, Any]] | None = None,
+        process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
         client_factory: Callable[[str], SurfacedCloudClient] | None = None,
         logger: Callable[[str], None] | None = None,
     ) -> None:
         self._pull_tasks = pull_tasks
         self._recover_upload_candidates = recover_upload_candidates
+        self._pull_state_delta = pull_state_delta
+        self._process_state_delta_inbox = process_state_delta_inbox
         self._session_store = session_store or CloudSessionStore()
         self._outbox = outbox or CloudOutbox()
         self._upload_retry_interval_seconds = max(5.0, float(upload_retry_interval_seconds or 20.0))
@@ -127,6 +131,10 @@ class CloudPlatformAutoSync:
             "upload_backpressure_bucket": "",
             "last_pull_metrics": {},
             "last_pull_summary": {},
+            "last_state_delta_at": "",
+            "last_state_delta_metrics": {},
+            "last_state_delta_inbox_metrics": {},
+            "last_state_delta_error": "",
             "startup_recovery_running": False,
             "last_startup_recovery_at": "",
             "last_startup_recovery_metrics": {},
@@ -163,6 +171,15 @@ class CloudPlatformAutoSync:
     def get_status(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._status)
+
+    def set_state_delta_handlers(
+        self,
+        *,
+        pull_state_delta: Callable[..., dict[str, Any]] | None = None,
+        process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
+    ) -> None:
+        self._pull_state_delta = pull_state_delta
+        self._process_state_delta_inbox = process_state_delta_inbox
 
     def _update_status(self, **patch: Any) -> None:
         with self._lock:
@@ -264,6 +281,7 @@ class CloudPlatformAutoSync:
         recovery_result: dict[str, Any] | None,
         upload_result: dict[str, Any] | None,
         pull_result: dict[str, Any] | None,
+        state_delta_result: dict[str, Any] | None = None,
     ) -> None:
         upload_metrics = (
             upload_result.get("metrics")
@@ -278,6 +296,8 @@ class CloudPlatformAutoSync:
             errors.append(str(upload_result.get("message") or "上传恢复失败"))
         if isinstance(pull_result, dict) and not pull_result.get("ok"):
             errors.append(str(pull_result.get("message") or "下放恢复失败"))
+        if isinstance(state_delta_result, dict) and not state_delta_result.get("ok"):
+            errors.append(str(state_delta_result.get("message") or "state-delta 下放失败"))
         self._update_status(
             startup_recovery_running=False,
             last_startup_recovery_at=local_now().isoformat(timespec="seconds"),
@@ -285,6 +305,7 @@ class CloudPlatformAutoSync:
                 "history_recovery": dict(recovery_result or {}),
                 "upload": upload_metrics,
                 "pull": pull_metrics,
+                "state_delta": _state_delta_metrics(state_delta_result or {}),
             },
             last_startup_recovery_error="；".join([item for item in errors if item]),
         )
@@ -378,6 +399,7 @@ class CloudPlatformAutoSync:
                         self._record_error(str(upload_result.get("message") or "运行数据自动上传失败"))
 
                 pull_result: dict[str, Any] | None = None
+                state_delta_result: dict[str, Any] | None = None
                 if first_sync_for_login or now - self._last_pull_started_at >= self._pull_interval_seconds:
                     self._last_pull_started_at = now
                     try:
@@ -391,14 +413,18 @@ class CloudPlatformAutoSync:
                             last_pull_metrics=pull_metrics,
                             last_pull_summary=_pull_summary(pull_metrics),
                         )
-                        self._clear_error()
+                        state_delta_result = self._invoke_state_delta_pipeline()
+                        if state_delta_result.get("ok"):
+                            self._clear_error()
+                        else:
+                            self._record_error(str(state_delta_result.get("message") or "state-delta 自动下放失败"))
                     else:
                         pull_metrics = _pull_metrics(pull_result)
                         self._update_status(last_pull_metrics=pull_metrics, last_pull_summary=_pull_summary(pull_metrics))
                         self._record_error(str(pull_result.get("message") or "云端任务自动拉取失败"))
 
                 if first_sync_for_login:
-                    self._finish_startup_recovery(recovery_result, upload_result, pull_result)
+                    self._finish_startup_recovery(recovery_result, upload_result, pull_result, state_delta_result)
 
                 if self._stop_event.wait(0.1):
                     break
@@ -556,7 +582,11 @@ class CloudPlatformAutoSync:
                 last_pull_metrics=pull_metrics,
                 last_pull_summary=_pull_summary(pull_metrics),
             )
-            self._clear_error()
+            state_delta_result = self._invoke_state_delta_pipeline()
+            if state_delta_result.get("ok"):
+                self._clear_error()
+            else:
+                self._record_error(str(state_delta_result.get("message") or f"state-delta 事件同步失败：{event_name}"))
         else:
             pull_metrics = _pull_metrics(pull_result)
             self._update_status(last_pull_metrics=pull_metrics, last_pull_summary=_pull_summary(pull_metrics))
@@ -566,6 +596,51 @@ class CloudPlatformAutoSync:
         if force and _callable_accepts_keyword(self._pull_tasks, "force"):
             return self._pull_tasks(force=True)
         return self._pull_tasks()
+
+    def _invoke_state_delta_pipeline(self) -> dict[str, Any]:
+        pull_handler = self._pull_state_delta
+        process_handler = self._process_state_delta_inbox
+        if not callable(pull_handler) and not callable(process_handler):
+            result = {"ok": True, "message": "", "skipped": True}
+            self._update_status(
+                last_state_delta_metrics={},
+                last_state_delta_inbox_metrics={},
+                last_state_delta_error="",
+            )
+            return result
+        pull_result: dict[str, Any] = {"ok": True, "message": "", "skipped": True}
+        process_result: dict[str, Any] = {"ok": True, "message": "", "skipped": True}
+        if callable(pull_handler):
+            try:
+                pull_result = _invoke_optional_payload_callback(
+                    pull_handler,
+                    {"limit": 500, "max_pages": 5, "source": "auto_sync"},
+                )
+            except Exception as exc:
+                pull_result = {"ok": False, "message": f"state-delta 拉取失败：{exc}"}
+        if pull_result.get("ok") and callable(process_handler):
+            try:
+                process_result = _invoke_optional_payload_callback(
+                    process_handler,
+                    {"limit": 500, "source": "auto_sync"},
+                )
+            except Exception as exc:
+                process_result = {"ok": False, "message": f"state-delta inbox 处理失败：{exc}"}
+
+        ok = bool(pull_result.get("ok")) and bool(process_result.get("ok"))
+        message = "" if ok else str(process_result.get("message") or pull_result.get("message") or "state-delta 自动下放失败")
+        self._update_status(
+            last_state_delta_at=local_now().isoformat(timespec="seconds") if ok else self.get_status().get("last_state_delta_at", ""),
+            last_state_delta_metrics=_state_delta_metrics(pull_result),
+            last_state_delta_inbox_metrics=_state_delta_inbox_metrics(process_result),
+            last_state_delta_error=message,
+        )
+        return {
+            "ok": ok,
+            "message": message,
+            "state_delta": pull_result,
+            "state_delta_inbox": process_result,
+        }
 
 
 def _callable_accepts_keyword(callback: Callable[..., Any], keyword: str) -> bool:
@@ -577,6 +652,27 @@ def _callable_accepts_keyword(callback: Callable[..., Any], keyword: str) -> boo
         parameter.kind == inspect.Parameter.VAR_KEYWORD or name == keyword
         for name, parameter in signature.parameters.items()
     )
+
+
+def _invoke_optional_payload_callback(callback: Callable[..., dict[str, Any]], payload: dict[str, Any]) -> dict[str, Any]:
+    if _callable_accepts_payload(callback):
+        result = callback(payload)
+    else:
+        result = callback()
+    return result if isinstance(result, dict) else {"ok": False, "message": "state-delta callback returned invalid payload"}
+
+
+def _callable_accepts_payload(callback: Callable[..., Any]) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return True
+    positional = {
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.VAR_POSITIONAL,
+    }
+    return any(parameter.kind in positional for parameter in signature.parameters.values())
 
 
 def _normalize_auto_sync_error(message: Any) -> str:
@@ -627,6 +723,40 @@ def _pull_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "article_cursor_updates": int(articles.get("cursor_updates") or 0),
     })
     return payload
+
+
+def _state_delta_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    payload = result.get("state_delta") if isinstance(result.get("state_delta"), dict) else result
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "ok": bool(payload.get("ok", True)),
+        "mode": str(payload.get("mode") or ""),
+        "duration_ms": _safe_int(payload.get("duration_ms")),
+        "pages": _safe_int(payload.get("pages")),
+        "changes": _safe_int(payload.get("changes")),
+        "object_refs": _safe_int(payload.get("object_refs")),
+        "inbox_created": _safe_int(payload.get("inbox_created")),
+        "inbox_duplicates": _safe_int(payload.get("inbox_duplicates")),
+        "reset_required": bool(payload.get("reset_required")),
+        "has_more": bool(payload.get("has_more")),
+        "next_retry_after_seconds": _safe_int(payload.get("next_retry_after_seconds")),
+        "streams": dict(payload.get("streams") if isinstance(payload.get("streams"), dict) else {}),
+    }
+
+
+def _state_delta_inbox_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    payload = result.get("state_delta_inbox") if isinstance(result.get("state_delta_inbox"), dict) else result
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "ok": bool(payload.get("ok", True)),
+        "claimed": _safe_int(payload.get("claimed")),
+        "applied": _safe_int(payload.get("applied")),
+        "failed": _safe_int(payload.get("failed")),
+        "skipped_no_applier": _safe_int(payload.get("skipped_no_applier")),
+        "streams": dict(payload.get("streams") if isinstance(payload.get("streams"), dict) else {}),
+    }
 
 
 def _pull_summary(metrics: dict[str, Any]) -> dict[str, Any]:

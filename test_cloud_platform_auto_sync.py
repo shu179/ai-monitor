@@ -127,6 +127,67 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
 
             self.assertEqual(calls, [False])
 
+    def test_logged_in_session_processes_state_delta_after_initial_pull(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.example.com",
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+                }
+            )
+            calls: list[tuple[str, dict[str, object]]] = []
+
+            def pull_state_delta(payload):
+                calls.append(("pull_delta", dict(payload or {})))
+                return {
+                    "ok": True,
+                    "mode": "delta",
+                    "changes": 2,
+                    "inbox_created": 2,
+                    "streams": {"tasks": 1, "runs": 1},
+                    "duration_ms": 12,
+                }
+
+            def process_inbox(payload):
+                calls.append(("process_inbox", dict(payload or {})))
+                return {
+                    "ok": True,
+                    "claimed": 2,
+                    "applied": 2,
+                    "failed": 0,
+                    "streams": {"tasks": {"applied": 1}, "runs": {"applied": 1}},
+                }
+
+            manager = CloudPlatformAutoSync(
+                session_store=store,
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                pull_state_delta=pull_state_delta,
+                process_state_delta_inbox=process_inbox,
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            manager.start()
+            try:
+                deadline = time.time() + 2.0
+                while len(calls) < 2 and time.time() < deadline:
+                    time.sleep(0.05)
+            finally:
+                manager.stop()
+
+            self.assertEqual([item[0] for item in calls], ["pull_delta", "process_inbox"])
+            self.assertEqual(calls[0][1]["source"], "auto_sync")
+            self.assertEqual(calls[1][1]["limit"], 500)
+            status = manager.get_status()
+            self.assertTrue(status["last_state_delta_at"])
+            self.assertEqual(status["last_state_delta_metrics"]["changes"], 2)
+            self.assertEqual(status["last_state_delta_inbox_metrics"]["applied"], 2)
+            self.assertEqual(status["last_state_delta_error"], "")
+
     def test_outbox_enqueue_wakes_upload_without_retry_delay(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = CloudSessionStore(Path(tmpdir) / "session.json")
@@ -490,6 +551,25 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             manager._pull_now_from_event("run_record_changed")
 
             self.assertEqual(calls, [False])
+
+    def test_event_pull_processes_state_delta_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            calls: list[str] = []
+            manager = CloudPlatformAutoSync(
+                session_store=store,
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda force=False: calls.append("pull") or {"ok": True},
+                pull_state_delta=lambda _payload=None: calls.append("state_delta") or {"ok": True, "changes": 1},
+                process_state_delta_inbox=lambda _payload=None: calls.append("process") or {"ok": True, "applied": 1},
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            manager._pull_now_from_event("run_record_changed")
+
+            self.assertEqual(calls, ["pull", "state_delta", "process"])
+            self.assertEqual(manager.get_status()["last_state_delta_inbox_metrics"]["applied"], 1)
 
     def test_pull_metrics_are_summarized_for_status_ui(self):
         with tempfile.TemporaryDirectory() as tmpdir:
