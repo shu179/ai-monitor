@@ -12,7 +12,19 @@ from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.models import CloudIdempotencyKey, SyncBatch, SyncBatchItem, User, WorkspaceChangeLog
+from app.models import (
+    Article,
+    ArticleTaskLink,
+    ArticleVersion,
+    CloudIdempotencyKey,
+    ObjectManifest,
+    RunRecord,
+    SyncBatch,
+    SyncBatchItem,
+    SyncEvent,
+    User,
+    WorkspaceChangeLog,
+)
 from app.schemas import SyncBatchEventIn, SyncEventIn
 from app.services.change_log_service import (
     STREAM_ARTICLES,
@@ -259,11 +271,12 @@ def build_state_delta(
             break
     for stream, seq in current.items():
         next_cursors.setdefault(stream, max(int((cursors or {}).get(stream) or 0), int(seq or 0)))
+    enriched_changes, object_refs = _enrich_state_delta_changes(db, user, changes)
     return {
-        "changes": changes,
+        "changes": enriched_changes,
         "next_cursors": next_cursors,
         "has_more": has_more,
-        "object_refs": [],
+        "object_refs": object_refs,
         "reset_required": False,
         "reset_token": None,
         "retry_after_seconds": DEFAULT_RETRY_AFTER_SECONDS,
@@ -337,6 +350,260 @@ def count_pending_materialization(db: Session, *, workspace_id: int) -> int:
         return int(value.scalar_one() or 0)
     except Exception:
         return 0
+
+
+def _enrich_state_delta_changes(db: Session, user: User, changes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    object_refs_by_id: dict[str, dict[str, Any]] = {}
+    enriched: list[dict[str, Any]] = []
+    for change in changes:
+        item = dict(change)
+        try:
+            entity = _entity_for_state_delta_change(db, user, item, object_refs_by_id)
+            if entity is not None:
+                item["entity"] = entity
+        except Exception:
+            item["entity_error"] = "unavailable"
+        enriched.append(item)
+    return enriched, list(object_refs_by_id.values())
+
+
+def _entity_for_state_delta_change(
+    db: Session,
+    user: User,
+    change: dict[str, Any],
+    object_refs_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    kind = str(change.get("kind") or "").strip()
+    ref_id = str(change.get("ref_id") or "").strip()
+    if not kind or not ref_id:
+        return None
+    if kind == "run.record":
+        return _state_delta_run_record_entity(db, user, ref_id)
+    if kind == "task.day_status":
+        return _state_delta_task_day_status_entity(db, user, ref_id)
+    if kind in {"article.upsert", "article.link"}:
+        return _state_delta_article_entity(db, user, ref_id, object_refs_by_id)
+    if kind == "profile.update":
+        return _state_delta_profile_entity(user)
+    return None
+
+
+def _state_delta_run_record_entity(db: Session, user: User, ref_id: str) -> dict[str, Any] | None:
+    record = db.scalar(
+        select(RunRecord).where(
+            RunRecord.workspace_id == user.workspace_id,
+            RunRecord.idempotency_key == ref_id,
+        )
+    )
+    if record is None:
+        return None
+    return {
+        "type": "run_record",
+        "id": int(record.id),
+        "workspace_id": int(record.workspace_id),
+        "task_id": int(record.task_id),
+        "executed_by": int(record.executed_by),
+        "platform": str(record.platform or ""),
+        "keyword": str(record.keyword or ""),
+        "brand": str(record.brand or ""),
+        "mode": str(record.mode or ""),
+        "result_json": dict(record.result_json or {}),
+        "idempotency_key": str(record.idempotency_key or ""),
+        "executed_at": _iso_datetime(record.executed_at),
+        "created_at": _iso_datetime(record.created_at),
+    }
+
+
+def _state_delta_task_day_status_entity(db: Session, user: User, ref_id: str) -> dict[str, Any] | None:
+    event = _sync_event_for_ref(db, user, ref_id)
+    if event is None:
+        return None
+    payload = dict(event.payload_json or {}) if isinstance(event.payload_json, dict) else {}
+    payload["type"] = "task_day_status"
+    payload["id"] = int(event.id or 0)
+    payload["idempotency_key"] = str(event.idempotency_key or "")
+    payload["created_at"] = _iso_datetime(event.created_at)
+    return payload
+
+
+def _state_delta_article_entity(
+    db: Session,
+    user: User,
+    ref_id: str,
+    object_refs_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    event = _sync_event_for_ref(db, user, ref_id)
+    payload = dict(event.payload_json or {}) if event is not None and isinstance(event.payload_json, dict) else {}
+    url_hash = str(payload.get("url_hash") or "").strip()
+    canonical_url = str(payload.get("canonical_url") or payload.get("url") or "").strip()
+    if not url_hash and canonical_url:
+        url_hash = hashlib.sha256(canonical_url.encode("utf-8")).hexdigest()
+    if not url_hash and not canonical_url:
+        return None
+
+    query = select(Article).where(Article.workspace_id == user.workspace_id)
+    if url_hash:
+        query = query.where(Article.url_hash == url_hash)
+    else:
+        query = query.where(Article.canonical_url == canonical_url)
+    article = db.scalar(query)
+    if article is None:
+        return None
+
+    task_links = [
+        _article_task_link_entity(link)
+        for link in db.scalars(
+            select(ArticleTaskLink)
+            .where(
+                ArticleTaskLink.workspace_id == user.workspace_id,
+                ArticleTaskLink.article_id == int(article.id),
+            )
+            .order_by(ArticleTaskLink.task_id.asc())
+        )
+    ]
+    version = db.scalar(
+        select(ArticleVersion)
+        .where(
+            ArticleVersion.workspace_id == user.workspace_id,
+            ArticleVersion.article_id == int(article.id),
+        )
+        .order_by(ArticleVersion.version.desc(), ArticleVersion.id.desc())
+        .limit(1)
+    )
+    content_ref = _article_content_ref(db, user, version, object_refs_by_id)
+    entity = {
+        "type": "article",
+        "id": int(article.id),
+        "workspace_id": int(article.workspace_id),
+        "canonical_url": str(article.canonical_url or ""),
+        "url_hash": str(article.url_hash or ""),
+        "title": article.title,
+        "source": article.source,
+        "media_type": article.media_type,
+        "published_at": _iso_datetime(article.published_at),
+        "payload_json": dict(article.payload_json or {}),
+        "created_at": _iso_datetime(article.created_at),
+        "updated_at": _iso_datetime(article.updated_at),
+        "task_links": task_links,
+        "content_ref": content_ref,
+    }
+    return entity
+
+
+def _article_task_link_entity(link: ArticleTaskLink) -> dict[str, Any]:
+    return {
+        "task_id": int(link.task_id),
+        "source": str(link.source or ""),
+        "confidence": int(link.confidence or 0),
+        "reason_json": dict(link.reason_json or {}),
+        "created_at": _iso_datetime(link.created_at),
+    }
+
+
+def _article_content_ref(
+    db: Session,
+    user: User,
+    version: ArticleVersion | None,
+    object_refs_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    if version is None:
+        return None
+    base = {
+        "version": int(version.version),
+        "sha256": str(version.content_sha256 or ""),
+        "size_bytes": int(version.size_bytes or 0),
+        "created_at": _iso_datetime(version.created_at),
+    }
+    if version.inline_text is not None:
+        return {
+            **base,
+            "kind": "inline_text",
+            "inline_text": str(version.inline_text),
+        }
+    object_id = str(version.content_object_id or "").strip()
+    if not object_id:
+        return None
+    manifest = db.scalar(
+        select(ObjectManifest).where(
+            ObjectManifest.workspace_id == user.workspace_id,
+            ObjectManifest.id == object_id,
+        )
+    )
+    if manifest is not None:
+        object_refs_by_id.setdefault(str(manifest.id), _object_ref_payload(manifest))
+        compression = str(manifest.compression or "")
+        content_type = str(manifest.content_type or "")
+        storage_size_bytes = int(manifest.storage_size_bytes or 0)
+    else:
+        compression = ""
+        content_type = ""
+        storage_size_bytes = 0
+    return {
+        **base,
+        "kind": "object",
+        "object_id": object_id,
+        "content_type": content_type,
+        "compression": compression,
+        "storage_size_bytes": storage_size_bytes,
+    }
+
+
+def _object_ref_payload(manifest: ObjectManifest) -> dict[str, Any]:
+    return {
+        "object_id": str(manifest.id),
+        "sha256": str(manifest.sha256 or ""),
+        "size_bytes": int(manifest.size_bytes or 0),
+        "storage_size_bytes": int(manifest.storage_size_bytes or 0),
+        "content_type": str(manifest.content_type or ""),
+        "compression": str(manifest.compression or ""),
+        "storage_key": str(manifest.storage_key or ""),
+    }
+
+
+def _state_delta_profile_entity(user: User) -> dict[str, Any]:
+    return {
+        "type": "profile",
+        "user_id": int(user.id),
+        "workspace_id": int(user.workspace_id),
+        "username": str(user.username or ""),
+        "role": _enum_value(user.role),
+        "display_name": user.display_name,
+        "email": user.email,
+        "email_verified": bool(user.email_verified),
+        "avatar": user.avatar,
+        "birthday": _iso_date(user.birthday),
+        "hire_date": _iso_date(user.hire_date),
+        "view_all_tasks": bool(getattr(user, "view_all_tasks", False)),
+        "enabled": bool(getattr(user, "enabled", True)),
+        "updated_at": _iso_datetime(user.updated_at),
+    }
+
+
+def _sync_event_for_ref(db: Session, user: User, ref_id: str) -> SyncEvent | None:
+    return db.scalar(
+        select(SyncEvent).where(
+            SyncEvent.workspace_id == user.workspace_id,
+            SyncEvent.idempotency_key == ref_id,
+        )
+    )
+
+
+def _iso_datetime(value: datetime | None) -> str:
+    if value is None:
+        return ""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc).isoformat()
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _iso_date(value: Any) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value) or "")
 
 
 def consume_workspace_rate_limit(
