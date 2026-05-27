@@ -7,10 +7,13 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from core.cloud_sync_daemon import (
+    CloudSyncCommandDaemonProcess,
     InProcessCloudSyncCommandClient,
+    DAEMON_SUPPORTED_COMMANDS,
     UnixSocketCloudSyncCommandClient,
     UnixSocketCloudSyncCommandServer,
     build_cloud_sync_socket_path,
+    run_cloud_sync_command_daemon,
 )
 from web_backend import AppRuntime, WebAppServer
 
@@ -53,6 +56,26 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True, "echo": {"limit": 7}})
         self.assertEqual(seen, [("cloud.flush_outbox", {"limit": 7})])
 
+    @unittest.skipUnless(hasattr(__import__("socket"), "AF_UNIX"), "Unix socket unsupported on this platform")
+    def test_child_process_daemon_ping_and_supported_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            socket_path = Path(tmpdir) / "cloud-sync.sock"
+            daemon = CloudSyncCommandDaemonProcess(socket_path)
+            daemon.start()
+            try:
+                client = UnixSocketCloudSyncCommandClient(socket_path)
+                ping = client.send_command("cloud.daemon.ping")
+                unsupported = client.send_command("cloud.status")
+            finally:
+                daemon.stop()
+
+        self.assertTrue(ping.get("ok"))
+        self.assertTrue(ping.get("daemon"))
+        self.assertTrue(unsupported.get("unsupported_by_daemon"))
+
+    def test_run_cloud_sync_command_daemon_exports_supported_command_list(self) -> None:
+        self.assertIn("cloud.flush_outbox", DAEMON_SUPPORTED_COMMANDS)
+
     def test_app_runtime_cloud_command_uses_transport_client(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         runtime._cloud_command_transport_lock = threading.RLock()
@@ -77,40 +100,62 @@ class CloudSyncDaemonTests(unittest.TestCase):
         runtime._cloud_command_transport_lock = threading.RLock()
         runtime._cloud_command_client = None
         runtime._cloud_command_server = None
+        runtime._cloud_command_daemon = None
         runtime._cloud_command_socket_path = None
 
         support = Mock()
         support.handle_command = Mock(return_value={"ok": True})
         fallback_client = Mock()
         socket_client = Mock()
-        socket_server = Mock()
+        daemon = Mock()
 
         with (
             patch("web_backend.create_in_process_cloud_sync_command_client", return_value=fallback_client),
             patch("web_backend.build_cloud_sync_socket_path", return_value=Path("/tmp/cloud-sync.sock")) as build_path,
-            patch("web_backend.UnixSocketCloudSyncCommandServer", return_value=socket_server) as server_cls,
+            patch("web_backend.CloudSyncCommandDaemonProcess", return_value=daemon) as daemon_cls,
             patch("web_backend.UnixSocketCloudSyncCommandClient", return_value=socket_client) as client_cls,
         ):
             runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
             AppRuntime._start_cloud_command_transport(runtime)
 
         build_path.assert_called_once()
-        server_cls.assert_called_once_with(
+        daemon_cls.assert_called_once_with(
             Path("/tmp/cloud-sync.sock"),
-            command_handler=support.handle_command,
+            supported_commands=DAEMON_SUPPORTED_COMMANDS,
         )
-        socket_server.start.assert_called_once()
+        daemon.start.assert_called_once()
         client_cls.assert_called_once_with(Path("/tmp/cloud-sync.sock"))
         self.assertIs(runtime._cloud_command_client, socket_client)
-        self.assertIs(runtime._cloud_command_server, socket_server)
+        self.assertIs(runtime._cloud_command_daemon, daemon)
         self.assertEqual(runtime._cloud_command_socket_path, Path("/tmp/cloud-sync.sock"))
 
         AppRuntime._stop_cloud_command_transport(runtime)
 
-        socket_server.stop.assert_called_once()
+        daemon.stop.assert_called_once()
         self.assertIsNone(runtime._cloud_command_client)
-        self.assertIsNone(runtime._cloud_command_server)
+        self.assertIsNone(runtime._cloud_command_daemon)
         self.assertIsNone(runtime._cloud_command_socket_path)
+
+    def test_app_runtime_cloud_runtime_command_falls_back_when_daemon_cannot_handle_command(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_command_transport_lock = threading.RLock()
+        runtime._cloud_command_client = Mock(
+            send_command=Mock(
+                return_value={
+                    "ok": False,
+                    "unsupported_by_daemon": True,
+                    "message": "命令仍需由主进程处理: cloud.status",
+                }
+            )
+        )
+        support = Mock()
+        support.handle_command.return_value = {"ok": True, "cloud": {"loggedIn": True}}
+        runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
+
+        result = AppRuntime._cloud_runtime_command(runtime, "cloud.status")
+
+        self.assertEqual(result, {"ok": True, "cloud": {"loggedIn": True}})
+        support.handle_command.assert_called_once_with("cloud.status", None)
 
     def test_web_app_server_start_boots_cloud_command_transport(self) -> None:
         runtime = Mock()

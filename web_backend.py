@@ -210,6 +210,8 @@ from core.cloud_run_sync import (
     enqueue_task_day_status,
 )
 from core.cloud_sync_daemon import (
+    CloudSyncCommandDaemonProcess,
+    DAEMON_SUPPORTED_COMMANDS,
     UnixSocketCloudSyncCommandClient,
     UnixSocketCloudSyncCommandServer,
     build_cloud_sync_socket_path,
@@ -2068,6 +2070,7 @@ class AppRuntime:
         self._cloud_command_transport_lock = threading.RLock()
         self._cloud_command_socket_path: Path | None = None
         self._cloud_command_server: UnixSocketCloudSyncCommandServer | None = None
+        self._cloud_command_daemon: CloudSyncCommandDaemonProcess | None = None
         self._cloud_command_client: Any | None = None
         self._isolate_ordinary_cloud_account_config(CloudSessionStore().load())
 
@@ -2120,7 +2123,7 @@ class AppRuntime:
             lock = threading.RLock()
             self._cloud_command_transport_lock = lock
         with lock:
-            if getattr(self, "_cloud_command_server", None) is not None:
+            if getattr(self, "_cloud_command_server", None) is not None or getattr(self, "_cloud_command_daemon", None) is not None:
                 return
             fallback_client = self._build_in_process_cloud_command_client()
             self._cloud_command_client = fallback_client
@@ -2128,6 +2131,24 @@ class AppRuntime:
             if not hasattr(socket, "AF_UNIX"):
                 return
             socket_path = self._build_cloud_command_socket_path()
+            daemon = CloudSyncCommandDaemonProcess(
+                socket_path,
+                supported_commands=DAEMON_SUPPORTED_COMMANDS,
+            )
+            try:
+                daemon.start()
+                client = UnixSocketCloudSyncCommandClient(socket_path)
+            except Exception as exc:
+                try:
+                    daemon.stop()
+                except Exception:
+                    pass
+                print(f"[CloudSyncDaemon] Child daemon unavailable, trying in-process socket server: {exc}")
+            else:
+                self._cloud_command_socket_path = socket_path
+                self._cloud_command_daemon = daemon
+                self._cloud_command_client = client
+                return
             server = UnixSocketCloudSyncCommandServer(
                 socket_path,
                 command_handler=self._ensure_cloud_runtime_support().handle_command,
@@ -2152,11 +2173,19 @@ class AppRuntime:
             lock = threading.RLock()
             self._cloud_command_transport_lock = lock
         server = None
+        daemon = None
         with lock:
             server = getattr(self, "_cloud_command_server", None)
+            daemon = getattr(self, "_cloud_command_daemon", None)
             self._cloud_command_server = None
+            self._cloud_command_daemon = None
             self._cloud_command_client = None
             self._cloud_command_socket_path = None
+        if daemon is not None:
+            try:
+                daemon.stop()
+            except Exception:
+                pass
         if server is not None:
             try:
                 server.stop()
@@ -4283,6 +4312,10 @@ return changedCount
     def _cloud_runtime_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         client = self._ensure_cloud_command_client()
         result = client.send_command(command, payload)
+        if isinstance(result, dict) and bool(result.get("unsupported_by_daemon")):
+            return self._ensure_cloud_runtime_support().handle_command(command, payload)
+        if isinstance(result, dict) and bool(result.get("daemon_unavailable")):
+            return self._ensure_cloud_runtime_support().handle_command(command, payload)
         if isinstance(result, dict):
             return result
         return {"ok": False, "message": "云同步命令返回无效响应"}

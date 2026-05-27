@@ -8,12 +8,32 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import socket
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
+
+
+DAEMON_SUPPORTED_COMMANDS = frozenset(
+    {
+        "cloud.flush_outbox",
+        "cloud.logout",
+        "cloud.list_admin_users",
+        "cloud.list_admin_article_classification_jobs",
+        "cloud.resolve_admin_article_classification_job",
+        "cloud.ignore_admin_article_classification_job",
+        "cloud.create_admin_user",
+        "cloud.update_admin_user",
+        "cloud.delete_admin_user",
+        "cloud.update_admin_task",
+        "cloud.delete_admin_task",
+        "cloud.restore_admin_task",
+    }
+)
 
 
 def build_cloud_sync_socket_path(scope_hint: str | os.PathLike[str]) -> Path:
@@ -51,8 +71,88 @@ class UnixSocketCloudSyncCommandClient:
                 sock.shutdown(socket.SHUT_WR)
                 response = _decode_message(_recv_until_eof(sock))
         except Exception as exc:
-            return {"ok": False, "message": f"云同步 daemon 不可用: {exc}"}
+            return {"ok": False, "daemon_unavailable": True, "message": f"云同步 daemon 不可用: {exc}"}
         return response if isinstance(response, dict) else {"ok": False, "message": "云同步 daemon 返回无效响应"}
+
+
+class CloudSyncCommandDaemonProcess:
+    """Manage a child-process Unix-socket daemon for cloud sync commands."""
+
+    def __init__(
+        self,
+        socket_path: str | os.PathLike[str],
+        *,
+        supported_commands: set[str] | frozenset[str] | None = None,
+        startup_timeout_seconds: float = 5.0,
+    ) -> None:
+        self.socket_path = Path(socket_path)
+        self.supported_commands = tuple(sorted(set(supported_commands or DAEMON_SUPPORTED_COMMANDS)))
+        self.startup_timeout_seconds = max(0.5, float(startup_timeout_seconds or 5.0))
+        self._process: multiprocessing.Process | None = None
+
+    @property
+    def process(self) -> multiprocessing.Process | None:
+        return self._process
+
+    def start(self) -> None:
+        process = self._process
+        if process is not None and process.is_alive():
+            return
+        try:
+            if self.socket_path.exists():
+                self.socket_path.unlink()
+        except FileNotFoundError:
+            pass
+        ctx = multiprocessing.get_context("spawn")
+        process = ctx.Process(
+            target=run_cloud_sync_command_daemon,
+            args=(str(self.socket_path), self.supported_commands),
+            name="cloud-sync-daemon",
+            daemon=True,
+        )
+        process.start()
+        self._process = process
+        self._wait_until_ready()
+
+    def stop(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None:
+            self._cleanup_socket_path()
+            return
+        try:
+            if process.is_alive():
+                client = UnixSocketCloudSyncCommandClient(self.socket_path, timeout_seconds=0.5)
+                client.send_command("cloud.daemon.shutdown")
+                process.join(timeout=2.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2.0)
+        finally:
+            self._cleanup_socket_path()
+
+    def _wait_until_ready(self) -> None:
+        deadline = time.monotonic() + self.startup_timeout_seconds
+        client = UnixSocketCloudSyncCommandClient(self.socket_path, timeout_seconds=0.2)
+        last_error = "daemon startup timed out"
+        while time.monotonic() < deadline:
+            process = self._process
+            if process is not None and not process.is_alive():
+                raise RuntimeError("云同步 daemon 启动失败：子进程已退出")
+            if self.socket_path.exists():
+                result = client.send_command("cloud.daemon.ping")
+                if bool(result.get("ok")) and bool(result.get("daemon")):
+                    return
+                last_error = str(result.get("message") or last_error)
+            time.sleep(0.05)
+        raise RuntimeError(f"云同步 daemon 启动超时: {last_error}")
+
+    def _cleanup_socket_path(self) -> None:
+        try:
+            if self.socket_path.exists():
+                self.socket_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 class UnixSocketCloudSyncCommandServer:
@@ -177,3 +277,59 @@ def _recv_until_eof(sock: socket.socket) -> bytes:
             break
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def run_cloud_sync_command_daemon(
+    socket_path: str | os.PathLike[str],
+    supported_commands: tuple[str, ...] | list[str] | set[str] | frozenset[str] | None = None,
+) -> None:
+    """Run the child-process cloud sync daemon until a shutdown command arrives."""
+    stop_event = threading.Event()
+    allowed = {str(item or "").strip() for item in (supported_commands or DAEMON_SUPPORTED_COMMANDS)}
+    server_holder: dict[str, UnixSocketCloudSyncCommandServer | None] = {"server": None}
+    support = _build_daemon_runtime_support()
+
+    def command_handler(command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        normalized = str(command or "").strip()
+        if normalized in {"cloud.daemon.ping", "daemon.ping"}:
+            return {"ok": True, "daemon": True, "pid": os.getpid()}
+        if normalized in {"cloud.daemon.shutdown", "daemon.shutdown"}:
+            stop_event.set()
+            server = server_holder.get("server")
+            if server is not None:
+                server.stop()
+            support.stop()
+            return {"ok": True, "daemon": True, "message": "云同步 daemon 已停止"}
+        if normalized not in allowed:
+            return {
+                "ok": False,
+                "unsupported_by_daemon": True,
+                "message": f"命令仍需由主进程处理: {normalized}",
+            }
+        return support.handle_command(normalized, payload)
+
+    server = UnixSocketCloudSyncCommandServer(
+        socket_path,
+        command_handler=command_handler,
+    )
+    server_holder["server"] = server
+    server.start()
+    try:
+        while not stop_event.wait(0.25):
+            continue
+    finally:
+        support.stop()
+        server.stop()
+
+
+def _build_daemon_runtime_support() -> Any:
+    from core.cloud_sync_runtime import AppCloudRuntimeSupport
+
+    class _DaemonOwner:
+        def __init__(self) -> None:
+            self._lock = threading.RLock()
+
+    return AppCloudRuntimeSupport(
+        owner=_DaemonOwner(),
+        auto_sync_status_getter=lambda: {},
+    )
