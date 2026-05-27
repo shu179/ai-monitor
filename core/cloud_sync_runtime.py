@@ -16,7 +16,11 @@ from typing import Any, Callable
 from core.cloud_client import CloudClientError, SurfacedCloudClient
 from core.cloud_event_types import EVENT_PROFILE_UPDATE
 from core.cloud_outbox import CloudOutbox
-from core.cloud_run_sync import enqueue_cloud_articles, enqueue_recent_cloud_run_records_from_history
+from core.cloud_run_sync import (
+    enqueue_cloud_articles,
+    enqueue_recent_cloud_run_records_from_history,
+    flush_cloud_outbox,
+)
 from core.cloud_session_store import (
     CloudSessionChangedError,
     CloudSessionStore,
@@ -107,6 +111,7 @@ class AppCloudRuntimeSupport:
         session_store_factory: Callable[[], Any] = CloudSessionStore,
         outbox_factory: Callable[[], Any] = CloudOutbox,
         article_enqueue_fn: Callable[..., dict[str, Any] | None] | None = None,
+        flush_outbox_fn: Callable[..., dict[str, Any]] | None = None,
         thread_factory: Callable[..., Any] = threading.Thread,
         sleep_fn: Callable[[float], None] = time.sleep,
         status_client_factory: Callable[[str], Any] | None = None,
@@ -121,6 +126,7 @@ class AppCloudRuntimeSupport:
         self._session_store_factory = session_store_factory
         self._outbox_factory = outbox_factory
         self._article_enqueue_fn = article_enqueue_fn or enqueue_cloud_articles
+        self._flush_outbox_fn = flush_outbox_fn or flush_cloud_outbox
         self._thread_factory = thread_factory
         self._sleep_fn = sleep_fn
         self._status_client_factory = status_client_factory or self._default_status_client_factory
@@ -267,6 +273,29 @@ class AppCloudRuntimeSupport:
             }
         except Exception as exc:
             return {"ok": False, "message": f"本地运行历史恢复失败：{exc}"}
+
+    def logout_cloud_account(self) -> dict[str, Any]:
+        store = self._session_store_factory()
+        session = store.load()
+        base_url = str(session.get("base_url") or "").strip()
+        refresh_token = str(session.get("refresh_token") or "").strip()
+        try:
+            current_outbox = self._outbox_factory().bind_to_session(session)
+            current_stats = current_outbox.stats()
+            if current_stats.get("pending", 0) or current_stats.get("failed", 0):
+                self._flush_outbox_fn(outbox=current_outbox)
+        except Exception as exc:
+            print(f"[WebBackend] 退出前运行数据补传失败，将继续退出: {exc}")
+        if base_url and refresh_token:
+            try:
+                self._request_client_factory(base_url).logout(refresh_token)
+            except CloudClientError:
+                pass
+        store.clear()
+        activate_account_space = getattr(self._owner, "_activate_current_account_space", None)
+        if callable(activate_account_space):
+            activate_account_space(copy_legacy=False)
+        return {"ok": True, "message": "已退出云端", "cloud": self.current_cloud_status().get("cloud")}
 
     def validate_cloud_session_if_needed(self, *, force: bool = False) -> None:
         store = self._session_store_factory()

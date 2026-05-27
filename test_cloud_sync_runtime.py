@@ -218,3 +218,69 @@ def test_app_cloud_runtime_support_schedules_retry_when_recovery_article_snapsho
     assert result["articles_sync"]["queued"] == 0
     owner._schedule_cloud_articles_snapshot_retry.assert_called_once()
     article_enqueue.assert_not_called()
+
+
+def test_app_cloud_runtime_support_logout_flushes_pending_outbox_and_clears_session():
+    owner = _support_owner()
+    owner._activate_current_account_space = Mock()
+    session = {
+        "base_url": "https://api.surfacedlab.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3},
+    }
+    session_store = MagicMock()
+    session_store.load.return_value = session
+    outbox = MagicMock()
+    bound_outbox = MagicMock()
+    bound_outbox.stats.return_value = {"pending": 2, "failed": 0}
+    outbox.bind_to_session.return_value = bound_outbox
+    flush_outbox = Mock(return_value={"ok": True})
+    client = MagicMock()
+    support = AppCloudRuntimeSupport(
+        owner=owner,
+        session_store_factory=lambda: session_store,
+        outbox_factory=lambda: outbox,
+        flush_outbox_fn=flush_outbox,
+        request_client_factory=lambda _base_url: client,
+    )
+
+    result = support.logout_cloud_account()
+
+    assert result["ok"] is True
+    outbox.bind_to_session.assert_called_once_with(session)
+    flush_outbox.assert_called_once_with(outbox=bound_outbox)
+    client.logout.assert_called_once_with("refresh")
+    session_store.clear.assert_called_once()
+    owner._activate_current_account_space.assert_called_once_with(copy_legacy=False)
+
+
+def test_app_cloud_runtime_support_logout_continues_when_flush_or_remote_logout_fails():
+    owner = _support_owner()
+    owner._activate_current_account_space = Mock()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.surfacedlab.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3},
+    }
+    outbox = MagicMock()
+    bound_outbox = MagicMock()
+    bound_outbox.stats.return_value = {"pending": 1, "failed": 1}
+    outbox.bind_to_session.return_value = bound_outbox
+    client = MagicMock()
+    client.logout.side_effect = CloudClientError("remote logout failed", status_code=503)
+    support = AppCloudRuntimeSupport(
+        owner=owner,
+        session_store_factory=lambda: session_store,
+        outbox_factory=lambda: outbox,
+        flush_outbox_fn=Mock(side_effect=RuntimeError("flush failed")),
+        request_client_factory=lambda _base_url: client,
+    )
+
+    result = support.logout_cloud_account()
+
+    assert result["ok"] is True
+    session_store.clear.assert_called_once()
+    owner._activate_current_account_space.assert_called_once_with(copy_legacy=False)

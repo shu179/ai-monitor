@@ -4804,25 +4804,7 @@ return changedCount
 
     def logout_cloud(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         del payload
-        store = CloudSessionStore()
-        session = store.load()
-        base_url = str(session.get("base_url") or "").strip()
-        refresh_token = str(session.get("refresh_token") or "").strip()
-        try:
-            current_outbox = CloudOutbox().bind_to_session(session)
-            current_stats = current_outbox.stats()
-            if current_stats.get("pending", 0) or current_stats.get("failed", 0):
-                flush_cloud_outbox_events(outbox=current_outbox)
-        except Exception as exc:
-            print(f"[WebBackend] 退出前运行数据补传失败，将继续退出: {exc}")
-        if base_url and refresh_token:
-            try:
-                SurfacedCloudClient(base_url).logout(refresh_token)
-            except CloudClientError:
-                pass
-        store.clear()
-        self._activate_current_account_space(copy_legacy=False)
-        return {"ok": True, "message": "已退出云端", "cloud": self.get_cloud_status().get("cloud")}
+        return self._ensure_cloud_runtime_support().logout_cloud_account()
 
     def flush_cloud_outbox(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
