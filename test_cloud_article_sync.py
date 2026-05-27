@@ -5,7 +5,12 @@ import unittest
 from pathlib import Path
 
 import core.article_store as article_store
-from core.cloud_article_sync import cloud_articles_to_local_articles, pull_cloud_articles_into_store
+from core.cloud_article_sync import (
+    cloud_articles_to_local_articles,
+    merge_cloud_article_entity_into_store,
+    merge_cloud_article_reference_entity_into_store,
+    pull_cloud_articles_into_store,
+)
 
 
 class _FakeCloudSessionStore:
@@ -115,6 +120,80 @@ class CloudArticleSyncTests(unittest.TestCase):
         self.assertEqual(article["cloud_article_id"], 7)
         self.assertEqual(article["cloud_task_ids"], [42])
         self.assertFalse(article["cloud_imported"])
+
+    def test_merge_cloud_article_entity_imports_one_article(self) -> None:
+        config = {"tasks": [{"name": "即搜AI", "brand": "即搜AI", "cloud_task_id": 42}]}
+
+        summary = merge_cloud_article_entity_into_store(
+            config,
+            {
+                "type": "article",
+                "id": 7,
+                "workspace_id": 1,
+                "canonical_url": "https://example.com/a",
+                "url_hash": "hash-a",
+                "title": "即搜AI 入选榜单",
+                "source": "武汉观察",
+                "media_type": "selfmedia",
+                "published_at": "2026-05-06T08:00:00+00:00",
+                "payload_json": {"excerpt": "摘要"},
+                "created_at": "2026-05-06T08:10:00+00:00",
+                "updated_at": "2026-05-06T08:10:00+00:00",
+                "task_links": [{"task_id": 42, "reason_json": {"reasons": ["标题匹配"]}}],
+            },
+            cloud_user={"workspace_id": 1},
+        )
+
+        articles = article_store.get_articles()
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["imported"], 1)
+        self.assertEqual(len(articles), 1)
+        self.assertEqual(articles[0]["cloud_article_id"], 7)
+        self.assertEqual(articles[0]["matched_tasks"], ["即搜AI"])
+
+    def test_merge_cloud_article_reference_entity_marks_existing_article(self) -> None:
+        article_store.import_article_store_bundle(
+            {
+                "articles": [
+                    {
+                        "id": "cloud-article-7",
+                        "url": "https://example.com/a",
+                        "title": "即搜AI 入选榜单",
+                        "matched_tasks": ["即搜AI"],
+                        "match_reasons": {"即搜AI": ["标题匹配"]},
+                        "cloud_article_id": 7,
+                        "cloud_task_ids": [42],
+                    }
+                ]
+            },
+            mode="replace",
+        )
+        config = {"tasks": [{"name": "即搜AI", "brand": "即搜AI", "cloud_task_id": 42}]}
+
+        summary = merge_cloud_article_reference_entity_into_store(
+            config,
+            {
+                "type": "article_reference",
+                "id": 31,
+                "workspace_id": 1,
+                "task_id": 42,
+                "article_id": 7,
+                "normalized_url": "https://example.com/a",
+                "platform": "doubao",
+                "source_record_key": "run:abc",
+                "idempotency_key": "ref-abc",
+                "created_at": "2026-05-06T08:10:00+00:00",
+            },
+            cloud_user={"workspace_id": 1},
+        )
+
+        article = article_store.get_articles()[0]
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["matched"], 1)
+        self.assertEqual(summary["updated"], 1)
+        self.assertEqual(article["referenced_tasks"], ["即搜AI"])
+        self.assertIn("即搜AI", article["reference_hits"])
+        self.assertEqual(article["reference_hits"]["即搜AI"]["events"][0]["event_id"], "ref-abc")
 
     def test_prune_cloud_articles_keeps_cloud_articles_on_disk(self) -> None:
         article_store.import_article_store_bundle(

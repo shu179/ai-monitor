@@ -146,6 +146,8 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
     assert callable(process_kwargs["appliers"]["profile"])
     assert callable(process_kwargs["appliers"]["tasks"])
     assert callable(process_kwargs["appliers"]["runs"])
+    assert callable(process_kwargs["appliers"]["articles"])
+    assert callable(process_kwargs["appliers"]["references"])
     assert process_kwargs["limit"] == 20
     assert process_kwargs["streams"] == ["tasks"]
     assert process_kwargs["include_failed"] is False
@@ -527,6 +529,166 @@ def test_app_cloud_runtime_support_rejects_run_state_delta_for_other_workspace()
     assert result["state_delta_inbox"]["failed"] == 1
     assert "工作区不匹配" in diagnostics["failed"][0]["last_error"]
     owner.save_config.assert_not_called()
+
+
+def test_app_cloud_runtime_support_applies_article_state_delta_to_store():
+    owner = _support_owner()
+    owner.load_config.return_value = {"tasks": [{"name": "即搜AI", "brand": "即搜AI", "cloud_task_id": 42}]}
+    owner._invalidate_article_cache = Mock()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        import core.article_store as article_store
+
+        original_paths = {
+            "ARTICLES_FILE": article_store.ARTICLES_FILE,
+            "DOMAIN_OVERRIDES_FILE": article_store.DOMAIN_OVERRIDES_FILE,
+            "DOMAIN_MEDIA_NAMES_FILE": article_store.DOMAIN_MEDIA_NAMES_FILE,
+            "EXCLUDED_ARTICLE_URLS_FILE": article_store.EXCLUDED_ARTICLE_URLS_FILE,
+        }
+        root = Path(tmp)
+        article_store.ARTICLES_FILE = root / "logs" / "articles.json"
+        article_store.DOMAIN_OVERRIDES_FILE = root / "logs" / "domain_overrides.json"
+        article_store.DOMAIN_MEDIA_NAMES_FILE = root / "logs" / "domain_media_names.json"
+        article_store.EXCLUDED_ARTICLE_URLS_FILE = root / "logs" / "excluded_article_urls.json"
+        article_store.ARTICLES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        article_store.ARTICLES_FILE.write_text("[]", encoding="utf-8")
+        try:
+            inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+            inbox.record_changes(
+                identity_key="https://api.example.com|3|2",
+                changes=[
+                    {
+                        "stream": "articles",
+                        "seq": 1,
+                        "kind": "article.upsert",
+                        "ref_id": "21",
+                        "entity": {
+                            "type": "article",
+                            "id": 21,
+                            "workspace_id": 3,
+                            "canonical_url": "https://example.com/a",
+                            "url_hash": "hash-a",
+                            "title": "即搜AI 入选榜单",
+                            "source": "武汉观察",
+                            "media_type": "selfmedia",
+                            "payload_json": {"excerpt": "摘要"},
+                            "task_links": [{"task_id": 42, "reason_json": {"reasons": ["标题匹配"]}}],
+                        },
+                    }
+                ],
+            )
+
+            with patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox):
+                result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["articles"]})
+
+            articles = article_store.get_articles()
+        finally:
+            article_store.ARTICLES_FILE = original_paths["ARTICLES_FILE"]
+            article_store.DOMAIN_OVERRIDES_FILE = original_paths["DOMAIN_OVERRIDES_FILE"]
+            article_store.DOMAIN_MEDIA_NAMES_FILE = original_paths["DOMAIN_MEDIA_NAMES_FILE"]
+            article_store.EXCLUDED_ARTICLE_URLS_FILE = original_paths["EXCLUDED_ARTICLE_URLS_FILE"]
+
+    assert result["ok"] is True
+    assert result["state_delta_inbox"]["applied"] == 1
+    assert articles[0]["cloud_article_id"] == 21
+    assert articles[0]["matched_tasks"] == ["即搜AI"]
+    owner._invalidate_article_cache.assert_called_once()
+
+
+def test_app_cloud_runtime_support_applies_reference_state_delta_to_store():
+    owner = _support_owner()
+    owner.load_config.return_value = {"tasks": [{"name": "即搜AI", "brand": "即搜AI", "cloud_task_id": 42}]}
+    owner._invalidate_article_cache = Mock()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        import core.article_store as article_store
+
+        original_paths = {
+            "ARTICLES_FILE": article_store.ARTICLES_FILE,
+            "DOMAIN_OVERRIDES_FILE": article_store.DOMAIN_OVERRIDES_FILE,
+            "DOMAIN_MEDIA_NAMES_FILE": article_store.DOMAIN_MEDIA_NAMES_FILE,
+            "EXCLUDED_ARTICLE_URLS_FILE": article_store.EXCLUDED_ARTICLE_URLS_FILE,
+        }
+        root = Path(tmp)
+        article_store.ARTICLES_FILE = root / "logs" / "articles.json"
+        article_store.DOMAIN_OVERRIDES_FILE = root / "logs" / "domain_overrides.json"
+        article_store.DOMAIN_MEDIA_NAMES_FILE = root / "logs" / "domain_media_names.json"
+        article_store.EXCLUDED_ARTICLE_URLS_FILE = root / "logs" / "excluded_article_urls.json"
+        article_store.ARTICLES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        article_store.ARTICLES_FILE.write_text("[]", encoding="utf-8")
+        try:
+            article_store.import_article_store_bundle(
+                {
+                    "articles": [
+                        {
+                            "id": "cloud-21",
+                            "url": "https://example.com/a",
+                            "title": "即搜AI 入选榜单",
+                            "matched_tasks": ["即搜AI"],
+                            "match_reasons": {"即搜AI": ["标题匹配"]},
+                            "cloud_article_id": 21,
+                            "cloud_task_ids": [42],
+                        }
+                    ]
+                },
+                mode="replace",
+            )
+            inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+            inbox.record_changes(
+                identity_key="https://api.example.com|3|2",
+                changes=[
+                    {
+                        "stream": "references",
+                        "seq": 1,
+                        "kind": "article.reference",
+                        "ref_id": "31",
+                        "entity": {
+                            "type": "article_reference",
+                            "id": 31,
+                            "workspace_id": 3,
+                            "task_id": 42,
+                            "article_id": 21,
+                            "normalized_url": "https://example.com/a",
+                            "platform": "doubao",
+                            "source_record_key": "run:abc",
+                            "idempotency_key": "ref-abc",
+                            "created_at": "2026-05-06T08:10:00+00:00",
+                        },
+                    }
+                ],
+            )
+
+            with patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox):
+                result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["references"]})
+
+            article = article_store.get_articles()[0]
+        finally:
+            article_store.ARTICLES_FILE = original_paths["ARTICLES_FILE"]
+            article_store.DOMAIN_OVERRIDES_FILE = original_paths["DOMAIN_OVERRIDES_FILE"]
+            article_store.DOMAIN_MEDIA_NAMES_FILE = original_paths["DOMAIN_MEDIA_NAMES_FILE"]
+            article_store.EXCLUDED_ARTICLE_URLS_FILE = original_paths["EXCLUDED_ARTICLE_URLS_FILE"]
+
+    assert result["ok"] is True
+    assert result["state_delta_inbox"]["applied"] == 1
+    assert article["referenced_tasks"] == ["即搜AI"]
+    assert article["reference_hits"]["即搜AI"]["events"][0]["event_id"] == "ref-abc"
+    owner._invalidate_article_cache.assert_called_once()
 
 
 def test_app_cloud_runtime_support_retries_request_after_refresh():

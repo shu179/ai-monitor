@@ -13,6 +13,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from core.cloud_article_sync import (
+    merge_cloud_article_entity_into_store,
+    merge_cloud_article_reference_entity_into_store,
+)
 from core.cloud_client import CloudClientError, SurfacedCloudClient
 from core.cloud_sync_daemon import InProcessCloudSyncCommandClient
 from core.cloud_event_types import EVENT_PROFILE_UPDATE
@@ -679,6 +683,8 @@ class AppCloudRuntimeSupport:
             "profile": self._apply_profile_state_delta,
             "tasks": self._apply_task_state_delta,
             "runs": self._apply_run_state_delta,
+            "articles": self._apply_article_state_delta,
+            "references": self._apply_reference_state_delta,
         }
         appliers.update(custom_appliers or {})
         return appliers
@@ -770,6 +776,40 @@ class AppCloudRuntimeSupport:
             self._save_runtime_config(config)
             self._invalidate_owner_task_views()
 
+    def _apply_article_state_delta(self, item: dict[str, Any]) -> None:
+        entity = item.get("entity") if isinstance(item.get("entity"), dict) else {}
+        if str(item.get("stream") or "") != "articles" or str(entity.get("type") or "") != "article":
+            raise ValueError("state-delta article item has invalid shape")
+        session = self._session_store_factory().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        workspace_id = _safe_int(entity.get("workspace_id") or entity.get("workspaceId"), 0)
+        current_workspace_id = _safe_int(user.get("workspace_id"), 0)
+        if workspace_id > 0 and current_workspace_id and workspace_id != current_workspace_id:
+            raise ValueError("article state-delta 与当前云端工作区不匹配")
+        config = self._load_runtime_config()
+        summary = merge_cloud_article_entity_into_store(config, entity, cloud_user=user)
+        if not bool(summary.get("ok")):
+            raise ValueError(str(summary.get("message") or "article state-delta apply failed"))
+        if int(summary.get("state_updated") or 0):
+            self._invalidate_owner_article_views()
+
+    def _apply_reference_state_delta(self, item: dict[str, Any]) -> None:
+        entity = item.get("entity") if isinstance(item.get("entity"), dict) else {}
+        if str(item.get("stream") or "") != "references" or str(entity.get("type") or "") != "article_reference":
+            raise ValueError("state-delta reference item has invalid shape")
+        session = self._session_store_factory().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        workspace_id = _safe_int(entity.get("workspace_id") or entity.get("workspaceId"), 0)
+        current_workspace_id = _safe_int(user.get("workspace_id"), 0)
+        if workspace_id > 0 and current_workspace_id and workspace_id != current_workspace_id:
+            raise ValueError("reference state-delta 与当前云端工作区不匹配")
+        config = self._load_runtime_config()
+        summary = merge_cloud_article_reference_entity_into_store(config, entity, cloud_user=user)
+        if not bool(summary.get("ok")):
+            raise ValueError(str(summary.get("message") or "reference state-delta apply failed"))
+        if int(summary.get("state_updated") or 0):
+            self._invalidate_owner_article_views()
+
     def _apply_run_state_delta(self, item: dict[str, Any]) -> None:
         entity = item.get("entity") if isinstance(item.get("entity"), dict) else {}
         if str(item.get("stream") or "") != "runs":
@@ -822,6 +862,11 @@ class AppCloudRuntimeSupport:
         refresh_runtime = getattr(self._owner, "_refresh_monitoring_runtime", None)
         if callable(refresh_runtime):
             refresh_runtime(restart_scheduler=True)
+
+    def _invalidate_owner_article_views(self) -> None:
+        invalidate_articles = getattr(self._owner, "_invalidate_article_cache", None)
+        if callable(invalidate_articles):
+            invalidate_articles()
 
     def cloud_request_with_refresh(self, operation: Callable[[Any, str], Any]) -> tuple[bool, Any, str]:
         store = self._session_store_factory()

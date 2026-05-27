@@ -7,6 +7,7 @@ from typing import Any
 from .article_store import (
     get_articles,
     import_article_store_bundle,
+    mark_articles_referenced_by_urls,
     normalize_article_url,
     prune_cloud_articles_by_visible_task_ids,
 )
@@ -176,6 +177,82 @@ def cloud_articles_to_local_articles(cloud_articles: list[dict[str, Any]], confi
     return items
 
 
+def merge_cloud_article_entity_into_store(
+    config: dict[str, Any],
+    entity: dict[str, Any],
+    *,
+    cloud_user: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply one state-delta article entity to the local article store."""
+    started_at = time.perf_counter()
+    if not isinstance(entity, dict) or str(entity.get("type") or "") != "article":
+        return _entity_summary(ok=False, message="invalid article entity", started_at=started_at)
+    workspace_id = _safe_int(entity.get("workspace_id") or entity.get("workspaceId"))
+    expected_workspace_id = _safe_int((cloud_user or {}).get("workspace_id"))
+    if workspace_id is not None and expected_workspace_id is not None and workspace_id != expected_workspace_id:
+        return _entity_summary(ok=False, message="article workspace mismatch", started_at=started_at)
+
+    local_articles = cloud_articles_to_local_articles([entity], config)
+    if not local_articles:
+        return _entity_summary(ok=False, message="article entity has no local representation", started_at=started_at)
+    import_result = import_article_store_bundle({"articles": local_articles}, mode="merge")
+    created = int(import_result.get("articles_created") or 0)
+    updated = int(import_result.get("articles_updated") or 0)
+    return {
+        "ok": True,
+        "fetched": 1,
+        "imported": len(local_articles),
+        "created": created,
+        "updated": updated,
+        "state_updated": 1 if created or updated else 0,
+        "duration_ms": _elapsed_ms(started_at),
+    }
+
+
+def merge_cloud_article_reference_entity_into_store(
+    config: dict[str, Any],
+    entity: dict[str, Any],
+    *,
+    cloud_user: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply one state-delta article_reference entity to local article reference marks."""
+    started_at = time.perf_counter()
+    if not isinstance(entity, dict) or str(entity.get("type") or "") != "article_reference":
+        return _entity_summary(ok=False, message="invalid article_reference entity", started_at=started_at)
+    workspace_id = _safe_int(entity.get("workspace_id") or entity.get("workspaceId"))
+    expected_workspace_id = _safe_int((cloud_user or {}).get("workspace_id"))
+    if workspace_id is not None and expected_workspace_id is not None and workspace_id != expected_workspace_id:
+        return _entity_summary(ok=False, message="article_reference workspace mismatch", started_at=started_at)
+
+    normalized_url = normalize_article_url(
+        str(entity.get("normalized_url") or entity.get("url") or entity.get("canonical_url") or "").strip()
+    )
+    if not normalized_url:
+        return _entity_summary(ok=False, message="article_reference missing normalized_url", started_at=started_at)
+    task_name = _task_name_for_reference(config, _safe_int(entity.get("task_id") or entity.get("taskId")))
+    if not task_name:
+        return _entity_summary(ok=False, message="article_reference local task not found", started_at=started_at)
+    result = mark_articles_referenced_by_urls(
+        [task_name],
+        [normalized_url],
+        source="cloud_reference",
+        referenced_at=str(entity.get("created_at") or "").strip(),
+        platform=str(entity.get("platform") or "").strip(),
+        event_id=str(entity.get("idempotency_key") or entity.get("id") or "").strip(),
+        record_id=str(entity.get("source_record_key") or "").strip(),
+    )
+    updated = int(result.get("updated_count") or 0)
+    matched = int(result.get("matched_count") or 0)
+    return {
+        "ok": True,
+        "fetched": 1,
+        "matched": matched,
+        "updated": updated,
+        "state_updated": 1 if updated else 0,
+        "duration_ms": _elapsed_ms(started_at),
+    }
+
+
 def _cloud_article_to_local_article(
     cloud_article: dict[str, Any],
     *,
@@ -252,6 +329,19 @@ def _task_name_by_cloud_id(config: dict[str, Any] | None) -> dict[int, str]:
             continue
         mapping[cloud_task_id] = task_name
     return mapping
+
+
+def _task_name_for_reference(config: dict[str, Any] | None, cloud_task_id: int | None) -> str:
+    if cloud_task_id is None:
+        return ""
+    for task in (config or {}).get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        task_cloud_id = _safe_int(task.get("cloud_task_id") or task.get("cloudTaskId"))
+        if task_cloud_id != cloud_task_id:
+            continue
+        return str(task.get("name") or task.get("brand") or task.get("task_id") or "").strip()
+    return ""
 
 
 def _visible_cloud_task_ids(config: dict[str, Any] | None) -> list[int]:
@@ -348,6 +438,19 @@ def _summary(*, ok: bool, message: str, started_at: float) -> dict[str, Any]:
         "created": 0,
         "updated": 0,
         "cursor_updates": 0,
+        "state_updated": 0,
+        "duration_ms": _elapsed_ms(started_at),
+    }
+
+
+def _entity_summary(*, ok: bool, message: str, started_at: float) -> dict[str, Any]:
+    return {
+        "ok": bool(ok),
+        "message": str(message or ""),
+        "fetched": 0,
+        "imported": 0,
+        "created": 0,
+        "updated": 0,
         "state_updated": 0,
         "duration_ms": _elapsed_ms(started_at),
     }
