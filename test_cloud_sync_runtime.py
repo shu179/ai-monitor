@@ -356,6 +356,17 @@ def test_app_cloud_runtime_support_command_lists_admin_users_via_cloud_request()
     assert result == {"ok": True, "payload": [{"id": 1, "username": "operator"}], "message": ""}
 
 
+def test_app_cloud_runtime_support_daemon_handle_command_delegates_to_main_handler_when_needed():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+    support.handle_command_for_main = Mock(return_value={"ok": True, "message": "main"})  # type: ignore[attr-defined]
+
+    result = support.daemon_handle_command("cloud.logout")
+
+    assert result == {"ok": True, "message": "main"}
+    support.handle_command_for_main.assert_called_once_with("cloud.logout", {})
+
+
 def test_app_cloud_runtime_support_command_resolves_article_classification_job():
     owner = _support_owner()
     support = AppCloudRuntimeSupport(owner=owner)

@@ -435,7 +435,10 @@ class AppCloudRuntimeSupport:
         if normalized in {"cloud.validate_session", "validate_session"}:
             self.validate_cloud_session_if_needed(force=bool(request_payload.get("force")))
             return self._daemon_current_cloud_status()
-        return self.handle_command(normalized, request_payload)
+        delegate = getattr(self, "handle_command_for_main", None)
+        if callable(delegate):
+            return delegate(normalized, request_payload)
+        return {"ok": False, "message": f"未知云同步命令: {normalized}"}
 
     def _daemon_get_cloud_status(self) -> dict[str, Any]:
         self.validate_cloud_session_if_needed()
