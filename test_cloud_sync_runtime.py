@@ -379,6 +379,30 @@ def test_app_cloud_runtime_support_command_validates_session_with_force():
     support.validate_cloud_session_if_needed.assert_called_once_with(force=True)
 
 
+def test_app_cloud_runtime_support_command_logs_into_account_space():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+    support.login_cloud_account_space = Mock(return_value={"base_url": "https://api.surfacedlab.com", "access_token": "a"})
+
+    result = support.handle_command(
+        "cloud.login_account_space",
+        {
+            "base_url": "https://api.surfacedlab.com",
+            "token_pair": {"access_token": "a", "refresh_token": "r"},
+        },
+    )
+
+    assert result == {
+        "ok": True,
+        "message": "云端账号空间已切换",
+        "session": {"base_url": "https://api.surfacedlab.com", "access_token": "a"},
+    }
+    support.login_cloud_account_space.assert_called_once_with(
+        base_url="https://api.surfacedlab.com",
+        token_pair={"access_token": "a", "refresh_token": "r"},
+    )
+
+
 def test_app_cloud_runtime_support_command_reports_unknown_command():
     owner = _support_owner()
     support = AppCloudRuntimeSupport(owner=owner)
@@ -433,8 +457,6 @@ def test_app_cloud_runtime_support_login_flushes_previous_account_outbox_before_
     saved = support.login_cloud_account_space(
         base_url="https://api.surfacedlab.com",
         token_pair=next_token_pair,
-        session_preview_builder=lambda *, base_url, token_pair: next_session,
-        cloud_role_getter=lambda session: session["user"]["role"],
     )
 
     assert saved == next_session
@@ -476,12 +498,19 @@ def test_app_cloud_runtime_support_login_does_not_flush_same_account_outbox():
     support.login_cloud_account_space(
         base_url="https://api.surfacedlab.com",
         token_pair=token_pair,
-        session_preview_builder=lambda *, base_url, token_pair: same_session,
-        cloud_role_getter=lambda session: session["user"]["role"],
     )
 
     outbox.bind_to_session.assert_not_called()
-    account_space_ensurer.assert_called_once_with(same_session, copy_legacy=False)
+    account_space_ensurer.assert_called_once_with(
+        {
+            "base_url": "https://api.surfacedlab.com",
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "token_type": "bearer",
+            "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+        },
+        copy_legacy=False,
+    )
 
 
 def test_app_cloud_runtime_support_login_copies_legacy_for_new_admin_profile():
@@ -506,8 +535,15 @@ def test_app_cloud_runtime_support_login_copies_legacy_for_new_admin_profile():
     support.login_cloud_account_space(
         base_url="https://api.surfacedlab.com",
         token_pair={"access_token": "access", "refresh_token": "refresh", "user": next_session["user"]},
-        session_preview_builder=lambda *, base_url, token_pair: next_session,
-        cloud_role_getter=lambda session: session["user"]["role"],
     )
 
-    account_space_ensurer.assert_called_once_with(next_session, copy_legacy=True)
+    account_space_ensurer.assert_called_once_with(
+        {
+            "base_url": "https://api.surfacedlab.com",
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "token_type": "bearer",
+            "user": {"id": 9, "workspace_id": 3, "role": "admin"},
+        },
+        copy_legacy=True,
+    )

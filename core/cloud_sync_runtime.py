@@ -26,6 +26,7 @@ from core.cloud_session_store import (
     CloudSessionStore,
     cloud_session_identity,
     cloud_session_identity_key,
+    normalize_cloud_base_url,
 )
 from core.cloud_platform_auto_sync import CloudPlatformAutoSync
 from core.cloud_sync import CloudSyncManager
@@ -327,6 +328,12 @@ class AppCloudRuntimeSupport:
         if normalized in {"cloud.validate_session", "validate_session"}:
             self.validate_cloud_session_if_needed(force=bool(request_payload.get("force")))
             return self.current_cloud_status()
+        if normalized in {"cloud.login_account_space", "login_account_space"}:
+            saved_session = self.login_cloud_account_space(
+                base_url=str(request_payload.get("base_url") or request_payload.get("baseUrl") or ""),
+                token_pair=request_payload.get("token_pair") or request_payload.get("tokenPair") or {},
+            )
+            return {"ok": True, "message": "云端账号空间已切换", "session": saved_session}
         return {"ok": False, "message": f"未知云同步命令: {normalized}"}
 
     def login_cloud_account_space(
@@ -334,10 +341,8 @@ class AppCloudRuntimeSupport:
         *,
         base_url: str,
         token_pair: dict[str, Any],
-        session_preview_builder: Callable[..., dict[str, Any]],
-        cloud_role_getter: Callable[[dict[str, Any] | None], str],
     ) -> dict[str, Any]:
-        preview_session = session_preview_builder(base_url=base_url, token_pair=token_pair)
+        preview_session = self._build_login_session_preview(base_url=base_url, token_pair=token_pair)
         store = self._session_store_factory()
         previous_session = store.load()
         previous_key = cloud_session_identity_key(previous_session)
@@ -350,7 +355,7 @@ class AppCloudRuntimeSupport:
 
         profile_dir = self._account_profile_dir_getter(preview_session)
         marker_exists = bool(profile_dir and (profile_dir / "profile_meta.json").exists())
-        copy_legacy = cloud_role_getter(preview_session) == "admin" and not marker_exists
+        copy_legacy = self._cloud_role(preview_session) == "admin" and not marker_exists
         self._account_space_ensurer(preview_session, copy_legacy=copy_legacy)
 
         saved_session = store.save_login(base_url=base_url, token_pair=token_pair)
@@ -581,6 +586,22 @@ class AppCloudRuntimeSupport:
             )
         except Exception:
             return max(0.0, self._article_snapshot_startup_delay_seconds)
+
+    @staticmethod
+    def _build_login_session_preview(*, base_url: str, token_pair: dict[str, Any]) -> dict[str, Any]:
+        user = token_pair.get("user") if isinstance(token_pair.get("user"), dict) else {}
+        return {
+            "base_url": normalize_cloud_base_url(base_url),
+            "access_token": str(token_pair.get("access_token") or "").strip(),
+            "refresh_token": str(token_pair.get("refresh_token") or "").strip(),
+            "token_type": str(token_pair.get("token_type") or "bearer").strip() or "bearer",
+            "user": dict(user or {}),
+        }
+
+    @staticmethod
+    def _cloud_role(session: dict[str, Any] | None) -> str:
+        user = session.get("user") if isinstance(session, dict) and isinstance(session.get("user"), dict) else {}
+        return str(user.get("role") or "").strip()
 
     @staticmethod
     def _default_has_pending_profile_update(session: dict[str, Any]) -> bool:

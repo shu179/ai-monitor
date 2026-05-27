@@ -215,7 +215,6 @@ from core.cloud_session_store import (
     CloudSessionStore,
     cloud_session_identity,
     cloud_session_identity_key,
-    normalize_cloud_base_url,
 )
 from core.sqlite_retry import call_with_locked_retry
 from core.cloud_task_sync import (
@@ -2119,28 +2118,17 @@ class AppRuntime:
         self._invalidate_article_cache()
 
     @staticmethod
-    def _cloud_login_session_preview(*, base_url: str, token_pair: dict[str, Any]) -> dict[str, Any]:
-        user = token_pair.get("user") if isinstance(token_pair.get("user"), dict) else {}
-        return {
-            "base_url": normalize_cloud_base_url(base_url),
-            "access_token": str(token_pair.get("access_token") or "").strip(),
-            "refresh_token": str(token_pair.get("refresh_token") or "").strip(),
-            "token_type": str(token_pair.get("token_type") or "bearer").strip() or "bearer",
-            "user": dict(user or {}),
-        }
-
-    @staticmethod
     def _cloud_role(session: dict[str, Any] | None) -> str:
         user = session.get("user") if isinstance(session, dict) and isinstance(session.get("user"), dict) else {}
         return str(user.get("role") or "").strip()
 
     def _login_cloud_account_space(self, *, base_url: str, token_pair: dict[str, Any]) -> dict[str, Any]:
-        return self._ensure_cloud_runtime_support().login_cloud_account_space(
-            base_url=base_url,
-            token_pair=token_pair,
-            session_preview_builder=self._cloud_login_session_preview,
-            cloud_role_getter=self._cloud_role,
+        result = self._cloud_runtime_command(
+            "cloud.login_account_space",
+            {"base_url": base_url, "token_pair": token_pair},
         )
+        session = result.get("session") if isinstance(result, dict) and isinstance(result.get("session"), dict) else {}
+        return session
 
     def _isolate_ordinary_cloud_account_config(self, session: dict[str, Any] | None) -> bool:
         if not isinstance(session, dict):

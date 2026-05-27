@@ -746,6 +746,27 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
             ],
         )
 
+    def test_login_account_space_wrapper_routes_through_runtime_command_boundary(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_runtime_command = Mock(return_value={
+            "ok": True,
+            "session": {"base_url": "https://api.surfacedlab.com", "access_token": "access"},
+        })  # type: ignore[method-assign]
+
+        result = runtime._login_cloud_account_space(  # noqa: SLF001
+            base_url="https://api.surfacedlab.com",
+            token_pair={"access_token": "access", "refresh_token": "refresh"},
+        )
+
+        self.assertEqual(result, {"base_url": "https://api.surfacedlab.com", "access_token": "access"})
+        runtime._cloud_runtime_command.assert_called_once_with(
+            "cloud.login_account_space",
+            {
+                "base_url": "https://api.surfacedlab.com",
+                "token_pair": {"access_token": "access", "refresh_token": "refresh"},
+            },
+        )
+
     def test_delete_cloud_task_flushes_outbox_through_runtime_support(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         runtime._current_cloud_role = Mock(return_value="admin")  # type: ignore[method-assign]
