@@ -150,7 +150,7 @@ class AppCloudRuntimeSupport:
         self._account_profile_dir_getter = account_profile_dir_getter
         self._account_space_ensurer = account_space_ensurer
         self._has_pending_profile_update = has_pending_profile_update or self._default_has_pending_profile_update
-        self._state_delta_appliers = dict(state_delta_appliers or {})
+        self._state_delta_appliers = self._build_state_delta_appliers(state_delta_appliers)
         self._article_snapshot_startup_delay_seconds = float(article_snapshot_startup_delay_seconds or 0.0)
         self._article_deferred_retry_seconds = float(article_deferred_retry_seconds or 0.0)
         self._stop_event = threading.Event()
@@ -658,12 +658,59 @@ class AppCloudRuntimeSupport:
         request_payload = payload if isinstance(payload, dict) else {}
         streams = request_payload.get("streams") if isinstance(request_payload.get("streams"), list) else []
         result = process_state_delta_inbox(
+            inbox=CloudStateDeltaInbox(),
             appliers=self._state_delta_appliers,
             limit=_safe_int(request_payload.get("limit"), 100),
             streams=[str(stream) for stream in streams],
             include_failed=bool(request_payload.get("include_failed") or request_payload.get("includeFailed")),
         )
         return {"ok": bool(result.get("ok")), "state_delta_inbox": result}
+
+    def _build_state_delta_appliers(
+        self,
+        custom_appliers: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
+    ) -> dict[str, Callable[[dict[str, Any]], Any]]:
+        appliers: dict[str, Callable[[dict[str, Any]], Any]] = {"profile": self._apply_profile_state_delta}
+        appliers.update(custom_appliers or {})
+        return appliers
+
+    def _apply_profile_state_delta(self, item: dict[str, Any]) -> None:
+        entity = item.get("entity") if isinstance(item.get("entity"), dict) else {}
+        if str(item.get("stream") or "") != "profile" or str(entity.get("type") or "") != "profile":
+            raise ValueError("state-delta profile item has invalid shape")
+        store = self._session_store_factory()
+        session = store.load()
+        current_user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        current_workspace_id = str(current_user.get("workspace_id") or "").strip()
+        current_user_id = str(current_user.get("id") or "").strip()
+        incoming_workspace_id = str(entity.get("workspace_id") or "").strip()
+        incoming_user_id = str(entity.get("user_id") or entity.get("id") or "").strip()
+        if not current_workspace_id or not current_user_id:
+            raise ValueError("未登录云端，无法应用 profile state-delta")
+        if incoming_workspace_id != current_workspace_id or incoming_user_id != current_user_id:
+            raise ValueError("profile state-delta 与当前云端账号不匹配")
+        merged_user = dict(current_user)
+        merged_user.update(
+            {
+                "id": _safe_int(entity.get("user_id") or entity.get("id"), _safe_int(current_user.get("id"), 0)),
+                "workspace_id": _safe_int(
+                    entity.get("workspace_id"),
+                    _safe_int(current_user.get("workspace_id"), 0),
+                ),
+                "username": str(entity.get("username") or current_user.get("username") or ""),
+                "role": str(entity.get("role") or current_user.get("role") or ""),
+                "display_name": entity.get("display_name"),
+                "email": entity.get("email"),
+                "email_verified": bool(entity.get("email_verified")),
+                "avatar": entity.get("avatar"),
+                "birthday": entity.get("birthday"),
+                "hire_date": entity.get("hire_date"),
+                "view_all_tasks": bool(entity.get("view_all_tasks")),
+                "enabled": bool(entity.get("enabled", True)),
+                "updated_at": str(entity.get("updated_at") or current_user.get("updated_at") or ""),
+            }
+        )
+        store.update_user(merged_user)
 
     def cloud_request_with_refresh(self, operation: Callable[[Any, str], Any]) -> tuple[bool, Any, str]:
         store = self._session_store_factory()

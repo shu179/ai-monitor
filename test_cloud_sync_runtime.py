@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import threading
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 from core.cloud_client import CloudClientError
+from core.cloud_state_delta_inbox import CloudStateDeltaInbox
 from core.cloud_sync_runtime import (
     AppCloudRuntimeSupport,
     create_in_process_cloud_sync_command_client,
@@ -137,12 +139,11 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
     assert pull_result == {"ok": True, "state_delta": {"ok": True, "changes": 3}, "message": ""}
     pull_delta.assert_called_once_with(limit=50, max_pages=2)
     assert process_result == {"ok": True, "state_delta_inbox": {"ok": True, "applied": 1}}
-    process_inbox.assert_called_once_with(
-        appliers={},
-        limit=20,
-        streams=["tasks"],
-        include_failed=False,
-    )
+    process_kwargs = process_inbox.call_args.kwargs
+    assert callable(process_kwargs["appliers"]["profile"])
+    assert process_kwargs["limit"] == 20
+    assert process_kwargs["streams"] == ["tasks"]
+    assert process_kwargs["include_failed"] is False
     assert diagnostics == {
         "ok": True,
         "state_delta": {"cursors": {"tasks": 2}},
@@ -150,6 +151,94 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
     }
     store_cls.return_value.diagnostics.assert_called_once_with(session_store.load.return_value)
     inbox_cls.return_value.diagnostics.assert_called_once_with(failed_limit=10)
+
+
+def test_app_cloud_runtime_support_applies_profile_state_delta_to_session():
+    owner = _support_owner()
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+        inbox.record_changes(
+            identity_key="https://api.example.com|3|2",
+            changes=[
+                {
+                    "stream": "profile",
+                    "seq": 1,
+                    "kind": "profile.update",
+                    "ref_id": "profile:2",
+                    "entity": {
+                        "type": "profile",
+                        "user_id": 2,
+                        "workspace_id": 3,
+                        "username": "operator@example.com",
+                        "role": "operate",
+                        "display_name": "新名字",
+                        "email": "operator@example.com",
+                        "email_verified": True,
+                        "avatar": "https://cdn.example.com/a.png",
+                        "birthday": "2000-01-02",
+                        "hire_date": "2026-05-01",
+                        "view_all_tasks": False,
+                        "enabled": True,
+                        "updated_at": "2026-05-28T00:00:00Z",
+                    },
+                }
+            ],
+        )
+        session_store = MagicMock()
+        session_store.load.return_value = {
+            "base_url": "https://api.example.com",
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "user": {"id": 2, "workspace_id": 3, "username": "old", "role": "operate"},
+        }
+        support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+        with patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox):
+            result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["profile"]})
+
+        assert result["ok"] is True
+        assert result["state_delta_inbox"]["applied"] == 1
+        saved_user = session_store.update_user.call_args.args[0]
+        assert saved_user["display_name"] == "新名字"
+        assert saved_user["email_verified"] is True
+        assert saved_user["workspace_id"] == 3
+        assert inbox.diagnostics()["by_status"] == {"applied": 1}
+
+
+def test_app_cloud_runtime_support_rejects_profile_delta_for_other_user():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "username": "old", "role": "operate"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+        inbox.record_changes(
+            identity_key="https://api.example.com|3|2",
+            changes=[
+                {
+                    "stream": "profile",
+                    "seq": 1,
+                    "kind": "profile.update",
+                    "ref_id": "profile:99",
+                    "entity": {"type": "profile", "user_id": 99, "workspace_id": 3},
+                }
+            ],
+        )
+
+        with patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox):
+            result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["profile"]})
+            diagnostics = inbox.diagnostics()
+
+    assert result["ok"] is False
+    assert result["state_delta_inbox"]["failed"] == 1
+    assert "不匹配" in diagnostics["failed"][0]["last_error"]
+    session_store.update_user.assert_not_called()
 
 
 def test_app_cloud_runtime_support_retries_request_after_refresh():
