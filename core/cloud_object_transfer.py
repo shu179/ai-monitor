@@ -23,6 +23,7 @@ def upload_cloud_object_file(
     compression: str = "auto",
     trace_id: str = "",
     chunk_bytes: int = DEFAULT_UPLOAD_CHUNK_BYTES,
+    transfer_store: Any | None = None,
 ) -> dict[str, Any]:
     """Upload a local file through the cloud object API.
 
@@ -45,6 +46,52 @@ def upload_cloud_object_file(
     if size <= 0:
         raise CloudObjectTransferError("object file is empty")
     sha256 = digest.hexdigest()
+    transfer_id = str(trace_id or f"upload:{sha256}").strip()
+    store = transfer_store
+    if store is not None:
+        store.start_transfer(
+            transfer_id=transfer_id,
+            direction="upload",
+            sha256=sha256,
+            size_bytes=size,
+            path=str(path),
+            content_type=content_type,
+            trace_id=trace_id,
+        )
+    try:
+        return _upload_cloud_object_file(
+            client,
+            access_token,
+            path,
+            sha256=sha256,
+            size=size,
+            content_type=content_type,
+            compression=compression,
+            trace_id=trace_id,
+            chunk_bytes=chunk_bytes,
+            transfer_store=store,
+            transfer_id=transfer_id,
+        )
+    except Exception as exc:
+        if store is not None:
+            store.fail_transfer(transfer_id, str(exc))
+        raise
+
+
+def _upload_cloud_object_file(
+    client: Any,
+    access_token: str,
+    path: Path,
+    *,
+    sha256: str,
+    size: int,
+    content_type: str,
+    compression: str,
+    trace_id: str,
+    chunk_bytes: int,
+    transfer_store: Any | None,
+    transfer_id: str,
+) -> dict[str, Any]:
     upload = client.create_object_upload(
         access_token,
         sha256=sha256,
@@ -56,8 +103,17 @@ def upload_cloud_object_file(
     )
     strategy = str(upload.get("strategy") or "").strip()
     if strategy == "already_exists":
+        if transfer_store is not None:
+            transfer_store.finish_transfer(
+                transfer_id,
+                object_id=str(upload.get("object_id") or ""),
+                path=str(path),
+                status="completed",
+            )
         return {"ok": True, "uploaded": False, "strategy": strategy, "object": upload}
     if strategy == "inline":
+        if transfer_store is not None:
+            transfer_store.finish_transfer(transfer_id, path=str(path), status="completed")
         return {"ok": True, "uploaded": False, "strategy": strategy, "object": upload}
     if strategy != "single_put":
         raise CloudObjectTransferError(f"unsupported object upload strategy: {strategy or 'unknown'}")
@@ -82,6 +138,13 @@ def upload_cloud_object_file(
         compression=str(upload.get("compression") or compression),
         trace_id=trace_id,
     )
+    if transfer_store is not None:
+        transfer_store.finish_transfer(
+            transfer_id,
+            object_id=str(completed.get("object_id") or completed.get("objectId") or ""),
+            path=str(path),
+            status=str(completed.get("status") or "completed"),
+        )
     return {"ok": True, "uploaded": True, "strategy": strategy, "object": completed}
 
 

@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from core.cloud_object_transfer import CloudObjectTransferError, upload_cloud_object_file
+from core.cloud_object_transfer_store import CloudObjectTransferStore
 
 
 class FakeUploadClient:
@@ -59,6 +60,7 @@ def test_upload_cloud_object_file_single_puts_and_completes(tmp_path: Path):
     path = tmp_path / "answer.txt"
     path.write_bytes(b"hello cloud object")
     client = FakeUploadClient()
+    store = CloudObjectTransferStore(tmp_path / "transfers.sqlite3")
 
     result = upload_cloud_object_file(
         client,
@@ -68,7 +70,9 @@ def test_upload_cloud_object_file_single_puts_and_completes(tmp_path: Path):
         compression="none",
         trace_id="trace-1",
         chunk_bytes=5,
+        transfer_store=store,
     )
+    diagnostics = store.diagnostics()
 
     assert result["ok"] is True
     assert result["uploaded"] is True
@@ -80,6 +84,9 @@ def test_upload_cloud_object_file_single_puts_and_completes(tmp_path: Path):
     assert client.calls[1][1]["headers"] == {"X-Test": "1"}
     assert client.calls[2][1]["session_id"] == "session-1"
     assert client.calls[2][1]["storage_size_bytes"] == len(path.read_bytes())
+    assert diagnostics["by_status"] == {"active": 1}
+    assert diagnostics["newest"][0]["object_id"] == "object-1"
+    assert diagnostics["newest"][0]["path"] == str(path)
 
 
 def test_upload_cloud_object_file_returns_existing_manifest_without_upload(tmp_path: Path):
@@ -98,9 +105,14 @@ def test_upload_cloud_object_file_rejects_unsupported_multipart_for_now(tmp_path
     path = tmp_path / "large.bin"
     path.write_bytes(b"x" * 10)
     client = FakeUploadClient(strategy="multipart")
+    store = CloudObjectTransferStore(tmp_path / "transfers.sqlite3")
 
     with pytest.raises(CloudObjectTransferError, match="unsupported object upload strategy"):
-        upload_cloud_object_file(client, "access", path)
+        upload_cloud_object_file(client, "access", path, transfer_store=store)
+
+    diagnostics = store.diagnostics()
+    assert diagnostics["by_status"] == {"failed": 1}
+    assert "unsupported object upload strategy" in diagnostics["failed"][0]["last_error"]
 
 
 def test_upload_cloud_object_file_rejects_empty_file(tmp_path: Path):
