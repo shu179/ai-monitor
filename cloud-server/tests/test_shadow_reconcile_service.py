@@ -80,6 +80,30 @@ class ShadowReconcileServiceTests(unittest.TestCase):
         self.assertIn("mismatches:", text)
         self.assertIn("fallback_required=True", text)
 
+    def test_skipped_article_payloads_are_not_migration_tail(self) -> None:
+        db = _db(
+            entity_rows=[
+                SimpleNamespace(name="tasks", count=0),
+                SimpleNamespace(name="runs", count=0),
+                SimpleNamespace(name="articles", count=1),
+                SimpleNamespace(name="article_links", count=0),
+                SimpleNamespace(name="references", count=0),
+                SimpleNamespace(name="agent_commands", count=0),
+                SimpleNamespace(name="article_versions", count=0),
+            ],
+            change_rows=[SimpleNamespace(stream="articles", count=1, max_seq=1)],
+            migration_rows=[SimpleNamespace(status="skipped", count=1)],
+            payload_candidates=1,
+            missing_versions=0,
+            sample_rows=[[], [], []],
+        )
+
+        report = build_shadow_reconcile_report(db)
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["migration"]["state_counts"], {"skipped": 1})
+        self.assertEqual(report["migration"]["fallback_required"], False)
+
     def test_admin_route_is_registered(self) -> None:
         from app.api.routes.admin import router
 

@@ -634,19 +634,43 @@ def _entity_for_state_delta_change(
     ref_id = str(change.get("ref_id") or "").strip()
     if not kind or not ref_id:
         return None
+    if kind in {"task.created", "task.updated", "task.deleted", "task.restored", "task.assignment_changed"}:
+        return _state_delta_task_entity(db, user, ref_id)
     if kind == "run.record":
         return _state_delta_run_record_entity(db, user, ref_id)
+    if kind == "run.record.backfill":
+        return _state_delta_run_record_entity_by_id(db, user, ref_id)
     if kind == "task.day_status":
         return _state_delta_task_day_status_entity(db, user, ref_id)
     if kind == "article.reference":
         return _state_delta_article_reference_entity(db, user, ref_id)
-    if kind in {"article.upsert", "article.link"}:
+    if kind == "article.reference.backfill":
+        return _state_delta_article_reference_entity_by_id(db, user, ref_id)
+    if kind in {"article.upsert", "article.link", "article.classification_resolved", "article.classification_ignored"}:
         return _state_delta_article_entity(db, user, ref_id, object_refs_by_id)
+    if kind == "article.upsert.backfill":
+        return _state_delta_article_entity_by_id(db, user, ref_id, object_refs_by_id)
     if kind.startswith("agent."):
         return _state_delta_agent_status_entity(db, user, ref_id)
-    if kind == "profile.update":
+    if kind in {"profile.update", "profile.updated", "admin.user_created", "admin.user_updated", "admin.user_deleted", "viewer.scope_changed"}:
         return _state_delta_profile_entity(user)
     return None
+
+
+def _state_delta_task_entity(db: Session, user: User, ref_id: str) -> dict[str, Any] | None:
+    try:
+        task_id = int(ref_id)
+    except (TypeError, ValueError):
+        return None
+    task = db.scalar(
+        select(BrandTask).where(
+            BrandTask.workspace_id == user.workspace_id,
+            BrandTask.id == task_id,
+        )
+    )
+    if task is None:
+        return None
+    return _task_entity(task, _task_access_level_for_user(user))
 
 
 def _state_delta_run_record_entity(db: Session, user: User, ref_id: str) -> dict[str, Any] | None:
@@ -654,6 +678,22 @@ def _state_delta_run_record_entity(db: Session, user: User, ref_id: str) -> dict
         select(RunRecord).where(
             RunRecord.workspace_id == user.workspace_id,
             RunRecord.idempotency_key == ref_id,
+        )
+    )
+    if record is None:
+        return None
+    return _run_record_entity(record)
+
+
+def _state_delta_run_record_entity_by_id(db: Session, user: User, ref_id: str) -> dict[str, Any] | None:
+    try:
+        record_id = int(ref_id)
+    except (TypeError, ValueError):
+        return None
+    record = db.scalar(
+        select(RunRecord).where(
+            RunRecord.workspace_id == user.workspace_id,
+            RunRecord.id == record_id,
         )
     )
     if record is None:
@@ -703,6 +743,22 @@ def _state_delta_article_reference_entity(db: Session, user: User, ref_id: str) 
     return _article_reference_entity(reference)
 
 
+def _state_delta_article_reference_entity_by_id(db: Session, user: User, ref_id: str) -> dict[str, Any] | None:
+    try:
+        reference_id = int(ref_id)
+    except (TypeError, ValueError):
+        return None
+    reference = db.scalar(
+        select(ArticleReferenceEvent).where(
+            ArticleReferenceEvent.workspace_id == user.workspace_id,
+            ArticleReferenceEvent.id == reference_id,
+        )
+    )
+    if reference is None:
+        return None
+    return _article_reference_entity(reference)
+
+
 def _article_reference_entity(reference: ArticleReferenceEvent) -> dict[str, Any]:
     return {
         "type": "article_reference",
@@ -745,6 +801,27 @@ def _state_delta_article_entity(
     if article is None:
         return None
 
+    return _article_entity_from_article(db, user, article, object_refs_by_id)
+
+
+def _state_delta_article_entity_by_id(
+    db: Session,
+    user: User,
+    ref_id: str,
+    object_refs_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    try:
+        article_id = int(ref_id)
+    except (TypeError, ValueError):
+        return None
+    article = db.scalar(
+        select(Article).where(
+            Article.workspace_id == user.workspace_id,
+            Article.id == article_id,
+        )
+    )
+    if article is None:
+        return None
     return _article_entity_from_article(db, user, article, object_refs_by_id)
 
 

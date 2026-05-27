@@ -54,6 +54,41 @@ class StateDeltaPayloadTests(unittest.TestCase):
 
     @patch("app.services.sync_v2_service._stale_cursor_streams", return_value=[])
     @patch("app.services.sync_v2_service.list_workspace_changes")
+    @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"runs": 1})
+    def test_state_delta_includes_backfilled_run_record_entity_by_id(self, _snapshot, list_changes, _stale) -> None:
+        list_changes.return_value = [
+            {
+                "stream": "runs",
+                "seq": 1,
+                "kind": "run.record.backfill",
+                "ref_id": "11",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }
+        ]
+        db = MagicMock()
+        db.scalar.return_value = SimpleNamespace(
+            id=11,
+            workspace_id=7,
+            task_id=3,
+            executed_by=9,
+            platform="douyin",
+            keyword="coffee",
+            brand="Acme",
+            mode="browser",
+            result_json={"rank": 1},
+            idempotency_key="run-001",
+            executed_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            created_at=datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc),
+        )
+
+        result = build_state_delta(db, _user(), cursors={"runs": 0})
+
+        entity = result["changes"][0]["entity"]
+        self.assertEqual(entity["type"], "run_record")
+        self.assertEqual(entity["id"], 11)
+
+    @patch("app.services.sync_v2_service._stale_cursor_streams", return_value=[])
+    @patch("app.services.sync_v2_service.list_workspace_changes")
     @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"articles": 1})
     def test_state_delta_includes_article_entity_and_object_ref(self, _snapshot, list_changes, _stale) -> None:
         list_changes.return_value = [
@@ -124,6 +159,43 @@ class StateDeltaPayloadTests(unittest.TestCase):
         self.assertEqual(entity["content_ref"]["object_id"], "object-001")
         self.assertEqual(result["object_refs"][0]["object_id"], "object-001")
         self.assertEqual(result["object_refs"][0]["compression"], "zstd")
+
+    @patch("app.services.sync_v2_service._stale_cursor_streams", return_value=[])
+    @patch("app.services.sync_v2_service.list_workspace_changes")
+    @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"articles": 1})
+    def test_state_delta_includes_backfilled_article_entity_by_id(self, _snapshot, list_changes, _stale) -> None:
+        list_changes.return_value = [
+            {
+                "stream": "articles",
+                "seq": 1,
+                "kind": "article.upsert.backfill",
+                "ref_id": "21",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }
+        ]
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        article = SimpleNamespace(
+            id=21,
+            workspace_id=7,
+            canonical_url="https://example.test/a",
+            url_hash="a" * 64,
+            title="Article A",
+            source="Example",
+            media_type="authority",
+            published_at=now,
+            payload_json={"excerpt": "short"},
+            created_at=now,
+            updated_at=now,
+        )
+        db = MagicMock()
+        db.scalar.side_effect = [article, None]
+        db.scalars.return_value = []
+
+        result = build_state_delta(db, _user(), cursors={"articles": 0})
+
+        entity = result["changes"][0]["entity"]
+        self.assertEqual(entity["type"], "article")
+        self.assertEqual(entity["id"], 21)
 
     @patch("app.services.sync_v2_service._stale_cursor_streams", return_value=[])
     @patch("app.services.sync_v2_service.list_workspace_changes")

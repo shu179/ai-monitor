@@ -125,15 +125,17 @@ def _migration_summary(db: Session) -> dict[str, Any]:
         )
     ).all()
     payload_candidates = int(db.execute(text("SELECT count(*) FROM articles WHERE payload_json <> '{}'::jsonb")).scalar_one() or 0)
-    missing_versions = int(
+    pending_versions = int(
         db.execute(
             text(
                 """
                 SELECT count(*)
                 FROM articles a
                 LEFT JOIN article_versions v ON v.article_id = a.id
+                LEFT JOIN articles_migration_state s ON s.article_id = a.id
                 WHERE a.payload_json <> '{}'::jsonb
                   AND v.article_id IS NULL
+                  AND coalesce(s.status, '') NOT IN ('completed', 'skipped')
                 """
             )
         ).scalar_one()
@@ -143,8 +145,8 @@ def _migration_summary(db: Session) -> dict[str, Any]:
     return {
         "state_counts": state_counts,
         "payload_candidates": payload_candidates,
-        "missing_versions": missing_versions,
-        "fallback_required": missing_versions > 0,
+        "missing_versions": pending_versions,
+        "fallback_required": pending_versions > 0,
     }
 
 
