@@ -722,27 +722,48 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         self.assertTrue(result["cloud"]["loggedIn"])
         runtime.pull_cloud_tasks.assert_not_called()
 
+    def test_cloud_endpoint_wrappers_route_through_runtime_command_boundary(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_runtime_command = Mock(side_effect=[
+            {"ok": True, "cloud": {"loggedIn": True}},
+            {"ok": True, "message": "已退出云端"},
+            {"ok": True, "metrics": {"event_count": 2}},
+            {"ok": True, "run_records": {"queued": 1}},
+        ])  # type: ignore[method-assign]
+
+        self.assertEqual(runtime.get_cloud_status(), {"ok": True, "cloud": {"loggedIn": True}})
+        self.assertEqual(runtime.logout_cloud({}), {"ok": True, "message": "已退出云端"})
+        self.assertEqual(runtime.flush_cloud_outbox({"limit": 7}), {"ok": True, "metrics": {"event_count": 2}})
+        self.assertEqual(runtime._recover_cloud_run_history_uploads(), {"ok": True, "run_records": {"queued": 1}})  # noqa: SLF001
+
+        self.assertEqual(
+            runtime._cloud_runtime_command.call_args_list,
+            [
+                unittest.mock.call("cloud.status"),
+                unittest.mock.call("cloud.logout"),
+                unittest.mock.call("cloud.flush_outbox", {"limit": 7}),
+                unittest.mock.call("cloud.recover_uploads"),
+            ],
+        )
+
     def test_delete_cloud_task_flushes_outbox_through_runtime_support(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         runtime._current_cloud_role = Mock(return_value="admin")  # type: ignore[method-assign]
         runtime._cloud_request_with_refresh = Mock(return_value=(True, {}, ""))  # type: ignore[method-assign]
-        support = Mock()
-        runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
+        runtime._cloud_runtime_command = Mock(return_value={"ok": True})  # type: ignore[method-assign]
 
         ok, message = runtime._delete_cloud_task_for_local_task({"cloud_task_id": 42})  # noqa: SLF001
 
         self.assertTrue(ok)
         self.assertEqual(message, "")
-        support.flush_cloud_outbox.assert_called_once_with({"limit": 10000})
+        runtime._cloud_runtime_command.assert_called_once_with("cloud.flush_outbox", {"limit": 10000})
         runtime._cloud_request_with_refresh.assert_called_once()
 
     def test_delete_cloud_task_continues_when_predelete_flush_fails(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         runtime._current_cloud_role = Mock(return_value="admin")  # type: ignore[method-assign]
         runtime._cloud_request_with_refresh = Mock(return_value=(True, {}, ""))  # type: ignore[method-assign]
-        support = Mock()
-        support.flush_cloud_outbox.side_effect = RuntimeError("flush failed")
-        runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
+        runtime._cloud_runtime_command = Mock(side_effect=RuntimeError("flush failed"))  # type: ignore[method-assign]
 
         ok, message = runtime._delete_cloud_task_for_local_task({"cloud_task_id": 42})  # noqa: SLF001
 

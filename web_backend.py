@@ -4218,11 +4218,14 @@ return changedCount
     def get_cloud_sync_status(self) -> dict[str, Any]:
         return {"ok": True, "cloud_sync": self._cloud_sync_manager.get_status()}
 
+    def _cloud_runtime_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._ensure_cloud_runtime_support().handle_command(command, payload)
+
     def _validate_cloud_session_if_needed(self, *, force: bool = False) -> None:
-        self._ensure_cloud_runtime_support().validate_cloud_session_if_needed(force=force)
+        self._cloud_runtime_command("cloud.validate_session", {"force": force})
 
     def get_cloud_status(self) -> dict[str, Any]:
-        return self._ensure_cloud_runtime_support().get_cloud_status()
+        return self._cloud_runtime_command("cloud.status")
 
     def _current_cloud_status(self) -> dict[str, Any]:
         return self._ensure_cloud_runtime_support().current_cloud_status()
@@ -4785,13 +4788,13 @@ return changedCount
 
     def logout_cloud(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         del payload
-        return self._ensure_cloud_runtime_support().logout_cloud_account()
+        return self._cloud_runtime_command("cloud.logout")
 
     def flush_cloud_outbox(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._ensure_cloud_runtime_support().flush_cloud_outbox(payload)
+        return self._cloud_runtime_command("cloud.flush_outbox", payload)
 
     def _recover_cloud_run_history_uploads(self) -> dict[str, Any]:
-        return self._ensure_cloud_runtime_support().recover_cloud_run_history_uploads()
+        return self._cloud_runtime_command("cloud.recover_uploads")
 
     def pull_cloud_tasks(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
@@ -7317,7 +7320,7 @@ return changedCount
         if self._current_cloud_role() != "admin":
             return False, "只有管理员账号可以删除云端品牌任务"
         try:
-            self._ensure_cloud_runtime_support().flush_cloud_outbox({"limit": 10000})
+            self._cloud_runtime_command("cloud.flush_outbox", {"limit": 10000})
         except Exception as exc:
             print(f"[WebBackend] 删除任务前上传云端 outbox 失败，将继续尝试删除: {exc}")
         ok, _payload, message = self._cloud_request_with_refresh(
