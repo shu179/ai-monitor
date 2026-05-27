@@ -5,7 +5,11 @@ from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 from core.cloud_client import CloudClientError
-from core.cloud_sync_runtime import AppCloudRuntimeSupport, create_local_cloud_sync_runtime
+from core.cloud_sync_runtime import (
+    AppCloudRuntimeSupport,
+    create_in_process_cloud_sync_command_client,
+    create_local_cloud_sync_runtime,
+)
 
 
 def test_create_local_cloud_sync_runtime_wires_burst_env(monkeypatch):
@@ -34,6 +38,18 @@ def test_create_local_cloud_sync_runtime_wires_burst_env(monkeypatch):
     assert runtime.platform_auto_sync is auto_sync
     assert auto_sync_cls.call_args.kwargs["upload_burst_interval_seconds"] == 2.5
     assert auto_sync_cls.call_args.kwargs["upload_burst_pending_threshold"] == 321
+
+
+def test_create_in_process_cloud_sync_command_client_wraps_handler():
+    seen: list[tuple[str, dict[str, object] | None]] = []
+    client = create_in_process_cloud_sync_command_client(
+        lambda command, payload: seen.append((command, payload)) or {"ok": True}
+    )
+
+    result = client.send_command("cloud.status", {"force": True})
+
+    assert result == {"ok": True}
+    assert seen == [("cloud.status", {"force": True})]
 
 
 def _support_owner() -> MagicMock:

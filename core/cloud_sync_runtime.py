@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from core.cloud_client import CloudClientError, SurfacedCloudClient
+from core.cloud_sync_daemon import InProcessCloudSyncCommandClient
 from core.cloud_event_types import EVENT_PROFILE_UPDATE
 from core.cloud_outbox import CloudOutbox
 from core.cloud_run_sync import (
@@ -52,6 +53,13 @@ class LocalCloudSyncRuntime:
 
     def auto_sync_status(self) -> dict[str, Any]:
         return self.platform_auto_sync.get_status()
+
+
+def create_in_process_cloud_sync_command_client(
+    command_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
+) -> InProcessCloudSyncCommandClient:
+    """Return the transport-shaped client used before daemon IPC takes over."""
+    return InProcessCloudSyncCommandClient(command_handler)
 
 
 def create_local_cloud_sync_runtime(
