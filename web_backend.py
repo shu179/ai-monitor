@@ -226,7 +226,6 @@ from core.cloud_task_sync import (
 from core.local_account_space import (
     account_profile_dir_from_session,
     current_account_config_path,
-    ensure_account_space,
     ensure_current_account_space,
     merge_profile_meta,
 )
@@ -2137,29 +2136,12 @@ class AppRuntime:
         return str(user.get("role") or "").strip()
 
     def _login_cloud_account_space(self, *, base_url: str, token_pair: dict[str, Any]) -> dict[str, Any]:
-        preview_session = self._cloud_login_session_preview(base_url=base_url, token_pair=token_pair)
-        store = CloudSessionStore()
-        previous_session = store.load()
-        previous_key = cloud_session_identity_key(previous_session)
-        next_key = cloud_session_identity_key(preview_session)
-        if previous_key and next_key and previous_key != next_key:
-            try:
-                previous_outbox = CloudOutbox().bind_to_session(previous_session)
-                previous_stats = previous_outbox.stats()
-                if previous_stats.get("pending", 0) or previous_stats.get("failed", 0):
-                    flush_cloud_outbox_events(outbox=previous_outbox)
-            except Exception as exc:
-                print(f"[WebBackend] 切换账号前旧账号运行数据补传失败，将继续登录新账号: {exc}")
-        profile_dir = account_profile_dir_from_session(preview_session)
-        marker_exists = bool(profile_dir and (profile_dir / "profile_meta.json").exists())
-        copy_legacy = self._cloud_role(preview_session) == "admin" and not marker_exists
-        ensure_account_space(preview_session, copy_legacy=copy_legacy)
-
-        saved_session = store.save_login(base_url=base_url, token_pair=token_pair)
-        self._activate_current_account_space(copy_legacy=False)
-        self._isolate_ordinary_cloud_account_config(saved_session)
-        self._close_execution_runtime_for_viewer()
-        return saved_session
+        return self._ensure_cloud_runtime_support().login_cloud_account_space(
+            base_url=base_url,
+            token_pair=token_pair,
+            session_preview_builder=self._cloud_login_session_preview,
+            cloud_role_getter=self._cloud_role,
+        )
 
     def _isolate_ordinary_cloud_account_config(self, session: dict[str, Any] | None) -> bool:
         if not isinstance(session, dict):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 from core.cloud_client import CloudClientError
@@ -305,3 +306,127 @@ def test_app_cloud_runtime_support_flush_cloud_outbox_defaults_bad_limit():
     support.flush_cloud_outbox({"limit": "not-a-number"})
 
     flush_outbox.assert_called_once_with(limit=100)
+
+
+def test_app_cloud_runtime_support_login_flushes_previous_account_outbox_before_switch():
+    owner = _support_owner()
+    owner._activate_current_account_space = Mock()
+    owner._isolate_ordinary_cloud_account_config = Mock()
+    owner._close_execution_runtime_for_viewer = Mock()
+    previous_session = {
+        "base_url": "https://api.surfacedlab.com",
+        "access_token": "old-access",
+        "refresh_token": "old-refresh",
+        "user": {"id": 1, "workspace_id": 3, "role": "operator"},
+    }
+    next_token_pair = {
+        "access_token": "new-access",
+        "refresh_token": "new-refresh",
+        "token_type": "bearer",
+        "user": {"id": 2, "workspace_id": 3, "role": "admin"},
+    }
+    next_session = {
+        "base_url": "https://api.surfacedlab.com",
+        "access_token": "new-access",
+        "refresh_token": "new-refresh",
+        "token_type": "bearer",
+        "user": {"id": 2, "workspace_id": 3, "role": "admin"},
+    }
+    session_store = MagicMock()
+    session_store.load.return_value = previous_session
+    session_store.save_login.return_value = next_session
+    outbox = MagicMock()
+    bound_outbox = MagicMock()
+    bound_outbox.stats.return_value = {"pending": 1, "failed": 0}
+    outbox.bind_to_session.return_value = bound_outbox
+    flush_outbox = Mock(return_value={"ok": True})
+    support = AppCloudRuntimeSupport(
+        owner=owner,
+        session_store_factory=lambda: session_store,
+        outbox_factory=lambda: outbox,
+        flush_outbox_fn=flush_outbox,
+        account_profile_dir_getter=lambda _session: Path("/tmp/new-profile"),
+        account_space_ensurer=Mock(),
+    )
+
+    saved = support.login_cloud_account_space(
+        base_url="https://api.surfacedlab.com",
+        token_pair=next_token_pair,
+        session_preview_builder=lambda *, base_url, token_pair: next_session,
+        cloud_role_getter=lambda session: session["user"]["role"],
+    )
+
+    assert saved == next_session
+    outbox.bind_to_session.assert_called_once_with(previous_session)
+    flush_outbox.assert_called_once_with(outbox=bound_outbox)
+    session_store.save_login.assert_called_once_with(base_url="https://api.surfacedlab.com", token_pair=next_token_pair)
+    owner._activate_current_account_space.assert_called_once_with(copy_legacy=False)
+    owner._isolate_ordinary_cloud_account_config.assert_called_once_with(next_session)
+    owner._close_execution_runtime_for_viewer.assert_called_once()
+
+
+def test_app_cloud_runtime_support_login_does_not_flush_same_account_outbox():
+    owner = _support_owner()
+    same_session = {
+        "base_url": "https://api.surfacedlab.com",
+        "access_token": "old-access",
+        "refresh_token": "old-refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    token_pair = {
+        "access_token": "new-access",
+        "refresh_token": "new-refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    session_store = MagicMock()
+    session_store.load.return_value = same_session
+    session_store.save_login.return_value = dict(same_session, access_token="new-access")
+    outbox = MagicMock()
+    account_space_ensurer = Mock()
+    support = AppCloudRuntimeSupport(
+        owner=owner,
+        session_store_factory=lambda: session_store,
+        outbox_factory=lambda: outbox,
+        flush_outbox_fn=Mock(),
+        account_profile_dir_getter=lambda _session: Path("/tmp/existing-profile"),
+        account_space_ensurer=account_space_ensurer,
+    )
+
+    support.login_cloud_account_space(
+        base_url="https://api.surfacedlab.com",
+        token_pair=token_pair,
+        session_preview_builder=lambda *, base_url, token_pair: same_session,
+        cloud_role_getter=lambda session: session["user"]["role"],
+    )
+
+    outbox.bind_to_session.assert_not_called()
+    account_space_ensurer.assert_called_once_with(same_session, copy_legacy=False)
+
+
+def test_app_cloud_runtime_support_login_copies_legacy_for_new_admin_profile():
+    owner = _support_owner()
+    next_session = {
+        "base_url": "https://api.surfacedlab.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 9, "workspace_id": 3, "role": "admin"},
+    }
+    session_store = MagicMock()
+    session_store.load.return_value = {}
+    session_store.save_login.return_value = next_session
+    account_space_ensurer = Mock()
+    support = AppCloudRuntimeSupport(
+        owner=owner,
+        session_store_factory=lambda: session_store,
+        account_profile_dir_getter=lambda _session: Path("/tmp/profile-without-marker"),
+        account_space_ensurer=account_space_ensurer,
+    )
+
+    support.login_cloud_account_space(
+        base_url="https://api.surfacedlab.com",
+        token_pair={"access_token": "access", "refresh_token": "refresh", "user": next_session["user"]},
+        session_preview_builder=lambda *, base_url, token_pair: next_session,
+        cloud_role_getter=lambda session: session["user"]["role"],
+    )
+
+    account_space_ensurer.assert_called_once_with(next_session, copy_legacy=True)

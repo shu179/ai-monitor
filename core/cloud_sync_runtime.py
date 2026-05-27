@@ -29,7 +29,7 @@ from core.cloud_session_store import (
 )
 from core.cloud_platform_auto_sync import CloudPlatformAutoSync
 from core.cloud_sync import CloudSyncManager
-from core.local_account_space import current_account_config_path
+from core.local_account_space import account_profile_dir_from_session, current_account_config_path, ensure_account_space
 from core.sync_service import build_sync_bundle
 
 
@@ -118,6 +118,8 @@ class AppCloudRuntimeSupport:
         request_client_factory: Callable[[str], Any] | None = None,
         auto_sync_status_getter: Callable[[], dict[str, Any]] | None = None,
         current_account_config_path_getter: Callable[[], Any] = current_account_config_path,
+        account_profile_dir_getter: Callable[[dict[str, Any] | None], Any] = account_profile_dir_from_session,
+        account_space_ensurer: Callable[..., Any] = ensure_account_space,
         has_pending_profile_update: Callable[[dict[str, Any]], bool] | None = None,
         article_snapshot_startup_delay_seconds: float = 5.0,
         article_deferred_retry_seconds: float = 2.0,
@@ -133,6 +135,8 @@ class AppCloudRuntimeSupport:
         self._request_client_factory = request_client_factory or SurfacedCloudClient
         self._auto_sync_status_getter = auto_sync_status_getter or (lambda: {})
         self._current_account_config_path_getter = current_account_config_path_getter
+        self._account_profile_dir_getter = account_profile_dir_getter
+        self._account_space_ensurer = account_space_ensurer
         self._has_pending_profile_update = has_pending_profile_update or self._default_has_pending_profile_update
         self._article_snapshot_startup_delay_seconds = float(article_snapshot_startup_delay_seconds or 0.0)
         self._article_deferred_retry_seconds = float(article_deferred_retry_seconds or 0.0)
@@ -279,13 +283,10 @@ class AppCloudRuntimeSupport:
         session = store.load()
         base_url = str(session.get("base_url") or "").strip()
         refresh_token = str(session.get("refresh_token") or "").strip()
-        try:
-            current_outbox = self._outbox_factory().bind_to_session(session)
-            current_stats = current_outbox.stats()
-            if current_stats.get("pending", 0) or current_stats.get("failed", 0):
-                self._flush_outbox_fn(outbox=current_outbox)
-        except Exception as exc:
-            print(f"[WebBackend] 退出前运行数据补传失败，将继续退出: {exc}")
+        self._flush_bound_outbox_if_needed(
+            session,
+            failure_message="[WebBackend] 退出前运行数据补传失败，将继续退出: {exc}",
+        )
         if base_url and refresh_token:
             try:
                 self._request_client_factory(base_url).logout(refresh_token)
@@ -301,6 +302,42 @@ class AppCloudRuntimeSupport:
         request_payload = payload if isinstance(payload, dict) else {}
         limit = _safe_int(request_payload.get("limit", 100), 100)
         return self._flush_outbox_fn(limit=limit)
+
+    def login_cloud_account_space(
+        self,
+        *,
+        base_url: str,
+        token_pair: dict[str, Any],
+        session_preview_builder: Callable[..., dict[str, Any]],
+        cloud_role_getter: Callable[[dict[str, Any] | None], str],
+    ) -> dict[str, Any]:
+        preview_session = session_preview_builder(base_url=base_url, token_pair=token_pair)
+        store = self._session_store_factory()
+        previous_session = store.load()
+        previous_key = cloud_session_identity_key(previous_session)
+        next_key = cloud_session_identity_key(preview_session)
+        if previous_key and next_key and previous_key != next_key:
+            self._flush_bound_outbox_if_needed(
+                previous_session,
+                failure_message="[WebBackend] 切换账号前旧账号运行数据补传失败，将继续登录新账号: {exc}",
+            )
+
+        profile_dir = self._account_profile_dir_getter(preview_session)
+        marker_exists = bool(profile_dir and (profile_dir / "profile_meta.json").exists())
+        copy_legacy = cloud_role_getter(preview_session) == "admin" and not marker_exists
+        self._account_space_ensurer(preview_session, copy_legacy=copy_legacy)
+
+        saved_session = store.save_login(base_url=base_url, token_pair=token_pair)
+        activate_account_space = getattr(self._owner, "_activate_current_account_space", None)
+        if callable(activate_account_space):
+            activate_account_space(copy_legacy=False)
+        isolate_account_config = getattr(self._owner, "_isolate_ordinary_cloud_account_config", None)
+        if callable(isolate_account_config):
+            isolate_account_config(saved_session)
+        close_viewer_runtime = getattr(self._owner, "_close_execution_runtime_for_viewer", None)
+        if callable(close_viewer_runtime):
+            close_viewer_runtime()
+        return saved_session
 
     def validate_cloud_session_if_needed(self, *, force: bool = False) -> None:
         store = self._session_store_factory()
@@ -495,6 +532,15 @@ class AppCloudRuntimeSupport:
             return self._load_runtime_config()
         with lock:
             return self._load_runtime_config()
+
+    def _flush_bound_outbox_if_needed(self, session: dict[str, Any], *, failure_message: str) -> None:
+        try:
+            current_outbox = self._outbox_factory().bind_to_session(session)
+            current_stats = current_outbox.stats()
+            if current_stats.get("pending", 0) or current_stats.get("failed", 0):
+                self._flush_outbox_fn(outbox=current_outbox)
+        except Exception as exc:
+            print(failure_message.format(exc=exc))
 
     def _read_article_snapshot_startup_delay_seconds(self) -> float:
         try:
