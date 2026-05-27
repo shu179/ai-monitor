@@ -69,6 +69,8 @@ class CloudObjectCache:
             raise CloudObjectCacheError("object_ref.size_bytes must be non-negative")
         if expected_size > self.max_object_bytes:
             raise CloudObjectCacheError("object exceeds local cache object size limit")
+        if expected_size > self.max_cache_bytes:
+            raise CloudObjectCacheError("object exceeds local cache total size limit")
 
         target = self.object_path(normalized)
         meta_path = self.metadata_path(normalized)
@@ -86,6 +88,8 @@ class CloudObjectCache:
                     total += len(data)
                     if total > self.max_object_bytes:
                         raise CloudObjectCacheError("object exceeds local cache object size limit")
+                    if total > self.max_cache_bytes:
+                        raise CloudObjectCacheError("object exceeds local cache total size limit")
                     digest.update(data)
                     handle.write(data)
                 handle.flush()
@@ -117,6 +121,11 @@ class CloudObjectCache:
                 pass
             raise
 
+        prune_result = self.prune() if self.diagnostics()["bytes"] > self.max_cache_bytes else {
+            "pruned": 0,
+            "bytes_removed": 0,
+        }
+        cached_exists = target.is_file()
         return {
             "ok": True,
             "object_id": str(normalized.get("object_id") or ""),
@@ -124,6 +133,9 @@ class CloudObjectCache:
             "size_bytes": total,
             "path": str(target),
             "metadata_path": str(meta_path),
+            "cached": cached_exists,
+            "pruned": int(prune_result.get("pruned") or 0),
+            "bytes_removed": int(prune_result.get("bytes_removed") or 0),
         }
 
     def object_path(self, object_ref: dict[str, Any]) -> Path:

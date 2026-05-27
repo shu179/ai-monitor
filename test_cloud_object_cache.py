@@ -69,13 +69,37 @@ def test_cloud_object_cache_rejects_oversized_object(tmp_path: Path):
         cache.cache_bytes(_ref(data), [data])
 
 
-def test_cloud_object_cache_prunes_lru_objects_when_over_budget(tmp_path: Path):
-    old_data = b"old cached object"
-    new_data = b"new cached object"
+def test_cloud_object_cache_rejects_object_larger_than_total_budget(tmp_path: Path):
+    cache = CloudObjectCache(tmp_path / "cache", max_cache_bytes=4)
+    data = b"12345"
+
+    with pytest.raises(CloudObjectCacheError, match="total size limit"):
+        cache.cache_bytes(_ref(data), [data])
+
+
+def test_cloud_object_cache_auto_prunes_after_write(tmp_path: Path):
+    old_data = b"old object"
+    new_data = b"new object"
     cache = CloudObjectCache(tmp_path / "cache", max_cache_bytes=len(old_data) + 2)
     old_result = cache.cache_bytes(_ref(old_data, object_id="old"), [old_data])
     time.sleep(0.01)
+
     new_result = cache.cache_bytes(_ref(new_data, object_id="new"), [new_data])
+
+    assert new_result["pruned"] == 1
+    assert not Path(old_result["path"]).exists()
+    assert Path(new_result["path"]).exists()
+    assert cache.diagnostics()["bytes"] == len(new_data)
+
+
+def test_cloud_object_cache_prunes_lru_objects_when_over_budget(tmp_path: Path):
+    old_data = b"old cached object"
+    new_data = b"new cached object"
+    cache = CloudObjectCache(tmp_path / "cache", max_cache_bytes=10_000)
+    old_result = cache.cache_bytes(_ref(old_data, object_id="old"), [old_data])
+    time.sleep(0.01)
+    new_result = cache.cache_bytes(_ref(new_data, object_id="new"), [new_data])
+    cache.max_cache_bytes = len(old_data) + 2
 
     result = cache.prune(target_bytes=len(new_data))
 

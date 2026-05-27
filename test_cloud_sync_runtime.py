@@ -1474,7 +1474,7 @@ def test_app_cloud_runtime_support_prunes_object_cache():
     data_a = b"a" * 10
     data_b = b"b" * 10
     with tempfile.TemporaryDirectory() as tmp:
-        cache = CloudObjectCache(Path(tmp) / "cache", max_cache_bytes=12)
+        cache = CloudObjectCache(Path(tmp) / "cache", max_cache_bytes=100)
         cache.cache_bytes(
             {"object_id": "a", "sha256": hashlib.sha256(data_a).hexdigest(), "size_bytes": len(data_a)},
             [data_a],
@@ -1483,6 +1483,7 @@ def test_app_cloud_runtime_support_prunes_object_cache():
             {"object_id": "b", "sha256": hashlib.sha256(data_b).hexdigest(), "size_bytes": len(data_b)},
             [data_b],
         )
+        cache.max_cache_bytes = 12
         support = AppCloudRuntimeSupport(owner=owner, object_cache_factory=lambda: cache)
 
         result = support.handle_command("cloud.prune_object_cache", {"target_bytes": 10})
