@@ -308,6 +308,65 @@ def test_app_cloud_runtime_support_flush_cloud_outbox_defaults_bad_limit():
     flush_outbox.assert_called_once_with(limit=100)
 
 
+def test_app_cloud_runtime_support_command_flushes_outbox_with_payload_limit():
+    owner = _support_owner()
+    flush_outbox = Mock(return_value={"ok": True, "metrics": {"event_count": 4}})
+    support = AppCloudRuntimeSupport(owner=owner, flush_outbox_fn=flush_outbox)
+
+    result = support.handle_command("cloud.flush_outbox", {"limit": "333"})
+
+    assert result == {"ok": True, "metrics": {"event_count": 4}}
+    flush_outbox.assert_called_once_with(limit=333)
+
+
+def test_app_cloud_runtime_support_command_schedules_article_snapshot():
+    owner = _support_owner()
+    started: list[object] = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.started = False
+
+        def start(self) -> None:
+            self.started = True
+            started.append(self)
+
+        def is_alive(self) -> bool:
+            return self.started
+
+    support = AppCloudRuntimeSupport(owner=owner, thread_factory=lambda *args, **kwargs: FakeThread(*args, **kwargs))
+
+    result = support.handle_command("cloud.schedule_article_snapshot")
+
+    assert result == {"ok": True, "message": "文章云端同步已调度"}
+    assert owner._article_cloud_enqueue_requested is True
+    assert len(started) == 1
+    assert started[0].kwargs["name"] == "cloud-article-snapshot-enqueue"
+
+
+def test_app_cloud_runtime_support_command_validates_session_with_force():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+    support.validate_cloud_session_if_needed = Mock()
+    support.current_cloud_status = Mock(return_value={"ok": True, "cloud": {"loggedIn": True}})
+
+    result = support.handle_command("cloud.validate_session", {"force": True})
+
+    assert result == {"ok": True, "cloud": {"loggedIn": True}}
+    support.validate_cloud_session_if_needed.assert_called_once_with(force=True)
+
+
+def test_app_cloud_runtime_support_command_reports_unknown_command():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+
+    result = support.handle_command("cloud.nope", {"limit": 10})
+
+    assert result["ok"] is False
+    assert "cloud.nope" in result["message"]
+
+
 def test_app_cloud_runtime_support_login_flushes_previous_account_outbox_before_switch():
     owner = _support_owner()
     owner._activate_current_account_space = Mock()

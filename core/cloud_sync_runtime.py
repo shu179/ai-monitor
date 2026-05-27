@@ -303,6 +303,26 @@ class AppCloudRuntimeSupport:
         limit = _safe_int(request_payload.get("limit", 100), 100)
         return self._flush_outbox_fn(limit=limit)
 
+    def handle_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Handle a cloud-sync runtime command through the future daemon boundary."""
+        normalized = str(command or "").strip()
+        request_payload = payload if isinstance(payload, dict) else {}
+        if normalized in {"cloud.status", "status"}:
+            return self.get_cloud_status()
+        if normalized in {"cloud.flush_outbox", "flush_outbox"}:
+            return self.flush_cloud_outbox(request_payload)
+        if normalized in {"cloud.logout", "logout"}:
+            return self.logout_cloud_account()
+        if normalized in {"cloud.recover_uploads", "recover_uploads"}:
+            return self.recover_cloud_run_history_uploads()
+        if normalized in {"cloud.schedule_article_snapshot", "schedule_article_snapshot"}:
+            self.schedule_article_snapshot()
+            return {"ok": True, "message": "文章云端同步已调度"}
+        if normalized in {"cloud.validate_session", "validate_session"}:
+            self.validate_cloud_session_if_needed(force=bool(request_payload.get("force")))
+            return self.current_cloud_status()
+        return {"ok": False, "message": f"未知云同步命令: {normalized}"}
+
     def login_cloud_account_space(
         self,
         *,
