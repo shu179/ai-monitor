@@ -571,6 +571,40 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             self.assertEqual(calls, ["pull", "state_delta", "process"])
             self.assertEqual(manager.get_status()["last_state_delta_inbox_metrics"]["applied"], 1)
 
+    def test_state_delta_backpressure_skips_remote_pull_but_processes_inbox(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            calls: list[str] = []
+            manager = CloudPlatformAutoSync(
+                session_store=store,
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                pull_state_delta=lambda _payload=None: calls.append("state_delta") or {
+                    "ok": False,
+                    "message": "queue overloaded",
+                    "retry_after_seconds": 0.6,
+                    "queue_depth_hint": 900,
+                    "throttle_bucket": "state_delta",
+                },
+                process_state_delta_inbox=lambda _payload=None: calls.append("process") or {"ok": True, "applied": 1},
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            first = manager._invoke_state_delta_pipeline()  # noqa: SLF001
+            second = manager._invoke_state_delta_pipeline()  # noqa: SLF001
+
+            self.assertFalse(first["ok"])
+            self.assertTrue(second["ok"])
+            self.assertEqual(calls, ["state_delta", "process"])
+            status = manager.get_status()
+            self.assertEqual(status["state_delta_backpressure_retry_after_seconds"], 0.6)
+            self.assertEqual(status["state_delta_backpressure_queue_depth_hint"], 900)
+            self.assertEqual(status["state_delta_backpressure_bucket"], "state_delta")
+            self.assertTrue(status["state_delta_backpressure_until"])
+            self.assertEqual(status["last_state_delta_metrics"]["backpressure_active"], True)
+            self.assertEqual(status["last_state_delta_inbox_metrics"]["applied"], 1)
+
     def test_pull_metrics_are_summarized_for_status_ui(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = CloudSessionStore(Path(tmpdir) / "session.json")

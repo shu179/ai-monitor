@@ -196,7 +196,9 @@ def pull_cloud_state_delta(
     mode = "reset" if str(state.get("reset_token") or "") else "delta"
     has_more = False
     reset_required = False
-    retry_after_seconds = 0
+    retry_after_seconds = 0.0
+    queue_depth_hint = 0
+    throttle_bucket = ""
     state_updated = False
     inbox_store = inbox or CloudStateDeltaInbox()
     inbox_created = 0
@@ -233,7 +235,11 @@ def pull_cloud_state_delta(
                     stream = str(change.get("stream") or "").strip() or "unknown"
                     streams[stream] += 1
 
-            retry_after_seconds = max(retry_after_seconds, int(response.get("retry_after_seconds") or 0))
+            retry_after_seconds = max(retry_after_seconds, _safe_float(response.get("retry_after_seconds"), 0.0))
+            queue_depth_hint = max(queue_depth_hint, _safe_int(response.get("queue_depth_hint"), 0))
+            response_throttle_bucket = str(response.get("throttle_bucket") or "").strip()
+            if response_throttle_bucket:
+                throttle_bucket = response_throttle_bucket
             if bool(response.get("reset_required")):
                 reset_required = True
                 state["reset_token"] = str(response.get("reset_token") or "")
@@ -278,6 +284,8 @@ def pull_cloud_state_delta(
             reset_required=reset_required,
             has_more=has_more,
             next_retry_after_seconds=retry_after_seconds,
+            queue_depth_hint=queue_depth_hint,
+            throttle_bucket=throttle_bucket,
             state_updated=state_updated,
             inbox_created=inbox_created,
             inbox_duplicates=inbox_duplicates,
@@ -289,6 +297,11 @@ def pull_cloud_state_delta(
         delta_store.save(state)
         return summary
     except (CloudClientError, CloudSessionChangedError, Exception) as exc:
+        if isinstance(exc, CloudClientError):
+            retry_after_seconds = max(retry_after_seconds, _safe_float(exc.retry_after_seconds, 0.0))
+            queue_depth_hint = max(queue_depth_hint, _safe_int(exc.queue_depth_hint, 0))
+            if str(exc.throttle_bucket or "").strip():
+                throttle_bucket = str(exc.throttle_bucket or "").strip()
         summary = _summary(
             ok=False,
             mode=mode,
@@ -301,6 +314,8 @@ def pull_cloud_state_delta(
             reset_required=reset_required,
             has_more=has_more,
             next_retry_after_seconds=retry_after_seconds,
+            queue_depth_hint=queue_depth_hint,
+            throttle_bucket=throttle_bucket,
             state_updated=state_updated,
             inbox_created=inbox_created,
             inbox_duplicates=inbox_duplicates,
@@ -352,6 +367,8 @@ def _summary(
     reset_required: bool = False,
     has_more: bool = False,
     next_retry_after_seconds: int = 0,
+    queue_depth_hint: int = 0,
+    throttle_bucket: str = "",
     state_updated: bool = False,
     inbox_created: int = 0,
     inbox_duplicates: int = 0,
@@ -366,9 +383,26 @@ def _summary(
         "object_refs": max(0, int(object_refs or 0)),
         "reset_required": bool(reset_required),
         "has_more": bool(has_more),
-        "next_retry_after_seconds": max(0, int(next_retry_after_seconds or 0)),
+        "next_retry_after_seconds": max(0.0, float(next_retry_after_seconds or 0.0)),
+        "retry_after_seconds": max(0.0, float(next_retry_after_seconds or 0.0)),
+        "queue_depth_hint": max(0, int(queue_depth_hint or 0)),
+        "throttle_bucket": str(throttle_bucket or "").strip(),
         "duration_ms": int(round((time.perf_counter() - started_at) * 1000)),
         "state_updated": bool(state_updated),
         "inbox_created": max(0, int(inbox_created or 0)),
         "inbox_duplicates": max(0, int(inbox_duplicates or 0)),
     }
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)

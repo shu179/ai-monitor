@@ -225,6 +225,34 @@ class CloudStateDeltaTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["message"], "未登录云端")
 
+    def test_pull_records_backpressure_from_cloud_error(self) -> None:
+        class BackpressureClient(FakeStateDeltaClient):
+            def state_delta(self, access_token: str, **kwargs) -> dict:
+                self.calls.append({"access_token": access_token, **kwargs})
+                raise CloudClientError(
+                    "queue overloaded",
+                    status_code=429,
+                    retry_after_seconds=12,
+                    queue_depth_hint=23000,
+                    throttle_bucket="state_delta",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CloudStateDeltaStore(Path(tmp) / "state.json")
+            result = pull_cloud_state_delta(
+                client=BackpressureClient(),
+                session_store=FakeSessionStore(_session()),
+                state_store=store,
+            )
+            state = store.load(_session())
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["retry_after_seconds"], 12.0)
+        self.assertEqual(result["next_retry_after_seconds"], 12.0)
+        self.assertEqual(result["queue_depth_hint"], 23000)
+        self.assertEqual(result["throttle_bucket"], "state_delta")
+        self.assertEqual(state["last_summary"]["queue_depth_hint"], 23000)
+
 
 if __name__ == "__main__":
     unittest.main()

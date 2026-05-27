@@ -113,6 +113,7 @@ class CloudPlatformAutoSync:
         self._last_error_log_at = 0.0
         self._last_transient_error_log_at = 0.0
         self._upload_backpressure_until_at = 0.0
+        self._state_delta_backpressure_until_at = 0.0
         self._status: dict[str, Any] = {
             "running": False,
             "logged_in": False,
@@ -135,6 +136,10 @@ class CloudPlatformAutoSync:
             "last_state_delta_metrics": {},
             "last_state_delta_inbox_metrics": {},
             "last_state_delta_error": "",
+            "state_delta_backpressure_until": "",
+            "state_delta_backpressure_retry_after_seconds": 0.0,
+            "state_delta_backpressure_queue_depth_hint": 0,
+            "state_delta_backpressure_bucket": "",
             "startup_recovery_running": False,
             "last_startup_recovery_at": "",
             "last_startup_recovery_metrics": {},
@@ -274,6 +279,47 @@ class CloudPlatformAutoSync:
             upload_backpressure_retry_after_seconds=0.0,
             upload_backpressure_queue_depth_hint=0,
             upload_backpressure_bucket="",
+        )
+
+    def _refresh_state_delta_backpressure_status(self, now: float | None = None) -> bool:
+        current = time.monotonic() if now is None else float(now)
+        if self._state_delta_backpressure_until_at <= 0:
+            return False
+        remaining = self._state_delta_backpressure_until_at - current
+        if remaining <= 0:
+            self._clear_state_delta_backpressure()
+            return False
+        self._update_status(
+            state_delta_backpressure_until=(local_now() + timedelta(seconds=remaining)).isoformat(timespec="seconds"),
+        )
+        return True
+
+    def _apply_state_delta_backpressure(self, metrics: dict[str, Any], *, now: float | None = None) -> bool:
+        retry_after = _optional_positive_float(
+            metrics.get("retry_after_seconds") or metrics.get("next_retry_after_seconds")
+        )
+        if retry_after is None:
+            return False
+        current = time.monotonic() if now is None else float(now)
+        self._state_delta_backpressure_until_at = max(self._state_delta_backpressure_until_at, current + retry_after)
+        remaining = max(0.0, self._state_delta_backpressure_until_at - current)
+        queue_depth_hint = _optional_non_negative_int(metrics.get("queue_depth_hint"))
+        throttle_bucket = str(metrics.get("throttle_bucket") or "").strip()
+        self._update_status(
+            state_delta_backpressure_until=(local_now() + timedelta(seconds=remaining)).isoformat(timespec="seconds"),
+            state_delta_backpressure_retry_after_seconds=retry_after,
+            state_delta_backpressure_queue_depth_hint=queue_depth_hint if queue_depth_hint is not None else 0,
+            state_delta_backpressure_bucket=throttle_bucket,
+        )
+        return True
+
+    def _clear_state_delta_backpressure(self) -> None:
+        self._state_delta_backpressure_until_at = 0.0
+        self._update_status(
+            state_delta_backpressure_until="",
+            state_delta_backpressure_retry_after_seconds=0.0,
+            state_delta_backpressure_queue_depth_hint=0,
+            state_delta_backpressure_bucket="",
         )
 
     def _finish_startup_recovery(
@@ -600,6 +646,7 @@ class CloudPlatformAutoSync:
     def _invoke_state_delta_pipeline(self) -> dict[str, Any]:
         pull_handler = self._pull_state_delta
         process_handler = self._process_state_delta_inbox
+        backpressure_active = self._refresh_state_delta_backpressure_status()
         if not callable(pull_handler) and not callable(process_handler):
             result = {"ok": True, "message": "", "skipped": True}
             self._update_status(
@@ -610,7 +657,7 @@ class CloudPlatformAutoSync:
             return result
         pull_result: dict[str, Any] = {"ok": True, "message": "", "skipped": True}
         process_result: dict[str, Any] = {"ok": True, "message": "", "skipped": True}
-        if callable(pull_handler):
+        if callable(pull_handler) and not backpressure_active:
             try:
                 pull_result = _invoke_optional_payload_callback(
                     pull_handler,
@@ -618,6 +665,11 @@ class CloudPlatformAutoSync:
                 )
             except Exception as exc:
                 pull_result = {"ok": False, "message": f"state-delta 拉取失败：{exc}"}
+        elif callable(pull_handler) and backpressure_active:
+            pull_result = {"ok": True, "message": "", "skipped": True, "backpressure_active": True}
+        pull_metrics = _state_delta_metrics(pull_result)
+        if not self._apply_state_delta_backpressure(pull_metrics, now=time.monotonic()) and not backpressure_active:
+            self._clear_state_delta_backpressure()
         if pull_result.get("ok") and callable(process_handler):
             try:
                 process_result = _invoke_optional_payload_callback(
@@ -631,7 +683,7 @@ class CloudPlatformAutoSync:
         message = "" if ok else str(process_result.get("message") or pull_result.get("message") or "state-delta 自动下放失败")
         self._update_status(
             last_state_delta_at=local_now().isoformat(timespec="seconds") if ok else self.get_status().get("last_state_delta_at", ""),
-            last_state_delta_metrics=_state_delta_metrics(pull_result),
+            last_state_delta_metrics=pull_metrics,
             last_state_delta_inbox_metrics=_state_delta_inbox_metrics(process_result),
             last_state_delta_error=message,
         )
@@ -740,7 +792,11 @@ def _state_delta_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "inbox_duplicates": _safe_int(payload.get("inbox_duplicates")),
         "reset_required": bool(payload.get("reset_required")),
         "has_more": bool(payload.get("has_more")),
+        "backpressure_active": bool(payload.get("backpressure_active")),
         "next_retry_after_seconds": _safe_int(payload.get("next_retry_after_seconds")),
+        "retry_after_seconds": _safe_float(payload.get("retry_after_seconds") or payload.get("next_retry_after_seconds")),
+        "queue_depth_hint": _safe_int(payload.get("queue_depth_hint")),
+        "throttle_bucket": str(payload.get("throttle_bucket") or ""),
         "streams": dict(payload.get("streams") if isinstance(payload.get("streams"), dict) else {}),
     }
 
@@ -788,3 +844,10 @@ def _safe_int(value: Any) -> int:
         return max(0, int(value or 0))
     except Exception:
         return 0
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return max(0.0, float(value or 0.0))
+    except Exception:
+        return 0.0
