@@ -21,6 +21,7 @@ from core.cloud_agent_status_store import CloudAgentStatusStore
 from core.cloud_client import CloudClientError, SurfacedCloudClient
 from core.cloud_content_state_store import CloudContentStateStore
 from core.cloud_object_cache import CloudObjectCache, CloudObjectCacheError, normalize_object_ref
+from core.cloud_object_transfer_store import CloudObjectTransferStore
 from core.cloud_sync_daemon import InProcessCloudSyncCommandClient
 from core.cloud_event_types import EVENT_PROFILE_UPDATE
 from core.cloud_outbox import CloudOutbox
@@ -144,6 +145,7 @@ class AppCloudRuntimeSupport:
         status_client_factory: Callable[[str], Any] | None = None,
         request_client_factory: Callable[[str], Any] | None = None,
         object_cache_factory: Callable[[], Any] | None = None,
+        object_transfer_store_factory: Callable[[], Any] | None = None,
         auto_sync_status_getter: Callable[[], dict[str, Any]] | None = None,
         current_account_config_path_getter: Callable[[], Any] = current_account_config_path,
         account_profile_dir_getter: Callable[[dict[str, Any] | None], Any] = account_profile_dir_from_session,
@@ -163,6 +165,7 @@ class AppCloudRuntimeSupport:
         self._status_client_factory = status_client_factory or self._default_status_client_factory
         self._request_client_factory = request_client_factory or SurfacedCloudClient
         self._object_cache_factory = object_cache_factory or CloudObjectCache
+        self._object_transfer_store_factory = object_transfer_store_factory or CloudObjectTransferStore
         self._auto_sync_status_getter = auto_sync_status_getter or (lambda: {})
         self._current_account_config_path_getter = current_account_config_path_getter
         self._account_profile_dir_getter = account_profile_dir_getter
@@ -397,6 +400,7 @@ class AppCloudRuntimeSupport:
         agent_status = CloudAgentStatusStore().diagnostics(session)
         content_state = CloudContentStateStore().diagnostics(session)
         object_cache = self._object_cache_factory().diagnostics()
+        object_transfers = self._object_transfer_store_factory().diagnostics(failed_limit=failed_limit)
         auto_sync = self._safe_auto_sync_status()
         return {
             "ok": True,
@@ -409,6 +413,7 @@ class AppCloudRuntimeSupport:
                     agent_status=agent_status,
                     content_state=content_state,
                     object_cache=object_cache,
+                    object_transfers=object_transfers,
                 ),
                 "auto_sync": auto_sync,
                 "outbox": outbox,
@@ -417,6 +422,7 @@ class AppCloudRuntimeSupport:
                 "agent_status": agent_status,
                 "content_state": content_state,
                 "object_cache": object_cache,
+                "object_transfers": object_transfers,
             },
         }
 
@@ -462,6 +468,9 @@ class AppCloudRuntimeSupport:
             return self.cloud_sync_health(request_payload)
         if normalized in {"cloud.object_cache_diagnostics", "object_cache_diagnostics"}:
             return {"ok": True, "object_cache": self._object_cache_factory().diagnostics()}
+        if normalized in {"cloud.object_transfer_diagnostics", "object_transfer_diagnostics"}:
+            failed_limit = _safe_int(request_payload.get("failed_limit") or request_payload.get("failedLimit"), 10)
+            return {"ok": True, "object_transfers": self._object_transfer_store_factory().diagnostics(failed_limit=failed_limit)}
         if normalized in {"cloud.prune_object_cache", "prune_object_cache"}:
             return self.prune_cloud_object_cache(request_payload)
         if normalized in {"cloud.cache_object", "cache_object"}:
@@ -520,6 +529,9 @@ class AppCloudRuntimeSupport:
             return self.cloud_sync_health(request_payload)
         if normalized in {"cloud.object_cache_diagnostics", "object_cache_diagnostics"}:
             return {"ok": True, "object_cache": self._object_cache_factory().diagnostics()}
+        if normalized in {"cloud.object_transfer_diagnostics", "object_transfer_diagnostics"}:
+            failed_limit = _safe_int(request_payload.get("failed_limit") or request_payload.get("failedLimit"), 10)
+            return {"ok": True, "object_transfers": self._object_transfer_store_factory().diagnostics(failed_limit=failed_limit)}
         if normalized in {"cloud.prune_object_cache", "prune_object_cache"}:
             return self.prune_cloud_object_cache(request_payload)
         if normalized in {"cloud.cache_object", "cache_object"}:
@@ -799,6 +811,17 @@ class AppCloudRuntimeSupport:
             return {"ok": False, "message": str(exc)}
 
         trace_id = str(request_payload.get("trace_id") or request_payload.get("traceId") or "").strip()
+        transfer_id = trace_id or f"download:{object_id}:{object_ref.get('sha256') or ''}"
+        transfer_store = self._object_transfer_store_factory()
+        transfer_store.start_transfer(
+            transfer_id=transfer_id,
+            direction="download",
+            object_id=object_id,
+            sha256=str(object_ref.get("sha256") or ""),
+            size_bytes=_safe_int(object_ref.get("size_bytes"), 0),
+            content_type=str(object_ref.get("content_type") or ""),
+            trace_id=trace_id,
+        )
 
         def operation(client: Any, token: str) -> Any:
             download = client.create_object_download(token, object_id, trace_id=trace_id)
@@ -809,17 +832,26 @@ class AppCloudRuntimeSupport:
             for key in ("size_bytes", "storage_size_bytes", "content_type", "compression"):
                 if not merged_ref.get(key) and download.get(key) is not None:
                     merged_ref[key] = download.get(key)
-            return cache.cache_bytes(
+            cached_result = cache.cache_bytes(
                 merged_ref,
                 client.iter_object_content(token, download_url, trace_id=trace_id),
                 trace_id=trace_id,
             )
+            transfer_store.finish_transfer(
+                transfer_id,
+                object_id=object_id,
+                path=str(cached_result.get("path") or ""),
+                status="completed",
+            )
+            return cached_result
 
         try:
             ok, response_payload, message = self.cloud_request_with_refresh(operation)
         except CloudObjectCacheError as exc:
+            transfer_store.fail_transfer(transfer_id, str(exc))
             return {"ok": False, "message": str(exc)}
         if not ok:
+            transfer_store.fail_transfer(transfer_id, message)
             return {"ok": False, "message": message}
         return {"ok": True, "cached": response_payload, "downloaded": True, "message": ""}
 
@@ -1415,6 +1447,7 @@ def _cloud_sync_health_summary(
     agent_status: dict[str, Any],
     content_state: dict[str, Any],
     object_cache: dict[str, Any] | None = None,
+    object_transfers: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     session_payload = session if isinstance(session, dict) else {}
     outbox_stats = outbox.get("stats") if isinstance(outbox.get("stats"), dict) else {}
@@ -1427,6 +1460,8 @@ def _cloud_sync_health_summary(
     failed_inbox = _safe_int(inbox_by_status.get("failed"), 0)
     applied_inbox = _safe_int(inbox_by_status.get("applied"), 0)
     cache_payload = object_cache if isinstance(object_cache, dict) else {}
+    transfers_payload = object_transfers if isinstance(object_transfers, dict) else {}
+    transfer_by_status = transfers_payload.get("by_status") if isinstance(transfers_payload.get("by_status"), dict) else {}
     backpressure_until = str(auto_sync.get("upload_backpressure_until") or "")
     last_error = str(auto_sync.get("last_error") or auto_sync.get("last_state_delta_error") or "")
     return {
@@ -1462,6 +1497,9 @@ def _cloud_sync_health_summary(
         "object_cache_objects": _safe_int(cache_payload.get("objects"), 0),
         "object_cache_bytes": _safe_int(cache_payload.get("bytes"), 0),
         "object_cache_max_bytes": _safe_int(cache_payload.get("max_cache_bytes"), 0),
+        "object_transfers_total": _safe_int(transfers_payload.get("total"), 0),
+        "object_transfers_failed": _safe_int(transfer_by_status.get("failed"), 0),
+        "object_transfers_running": _safe_int(transfer_by_status.get("running"), 0),
         "last_upload_at": str(auto_sync.get("last_upload_at") or ""),
         "last_pull_at": str(auto_sync.get("last_pull_at") or ""),
         "last_state_delta_at": str(auto_sync.get("last_state_delta_at") or ""),

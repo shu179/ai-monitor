@@ -13,6 +13,7 @@ from core.cloud_agent_status_store import CloudAgentStatusStore
 from core.cloud_client import CloudClientError
 from core.cloud_content_state_store import CloudContentStateStore
 from core.cloud_object_cache import CloudObjectCache
+from core.cloud_object_transfer_store import CloudObjectTransferStore
 from core.cloud_state_delta_inbox import CloudStateDeltaInbox
 from core.cloud_sync_runtime import (
     AppCloudRuntimeSupport,
@@ -1337,6 +1338,9 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
         outbox_factory=lambda: outbox,
         auto_sync_status_getter=lambda: auto_sync_status,
         object_cache_factory=lambda: MagicMock(diagnostics=lambda: {"objects": 4, "bytes": 12345}),
+        object_transfer_store_factory=lambda: MagicMock(
+            diagnostics=lambda failed_limit=10: {"total": 3, "by_status": {"failed": 1, "running": 1}}
+        ),
     )
 
     with (
@@ -1368,6 +1372,9 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     assert health["summary"]["object_cache_objects"] == 4
     assert health["summary"]["object_cache_bytes"] == 12345
     assert health["summary"]["object_cache_max_bytes"] == 0
+    assert health["summary"]["object_transfers_total"] == 3
+    assert health["summary"]["object_transfers_failed"] == 1
+    assert health["summary"]["object_transfers_running"] == 1
     assert health["summary"]["healthy"] is True
     assert health["auto_sync"] == auto_sync_status
     assert health["state_delta"] == {"cursors": {"tasks": 2}}
@@ -1411,11 +1418,13 @@ def test_app_cloud_runtime_support_cache_object_downloads_to_file_cache():
 
     with tempfile.TemporaryDirectory() as tmp:
         cache = CloudObjectCache(Path(tmp) / "cache")
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
         support = AppCloudRuntimeSupport(
             owner=owner,
             session_store_factory=lambda: session_store,
             request_client_factory=FakeClient,
             object_cache_factory=lambda: cache,
+            object_transfer_store_factory=lambda: transfer_store,
         )
 
         result = support.handle_command(
@@ -1434,6 +1443,10 @@ def test_app_cloud_runtime_support_cache_object_downloads_to_file_cache():
         assert result["ok"] is True
         assert result["downloaded"] is True
         assert Path(result["cached"]["path"]).read_bytes() == data
+        transfer_diagnostics = transfer_store.diagnostics()
+        assert transfer_diagnostics["by_status"] == {"completed": 1}
+        assert transfer_diagnostics["newest"][0]["object_id"] == "object-1"
+        assert transfer_diagnostics["newest"][0]["path"] == result["cached"]["path"]
 
 
 def test_app_cloud_runtime_support_cache_object_reuses_valid_cached_file():
@@ -1454,12 +1467,14 @@ def test_app_cloud_runtime_support_cache_object_reuses_valid_cached_file():
     with tempfile.TemporaryDirectory() as tmp:
         cache = CloudObjectCache(Path(tmp) / "cache")
         cache.cache_bytes(ref, [data])
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
         client_factory = MagicMock()
         support = AppCloudRuntimeSupport(
             owner=owner,
             session_store_factory=lambda: session_store,
             request_client_factory=client_factory,
             object_cache_factory=lambda: cache,
+            object_transfer_store_factory=lambda: transfer_store,
         )
 
         result = support.handle_command("cloud.cache_object", {"object_ref": ref})
@@ -1467,6 +1482,56 @@ def test_app_cloud_runtime_support_cache_object_reuses_valid_cached_file():
         assert result["ok"] is True
         assert result["downloaded"] is False
         client_factory.assert_not_called()
+        assert transfer_store.diagnostics()["total"] == 0
+
+
+def test_app_cloud_runtime_support_cache_object_records_failed_transfer():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+
+    class FailingClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        def create_object_download(self, _token: str, _object_id: str, *, trace_id: str = ""):
+            raise CloudClientError("download unavailable", status_code=503)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = CloudObjectCache(Path(tmp) / "cache")
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            request_client_factory=FailingClient,
+            object_cache_factory=lambda: cache,
+            object_transfer_store_factory=lambda: transfer_store,
+        )
+
+        result = support.handle_command(
+            "cloud.cache_object",
+            {
+                "trace_id": "trace-fail",
+                "object_ref": {
+                    "object_id": "object-1",
+                    "sha256": "c" * 64,
+                    "size_bytes": 10,
+                    "content_type": "text/plain",
+                },
+            },
+        )
+        diagnostics = transfer_store.diagnostics()
+
+    assert result["ok"] is False
+    assert "download unavailable" in result["message"]
+    assert diagnostics["by_status"] == {"failed": 1}
+    assert diagnostics["failed"][0]["transfer_id"] == "trace-fail"
+    assert diagnostics["failed"][0]["last_error"] == "download unavailable"
 
 
 def test_app_cloud_runtime_support_prunes_object_cache():
