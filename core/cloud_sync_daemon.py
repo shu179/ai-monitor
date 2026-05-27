@@ -105,7 +105,11 @@ class UnixSocketCloudSyncCommandServer:
             except Exception:
                 pass
         thread = self._thread
-        if thread is not None and callable(getattr(thread, "join", None)):
+        if (
+            thread is not None
+            and thread is not threading.current_thread()
+            and callable(getattr(thread, "join", None))
+        ):
             try:
                 thread.join(timeout=1.0)
             except Exception:

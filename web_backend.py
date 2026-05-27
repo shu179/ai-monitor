@@ -209,7 +209,17 @@ from core.cloud_run_sync import (
     enqueue_profile_update,
     enqueue_task_day_status,
 )
-from core.cloud_sync_runtime import AppCloudRuntimeSupport, LocalCloudSyncRuntime, create_local_cloud_sync_runtime
+from core.cloud_sync_daemon import (
+    UnixSocketCloudSyncCommandClient,
+    UnixSocketCloudSyncCommandServer,
+    build_cloud_sync_socket_path,
+)
+from core.cloud_sync_runtime import (
+    AppCloudRuntimeSupport,
+    LocalCloudSyncRuntime,
+    create_in_process_cloud_sync_command_client,
+    create_local_cloud_sync_runtime,
+)
 from core.cloud_session_store import (
     CloudSessionChangedError,
     CloudSessionStore,
@@ -2064,6 +2074,10 @@ class AppRuntime:
         self._cloud_sync_manager = self._cloud_runtime.manager
         self._cloud_platform_auto_sync = self._cloud_runtime.platform_auto_sync
         self._cloud_runtime_support = self._build_cloud_runtime_support()
+        self._cloud_command_transport_lock = threading.RLock()
+        self._cloud_command_socket_path: Path | None = None
+        self._cloud_command_server: UnixSocketCloudSyncCommandServer | None = None
+        self._cloud_command_client: Any | None = None
         self._isolate_ordinary_cloud_account_config(CloudSessionStore().load())
 
     def _build_cloud_runtime_support(self) -> AppCloudRuntimeSupport:
@@ -2091,6 +2105,72 @@ class AppRuntime:
         support = self._build_cloud_runtime_support()
         self._cloud_runtime_support = support
         return support
+
+    def _build_cloud_command_socket_path(self) -> Path:
+        scope_hint = f"{Path(self.config_path)}:{os.getpid()}"
+        return build_cloud_sync_socket_path(scope_hint)
+
+    def _build_in_process_cloud_command_client(self) -> Any:
+        return create_in_process_cloud_sync_command_client(
+            self._ensure_cloud_runtime_support().handle_command,
+        )
+
+    def _ensure_cloud_command_client(self) -> Any:
+        client = getattr(self, "_cloud_command_client", None)
+        if client is not None:
+            return client
+        client = self._build_in_process_cloud_command_client()
+        self._cloud_command_client = client
+        return client
+
+    def _start_cloud_command_transport(self) -> None:
+        lock = getattr(self, "_cloud_command_transport_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._cloud_command_transport_lock = lock
+        with lock:
+            if getattr(self, "_cloud_command_server", None) is not None:
+                return
+            fallback_client = self._build_in_process_cloud_command_client()
+            self._cloud_command_client = fallback_client
+            self._cloud_command_socket_path = None
+            if not hasattr(socket, "AF_UNIX"):
+                return
+            socket_path = self._build_cloud_command_socket_path()
+            server = UnixSocketCloudSyncCommandServer(
+                socket_path,
+                command_handler=self._ensure_cloud_runtime_support().handle_command,
+            )
+            try:
+                server.start()
+                client = UnixSocketCloudSyncCommandClient(socket_path)
+            except Exception as exc:
+                try:
+                    server.stop()
+                except Exception:
+                    pass
+                print(f"[CloudSyncDaemon] Unix socket transport unavailable, falling back in-process: {exc}")
+                return
+            self._cloud_command_socket_path = socket_path
+            self._cloud_command_server = server
+            self._cloud_command_client = client
+
+    def _stop_cloud_command_transport(self) -> None:
+        lock = getattr(self, "_cloud_command_transport_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._cloud_command_transport_lock = lock
+        server = None
+        with lock:
+            server = getattr(self, "_cloud_command_server", None)
+            self._cloud_command_server = None
+            self._cloud_command_client = None
+            self._cloud_command_socket_path = None
+        if server is not None:
+            try:
+                server.stop()
+            except Exception:
+                pass
 
     def _sync_loaded_config(self, config: dict[str, Any]) -> None:
         _apply_guarded_history_storage_defaults(config, session=CloudSessionStore().load())
@@ -4207,7 +4287,11 @@ return changedCount
         return {"ok": True, "cloud_sync": self._cloud_sync_manager.get_status()}
 
     def _cloud_runtime_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._ensure_cloud_runtime_support().handle_command(command, payload)
+        client = self._ensure_cloud_command_client()
+        result = client.send_command(command, payload)
+        if isinstance(result, dict):
+            return result
+        return {"ok": False, "message": "云同步命令返回无效响应"}
 
     def _cloud_runtime_payload_command(self, command: str, payload: dict[str, Any] | None = None) -> tuple[bool, Any, str]:
         result = self._cloud_runtime_command(command, payload)
@@ -5456,6 +5540,7 @@ return changedCount
 
     def shutdown(self) -> None:
         self._cloud_runtime.stop()
+        self._stop_cloud_command_transport()
         self.stop_account_crawl_scheduler()
         self._stop_recognition_test_session(restore_previous=False)
         if self._is_monitoring_running():
@@ -11472,6 +11557,7 @@ class WebAppServer:
         self.runtime._server = server
         self.runtime.port = port
         self._server = server
+        self.runtime._start_cloud_command_transport()
 
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
