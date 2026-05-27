@@ -367,7 +367,8 @@ class CloudPlatformAutoSync:
                             last_upload_at=local_now().isoformat(timespec="seconds"),
                             last_upload_metrics=upload_metrics,
                         )
-                        self._clear_upload_backpressure()
+                        if not self._apply_upload_backpressure(upload_metrics, now=time.monotonic()):
+                            self._clear_upload_backpressure()
                         self._clear_error()
                     else:
                         self._apply_upload_backpressure(upload_metrics, now=time.monotonic())

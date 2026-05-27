@@ -585,6 +585,40 @@ class CloudRunSyncTests(unittest.TestCase):
                 retry_ready = outbox.pending(limit=10)
             self.assertEqual([item["idempotency_key"] for item in retry_ready], ["run:backpressure"])
 
+    def test_flush_cloud_outbox_preserves_success_backpressure_hints(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outbox = CloudOutbox(Path(tmpdir) / "outbox.json")
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save({
+                "base_url": "https://api.example.com",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+            })
+            outbox.enqueue(
+                event_type="run_record",
+                idempotency_key="run:success-backpressure",
+                payload={"task_id": 1, "platform": "kimi"},
+            )
+
+            class BackpressureSuccessClient:
+                def post_events(self, _access_token, events, **_kwargs):
+                    return {
+                        "accepted": len(events),
+                        "retry_after_seconds": 7,
+                        "queue_depth_hint": 18000,
+                        "throttle_bucket": "sync_metadata",
+                    }
+
+            result = flush_cloud_outbox(client=BackpressureSuccessClient(), session_store=store, outbox=outbox)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["retry_after_seconds"], 7.0)
+            self.assertEqual(result["queue_depth_hint"], 18000)
+            self.assertEqual(result["throttle_bucket"], "sync_metadata")
+            self.assertEqual(result["metrics"]["retry_after_seconds"], 7.0)
+            self.assertEqual(outbox.stats()["sent"], 1)
+
     def test_flush_cloud_outbox_sanitizes_legacy_run_payloads(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             outbox = CloudOutbox(Path(tmpdir) / "outbox.json")

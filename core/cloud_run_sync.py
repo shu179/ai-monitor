@@ -795,13 +795,19 @@ def flush_cloud_outbox(
     outbox_stats = queue.stats()
     _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
     response_status = _cloud_response_status(response)
+    metrics = _flush_metrics(
+        started_at,
+        len(events),
+        int((response or {}).get("accepted") or 0) if isinstance(response, dict) else 0,
+    )
+    metrics.update(_response_backpressure_metrics(response))
     return finish(
         {
             "ok": True,
             "message": "上传完成",
             "response": response if isinstance(response, dict) else {},
             "outbox": outbox_stats,
-            "metrics": _flush_metrics(started_at, len(events), int((response or {}).get("accepted") or 0) if isinstance(response, dict) else 0),
+            "metrics": metrics,
         },
         batch_size=len(events),
         http_status=response_status,
@@ -821,6 +827,29 @@ def _cloud_response_status(response: Any) -> int:
             except Exception:
                 continue
     return 200
+
+
+def _response_backpressure_metrics(response: Any) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        return {}
+    metrics: dict[str, Any] = {}
+    retry_after = _optional_positive_float(
+        response.get("retry_after_seconds")
+        or response.get("retry_after")
+        or response.get("retryAfterSeconds")
+    )
+    queue_depth_hint = _optional_non_negative_int(
+        response.get("queue_depth_hint")
+        or response.get("queueDepthHint")
+    )
+    throttle_bucket = str(response.get("throttle_bucket") or response.get("throttleBucket") or "").strip()
+    if retry_after is not None:
+        metrics["retry_after_seconds"] = retry_after
+    if queue_depth_hint is not None:
+        metrics["queue_depth_hint"] = queue_depth_hint
+    if throttle_bucket:
+        metrics["throttle_bucket"] = throttle_bucket
+    return metrics
 
 
 def _post_events_with_trace(client: Any, access_token: str, events: list[dict[str, Any]], *, trace_id: str) -> dict[str, Any]:
@@ -917,6 +946,22 @@ def _flush_metrics(
         if error.throttle_bucket:
             metrics["throttle_bucket"] = error.throttle_bucket
     return metrics
+
+
+def _optional_positive_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except Exception:
+        return None
+    return result if result > 0 else None
+
+
+def _optional_non_negative_int(value: Any) -> int | None:
+    try:
+        result = int(float(value))
+    except Exception:
+        return None
+    return max(0, result)
 
 
 def _record_cloud_task_id(record: dict[str, Any]) -> Any:
