@@ -82,17 +82,17 @@ class CloudSyncDaemonTests(unittest.TestCase):
         runtime._cloud_command_client = None
 
         client = Mock()
-        client.send_command.return_value = {"ok": True, "cloud": {"loggedIn": True}}
+        client.send_command.return_value = {"ok": True, "message": "ok"}
 
         with patch(
             "web_backend.create_in_process_cloud_sync_command_client",
             return_value=client,
         ):
             runtime._ensure_cloud_runtime_support = Mock(return_value=Mock(handle_command=Mock()))  # type: ignore[method-assign]
-            result = AppRuntime._cloud_runtime_command(runtime, "cloud.status", {"force": True})
+            result = AppRuntime._cloud_runtime_command(runtime, "cloud.flush_outbox", {"limit": 7})
 
-        self.assertEqual(result, {"ok": True, "cloud": {"loggedIn": True}})
-        client.send_command.assert_called_once_with("cloud.status", {"force": True})
+        self.assertEqual(result, {"ok": True, "message": "ok"})
+        client.send_command.assert_called_once_with("cloud.flush_outbox", {"limit": 7})
 
     def test_app_runtime_start_and_stop_cloud_command_transport(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
@@ -156,6 +156,18 @@ class CloudSyncDaemonTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True, "cloud": {"loggedIn": True}})
         support.handle_command.assert_called_once_with("cloud.status", None)
+
+    def test_app_runtime_cloud_runtime_command_skips_daemon_for_unsupported_command(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        support = Mock()
+        support.handle_command.return_value = {"ok": True, "message": "local"}
+        runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
+        runtime._cloud_command_client = Mock(send_command=Mock(side_effect=AssertionError("daemon should not be used")))
+
+        result = AppRuntime._cloud_runtime_command(runtime, "cloud.schedule_article_snapshot")
+
+        self.assertEqual(result, {"ok": True, "message": "local"})
+        support.handle_command.assert_called_once_with("cloud.schedule_article_snapshot", None)
 
     def test_web_app_server_start_boots_cloud_command_transport(self) -> None:
         runtime = Mock()

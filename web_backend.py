@@ -4310,12 +4310,13 @@ return changedCount
         return {"ok": True, "cloud_sync": self._cloud_sync_manager.get_status()}
 
     def _cloud_runtime_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        normalized = str(command or "").strip()
+        if normalized not in DAEMON_SUPPORTED_COMMANDS:
+            return self._ensure_cloud_runtime_support().handle_command(command, payload)
         client = self._ensure_cloud_command_client()
-        result = client.send_command(command, payload)
-        if isinstance(result, dict) and bool(result.get("unsupported_by_daemon")):
-            return self._ensure_cloud_runtime_support().handle_command(command, payload)
-        if isinstance(result, dict) and bool(result.get("daemon_unavailable")):
-            return self._ensure_cloud_runtime_support().handle_command(command, payload)
+        result = client.send_command(normalized, payload)
+        if isinstance(result, dict) and (bool(result.get("unsupported_by_daemon")) or bool(result.get("daemon_unavailable"))):
+            return self._ensure_cloud_runtime_support().handle_command(normalized, payload)
         if isinstance(result, dict):
             return result
         return {"ok": False, "message": "云同步命令返回无效响应"}
