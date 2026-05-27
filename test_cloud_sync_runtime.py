@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import core.daily_task_state as daily_task_state_module
 import core.history as history_module
+from core.cloud_agent_status_store import CloudAgentStatusStore
 from core.cloud_client import CloudClientError
 from core.cloud_state_delta_inbox import CloudStateDeltaInbox
 from core.cloud_sync_runtime import (
@@ -129,11 +130,13 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
     with (
         patch("core.cloud_sync_runtime.pull_cloud_state_delta", return_value={"ok": True, "changes": 3}) as pull_delta,
         patch("core.cloud_sync_runtime.process_state_delta_inbox", return_value={"ok": True, "applied": 1}) as process_inbox,
+        patch("core.cloud_sync_runtime.CloudAgentStatusStore") as agent_status_store_cls,
         patch("core.cloud_sync_runtime.CloudStateDeltaStore") as store_cls,
         patch("core.cloud_sync_runtime.CloudStateDeltaInbox") as inbox_cls,
     ):
         store_cls.return_value.diagnostics.return_value = {"cursors": {"tasks": 2}}
         inbox_cls.return_value.diagnostics.return_value = {"by_status": {"pending": 1}}
+        agent_status_store_cls.return_value.diagnostics.return_value = {"total": 0}
 
         pull_result = support.handle_command("cloud.pull_state_delta", {"limit": 50, "max_pages": 2})
         process_result = support.handle_command("cloud.process_state_delta_inbox", {"limit": 20, "streams": ["tasks"]})
@@ -148,6 +151,7 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
     assert callable(process_kwargs["appliers"]["runs"])
     assert callable(process_kwargs["appliers"]["articles"])
     assert callable(process_kwargs["appliers"]["references"])
+    assert callable(process_kwargs["appliers"]["agent_status"])
     assert process_kwargs["limit"] == 20
     assert process_kwargs["streams"] == ["tasks"]
     assert process_kwargs["include_failed"] is False
@@ -155,9 +159,11 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
         "ok": True,
         "state_delta": {"cursors": {"tasks": 2}},
         "inbox": {"by_status": {"pending": 1}},
+        "agent_status": {"total": 0},
     }
     store_cls.return_value.diagnostics.assert_called_once_with(session_store.load.return_value)
     inbox_cls.return_value.diagnostics.assert_called_once_with(failed_limit=10)
+    agent_status_store_cls.return_value.diagnostics.assert_called_once_with(session_store.load.return_value)
 
 
 def test_app_cloud_runtime_support_applies_profile_state_delta_to_session():
@@ -689,6 +695,110 @@ def test_app_cloud_runtime_support_applies_reference_state_delta_to_store():
     assert article["referenced_tasks"] == ["即搜AI"]
     assert article["reference_hits"]["即搜AI"]["events"][0]["event_id"] == "ref-abc"
     owner._invalidate_article_cache.assert_called_once()
+
+
+def test_app_cloud_runtime_support_applies_agent_status_state_delta_to_store():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+        agent_store = CloudAgentStatusStore(Path(tmp) / "agent_status.sqlite3")
+        inbox.record_changes(
+            identity_key="https://api.example.com|3|2",
+            changes=[
+                {
+                    "stream": "agent_status",
+                    "seq": 1,
+                    "kind": "agent.command.status",
+                    "ref_id": "command-001",
+                    "entity": {
+                        "type": "agent_command_status",
+                        "id": "command-001",
+                        "workspace_id": 3,
+                        "target_device_id": "mac-1",
+                        "target_role": "desktop",
+                        "status": "completed",
+                        "idempotency_key": "agent-key-1",
+                        "created_at": "2026-01-01T00:00:00+00:00",
+                        "result_chunks": [
+                            {
+                                "command_id": "command-001",
+                                "seq": 0,
+                                "payload_json": {"text": "done"},
+                                "is_final": True,
+                            }
+                        ],
+                    },
+                }
+            ],
+        )
+
+        with (
+            patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox),
+            patch("core.cloud_sync_runtime.CloudAgentStatusStore", return_value=agent_store),
+        ):
+            result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["agent_status"]})
+
+        diagnostics = agent_store.diagnostics(session_store.load.return_value)
+
+    assert result["ok"] is True
+    assert result["state_delta_inbox"]["applied"] == 1
+    assert diagnostics["total"] == 1
+    assert diagnostics["by_status"] == {"completed": 1}
+    assert diagnostics["newest"][0]["chunk_count"] == 1
+
+
+def test_app_cloud_runtime_support_rejects_agent_status_state_delta_for_other_workspace():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+        agent_store = CloudAgentStatusStore(Path(tmp) / "agent_status.sqlite3")
+        inbox.record_changes(
+            identity_key="https://api.example.com|3|2",
+            changes=[
+                {
+                    "stream": "agent_status",
+                    "seq": 1,
+                    "kind": "agent.command.status",
+                    "ref_id": "command-001",
+                    "entity": {
+                        "type": "agent_command_status",
+                        "id": "command-001",
+                        "workspace_id": 99,
+                        "status": "completed",
+                    },
+                }
+            ],
+        )
+
+        with (
+            patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox),
+            patch("core.cloud_sync_runtime.CloudAgentStatusStore", return_value=agent_store),
+        ):
+            result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["agent_status"]})
+            diagnostics = inbox.diagnostics()
+
+    assert result["ok"] is False
+    assert result["state_delta_inbox"]["failed"] == 1
+    assert "工作区不匹配" in diagnostics["failed"][0]["last_error"]
+    assert agent_store.diagnostics(session_store.load.return_value)["total"] == 0
 
 
 def test_app_cloud_runtime_support_retries_request_after_refresh():

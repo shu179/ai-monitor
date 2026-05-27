@@ -17,6 +17,7 @@ from core.cloud_article_sync import (
     merge_cloud_article_entity_into_store,
     merge_cloud_article_reference_entity_into_store,
 )
+from core.cloud_agent_status_store import CloudAgentStatusStore
 from core.cloud_client import CloudClientError, SurfacedCloudClient
 from core.cloud_sync_daemon import InProcessCloudSyncCommandClient
 from core.cloud_event_types import EVENT_PROFILE_UPDATE
@@ -661,7 +662,13 @@ class AppCloudRuntimeSupport:
         inbox_diagnostics = CloudStateDeltaInbox().diagnostics(
             failed_limit=_safe_int(request_payload.get("failed_limit") or request_payload.get("failedLimit"), 10)
         )
-        return {"ok": True, "state_delta": diagnostics, "inbox": inbox_diagnostics}
+        agent_status_diagnostics = CloudAgentStatusStore().diagnostics(session)
+        return {
+            "ok": True,
+            "state_delta": diagnostics,
+            "inbox": inbox_diagnostics,
+            "agent_status": agent_status_diagnostics,
+        }
 
     def process_cloud_state_delta_inbox(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
@@ -685,6 +692,7 @@ class AppCloudRuntimeSupport:
             "runs": self._apply_run_state_delta,
             "articles": self._apply_article_state_delta,
             "references": self._apply_reference_state_delta,
+            "agent_status": self._apply_agent_status_state_delta,
         }
         appliers.update(custom_appliers or {})
         return appliers
@@ -809,6 +817,21 @@ class AppCloudRuntimeSupport:
             raise ValueError(str(summary.get("message") or "reference state-delta apply failed"))
         if int(summary.get("state_updated") or 0):
             self._invalidate_owner_article_views()
+
+    def _apply_agent_status_state_delta(self, item: dict[str, Any]) -> None:
+        entity = item.get("entity") if isinstance(item.get("entity"), dict) else {}
+        if str(item.get("stream") or "") != "agent_status" or str(entity.get("type") or "") != "agent_command_status":
+            raise ValueError("state-delta agent_status item has invalid shape")
+        session = self._session_store_factory().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        workspace_id = _safe_int(entity.get("workspace_id") or entity.get("workspaceId"), 0)
+        current_workspace_id = _safe_int(user.get("workspace_id"), 0)
+        if workspace_id > 0 and current_workspace_id and workspace_id != current_workspace_id:
+            raise ValueError("agent_status state-delta 与当前云端工作区不匹配")
+        identity_key = str(item.get("identity_key") or cloud_session_identity_key(session)).strip()
+        result = CloudAgentStatusStore().apply_status(identity_key, entity)
+        if not bool(result.get("ok")):
+            raise ValueError(str(result.get("message") or "agent_status state-delta apply failed"))
 
     def _apply_run_state_delta(self, item: dict[str, Any]) -> None:
         entity = item.get("entity") if isinstance(item.get("entity"), dict) else {}
