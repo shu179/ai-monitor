@@ -19,6 +19,7 @@ from core.cloud_article_sync import (
 )
 from core.cloud_agent_status_store import CloudAgentStatusStore
 from core.cloud_client import CloudClientError, SurfacedCloudClient
+from core.cloud_content_state_store import CloudContentStateStore
 from core.cloud_sync_daemon import InProcessCloudSyncCommandClient
 from core.cloud_event_types import EVENT_PROFILE_UPDATE
 from core.cloud_outbox import CloudOutbox
@@ -663,11 +664,13 @@ class AppCloudRuntimeSupport:
             failed_limit=_safe_int(request_payload.get("failed_limit") or request_payload.get("failedLimit"), 10)
         )
         agent_status_diagnostics = CloudAgentStatusStore().diagnostics(session)
+        content_state_diagnostics = CloudContentStateStore().diagnostics(session)
         return {
             "ok": True,
             "state_delta": diagnostics,
             "inbox": inbox_diagnostics,
             "agent_status": agent_status_diagnostics,
+            "content_state": content_state_diagnostics,
         }
 
     def process_cloud_state_delta_inbox(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -692,6 +695,8 @@ class AppCloudRuntimeSupport:
             "runs": self._apply_run_state_delta,
             "articles": self._apply_article_state_delta,
             "references": self._apply_reference_state_delta,
+            "answers": self._apply_answer_state_delta,
+            "assets": self._apply_asset_state_delta,
             "agent_status": self._apply_agent_status_state_delta,
         }
         appliers.update(custom_appliers or {})
@@ -832,6 +837,48 @@ class AppCloudRuntimeSupport:
         result = CloudAgentStatusStore().apply_status(identity_key, entity)
         if not bool(result.get("ok")):
             raise ValueError(str(result.get("message") or "agent_status state-delta apply failed"))
+
+    def _apply_answer_state_delta(self, item: dict[str, Any]) -> None:
+        entity = item.get("entity") if isinstance(item.get("entity"), dict) else {}
+        if str(item.get("stream") or "") != "answers":
+            raise ValueError("state-delta answers item has invalid stream")
+        session = self._session_store_factory().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        workspace_id = _safe_int(entity.get("workspace_id") or entity.get("workspaceId"), 0)
+        current_workspace_id = _safe_int(user.get("workspace_id"), 0)
+        if workspace_id > 0 and current_workspace_id and workspace_id != current_workspace_id:
+            raise ValueError("answer state-delta 与当前云端工作区不匹配")
+        identity_key = str(item.get("identity_key") or cloud_session_identity_key(session)).strip()
+        object_refs = item.get("object_refs") if isinstance(item.get("object_refs"), list) else []
+        result = CloudContentStateStore().apply_answer(
+            identity_key,
+            entity,
+            object_refs=object_refs,
+            ref_id=str(item.get("ref_id") or ""),
+        )
+        if not bool(result.get("ok")):
+            raise ValueError(str(result.get("message") or "answer state-delta apply failed"))
+
+    def _apply_asset_state_delta(self, item: dict[str, Any]) -> None:
+        entity = item.get("entity") if isinstance(item.get("entity"), dict) else {}
+        if str(item.get("stream") or "") != "assets":
+            raise ValueError("state-delta assets item has invalid stream")
+        session = self._session_store_factory().load()
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        workspace_id = _safe_int(entity.get("workspace_id") or entity.get("workspaceId"), 0)
+        current_workspace_id = _safe_int(user.get("workspace_id"), 0)
+        if workspace_id > 0 and current_workspace_id and workspace_id != current_workspace_id:
+            raise ValueError("asset state-delta 与当前云端工作区不匹配")
+        identity_key = str(item.get("identity_key") or cloud_session_identity_key(session)).strip()
+        object_refs = item.get("object_refs") if isinstance(item.get("object_refs"), list) else []
+        result = CloudContentStateStore().apply_asset(
+            identity_key,
+            entity,
+            object_refs=object_refs,
+            ref_id=str(item.get("ref_id") or ""),
+        )
+        if not bool(result.get("ok")):
+            raise ValueError(str(result.get("message") or "asset state-delta apply failed"))
 
     def _apply_run_state_delta(self, item: dict[str, Any]) -> None:
         entity = item.get("entity") if isinstance(item.get("entity"), dict) else {}

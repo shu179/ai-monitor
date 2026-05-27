@@ -49,6 +49,27 @@ class CloudStateDeltaInboxTests(unittest.TestCase):
         self.assertEqual(diagnostics["total"], 2)
         self.assertEqual(diagnostics["by_stream"], {"tasks": {"pending": 2}})
 
+    def test_record_changes_attaches_nested_content_ref_object_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+            inbox.record_changes(
+                identity_key="account-a",
+                object_refs=[{"object_id": "obj-1", "sha256": "abc"}],
+                changes=[
+                    {
+                        "stream": "answers",
+                        "seq": 1,
+                        "kind": "answer.upsert",
+                        "ref_id": "answer:1",
+                        "entity": {"id": "answer:1", "content_ref": {"kind": "object", "object_id": "obj-1"}},
+                    }
+                ],
+            )
+
+            claimed = inbox.claim_pending(limit=10, streams=["answers"])
+
+        self.assertEqual(claimed[0]["object_refs"], [{"object_id": "obj-1", "sha256": "abc"}])
+
     def test_diagnostics_does_not_expose_change_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")

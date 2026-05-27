@@ -10,6 +10,7 @@ import core.daily_task_state as daily_task_state_module
 import core.history as history_module
 from core.cloud_agent_status_store import CloudAgentStatusStore
 from core.cloud_client import CloudClientError
+from core.cloud_content_state_store import CloudContentStateStore
 from core.cloud_state_delta_inbox import CloudStateDeltaInbox
 from core.cloud_sync_runtime import (
     AppCloudRuntimeSupport,
@@ -131,12 +132,14 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
         patch("core.cloud_sync_runtime.pull_cloud_state_delta", return_value={"ok": True, "changes": 3}) as pull_delta,
         patch("core.cloud_sync_runtime.process_state_delta_inbox", return_value={"ok": True, "applied": 1}) as process_inbox,
         patch("core.cloud_sync_runtime.CloudAgentStatusStore") as agent_status_store_cls,
+        patch("core.cloud_sync_runtime.CloudContentStateStore") as content_state_store_cls,
         patch("core.cloud_sync_runtime.CloudStateDeltaStore") as store_cls,
         patch("core.cloud_sync_runtime.CloudStateDeltaInbox") as inbox_cls,
     ):
         store_cls.return_value.diagnostics.return_value = {"cursors": {"tasks": 2}}
         inbox_cls.return_value.diagnostics.return_value = {"by_status": {"pending": 1}}
         agent_status_store_cls.return_value.diagnostics.return_value = {"total": 0}
+        content_state_store_cls.return_value.diagnostics.return_value = {"answers_total": 0, "assets_total": 0}
 
         pull_result = support.handle_command("cloud.pull_state_delta", {"limit": 50, "max_pages": 2})
         process_result = support.handle_command("cloud.process_state_delta_inbox", {"limit": 20, "streams": ["tasks"]})
@@ -151,6 +154,8 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
     assert callable(process_kwargs["appliers"]["runs"])
     assert callable(process_kwargs["appliers"]["articles"])
     assert callable(process_kwargs["appliers"]["references"])
+    assert callable(process_kwargs["appliers"]["answers"])
+    assert callable(process_kwargs["appliers"]["assets"])
     assert callable(process_kwargs["appliers"]["agent_status"])
     assert process_kwargs["limit"] == 20
     assert process_kwargs["streams"] == ["tasks"]
@@ -160,10 +165,12 @@ def test_app_cloud_runtime_support_routes_state_delta_commands():
         "state_delta": {"cursors": {"tasks": 2}},
         "inbox": {"by_status": {"pending": 1}},
         "agent_status": {"total": 0},
+        "content_state": {"answers_total": 0, "assets_total": 0},
     }
     store_cls.return_value.diagnostics.assert_called_once_with(session_store.load.return_value)
     inbox_cls.return_value.diagnostics.assert_called_once_with(failed_limit=10)
     agent_status_store_cls.return_value.diagnostics.assert_called_once_with(session_store.load.return_value)
+    content_state_store_cls.return_value.diagnostics.assert_called_once_with(session_store.load.return_value)
 
 
 def test_app_cloud_runtime_support_applies_profile_state_delta_to_session():
@@ -799,6 +806,155 @@ def test_app_cloud_runtime_support_rejects_agent_status_state_delta_for_other_wo
     assert result["state_delta_inbox"]["failed"] == 1
     assert "工作区不匹配" in diagnostics["failed"][0]["last_error"]
     assert agent_store.diagnostics(session_store.load.return_value)["total"] == 0
+
+
+def test_app_cloud_runtime_support_applies_answer_state_delta_to_content_store():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+        content_store = CloudContentStateStore(Path(tmp) / "content.sqlite3")
+        inbox.record_changes(
+            identity_key="https://api.example.com|3|2",
+            object_refs=[
+                {
+                    "object_id": "obj-1",
+                    "sha256": "a" * 64,
+                    "size_bytes": 1200,
+                    "storage_size_bytes": 450,
+                    "content_type": "text/plain",
+                    "compression": "zstd",
+                    "storage_key": "3/aa/bb/object",
+                }
+            ],
+            changes=[
+                {
+                    "stream": "answers",
+                    "seq": 1,
+                    "kind": "answer.upsert",
+                    "ref_id": "answer-001",
+                    "entity": {
+                        "type": "answer",
+                        "id": "answer-001",
+                        "workspace_id": 3,
+                        "run_record_id": "run-9",
+                        "platform": "doubao",
+                        "content_ref": {"kind": "object", "object_id": "obj-1"},
+                    },
+                }
+            ],
+        )
+
+        with (
+            patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox),
+            patch("core.cloud_sync_runtime.CloudContentStateStore", return_value=content_store),
+        ):
+            result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["answers"]})
+
+        diagnostics = content_store.diagnostics(session_store.load.return_value)
+
+    assert result["ok"] is True
+    assert result["state_delta_inbox"]["applied"] == 1
+    assert diagnostics["answers_total"] == 1
+    assert diagnostics["newest_answers"][0]["object_ref_count"] == 1
+
+
+def test_app_cloud_runtime_support_applies_asset_state_delta_to_content_store():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+        content_store = CloudContentStateStore(Path(tmp) / "content.sqlite3")
+        inbox.record_changes(
+            identity_key="https://api.example.com|3|2",
+            changes=[
+                {
+                    "stream": "assets",
+                    "seq": 1,
+                    "kind": "asset.upsert",
+                    "ref_id": "obj-1",
+                    "entity": {
+                        "type": "asset",
+                        "workspace_id": 3,
+                        "object_id": "obj-1",
+                        "sha256": "a" * 64,
+                        "size_bytes": 1200,
+                        "storage_size_bytes": 450,
+                        "content_type": "image/png",
+                        "status": "active",
+                    },
+                }
+            ],
+        )
+
+        with (
+            patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox),
+            patch("core.cloud_sync_runtime.CloudContentStateStore", return_value=content_store),
+        ):
+            result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["assets"]})
+
+        diagnostics = content_store.diagnostics(session_store.load.return_value)
+
+    assert result["ok"] is True
+    assert result["state_delta_inbox"]["applied"] == 1
+    assert diagnostics["assets_total"] == 1
+    assert diagnostics["newest_assets"][0]["object_id"] == "obj-1"
+
+
+def test_app_cloud_runtime_support_rejects_asset_state_delta_for_other_workspace():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3, "role": "operator"},
+    }
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+        content_store = CloudContentStateStore(Path(tmp) / "content.sqlite3")
+        inbox.record_changes(
+            identity_key="https://api.example.com|3|2",
+            changes=[
+                {
+                    "stream": "assets",
+                    "seq": 1,
+                    "kind": "asset.upsert",
+                    "ref_id": "obj-1",
+                    "entity": {"type": "asset", "workspace_id": 99, "object_id": "obj-1"},
+                }
+            ],
+        )
+
+        with (
+            patch("core.cloud_sync_runtime.CloudStateDeltaInbox", return_value=inbox),
+            patch("core.cloud_sync_runtime.CloudContentStateStore", return_value=content_store),
+        ):
+            result = support.process_cloud_state_delta_inbox({"limit": 10, "streams": ["assets"]})
+            diagnostics = inbox.diagnostics()
+
+    assert result["ok"] is False
+    assert result["state_delta_inbox"]["failed"] == 1
+    assert "工作区不匹配" in diagnostics["failed"][0]["last_error"]
+    assert content_store.diagnostics(session_store.load.return_value)["assets_total"] == 0
 
 
 def test_app_cloud_runtime_support_retries_request_after_refresh():

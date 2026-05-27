@@ -357,13 +357,24 @@ def _object_refs_for_change(
 ) -> list[dict[str, Any]]:
     object_ids: set[str] = set()
     for source in (change, entity):
-        for key in ("object_id", "objectId", "object_ids", "objectIds"):
-            raw = source.get(key) if isinstance(source, dict) else None
-            if isinstance(raw, list):
-                object_ids.update(str(item or "").strip() for item in raw if str(item or "").strip())
-            elif str(raw or "").strip():
-                object_ids.add(str(raw or "").strip())
+        _collect_object_ids(source, object_ids)
     return [refs_by_id[object_id] for object_id in sorted(object_ids) if object_id in refs_by_id]
+
+
+def _collect_object_ids(source: Any, object_ids: set[str]) -> None:
+    if not isinstance(source, dict):
+        return
+    for key in ("object_id", "objectId", "object_ids", "objectIds"):
+        raw = source.get(key)
+        if isinstance(raw, list):
+            object_ids.update(str(item or "").strip() for item in raw if str(item or "").strip())
+        elif str(raw or "").strip():
+            object_ids.add(str(raw or "").strip())
+    content_ref = source.get("content_ref") if isinstance(source.get("content_ref"), dict) else {}
+    if content_ref:
+        _collect_object_ids(content_ref, object_ids)
+    for nested in source.get("object_refs") if isinstance(source.get("object_refs"), list) else []:
+        _collect_object_ids(nested, object_ids)
 
 
 def process_state_delta_inbox(
