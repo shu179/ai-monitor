@@ -318,6 +318,12 @@ class AppCloudRuntimeSupport:
         if normalized in {"cloud.schedule_article_snapshot", "schedule_article_snapshot"}:
             self.schedule_article_snapshot()
             return {"ok": True, "message": "文章云端同步已调度"}
+        if normalized in {"cloud.enqueue_article_snapshot", "enqueue_article_snapshot"}:
+            self.enqueue_article_snapshot(request_payload.get("config"))
+            return {"ok": True, "message": "文章云端同步快照已触发"}
+        if normalized in {"cloud.schedule_article_snapshot_retry", "schedule_article_snapshot_retry"}:
+            self.schedule_article_snapshot_retry(delay_seconds=request_payload.get("delay_seconds"))
+            return {"ok": True, "message": "文章云端同步重试已调度"}
         if normalized in {"cloud.validate_session", "validate_session"}:
             self.validate_cloud_session_if_needed(force=bool(request_payload.get("force")))
             return self.current_cloud_status()

@@ -2493,16 +2493,16 @@ class AppRuntime:
         self._schedule_cloud_articles_snapshot()
 
     def _schedule_cloud_articles_snapshot(self) -> None:
-        self._ensure_cloud_runtime_support().schedule_article_snapshot()
+        self._cloud_runtime_command("cloud.schedule_article_snapshot")
 
     def _run_cloud_articles_snapshot_worker(self) -> None:
         self._ensure_cloud_runtime_support().run_article_snapshot_worker()
 
     def _enqueue_cloud_articles_snapshot(self, config: dict[str, Any] | None = None) -> None:
-        self._ensure_cloud_runtime_support().enqueue_article_snapshot(config)
+        self._cloud_runtime_command("cloud.enqueue_article_snapshot", {"config": config})
 
     def _schedule_cloud_articles_snapshot_retry(self, *, delay_seconds: float | None = None) -> None:
-        self._ensure_cloud_runtime_support().schedule_article_snapshot_retry(delay_seconds=delay_seconds)
+        self._cloud_runtime_command("cloud.schedule_article_snapshot_retry", {"delay_seconds": delay_seconds})
 
     def _run_cloud_articles_snapshot_retry(self, delay_seconds: float) -> None:
         self._ensure_cloud_runtime_support().run_article_snapshot_retry(delay_seconds)

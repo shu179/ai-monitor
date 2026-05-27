@@ -345,6 +345,28 @@ def test_app_cloud_runtime_support_command_schedules_article_snapshot():
     assert started[0].kwargs["name"] == "cloud-article-snapshot-enqueue"
 
 
+def test_app_cloud_runtime_support_command_enqueues_article_snapshot_with_config():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+    support.enqueue_article_snapshot = Mock()
+
+    result = support.handle_command("cloud.enqueue_article_snapshot", {"config": {"tasks": [{"name": "A"}]}})
+
+    assert result == {"ok": True, "message": "文章云端同步快照已触发"}
+    support.enqueue_article_snapshot.assert_called_once_with({"tasks": [{"name": "A"}]})
+
+
+def test_app_cloud_runtime_support_command_schedules_article_snapshot_retry():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+    support.schedule_article_snapshot_retry = Mock()
+
+    result = support.handle_command("cloud.schedule_article_snapshot_retry", {"delay_seconds": 1.25})
+
+    assert result == {"ok": True, "message": "文章云端同步重试已调度"}
+    support.schedule_article_snapshot_retry.assert_called_once_with(delay_seconds=1.25)
+
+
 def test_app_cloud_runtime_support_command_validates_session_with_force():
     owner = _support_owner()
     support = AppCloudRuntimeSupport(owner=owner)

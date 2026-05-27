@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from web_backend import AppRuntime
 
@@ -66,6 +66,23 @@ class _FakeCloudOutbox:
 
 
 class WebBackendArticleMatchRefreshTests(unittest.TestCase):
+    def test_cloud_article_snapshot_wrappers_route_through_runtime_command_boundary(self) -> None:
+        runtime = _runtime()
+        runtime._cloud_runtime_command = Mock(return_value={"ok": True})  # type: ignore[method-assign]
+
+        runtime._schedule_cloud_articles_snapshot()
+        runtime._enqueue_cloud_articles_snapshot(_config())
+        runtime._schedule_cloud_articles_snapshot_retry(delay_seconds=2.5)
+
+        self.assertEqual(
+            runtime._cloud_runtime_command.call_args_list,
+            [
+                unittest.mock.call("cloud.schedule_article_snapshot"),
+                unittest.mock.call("cloud.enqueue_article_snapshot", {"config": _config()}),
+                unittest.mock.call("cloud.schedule_article_snapshot_retry", {"delay_seconds": 2.5}),
+            ],
+        )
+
     def test_get_synced_articles_does_not_cache_deferred_snapshot(self) -> None:
         runtime = _runtime()
         stale_articles = [_article("stale match result")]
