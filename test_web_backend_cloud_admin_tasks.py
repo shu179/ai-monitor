@@ -808,10 +808,6 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
                 }
             )
             runtime = AppRuntime.__new__(AppRuntime)
-            runtime._cloud_status_validation_lock = threading.RLock()
-            runtime._cloud_status_validated_identity = ""
-            runtime._cloud_status_validated_at = 0.0
-            runtime._cloud_status_validation_error = ""
 
             with (
                 patch("web_backend.CloudSessionStore", return_value=store),
@@ -820,7 +816,7 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
                 runtime._validate_cloud_session_if_needed(force=True)  # noqa: SLF001
 
             self.assertEqual(store.load()["access_token"], "old-access")
-            self.assertEqual(runtime._cloud_status_validation_error, "Refresh token revoked")
+            self.assertEqual(runtime._ensure_cloud_runtime_support().validation_error, "Refresh token revoked")
 
     def test_cloud_login_returns_immediately_after_auth_without_blocking_pull(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)

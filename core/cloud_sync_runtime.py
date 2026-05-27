@@ -149,33 +149,85 @@ class AppCloudRuntimeSupport:
         self._has_pending_profile_update = has_pending_profile_update or self._default_has_pending_profile_update
         self._article_snapshot_startup_delay_seconds = float(article_snapshot_startup_delay_seconds or 0.0)
         self._article_deferred_retry_seconds = float(article_deferred_retry_seconds or 0.0)
+        self._stop_event = threading.Event()
+        self._article_cloud_enqueue_lock = threading.RLock()
+        self._last_article_cloud_enqueue_key: tuple[Any, ...] | None = None
+        self._article_cloud_enqueue_requested = False
+        self._article_cloud_enqueue_thread: Any = None
+        self._article_cloud_enqueue_retry_thread: Any = None
+        self._cloud_status_validation_lock = threading.RLock()
+        self._cloud_status_validated_identity = ""
+        self._cloud_status_validated_at = 0.0
+        self._cloud_status_validation_error = ""
+
+    @property
+    def last_article_cloud_enqueue_key(self) -> tuple[Any, ...] | None:
+        return self._last_article_cloud_enqueue_key
+
+    @property
+    def article_snapshot_requested(self) -> bool:
+        with self._article_cloud_enqueue_lock:
+            return self._article_cloud_enqueue_requested
+
+    @property
+    def validation_error(self) -> str:
+        with self._cloud_status_validation_lock:
+            return self._cloud_status_validation_error
+
+    def reset_transient_state(self) -> None:
+        self._reset_article_snapshot_state()
+        self._reset_validation_state()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        with self._article_cloud_enqueue_lock:
+            self._article_cloud_enqueue_requested = False
+            worker_thread = self._article_cloud_enqueue_thread
+            retry_thread = self._article_cloud_enqueue_retry_thread
+        self._join_thread_if_possible(worker_thread)
+        self._join_thread_if_possible(retry_thread)
+        with self._article_cloud_enqueue_lock:
+            self._article_cloud_enqueue_thread = None
+            self._article_cloud_enqueue_retry_thread = None
 
     def schedule_article_snapshot(self) -> None:
-        with self._owner._article_cloud_enqueue_lock:
-            self._owner._article_cloud_enqueue_requested = True
-            if self._owner._article_cloud_enqueue_thread and self._owner._article_cloud_enqueue_thread.is_alive():
+        if self._stop_event.is_set():
+            return
+        with self._article_cloud_enqueue_lock:
+            self._article_cloud_enqueue_requested = True
+            if self._article_cloud_enqueue_thread and self._article_cloud_enqueue_thread.is_alive():
                 return
-            self._owner._article_cloud_enqueue_thread = self._thread_factory(
+            self._article_cloud_enqueue_thread = self._thread_factory(
                 target=self.run_article_snapshot_worker,
                 name="cloud-article-snapshot-enqueue",
                 daemon=True,
             )
-            self._owner._article_cloud_enqueue_thread.start()
+            self._article_cloud_enqueue_thread.start()
 
     def run_article_snapshot_worker(self) -> None:
         startup_delay_seconds = self._read_article_snapshot_startup_delay_seconds()
         if startup_delay_seconds > 0:
             self._sleep_fn(startup_delay_seconds)
+        if self._stop_event.is_set():
+            with self._article_cloud_enqueue_lock:
+                if self._article_cloud_enqueue_thread is threading.current_thread():
+                    self._article_cloud_enqueue_thread = None
+            return
         while True:
-            with self._owner._article_cloud_enqueue_lock:
-                if not self._owner._article_cloud_enqueue_requested:
-                    self._owner._article_cloud_enqueue_thread = None
+            if self._stop_event.is_set():
+                with self._article_cloud_enqueue_lock:
+                    if self._article_cloud_enqueue_thread is threading.current_thread():
+                        self._article_cloud_enqueue_thread = None
+                return
+            with self._article_cloud_enqueue_lock:
+                if not self._article_cloud_enqueue_requested:
+                    self._article_cloud_enqueue_thread = None
                     return
-                self._owner._article_cloud_enqueue_requested = False
+                self._article_cloud_enqueue_requested = False
             self.enqueue_article_snapshot()
-            with self._owner._article_cloud_enqueue_lock:
-                if not self._owner._article_cloud_enqueue_requested:
-                    self._owner._article_cloud_enqueue_thread = None
+            with self._article_cloud_enqueue_lock:
+                if not self._article_cloud_enqueue_requested:
+                    self._article_cloud_enqueue_thread = None
                     return
 
     def enqueue_article_snapshot(self, config: dict[str, Any] | None = None) -> None:
@@ -192,24 +244,20 @@ class AppCloudRuntimeSupport:
                 session=session,
             )
             if deferred_refresh:
-                retry = getattr(self._owner, "_schedule_cloud_articles_snapshot_retry", None)
-                if callable(retry):
-                    retry()
-                else:
-                    self.schedule_article_snapshot_retry()
+                self.schedule_article_snapshot_retry()
                 return
             snapshot_key = (
                 cloud_session_identity_key(session),
                 self._owner._article_store_version_key(),
                 self._owner._article_cloud_task_map_key(resolved_config),
             )
-            with self._owner._article_cloud_enqueue_lock:
-                if self._owner._last_article_cloud_enqueue_key == snapshot_key:
+            with self._article_cloud_enqueue_lock:
+                if self._last_article_cloud_enqueue_key == snapshot_key:
                     return
 
             result = self._article_enqueue_fn(articles, resolved_config) or {}
-            with self._owner._article_cloud_enqueue_lock:
-                self._owner._last_article_cloud_enqueue_key = snapshot_key
+            with self._article_cloud_enqueue_lock:
+                self._last_article_cloud_enqueue_key = snapshot_key
             queued = int(result.get("queued") or 0)
             if queued > 0:
                 print(f"[WebBackend] 文章云端同步已入队: articles={result.get('articles', 0)}, queued={queued}")
@@ -217,13 +265,15 @@ class AppCloudRuntimeSupport:
             print(f"[WebBackend] 文章云端同步入队失败，将等待下次本地变更重试: {exc}")
 
     def schedule_article_snapshot_retry(self, *, delay_seconds: float | None = None) -> None:
+        if self._stop_event.is_set():
+            return
         delay = self._article_deferred_retry_seconds if delay_seconds is None else delay_seconds
         try:
             delay = max(0.0, float(delay))
         except Exception:
             delay = self._article_deferred_retry_seconds
-        with self._owner._article_cloud_enqueue_lock:
-            retry_thread = self._owner._article_cloud_enqueue_retry_thread
+        with self._article_cloud_enqueue_lock:
+            retry_thread = self._article_cloud_enqueue_retry_thread
             if retry_thread and retry_thread.is_alive():
                 return
             retry_thread = self._thread_factory(
@@ -232,7 +282,7 @@ class AppCloudRuntimeSupport:
                 name="cloud-article-snapshot-retry",
                 daemon=True,
             )
-            self._owner._article_cloud_enqueue_retry_thread = retry_thread
+            self._article_cloud_enqueue_retry_thread = retry_thread
             retry_thread.start()
 
     def run_article_snapshot_retry(self, delay_seconds: float) -> None:
@@ -240,14 +290,12 @@ class AppCloudRuntimeSupport:
             if delay_seconds > 0:
                 self._sleep_fn(delay_seconds)
         finally:
-            with self._owner._article_cloud_enqueue_lock:
-                if self._owner._article_cloud_enqueue_retry_thread is threading.current_thread():
-                    self._owner._article_cloud_enqueue_retry_thread = None
-        schedule = getattr(self._owner, "_schedule_cloud_articles_snapshot", None)
-        if callable(schedule):
-            schedule()
-        else:
-            self.schedule_article_snapshot()
+            with self._article_cloud_enqueue_lock:
+                if self._article_cloud_enqueue_retry_thread is threading.current_thread():
+                    self._article_cloud_enqueue_retry_thread = None
+        if self._stop_event.is_set():
+            return
+        self.schedule_article_snapshot()
 
     def recover_cloud_run_history_uploads(self) -> dict[str, Any]:
         """Recover local run/article sync candidates into the current account outbox."""
@@ -261,11 +309,7 @@ class AppCloudRuntimeSupport:
                 session=session,
             )
             if deferred_refresh:
-                retry = getattr(self._owner, "_schedule_cloud_articles_snapshot_retry", None)
-                if callable(retry):
-                    retry()
-                else:
-                    self.schedule_article_snapshot_retry()
+                self.schedule_article_snapshot_retry()
                 article_metrics = {
                     "deferred": True,
                     "reason": "match_refresh_deferred",
@@ -302,6 +346,7 @@ class AppCloudRuntimeSupport:
             except CloudClientError:
                 pass
         store.clear()
+        self.reset_transient_state()
         activate_account_space = getattr(self._owner, "_activate_current_account_space", None)
         if callable(activate_account_space):
             activate_account_space(copy_legacy=False)
@@ -401,6 +446,7 @@ class AppCloudRuntimeSupport:
         self._account_space_ensurer(preview_session, copy_legacy=copy_legacy)
 
         saved_session = store.save_login(base_url=base_url, token_pair=token_pair)
+        self.reset_transient_state()
         activate_account_space = getattr(self._owner, "_activate_current_account_space", None)
         if callable(activate_account_space):
             activate_account_space(copy_legacy=False)
@@ -425,16 +471,16 @@ class AppCloudRuntimeSupport:
             return
 
         now_ts = time.monotonic()
-        with self._owner._cloud_status_validation_lock:
+        with self._cloud_status_validation_lock:
             if (
                 not force
                 and identity_key
-                and identity_key == self._owner._cloud_status_validated_identity
-                and now_ts - self._owner._cloud_status_validated_at < 60.0
+                and identity_key == self._cloud_status_validated_identity
+                and now_ts - self._cloud_status_validated_at < 60.0
             ):
                 return
-            self._owner._cloud_status_validated_identity = identity_key
-            self._owner._cloud_status_validated_at = now_ts
+            self._cloud_status_validated_identity = identity_key
+            self._cloud_status_validated_at = now_ts
 
         identity = cloud_session_identity(session)
         client = self._status_client_factory(base_url)
@@ -442,13 +488,13 @@ class AppCloudRuntimeSupport:
             me_payload = client.me(access_token)
             if isinstance(me_payload, dict) and cloud_session_identity_key(store.load()) == identity_key:
                 store.update_user(me_payload)
-            with self._owner._cloud_status_validation_lock:
-                self._owner._cloud_status_validation_error = ""
+            with self._cloud_status_validation_lock:
+                self._cloud_status_validation_error = ""
             return
         except CloudClientError as exc:
             if exc.status_code != 401:
-                with self._owner._cloud_status_validation_lock:
-                    self._owner._cloud_status_validation_error = str(exc)
+                with self._cloud_status_validation_lock:
+                    self._cloud_status_validation_error = str(exc)
                 return
 
         try:
@@ -470,17 +516,17 @@ class AppCloudRuntimeSupport:
                     ):
                         store.update_user(me_payload)
                 except CloudClientError as verify_exc:
-                    with self._owner._cloud_status_validation_lock:
-                        self._owner._cloud_status_validation_error = str(verify_exc)
+                    with self._cloud_status_validation_lock:
+                        self._cloud_status_validation_error = str(verify_exc)
                     return
-            with self._owner._cloud_status_validation_lock:
-                self._owner._cloud_status_validation_error = ""
+            with self._cloud_status_validation_lock:
+                self._cloud_status_validation_error = ""
         except CloudSessionChangedError as exc:
-            with self._owner._cloud_status_validation_lock:
-                self._owner._cloud_status_validation_error = str(exc)
+            with self._cloud_status_validation_lock:
+                self._cloud_status_validation_error = str(exc)
         except CloudClientError as refresh_exc:
-            with self._owner._cloud_status_validation_lock:
-                self._owner._cloud_status_validation_error = str(refresh_exc)
+            with self._cloud_status_validation_lock:
+                self._cloud_status_validation_error = str(refresh_exc)
 
     def get_cloud_status(self) -> dict[str, Any]:
         self.validate_cloud_session_if_needed()
@@ -493,8 +539,8 @@ class AppCloudRuntimeSupport:
     def cloud_status_from_session(self, session: dict[str, Any] | None) -> dict[str, Any]:
         session_payload = session if isinstance(session, dict) else {}
         user = session_payload.get("user") if isinstance(session_payload.get("user"), dict) else {}
-        with self._owner._cloud_status_validation_lock:
-            validation_error = self._owner._cloud_status_validation_error
+        with self._cloud_status_validation_lock:
+            validation_error = self._cloud_status_validation_error
         return {
             "ok": True,
             "cloud": {
@@ -724,6 +770,30 @@ class AppCloudRuntimeSupport:
             )
         except Exception:
             return max(0.0, self._article_snapshot_startup_delay_seconds)
+
+    def _reset_article_snapshot_state(self) -> None:
+        with self._article_cloud_enqueue_lock:
+            self._last_article_cloud_enqueue_key = None
+            self._article_cloud_enqueue_requested = False
+
+    def _reset_validation_state(self) -> None:
+        with self._cloud_status_validation_lock:
+            self._cloud_status_validated_identity = ""
+            self._cloud_status_validated_at = 0.0
+            self._cloud_status_validation_error = ""
+
+    @staticmethod
+    def _join_thread_if_possible(thread: Any) -> None:
+        if (
+            thread is None
+            or thread is threading.current_thread()
+            or not callable(getattr(thread, "join", None))
+        ):
+            return
+        try:
+            thread.join(timeout=1.0)
+        except Exception:
+            pass
 
     @staticmethod
     def _build_login_session_preview(*, base_url: str, token_pair: dict[str, Any]) -> dict[str, Any]:

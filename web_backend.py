@@ -2007,16 +2007,7 @@ class AppRuntime:
         self._article_sqlite_shadow_health: dict[str, Any] = {}
         self._history_sqlite_shadow_rebuild_lock = threading.RLock()
         self._synced_articles_cache: dict[str, Any] | None = None
-        self._article_cloud_enqueue_lock = threading.RLock()
-        self._last_article_cloud_enqueue_key: tuple[Any, ...] | None = None
-        self._article_cloud_enqueue_requested = False
-        self._article_cloud_enqueue_thread: threading.Thread | None = None
-        self._article_cloud_enqueue_retry_thread: threading.Thread | None = None
         self._pending_delete_processing_lock = threading.RLock()
-        self._cloud_status_validation_lock = threading.RLock()
-        self._cloud_status_validated_identity = ""
-        self._cloud_status_validated_at = 0.0
-        self._cloud_status_validation_error = ""
         self.task_overview_service = TaskOverviewService(
             config_provider=self.config_provider,
             synced_articles_loader=self._get_synced_articles,
@@ -2196,6 +2187,9 @@ class AppRuntime:
         self._test_failure_notices.clear()
         self._invalidate_tasks_full_cache()
         self._invalidate_article_cache()
+        support = getattr(self, "_cloud_runtime_support", None)
+        if isinstance(support, AppCloudRuntimeSupport):
+            support.reset_transient_state()
 
     @staticmethod
     def _cloud_role(session: dict[str, Any] | None) -> str:
@@ -5540,6 +5534,9 @@ return changedCount
 
     def shutdown(self) -> None:
         self._cloud_runtime.stop()
+        support = getattr(self, "_cloud_runtime_support", None)
+        if isinstance(support, AppCloudRuntimeSupport):
+            support.stop()
         self._stop_cloud_command_transport()
         self.stop_account_crawl_scheduler()
         self._stop_recognition_test_session(restore_previous=False)

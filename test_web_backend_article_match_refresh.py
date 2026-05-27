@@ -20,11 +20,6 @@ def _runtime() -> AppRuntime:
     runtime = AppRuntime.__new__(AppRuntime)
     runtime._article_cache_lock = threading.RLock()
     runtime._synced_articles_cache = None
-    runtime._article_cloud_enqueue_lock = threading.RLock()
-    runtime._last_article_cloud_enqueue_key = None
-    runtime._article_cloud_enqueue_requested = False
-    runtime._article_cloud_enqueue_thread = None
-    runtime._article_cloud_enqueue_retry_thread = None
     return runtime
 
 
@@ -180,15 +175,14 @@ class WebBackendArticleMatchRefreshTests(unittest.TestCase):
                 side_effect=AssertionError("deferred refresh must not sync refresh"),
             ) as refresh_mock,
             patch("core.cloud_sync_runtime.enqueue_cloud_articles") as enqueue_mock,
-            patch.object(runtime, "_schedule_cloud_articles_snapshot_retry") as retry_mock,
         ):
             runtime._enqueue_cloud_articles_snapshot(_config())
 
         get_articles_mock.assert_called_once()
         refresh_mock.assert_not_called()
         enqueue_mock.assert_not_called()
-        retry_mock.assert_called_once()
-        self.assertIsNone(runtime._last_article_cloud_enqueue_key)
+        self.assertIsNotNone(runtime._ensure_cloud_runtime_support()._article_cloud_enqueue_retry_thread)
+        self.assertIsNone(runtime._ensure_cloud_runtime_support().last_article_cloud_enqueue_key)
 
     def test_deferred_retry_thread_guard_reuses_existing_timer(self) -> None:
         runtime = _runtime()
@@ -208,8 +202,8 @@ class WebBackendArticleMatchRefreshTests(unittest.TestCase):
                 return self.started
 
         with patch("web_backend.threading.Thread", side_effect=lambda *args, **kwargs: FakeAliveThread(*args, **kwargs)):
-            runtime._schedule_cloud_articles_snapshot_retry(delay_seconds=0)
-            runtime._schedule_cloud_articles_snapshot_retry(delay_seconds=0)
+            runtime._ensure_cloud_runtime_support().schedule_article_snapshot_retry(delay_seconds=0)
+            runtime._ensure_cloud_runtime_support().schedule_article_snapshot_retry(delay_seconds=0)
 
         self.assertEqual(len(created_threads), 1)
         self.assertEqual(created_threads[0].kwargs.get("name"), "cloud-article-snapshot-retry")
@@ -233,12 +227,11 @@ class WebBackendArticleMatchRefreshTests(unittest.TestCase):
             patch("web_backend.get_articles", return_value=copy.deepcopy(stale_articles)),
             patch("web_backend.refresh_article_matches", return_value=copy.deepcopy(fresh_articles)) as refresh_mock,
             patch("core.cloud_sync_runtime.enqueue_cloud_articles", return_value={"articles": 1, "queued": 1}) as enqueue_mock,
-            patch.object(runtime, "_schedule_cloud_articles_snapshot_retry") as retry_mock,
         ):
             runtime._enqueue_cloud_articles_snapshot(_config())
-            self.assertIsNone(runtime._last_article_cloud_enqueue_key)
+            self.assertIsNone(runtime._ensure_cloud_runtime_support().last_article_cloud_enqueue_key)
             enqueue_mock.assert_not_called()
-            retry_mock.assert_called_once()
+            self.assertIsNotNone(runtime._ensure_cloud_runtime_support()._article_cloud_enqueue_retry_thread)
 
             runtime._enqueue_cloud_articles_snapshot(_config())
 
@@ -246,7 +239,7 @@ class WebBackendArticleMatchRefreshTests(unittest.TestCase):
         enqueue_mock.assert_called_once()
         uploaded_articles = enqueue_mock.call_args.args[0]
         self.assertEqual([item["title"] for item in uploaded_articles], ["fresh cloud snapshot"])
-        self.assertIsNotNone(runtime._last_article_cloud_enqueue_key)
+        self.assertIsNotNone(runtime._ensure_cloud_runtime_support().last_article_cloud_enqueue_key)
 
     def test_recover_cloud_run_history_uploads_skips_deferred_article_snapshot(self) -> None:
         runtime = _runtime()
@@ -272,7 +265,6 @@ class WebBackendArticleMatchRefreshTests(unittest.TestCase):
                 side_effect=AssertionError("deferred recovery must not sync refresh"),
             ) as refresh_mock,
             patch("core.cloud_sync_runtime.enqueue_cloud_articles") as article_enqueue_mock,
-            patch.object(runtime, "_schedule_cloud_articles_snapshot_retry") as retry_mock,
         ):
             result = runtime._recover_cloud_run_history_uploads()
 
@@ -284,7 +276,7 @@ class WebBackendArticleMatchRefreshTests(unittest.TestCase):
         get_articles_mock.assert_called_once()
         refresh_mock.assert_not_called()
         article_enqueue_mock.assert_not_called()
-        retry_mock.assert_called_once()
+        self.assertIsNotNone(runtime._ensure_cloud_runtime_support()._article_cloud_enqueue_retry_thread)
         self.assertEqual(fake_outbox.bound_session, _cloud_session())
 
 

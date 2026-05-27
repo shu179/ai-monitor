@@ -54,15 +54,6 @@ def test_create_in_process_cloud_sync_command_client_wraps_handler():
 
 def _support_owner() -> MagicMock:
     owner = MagicMock()
-    owner._article_cloud_enqueue_lock = threading.RLock()
-    owner._last_article_cloud_enqueue_key = None
-    owner._article_cloud_enqueue_requested = False
-    owner._article_cloud_enqueue_thread = None
-    owner._article_cloud_enqueue_retry_thread = None
-    owner._cloud_status_validation_lock = threading.RLock()
-    owner._cloud_status_validated_identity = ""
-    owner._cloud_status_validated_at = 0.0
-    owner._cloud_status_validation_error = ""
     owner._article_store_version_key.return_value = ("articles.json", 1, 10)
     owner._article_cloud_task_map_key.return_value = "task-map"
     owner._get_cloud_article_upload_snapshot_with_refresh_state.return_value = ([{"title": "A"}], False)
@@ -95,7 +86,6 @@ def test_app_cloud_runtime_support_uses_injected_thread_factory_for_snapshot_wor
 
 def test_app_cloud_runtime_support_cloud_status_uses_injected_status_and_outbox():
     owner = _support_owner()
-    owner._cloud_status_validation_error = "stale token"
     auto_sync_status = {"running": True}
     outbox = MagicMock()
     outbox.stats.return_value = {"pending": 2, "failed": 1}
@@ -105,6 +95,7 @@ def test_app_cloud_runtime_support_cloud_status_uses_injected_status_and_outbox(
         auto_sync_status_getter=lambda: auto_sync_status,
         current_account_config_path_getter=lambda: "/tmp/config.yaml",
     )
+    support._cloud_status_validation_error = "stale token"
 
     result = support.cloud_status_from_session(
         {
@@ -233,7 +224,7 @@ def test_app_cloud_runtime_support_schedules_retry_when_recovery_article_snapsho
     assert result["ok"] is True
     assert result["articles_sync"]["deferred"] is True
     assert result["articles_sync"]["queued"] == 0
-    owner._schedule_cloud_articles_snapshot_retry.assert_called_once()
+    assert support._article_cloud_enqueue_retry_thread is not None
     article_enqueue.assert_not_called()
 
 
@@ -482,7 +473,7 @@ def test_app_cloud_runtime_support_command_schedules_article_snapshot():
     result = support.handle_command("cloud.schedule_article_snapshot")
 
     assert result == {"ok": True, "message": "文章云端同步已调度"}
-    assert owner._article_cloud_enqueue_requested is True
+    assert support.article_snapshot_requested is True
     assert len(started) == 1
     assert started[0].kwargs["name"] == "cloud-article-snapshot-enqueue"
 
