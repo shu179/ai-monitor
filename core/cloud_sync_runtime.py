@@ -316,6 +316,8 @@ class AppCloudRuntimeSupport:
             return self.cloud_status_from_session(request_payload.get("session"))
         if normalized in {"cloud.list_admin_tasks_with_local_sync", "list_admin_tasks_with_local_sync"}:
             return self._run_cloud_task_sync_request(request_payload)
+        if normalized in {"cloud.sync_admin_task", "sync_admin_task"}:
+            return self._run_sync_admin_task_request(request_payload)
         if normalized in {"cloud.list_admin_users", "list_admin_users"}:
             return self._run_cloud_api_request("list_admin_users", request_payload)
         if normalized in {"cloud.list_admin_article_classification_jobs", "list_admin_article_classification_jobs"}:
@@ -631,6 +633,46 @@ class AppCloudRuntimeSupport:
             if not callable(ensure_local):
                 raise RuntimeError("cloud task sync helper unavailable")
             return ensure_local(client, token, local_snapshots)
+
+        ok, response_payload, message = self.cloud_request_with_refresh(operation)
+        return {"ok": bool(ok), "payload": response_payload, "message": message}
+
+    def _run_sync_admin_task_request(self, request_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = request_payload if isinstance(request_payload, dict) else {}
+        local_task_id = str(payload.get("local_task_id") or payload.get("task_id") or "").strip()
+        local_task = payload.get("local_task") if isinstance(payload.get("local_task"), dict) else {}
+        cloud_payload = payload.get("cloud_payload") if isinstance(payload.get("cloud_payload"), dict) else {}
+        existing_cloud_task_id = _safe_int(payload.get("existing_cloud_task_id") or payload.get("existingCloudTaskId"), 0)
+        operator_user_id = _safe_int(payload.get("operator_user_id") or payload.get("operatorUserId"), 0)
+
+        def operation(client: Any, token: str) -> Any:
+            if existing_cloud_task_id > 0:
+                saved = client.update_admin_task(token, existing_cloud_task_id, cloud_payload)
+            else:
+                saved = client.create_admin_task(
+                    token,
+                    {
+                        "task_key": self._owner._cloud_task_key_for_local_task(local_task, local_task_id),
+                        **cloud_payload,
+                    },
+                )
+            saved_task_id = _safe_int(saved.get("id") if isinstance(saved, dict) else 0, existing_cloud_task_id)
+            if operator_user_id > 0 and saved_task_id > 0:
+                client.assign_admin_task_member(
+                    token,
+                    saved_task_id,
+                    user_id=operator_user_id,
+                    access_level="operate",
+                    note="品牌编辑页分配",
+                )
+            if saved_task_id > 0:
+                try:
+                    for task in client.list_admin_tasks(token):
+                        if _safe_int(task.get("id") if isinstance(task, dict) else 0, 0) == saved_task_id:
+                            return task
+                except Exception as exc:
+                    print(f"[WebBackend] 云端任务分配后刷新任务快照失败，将使用保存结果: {exc}")
+            return saved
 
         ok, response_payload, message = self.cloud_request_with_refresh(operation)
         return {"ok": bool(ok), "payload": response_payload, "message": message}

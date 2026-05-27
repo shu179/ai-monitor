@@ -4227,9 +4227,6 @@ return changedCount
     def _cloud_status_from_session(self, session: dict[str, Any] | None) -> dict[str, Any]:
         return self._cloud_runtime_command("cloud.status_from_session", {"session": session})
 
-    def _cloud_request_with_refresh(self, operation) -> tuple[bool, Any, str]:
-        return self._ensure_cloud_runtime_support().cloud_request_with_refresh(operation)
-
     def list_cloud_admin_tasks(self) -> dict[str, Any]:
         session = CloudSessionStore().load()
         user = session.get("user") if isinstance(session.get("user"), dict) else {}
@@ -4919,37 +4916,16 @@ return changedCount
         }
         if existing_cloud_task_id > 0 and _safe_int(local_task.get("cloud_config_version"), 0) > 0:
             cloud_payload["expected_config_version"] = _safe_int(local_task.get("cloud_config_version"), 0)
-
-        def operation(client: SurfacedCloudClient, token: str) -> dict[str, Any]:
-            if existing_cloud_task_id > 0:
-                saved = client.update_admin_task(token, existing_cloud_task_id, cloud_payload)
-            else:
-                saved = client.create_admin_task(
-                    token,
-                    {
-                        "task_key": self._cloud_task_key_for_local_task(local_task, local_task_id),
-                        **cloud_payload,
-                    },
-                )
-            saved_task_id = _safe_int(saved.get("id") if isinstance(saved, dict) else 0, existing_cloud_task_id)
-            if operator_user_id > 0 and saved_task_id > 0:
-                client.assign_admin_task_member(
-                    token,
-                    saved_task_id,
-                    user_id=operator_user_id,
-                    access_level="operate",
-                    note="品牌编辑页分配",
-                )
-            if saved_task_id > 0:
-                try:
-                    for task in client.list_admin_tasks(token):
-                        if _safe_int(task.get("id") if isinstance(task, dict) else 0, 0) == saved_task_id:
-                            return task
-                except Exception as exc:
-                    print(f"[WebBackend] 云端任务分配后刷新任务快照失败，将使用保存结果: {exc}")
-            return saved
-
-        ok, saved_task, message = self._cloud_request_with_refresh(operation)
+        ok, saved_task, message = self._cloud_runtime_payload_command(
+            "cloud.sync_admin_task",
+            {
+                "local_task_id": local_task_id,
+                "local_task": local_task,
+                "existing_cloud_task_id": existing_cloud_task_id,
+                "operator_user_id": operator_user_id,
+                "cloud_payload": cloud_payload,
+            },
+        )
         if not ok:
             return {"ok": False, "message": message or "云端任务同步失败", "cloud": self.get_cloud_status().get("cloud")}
         if not isinstance(saved_task, dict):

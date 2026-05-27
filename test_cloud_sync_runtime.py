@@ -408,6 +408,43 @@ def test_app_cloud_runtime_support_command_runs_admin_task_sync_with_local_snaps
     owner._ensure_local_admin_tasks_in_cloud.assert_called_once()
 
 
+def test_app_cloud_runtime_support_command_syncs_admin_task_and_assigns_operator():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.assigned: list[dict[str, int | str]] = []
+
+        def create_admin_task(self, _token: str, payload: dict[str, Any]) -> dict[str, Any]:
+            return {"id": 100, "task_key": payload["task_key"], "name": payload["name"]}
+
+        def assign_admin_task_member(self, _token: str, task_id: int, *, user_id: int, access_level: str, note: str) -> dict[str, Any]:
+            self.assigned.append({"task_id": task_id, "user_id": user_id, "access_level": access_level, "note": note})
+            return {}
+
+        def list_admin_tasks(self, _token: str) -> list[dict[str, Any]]:
+            return [{"id": 100, "task_key": "task-1", "assigned_operator_username": "user-7"}]
+
+    fake_client = FakeClient()
+    support.cloud_request_with_refresh = Mock(side_effect=lambda operation: (True, operation(fake_client, "access-token"), ""))
+
+    result = support.handle_command(
+        "cloud.sync_admin_task",
+        {
+            "local_task_id": "task-1",
+            "local_task": {"task_id": "task-1"},
+            "existing_cloud_task_id": 0,
+            "operator_user_id": 7,
+            "cloud_payload": {"name": "Brand A", "brand": "Brand A", "config_json": {}, "enabled": True},
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["payload"]["id"] == 100
+    assert fake_client.assigned[0]["user_id"] == 7
+
+
 def test_app_cloud_runtime_support_command_schedules_article_snapshot():
     owner = _support_owner()
     started: list[object] = []

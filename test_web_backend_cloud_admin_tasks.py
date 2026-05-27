@@ -352,11 +352,17 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
                 "optimization_trend": [{"value": 88.0}],
             },
         )
-        client = FakeAdminTaskClient()
         runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]
-        runtime._cloud_request_with_refresh = Mock(  # type: ignore[method-assign]
-            side_effect=lambda operation: (True, operation(client, "access-token"), "")
-        )
+        runtime._cloud_runtime_command = Mock(return_value={  # type: ignore[method-assign]
+            "ok": True,
+            "payload": {
+                "id": 100,
+                "task_key": "local-task-1",
+                "workspace_id": 1,
+                "config_version": 1,
+                "assigned_operator_username": "user-7",
+            },
+        })
 
         with patch("web_backend.CloudSessionStore", return_value=FakeCloudSessionStore()):
             with patch("web_backend.local_today", return_value=date(2026, 1, 5)):
@@ -383,7 +389,10 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["local_task"]["cloud_task_id"], 100)
         self.assertEqual(result["local_task"]["article_count"], 3)
-        self.assertEqual(client.assigned[0]["user_id"], 7)
+        runtime._cloud_runtime_command.assert_called_once()  # type: ignore[attr-defined]
+        command_name, payload = runtime._cloud_runtime_command.call_args.args  # type: ignore[attr-defined]
+        self.assertEqual(command_name, "cloud.sync_admin_task")
+        self.assertEqual(payload["operator_user_id"], 7)
         runtime.task_overview_service.get_tasks_full.assert_not_called()
 
     def test_sync_cloud_admin_task_defaults_unassigned_operator_to_admin(self) -> None:
@@ -413,11 +422,17 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
                 "optimization_trend": [{"value": 88.0}],
             },
         )
-        client = FakeAdminTaskClient()
         runtime.get_cloud_status = Mock(return_value={"cloud": {"loggedIn": True}})  # type: ignore[method-assign]
-        runtime._cloud_request_with_refresh = Mock(  # type: ignore[method-assign]
-            side_effect=lambda operation: (True, operation(client, "access-token"), "")
-        )
+        runtime._cloud_runtime_command = Mock(return_value={  # type: ignore[method-assign]
+            "ok": True,
+            "payload": {
+                "id": 100,
+                "task_key": "local-task-1",
+                "workspace_id": 1,
+                "config_version": 1,
+                "assigned_operator_username": "user-1",
+            },
+        })
 
         with patch("web_backend.CloudSessionStore", return_value=FakeCloudSessionStore()):
             with patch("web_backend.local_today", return_value=date(2026, 1, 5)):
@@ -442,7 +457,9 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
                             result = runtime.sync_cloud_admin_task({"local_task_id": "task-1"})
 
         self.assertTrue(result["ok"])
-        self.assertEqual(client.assigned[0]["user_id"], 1)
+        command_name, payload = runtime._cloud_runtime_command.call_args.args  # type: ignore[attr-defined]
+        self.assertEqual(command_name, "cloud.sync_admin_task")
+        self.assertEqual(payload["operator_user_id"], 1)
         self.assertEqual(result["local_task"]["cloud_assigned_operator_user_id"], 1)
 
     def test_admin_task_list_ensures_unsynced_local_tasks_exist_in_cloud(self) -> None:
