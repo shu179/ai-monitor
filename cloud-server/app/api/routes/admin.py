@@ -11,6 +11,7 @@ from app.schemas import (
     CloudMaintenanceRequest,
     CloudMaintenanceResponse,
     CloudOpsReportResponse,
+    CloudShadowReconcileResponse,
     CreateTaskRequest,
     CreateUserRequest,
     IgnoreArticleClassificationRequest,
@@ -41,6 +42,7 @@ from app.services.admin_service import (
 )
 from app.services.cloud_maintenance_service import run_cloud_maintenance
 from app.services.object_storage_diagnostics import build_object_storage_report, format_object_storage_report
+from app.services.shadow_reconcile_service import build_shadow_reconcile_report, format_shadow_reconcile_report
 from app.services.sync_queue_diagnostics import build_sync_queue_report, format_sync_queue_report
 
 router = APIRouter()
@@ -63,6 +65,13 @@ def object_storage_doctor(admin: AdminUser, db: DbSession) -> CloudOpsReportResp
     del admin
     report = build_object_storage_report(db)
     return CloudOpsReportResponse(report=report, text=format_object_storage_report(report))
+
+
+@router.get("/ops/shadow-reconcile", response_model=CloudShadowReconcileResponse)
+def shadow_reconcile_doctor(admin: AdminUser, db: DbSession) -> CloudShadowReconcileResponse:
+    del admin
+    report = build_shadow_reconcile_report(db)
+    return CloudShadowReconcileResponse(report=report, text=format_shadow_reconcile_report(report))
 
 
 @router.post("/ops/maintenance", response_model=CloudMaintenanceResponse)

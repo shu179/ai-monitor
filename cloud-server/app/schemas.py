@@ -15,6 +15,11 @@ class CloudOpsReportResponse(BaseModel):
     text: str
 
 
+class CloudShadowReconcileResponse(BaseModel):
+    report: dict[str, Any]
+    text: str
+
+
 class CloudMaintenanceRequest(BaseModel):
     dry_run: bool = True
 
