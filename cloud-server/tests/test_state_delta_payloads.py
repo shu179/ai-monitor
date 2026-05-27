@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.services.sync_v2_service import build_state_delta  # noqa: E402
+from app.services.sync_v2_service import build_state_delta, make_reset_token, parse_bootstrap_cursor  # noqa: E402
 
 
 class StateDeltaPayloadTests(unittest.TestCase):
@@ -167,6 +167,58 @@ class StateDeltaPayloadTests(unittest.TestCase):
 
         self.assertEqual(result["changes"][0]["ref_id"], "missing")
         self.assertNotIn("entity", result["changes"][0])
+
+    @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"runs": 10})
+    def test_reset_bootstrap_pages_run_records_by_after_id(self, _snapshot) -> None:
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = [
+            SimpleNamespace(
+                id=1,
+                workspace_id=7,
+                task_id=3,
+                executed_by=9,
+                platform="douyin",
+                keyword="coffee",
+                brand="Acme",
+                mode="browser",
+                result_json={"rank": 1},
+                idempotency_key="run-001",
+                executed_at=now,
+                created_at=now,
+            ),
+            SimpleNamespace(
+                id=2,
+                workspace_id=7,
+                task_id=3,
+                executed_by=9,
+                platform="douyin",
+                keyword="tea",
+                brand="Acme",
+                mode="browser",
+                result_json={"rank": 2},
+                idempotency_key="run-002",
+                executed_at=now,
+                created_at=now,
+            ),
+        ]
+        db = MagicMock()
+        db.scalars.side_effect = [[3], rows]
+        token = make_reset_token(7, ["runs"])
+
+        result = build_state_delta(db, _user(), cursors={}, reset_token=token, limit=1)
+
+        self.assertEqual(result["changes"][0]["entity"]["id"], 1)
+        self.assertTrue(result["has_more"])
+        self.assertEqual(parse_bootstrap_cursor(result["bootstrap_cursor"])["after_id"], 1)
+
+    @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"profile": 1})
+    def test_reset_bootstrap_includes_profile_payload(self, _snapshot) -> None:
+        token = make_reset_token(7, ["profile"])
+        result = build_state_delta(MagicMock(), _user(display_name="Shu"), cursors={}, reset_token=token)
+
+        self.assertEqual(result["changes"][0]["kind"], "profile.bootstrap")
+        self.assertEqual(result["changes"][0]["entity"]["display_name"], "Shu")
+        self.assertFalse(result["has_more"])
 
 
 def _user(**overrides):

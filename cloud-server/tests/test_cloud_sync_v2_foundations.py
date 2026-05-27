@@ -216,12 +216,14 @@ class SyncV2ServiceTests(unittest.TestCase):
 
         cursor = make_bootstrap_cursor(3)
         self.assertEqual(parse_bootstrap_cursor(cursor)["index"], 3)
+        cursor = make_bootstrap_cursor(1, after_id=42)
+        self.assertEqual(parse_bootstrap_cursor(cursor)["after_id"], 42)
 
     @patch("app.services.sync_v2_service._stale_cursor_streams", return_value=["articles"])
     @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"articles": 10})
     def test_state_delta_returns_reset_required_for_stale_cursor(self, _snapshot, _stale) -> None:
         db = MagicMock()
-        user = SimpleNamespace(workspace_id=7)
+        user = SimpleNamespace(id=9, workspace_id=7, role="admin", view_all_tasks=True, username="shu", email=None, email_verified=False, avatar=None, birthday=None, hire_date=None, display_name=None, enabled=True, updated_at=None)
 
         result = build_state_delta(db, user, cursors={"articles": 1})  # type: ignore[arg-type]
 
@@ -232,7 +234,21 @@ class SyncV2ServiceTests(unittest.TestCase):
     @patch("app.services.sync_v2_service.compact_change_snapshot", return_value={"articles": 10, "runs": 3})
     def test_state_delta_reset_token_pages_bootstrap_streams(self, _snapshot) -> None:
         db = MagicMock()
-        user = SimpleNamespace(workspace_id=7)
+        user = SimpleNamespace(
+            id=9,
+            workspace_id=7,
+            role="admin",
+            view_all_tasks=True,
+            username="shu",
+            email=None,
+            email_verified=False,
+            avatar=None,
+            birthday=None,
+            hire_date=None,
+            display_name=None,
+            enabled=True,
+            updated_at=None,
+        )
         token = make_reset_token(7, ["articles", "runs"])
 
         first = build_state_delta(db, user, cursors={}, reset_token=token)  # type: ignore[arg-type]
@@ -241,12 +257,14 @@ class SyncV2ServiceTests(unittest.TestCase):
             user,  # type: ignore[arg-type]
             cursors={},
             reset_token=token,
-            bootstrap_cursor=first["changes"][0]["bootstrap_cursor"],
+            bootstrap_cursor=first["bootstrap_cursor"],
         )
 
         self.assertEqual(first["changes"][0]["stream"], "articles")
+        self.assertEqual(first["changes"][0]["kind"], "articles.bootstrap_complete")
         self.assertTrue(first["has_more"])
         self.assertEqual(second["changes"][0]["stream"], "runs")
+        self.assertEqual(second["changes"][0]["kind"], "runs.bootstrap_complete")
         self.assertFalse(second["has_more"])
 
 

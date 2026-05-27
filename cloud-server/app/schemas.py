@@ -247,6 +247,7 @@ class StateDeltaResponse(BaseModel):
     object_refs: list[dict[str, Any]] = Field(default_factory=list)
     reset_required: bool = False
     reset_token: str | None = None
+    bootstrap_cursor: str | None = None
     retry_after_seconds: int = 0
 
 

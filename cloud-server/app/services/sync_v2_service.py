@@ -16,13 +16,17 @@ from app.models import (
     Article,
     ArticleTaskLink,
     ArticleVersion,
+    BrandTask,
     CloudIdempotencyKey,
     ObjectManifest,
     RunRecord,
     SyncBatch,
     SyncBatchItem,
     SyncEvent,
+    TaskAccessLevel,
+    TaskMember,
     User,
+    UserRole,
     WorkspaceChangeLog,
 )
 from app.schemas import SyncBatchEventIn, SyncEventIn
@@ -31,6 +35,7 @@ from app.services.change_log_service import (
     STREAM_PROFILE,
     STREAM_REFERENCES,
     STREAM_RUNS,
+    STREAM_TASKS,
     compact_change_snapshot,
     list_workspace_changes,
 )
@@ -305,6 +310,7 @@ def build_state_reset_page(
     streams = [str(item) for item in token_payload.get("streams", []) if str(item)]
     cursor_payload = parse_bootstrap_cursor(bootstrap_cursor)
     index = max(0, int(cursor_payload.get("index") or 0))
+    after_id = max(0, int(cursor_payload.get("after_id") or 0))
     if index >= len(streams):
         return {
             "changes": [],
@@ -315,25 +321,23 @@ def build_state_reset_page(
             "reset_token": None,
             "retry_after_seconds": DEFAULT_RETRY_AFTER_SECONDS,
         }
-    stream = streams[index]
     current = compact_change_snapshot(db, user.workspace_id)
+    stream = streams[index]
+    page = _build_reset_stream_page(db, user, stream=stream, after_id=after_id, limit=limit)
+    next_index = index + 1 if not page["has_more"] else index
+    next_after_id = 0 if not page["has_more"] else int(page["next_after_id"])
+    has_more = page["has_more"] or next_index < len(streams)
+    next_cursor = make_bootstrap_cursor(next_index, after_id=next_after_id) if has_more else None
+    next_cursors = {stream: int(current.get(stream) or 0)}
     return {
-        "changes": [
-            {
-                "stream": stream,
-                "seq": int(current.get(stream) or 0),
-                "kind": f"{stream}.reset_required",
-                "ref_id": f"bootstrap:{stream}",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "bootstrap_cursor": make_bootstrap_cursor(index + 1),
-            }
-        ],
-        "next_cursors": {stream: int(current.get(stream) or 0)},
-        "has_more": index + 1 < len(streams),
-        "object_refs": [],
+        "changes": page["changes"],
+        "next_cursors": next_cursors,
+        "has_more": has_more,
+        "object_refs": page["object_refs"],
         "reset_required": False,
-        "reset_token": reset_token if index + 1 < len(streams) else None,
-        "retry_after_seconds": RESET_RETRY_AFTER_SECONDS if index + 1 < len(streams) else DEFAULT_RETRY_AFTER_SECONDS,
+        "reset_token": reset_token if has_more else None,
+        "retry_after_seconds": RESET_RETRY_AFTER_SECONDS if has_more else DEFAULT_RETRY_AFTER_SECONDS,
+        "bootstrap_cursor": next_cursor,
     }
 
 
@@ -348,6 +352,180 @@ def count_pending_materialization(db: Session, *, workspace_id: int) -> int:
             )
         )
         return int(value.scalar_one() or 0)
+    except Exception:
+        return 0
+
+
+def _build_reset_stream_page(db: Session, user: User, *, stream: str, after_id: int, limit: int) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit or LIMITS["state_delta_reset_page_max_items"]), int(LIMITS["state_delta_reset_page_max_items"])))
+    object_refs_by_id: dict[str, dict[str, Any]] = {}
+    if stream == STREAM_TASKS:
+        rows = _reset_task_entities(db, user, after_id=after_id, limit=safe_limit + 1)
+    elif stream == STREAM_RUNS:
+        rows = _reset_run_record_entities(db, user, after_id=after_id, limit=safe_limit + 1)
+    elif stream == STREAM_ARTICLES:
+        rows = _reset_article_entities(db, user, after_id=after_id, limit=safe_limit + 1, object_refs_by_id=object_refs_by_id)
+    elif stream == STREAM_PROFILE:
+        rows = [_state_delta_profile_entity(user)] if after_id <= 0 else []
+    else:
+        rows = []
+    page_rows = rows[:safe_limit]
+    has_more = len(rows) > safe_limit
+    next_after_id = _reset_entity_cursor(page_rows[-1]) if page_rows else after_id
+    changes = [
+        {
+            "stream": stream,
+            "seq": next_after_id,
+            "kind": f"{stream}.bootstrap",
+            "ref_id": f"bootstrap:{stream}:{next_after_id}",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "entity": row,
+        }
+        for row in page_rows
+    ]
+    if not changes and not has_more:
+        changes.append(
+            {
+                "stream": stream,
+                "seq": 0,
+                "kind": f"{stream}.bootstrap_complete",
+                "ref_id": f"bootstrap:{stream}:complete",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "entity": {"type": f"{stream}_bootstrap_complete"},
+            }
+        )
+    return {
+        "changes": changes,
+        "object_refs": list(object_refs_by_id.values()),
+        "has_more": has_more,
+        "next_after_id": next_after_id,
+    }
+
+
+def _reset_task_entities(db: Session, user: User, *, after_id: int, limit: int) -> list[dict[str, Any]]:
+    query = select(BrandTask).where(
+        BrandTask.workspace_id == user.workspace_id,
+        BrandTask.id > int(after_id or 0),
+        BrandTask.deleted_at.is_(None),
+    )
+    if not _user_can_view_all_tasks(user):
+        query = query.join(TaskMember, TaskMember.task_id == BrandTask.id).where(
+            TaskMember.workspace_id == user.workspace_id,
+            TaskMember.user_id == user.id,
+        )
+    query = query.order_by(BrandTask.id.asc()).limit(limit)
+    return [_task_entity(task, _task_access_level_for_user(user)) for task in db.scalars(query)]
+
+
+def _reset_run_record_entities(db: Session, user: User, *, after_id: int, limit: int) -> list[dict[str, Any]]:
+    visible_task_ids = _visible_task_ids_for_state_delta(db, user)
+    if not visible_task_ids:
+        return []
+    rows = db.scalars(
+        select(RunRecord)
+        .where(
+            RunRecord.workspace_id == user.workspace_id,
+            RunRecord.id > int(after_id or 0),
+            RunRecord.task_id.in_(visible_task_ids),
+        )
+        .order_by(RunRecord.id.asc())
+        .limit(limit)
+    )
+    return [_run_record_entity(record) for record in rows]
+
+
+def _reset_article_entities(
+    db: Session,
+    user: User,
+    *,
+    after_id: int,
+    limit: int,
+    object_refs_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    visible_task_ids = _visible_task_ids_for_state_delta(db, user)
+    if not visible_task_ids:
+        return []
+    articles = list(
+        db.scalars(
+            select(Article)
+            .join(ArticleTaskLink, ArticleTaskLink.article_id == Article.id)
+            .where(
+                Article.workspace_id == user.workspace_id,
+                Article.id > int(after_id or 0),
+                ArticleTaskLink.workspace_id == user.workspace_id,
+                ArticleTaskLink.task_id.in_(visible_task_ids),
+            )
+            .distinct()
+            .order_by(Article.id.asc())
+            .limit(limit)
+        )
+    )
+    return [
+        _article_entity_from_article(db, user, article, object_refs_by_id, visible_task_ids=visible_task_ids)
+        for article in articles
+    ]
+
+
+def _visible_task_ids_for_state_delta(db: Session, user: User) -> list[int]:
+    retention_clause = (
+        (BrandTask.deleted_at.is_(None))
+        | (BrandTask.delete_expires_at.is_(None))
+        | (BrandTask.delete_expires_at > datetime.now(timezone.utc))
+    )
+    if _user_can_view_all_tasks(user):
+        rows = db.scalars(
+            select(BrandTask.id).where(
+                BrandTask.workspace_id == user.workspace_id,
+                retention_clause,
+            )
+        )
+        return [int(item) for item in rows]
+    rows = db.scalars(
+        select(TaskMember.task_id)
+        .join(BrandTask, BrandTask.id == TaskMember.task_id)
+        .where(
+            TaskMember.workspace_id == user.workspace_id,
+            TaskMember.user_id == user.id,
+            BrandTask.workspace_id == user.workspace_id,
+            retention_clause,
+        )
+    )
+    return [int(item) for item in rows]
+
+
+def _task_entity(task: BrandTask, access_level: str) -> dict[str, Any]:
+    return {
+        "type": "task",
+        "id": int(task.id),
+        "workspace_id": int(task.workspace_id),
+        "task_key": str(task.task_key or ""),
+        "name": str(task.name or ""),
+        "brand": str(task.brand or ""),
+        "config_json": dict(task.config_json or {}),
+        "config_version": int(task.config_version or 0),
+        "enabled": bool(task.enabled),
+        "deleted_at": _iso_datetime(task.deleted_at),
+        "delete_expires_at": _iso_datetime(task.delete_expires_at),
+        "created_at": _iso_datetime(task.created_at),
+        "updated_at": _iso_datetime(task.updated_at),
+        "access_level": access_level,
+    }
+
+
+def _task_access_level_for_user(user: User) -> str:
+    if getattr(user, "role", None) == UserRole.admin or _enum_value(getattr(user, "role", "")) == "admin":
+        return "admin"
+    return TaskAccessLevel.view.value
+
+
+def _user_can_view_all_tasks(user: User) -> bool:
+    role = _enum_value(getattr(user, "role", ""))
+    return role == "admin" or (role == "viewer" and bool(getattr(user, "view_all_tasks", False)))
+
+
+def _reset_entity_cursor(entity: dict[str, Any]) -> int:
+    try:
+        return int(entity.get("id") or 0)
     except Exception:
         return 0
 
@@ -397,6 +575,10 @@ def _state_delta_run_record_entity(db: Session, user: User, ref_id: str) -> dict
     )
     if record is None:
         return None
+    return _run_record_entity(record)
+
+
+def _run_record_entity(record: RunRecord) -> dict[str, Any]:
     return {
         "type": "run_record",
         "id": int(record.id),
@@ -450,17 +632,24 @@ def _state_delta_article_entity(
     if article is None:
         return None
 
-    task_links = [
-        _article_task_link_entity(link)
-        for link in db.scalars(
-            select(ArticleTaskLink)
-            .where(
-                ArticleTaskLink.workspace_id == user.workspace_id,
-                ArticleTaskLink.article_id == int(article.id),
-            )
-            .order_by(ArticleTaskLink.task_id.asc())
-        )
-    ]
+    return _article_entity_from_article(db, user, article, object_refs_by_id)
+
+
+def _article_entity_from_article(
+    db: Session,
+    user: User,
+    article: Article,
+    object_refs_by_id: dict[str, dict[str, Any]],
+    *,
+    visible_task_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    link_query = select(ArticleTaskLink).where(
+        ArticleTaskLink.workspace_id == user.workspace_id,
+        ArticleTaskLink.article_id == int(article.id),
+    )
+    if visible_task_ids is not None:
+        link_query = link_query.where(ArticleTaskLink.task_id.in_(visible_task_ids or [-1]))
+    task_links = [_article_task_link_entity(link) for link in db.scalars(link_query.order_by(ArticleTaskLink.task_id.asc()))]
     version = db.scalar(
         select(ArticleVersion)
         .where(
@@ -471,7 +660,7 @@ def _state_delta_article_entity(
         .limit(1)
     )
     content_ref = _article_content_ref(db, user, version, object_refs_by_id)
-    entity = {
+    return {
         "type": "article",
         "id": int(article.id),
         "workspace_id": int(article.workspace_id),
@@ -487,7 +676,6 @@ def _state_delta_article_entity(
         "task_links": task_links,
         "content_ref": content_ref,
     }
-    return entity
 
 
 def _article_task_link_entity(link: ArticleTaskLink) -> dict[str, Any]:
@@ -765,8 +953,8 @@ def parse_reset_token(value: str | None) -> dict[str, Any]:
     return payload
 
 
-def make_bootstrap_cursor(index: int) -> str:
-    return _encode_cursor_payload({"v": 1, "index": max(0, int(index or 0))})
+def make_bootstrap_cursor(index: int, *, after_id: int = 0) -> str:
+    return _encode_cursor_payload({"v": 1, "index": max(0, int(index or 0)), "after_id": max(0, int(after_id or 0))})
 
 
 def parse_bootstrap_cursor(value: str | None) -> dict[str, Any]:
