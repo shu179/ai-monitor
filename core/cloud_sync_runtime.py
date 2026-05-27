@@ -297,6 +297,11 @@ class AppCloudRuntimeSupport:
             activate_account_space(copy_legacy=False)
         return {"ok": True, "message": "已退出云端", "cloud": self.current_cloud_status().get("cloud")}
 
+    def flush_cloud_outbox(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        limit = _safe_int(request_payload.get("limit", 100), 100)
+        return self._flush_outbox_fn(limit=limit)
+
     def validate_cloud_session_if_needed(self, *, force: bool = False) -> None:
         store = self._session_store_factory()
         session = store.load()
@@ -522,3 +527,10 @@ class AppCloudRuntimeSupport:
             return SurfacedCloudClient(base_url, timeout_seconds=3.0)
         except TypeError:
             return SurfacedCloudClient(base_url)
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)

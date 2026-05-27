@@ -4807,9 +4807,7 @@ return changedCount
         return self._ensure_cloud_runtime_support().logout_cloud_account()
 
     def flush_cloud_outbox(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        request_payload = payload if isinstance(payload, dict) else {}
-        limit = _safe_int(request_payload.get("limit", 100), 100)
-        return flush_cloud_outbox_events(limit=limit)
+        return self._ensure_cloud_runtime_support().flush_cloud_outbox(payload)
 
     def _recover_cloud_run_history_uploads(self) -> dict[str, Any]:
         return self._ensure_cloud_runtime_support().recover_cloud_run_history_uploads()

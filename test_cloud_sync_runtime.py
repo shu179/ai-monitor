@@ -284,3 +284,24 @@ def test_app_cloud_runtime_support_logout_continues_when_flush_or_remote_logout_
     assert result["ok"] is True
     session_store.clear.assert_called_once()
     owner._activate_current_account_space.assert_called_once_with(copy_legacy=False)
+
+
+def test_app_cloud_runtime_support_flush_cloud_outbox_uses_payload_limit():
+    owner = _support_owner()
+    flush_outbox = Mock(return_value={"ok": True, "metrics": {"event_count": 3}})
+    support = AppCloudRuntimeSupport(owner=owner, flush_outbox_fn=flush_outbox)
+
+    result = support.flush_cloud_outbox({"limit": "250"})
+
+    assert result == {"ok": True, "metrics": {"event_count": 3}}
+    flush_outbox.assert_called_once_with(limit=250)
+
+
+def test_app_cloud_runtime_support_flush_cloud_outbox_defaults_bad_limit():
+    owner = _support_owner()
+    flush_outbox = Mock(return_value={"ok": True})
+    support = AppCloudRuntimeSupport(owner=owner, flush_outbox_fn=flush_outbox)
+
+    support.flush_cloud_outbox({"limit": "not-a-number"})
+
+    flush_outbox.assert_called_once_with(limit=100)
