@@ -206,9 +206,7 @@ from core.cloud_event_types import EVENT_ARTICLE_CHANGED, EVENT_PROFILE_UPDATE, 
 from core.cloud_article_sync import pull_cloud_articles_into_store
 from core.cloud_outbox import CloudOutbox
 from core.cloud_run_sync import (
-    enqueue_cloud_articles,
     enqueue_profile_update,
-    enqueue_recent_cloud_run_records_from_history,
     enqueue_task_day_status,
     flush_cloud_outbox as flush_cloud_outbox_events,
 )
@@ -2076,7 +2074,6 @@ class AppRuntime:
             owner=self,
             session_store_factory=lambda: CloudSessionStore(),
             outbox_factory=lambda: CloudOutbox(),
-            article_enqueue_fn=lambda articles, config: enqueue_cloud_articles(articles, config),
             thread_factory=lambda *args, **kwargs: threading.Thread(*args, **kwargs),
             sleep_fn=lambda seconds: time.sleep(seconds),
             status_client_factory=lambda base_url: SurfacedCloudClient(base_url, timeout_seconds=3.0),
@@ -4833,38 +4830,7 @@ return changedCount
         return flush_cloud_outbox_events(limit=limit)
 
     def _recover_cloud_run_history_uploads(self) -> dict[str, Any]:
-        try:
-            with self._lock:
-                config = self.load_config()
-            session = CloudSessionStore().load()
-            session_outbox = CloudOutbox().bind_to_session(session)
-            run_metrics = enqueue_recent_cloud_run_records_from_history(config, outbox=session_outbox, days=7)
-            articles, deferred_refresh = self._get_cloud_article_upload_snapshot_with_refresh_state(
-                config,
-                session=session,
-            )
-            if deferred_refresh:
-                self._schedule_cloud_articles_snapshot_retry()
-                article_metrics = {
-                    "deferred": True,
-                    "reason": "match_refresh_deferred",
-                    "articles": len(articles),
-                    "queued": 0,
-                }
-            else:
-                article_metrics = enqueue_cloud_articles(
-                    articles,
-                    config,
-                    outbox=session_outbox,
-                )
-            return {
-                "ok": True,
-                **run_metrics,
-                "run_records": run_metrics,
-                "articles_sync": article_metrics,
-            }
-        except Exception as exc:
-            return {"ok": False, "message": f"本地运行历史恢复失败：{exc}"}
+        return self._ensure_cloud_runtime_support().recover_cloud_run_history_uploads()
 
     def pull_cloud_tasks(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}

@@ -145,3 +145,76 @@ def test_app_cloud_runtime_support_retries_request_after_refresh():
     session_store.refresh_login_if_current.assert_called_once()
     assert operation.call_args_list[0].args == (client, "old-access")
     assert operation.call_args_list[1].args == (client, "new-access")
+
+
+def test_app_cloud_runtime_support_recovers_run_history_and_articles_into_session_outbox():
+    owner = _support_owner()
+    owner.load_config.return_value = {"tasks": [{"cloud_task_id": 42}]}
+    owner._get_cloud_article_upload_snapshot_with_refresh_state.return_value = ([{"title": "A"}], False)
+    session = {
+        "base_url": "https://api.surfacedlab.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3},
+    }
+    session_store = MagicMock()
+    session_store.load.return_value = session
+    outbox = MagicMock()
+    bound_outbox = MagicMock()
+    outbox.bind_to_session.return_value = bound_outbox
+    article_enqueue = Mock(return_value={"articles": 1, "queued": 1})
+
+    with patch(
+        "core.cloud_sync_runtime.enqueue_recent_cloud_run_records_from_history",
+        return_value={"records": 2, "queued": 2},
+    ) as run_enqueue:
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            outbox_factory=lambda: outbox,
+            article_enqueue_fn=article_enqueue,
+        )
+
+        result = support.recover_cloud_run_history_uploads()
+
+    assert result["ok"] is True
+    assert result["run_records"] == {"records": 2, "queued": 2}
+    assert result["articles_sync"] == {"articles": 1, "queued": 1}
+    outbox.bind_to_session.assert_called_once_with(session)
+    run_enqueue.assert_called_once_with(owner.load_config.return_value, outbox=bound_outbox, days=7)
+    article_enqueue.assert_called_once_with([{"title": "A"}], owner.load_config.return_value, outbox=bound_outbox)
+
+
+def test_app_cloud_runtime_support_schedules_retry_when_recovery_article_snapshot_is_deferred():
+    owner = _support_owner()
+    owner.load_config.return_value = {"tasks": []}
+    owner._get_cloud_article_upload_snapshot_with_refresh_state.return_value = ([{"title": "stale"}], True)
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.surfacedlab.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3},
+    }
+    outbox = MagicMock()
+    outbox.bind_to_session.return_value = MagicMock()
+    article_enqueue = Mock()
+    support = AppCloudRuntimeSupport(
+        owner=owner,
+        session_store_factory=lambda: session_store,
+        outbox_factory=lambda: outbox,
+        article_enqueue_fn=article_enqueue,
+        thread_factory=lambda *args, **kwargs: MagicMock(start=lambda: None, is_alive=lambda: False),
+    )
+
+    with patch(
+        "core.cloud_sync_runtime.enqueue_recent_cloud_run_records_from_history",
+        return_value={"records": 0, "queued": 0},
+    ):
+        result = support.recover_cloud_run_history_uploads()
+
+    assert result["ok"] is True
+    assert result["articles_sync"]["deferred"] is True
+    assert result["articles_sync"]["queued"] == 0
+    owner._schedule_cloud_articles_snapshot_retry.assert_called_once()
+    article_enqueue.assert_not_called()

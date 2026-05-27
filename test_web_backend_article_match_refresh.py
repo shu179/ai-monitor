@@ -158,7 +158,7 @@ class WebBackendArticleMatchRefreshTests(unittest.TestCase):
                 "web_backend.refresh_article_matches",
                 side_effect=AssertionError("deferred refresh must not sync refresh"),
             ) as refresh_mock,
-            patch("web_backend.enqueue_cloud_articles") as enqueue_mock,
+            patch("core.cloud_sync_runtime.enqueue_cloud_articles") as enqueue_mock,
             patch.object(runtime, "_schedule_cloud_articles_snapshot_retry") as retry_mock,
         ):
             runtime._enqueue_cloud_articles_snapshot(_config())
@@ -211,7 +211,7 @@ class WebBackendArticleMatchRefreshTests(unittest.TestCase):
             ),
             patch("web_backend.get_articles", return_value=copy.deepcopy(stale_articles)),
             patch("web_backend.refresh_article_matches", return_value=copy.deepcopy(fresh_articles)) as refresh_mock,
-            patch("web_backend.enqueue_cloud_articles", return_value={"articles": 1, "queued": 1}) as enqueue_mock,
+            patch("core.cloud_sync_runtime.enqueue_cloud_articles", return_value={"articles": 1, "queued": 1}) as enqueue_mock,
             patch.object(runtime, "_schedule_cloud_articles_snapshot_retry") as retry_mock,
         ):
             runtime._enqueue_cloud_articles_snapshot(_config())
@@ -238,7 +238,7 @@ class WebBackendArticleMatchRefreshTests(unittest.TestCase):
             patch("web_backend.CloudSessionStore", return_value=_FakeCloudSessionStore(_cloud_session())),
             patch("web_backend.CloudOutbox", return_value=fake_outbox),
             patch(
-                "web_backend.enqueue_recent_cloud_run_records_from_history",
+                "core.cloud_sync_runtime.enqueue_recent_cloud_run_records_from_history",
                 return_value={"run_queued": 2},
             ) as run_enqueue_mock,
             patch(
@@ -250,7 +250,7 @@ class WebBackendArticleMatchRefreshTests(unittest.TestCase):
                 "web_backend.refresh_article_matches",
                 side_effect=AssertionError("deferred recovery must not sync refresh"),
             ) as refresh_mock,
-            patch("web_backend.enqueue_cloud_articles") as article_enqueue_mock,
+            patch("core.cloud_sync_runtime.enqueue_cloud_articles") as article_enqueue_mock,
             patch.object(runtime, "_schedule_cloud_articles_snapshot_retry") as retry_mock,
         ):
             result = runtime._recover_cloud_run_history_uploads()

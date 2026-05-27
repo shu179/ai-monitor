@@ -16,7 +16,7 @@ from typing import Any, Callable
 from core.cloud_client import CloudClientError, SurfacedCloudClient
 from core.cloud_event_types import EVENT_PROFILE_UPDATE
 from core.cloud_outbox import CloudOutbox
-from core.cloud_run_sync import enqueue_cloud_articles
+from core.cloud_run_sync import enqueue_cloud_articles, enqueue_recent_cloud_run_records_from_history
 from core.cloud_session_store import (
     CloudSessionChangedError,
     CloudSessionStore,
@@ -106,7 +106,7 @@ class AppCloudRuntimeSupport:
         owner: Any,
         session_store_factory: Callable[[], Any] = CloudSessionStore,
         outbox_factory: Callable[[], Any] = CloudOutbox,
-        article_enqueue_fn: Callable[[list[dict[str, Any]], dict[str, Any]], dict[str, Any] | None] = enqueue_cloud_articles,
+        article_enqueue_fn: Callable[..., dict[str, Any] | None] | None = None,
         thread_factory: Callable[..., Any] = threading.Thread,
         sleep_fn: Callable[[float], None] = time.sleep,
         status_client_factory: Callable[[str], Any] | None = None,
@@ -120,7 +120,7 @@ class AppCloudRuntimeSupport:
         self._owner = owner
         self._session_store_factory = session_store_factory
         self._outbox_factory = outbox_factory
-        self._article_enqueue_fn = article_enqueue_fn
+        self._article_enqueue_fn = article_enqueue_fn or enqueue_cloud_articles
         self._thread_factory = thread_factory
         self._sleep_fn = sleep_fn
         self._status_client_factory = status_client_factory or self._default_status_client_factory
@@ -229,6 +229,44 @@ class AppCloudRuntimeSupport:
             schedule()
         else:
             self.schedule_article_snapshot()
+
+    def recover_cloud_run_history_uploads(self) -> dict[str, Any]:
+        """Recover local run/article sync candidates into the current account outbox."""
+        try:
+            config = self._load_runtime_config_locked()
+            session = self._session_store_factory().load()
+            session_outbox = self._outbox_factory().bind_to_session(session)
+            run_metrics = enqueue_recent_cloud_run_records_from_history(config, outbox=session_outbox, days=7)
+            articles, deferred_refresh = self._owner._get_cloud_article_upload_snapshot_with_refresh_state(
+                config,
+                session=session,
+            )
+            if deferred_refresh:
+                retry = getattr(self._owner, "_schedule_cloud_articles_snapshot_retry", None)
+                if callable(retry):
+                    retry()
+                else:
+                    self.schedule_article_snapshot_retry()
+                article_metrics = {
+                    "deferred": True,
+                    "reason": "match_refresh_deferred",
+                    "articles": len(articles),
+                    "queued": 0,
+                }
+            else:
+                article_metrics = self._article_enqueue_fn(
+                    articles,
+                    config,
+                    outbox=session_outbox,
+                )
+            return {
+                "ok": True,
+                **run_metrics,
+                "run_records": run_metrics,
+                "articles_sync": article_metrics,
+            }
+        except Exception as exc:
+            return {"ok": False, "message": f"本地运行历史恢复失败：{exc}"}
 
     def validate_cloud_session_if_needed(self, *, force: bool = False) -> None:
         store = self._session_store_factory()
@@ -416,6 +454,13 @@ class AppCloudRuntimeSupport:
             loaded = config_provider.load()
             return loaded if isinstance(loaded, dict) else {}
         return {}
+
+    def _load_runtime_config_locked(self) -> dict[str, Any]:
+        lock = getattr(self._owner, "_lock", None)
+        if lock is None:
+            return self._load_runtime_config()
+        with lock:
+            return self._load_runtime_config()
 
     def _read_article_snapshot_startup_delay_seconds(self) -> float:
         try:
