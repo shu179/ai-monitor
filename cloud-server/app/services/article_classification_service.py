@@ -17,6 +17,7 @@ from app.models import (
     ClassificationStatus,
     User,
 )
+from app.services.change_log_service import record_workspace_change
 
 _TOKEN_SPLIT_RE = re.compile(r"[\s,，、/|;；:：!！?？()（）\\[\\]【】\"'“”‘’<>《》]+")
 
@@ -252,6 +253,13 @@ def resolve_article_classification_job(
     )
     job.updated_at = now
     article.updated_at = now
+    record_workspace_change(
+        db,
+        workspace_id=admin.workspace_id,
+        stream="articles",
+        kind="article.classification_resolved",
+        ref_id=str(article.id),
+    )
     db.commit()
     db.refresh(job)
     db.refresh(article)
@@ -282,6 +290,13 @@ def ignore_article_classification_job(
     )
     job.updated_at = now
     article.updated_at = now
+    record_workspace_change(
+        db,
+        workspace_id=admin.workspace_id,
+        stream="articles",
+        kind="article.classification_ignored",
+        ref_id=str(article.id),
+    )
     db.commit()
     db.refresh(job)
     db.refresh(article)

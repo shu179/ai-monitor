@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password, utc_now
+from app.services.change_log_service import record_workspace_change
 from app.models import (
     BrandTask,
     TaskAccessLevel,
@@ -123,6 +124,21 @@ def create_workspace_user(
                 view_all_tasks=bool(view_all_tasks),
                 visible_task_ids=visible_task_ids or [],
             )
+        record_workspace_change(
+            db,
+            workspace_id=admin.workspace_id,
+            stream="profile",
+            kind="admin.user_created",
+            ref_id=str(user.id),
+        )
+        if user.role == UserRole.viewer and not bool(getattr(user, "view_all_tasks", False)):
+            record_workspace_change(
+                db,
+                workspace_id=admin.workspace_id,
+                stream="tasks",
+                kind="viewer.scope_changed",
+                ref_id=str(user.id),
+            )
         db.commit()
     except HTTPException:
         db.rollback()
@@ -198,6 +214,33 @@ def update_workspace_user(
         user.token_version += 1
     user.updated_at = utc_now()
     try:
+        scope_changed = user.role == UserRole.viewer and (
+            "view_all_tasks" in fields_set or "visible_task_ids" in fields_set
+        )
+        profile_changed = bool(
+            next_username is not None
+            or password
+            or email is not None
+            or "birthday" in fields_set
+            or "hire_date" in fields_set
+            or enabled is not None
+        )
+        if profile_changed:
+            record_workspace_change(
+                db,
+                workspace_id=admin.workspace_id,
+                stream="profile",
+                kind="admin.user_updated",
+                ref_id=str(user.id),
+            )
+        if scope_changed:
+            record_workspace_change(
+                db,
+                workspace_id=admin.workspace_id,
+                stream="tasks",
+                kind="viewer.scope_changed",
+                ref_id=str(user.id),
+            )
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -401,6 +444,20 @@ def delete_workspace_user(db: Session, admin: User, user_id: int) -> None:
     user.token_version += 1
     user.deleted_at = now
     user.updated_at = now
+    record_workspace_change(
+        db,
+        workspace_id=admin.workspace_id,
+        stream="profile",
+        kind="admin.user_deleted",
+        ref_id=str(user.id),
+    )
+    record_workspace_change(
+        db,
+        workspace_id=admin.workspace_id,
+        stream="tasks",
+        kind="task.assignment_changed",
+        ref_id=f"user:{user.id}",
+    )
     db.commit()
 
 
@@ -490,6 +547,14 @@ def create_task(
     )
     db.add(task)
     try:
+        db.flush()
+        record_workspace_change(
+            db,
+            workspace_id=admin.workspace_id,
+            stream="tasks",
+            kind="task.created",
+            ref_id=str(task.id),
+        )
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -577,6 +642,13 @@ def update_task(
     if changed:
         task.config_version = int(task.config_version or 1) + 1
         task.updated_at = utc_now()
+        record_workspace_change(
+            db,
+            workspace_id=admin.workspace_id,
+            stream="tasks",
+            kind="task.updated",
+            ref_id=str(task.id),
+        )
         db.commit()
         db.refresh(task)
     return task
@@ -655,6 +727,13 @@ def assign_task_member(
         assigned_by=admin.id,
     )
     db.add(event)
+    record_workspace_change(
+        db,
+        workspace_id=admin.workspace_id,
+        stream="tasks",
+        kind="task.assignment_changed",
+        ref_id=str(task.id),
+    )
     db.commit()
     db.refresh(member)
     return member
@@ -703,6 +782,13 @@ def clear_task_operator_assignment(
             )
         )
         db.delete(old_member)
+    record_workspace_change(
+        db,
+        workspace_id=admin.workspace_id,
+        stream="tasks",
+        kind="task.assignment_changed",
+        ref_id=str(task.id),
+    )
     db.commit()
 
 
@@ -733,6 +819,13 @@ def delete_task(db: Session, admin: User, task_id: int) -> BrandTask:
     task.deleted_by = admin.id
     task.config_version = int(task.config_version or 1) + 1
     task.updated_at = now
+    record_workspace_change(
+        db,
+        workspace_id=admin.workspace_id,
+        stream="tasks",
+        kind="task.deleted",
+        ref_id=str(task.id),
+    )
     db.commit()
     db.refresh(task)
     return task
@@ -764,6 +857,13 @@ def restore_task(db: Session, admin: User, task_id: int) -> BrandTask:
     task.deleted_by = None
     task.config_version = int(task.config_version or 1) + 1
     task.updated_at = utc_now()
+    record_workspace_change(
+        db,
+        workspace_id=admin.workspace_id,
+        stream="tasks",
+        kind="task.restored",
+        ref_id=str(task.id),
+    )
     db.commit()
     db.refresh(task)
     return task

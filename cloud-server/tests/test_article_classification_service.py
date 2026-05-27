@@ -139,6 +139,7 @@ class ArticleClassificationServiceTests(unittest.TestCase):
         with (
             patch("app.services.article_classification_service._get_workspace_job_with_article", return_value=(job, article)),
             patch("app.services.article_classification_service._links_by_article_id", return_value={7: []}),
+            patch("app.services.article_classification_service.record_workspace_change") as record_change,
         ):
             result = resolve_article_classification_job(
                 db,
@@ -152,7 +153,8 @@ class ArticleClassificationServiceTests(unittest.TestCase):
         self.assertEqual(job.resolved_task_id, 42)
         self.assertEqual(job.resolved_by, 1)
         self.assertEqual(result["status"], "resolved")
-        db.execute.assert_called_once()
+        record_change.assert_called_once()
+        self.assertEqual(record_change.call_args.kwargs["stream"], "articles")
         db.commit.assert_called_once()
 
     def test_list_article_classification_jobs_includes_article_payload(self) -> None:

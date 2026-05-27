@@ -21,7 +21,7 @@ from app.services.admin_service import (  # noqa: E402
     update_workspace_user,
     workspace_user_public_payload,
 )
-from app.services.auth_service import login_user  # noqa: E402
+from app.services.auth_service import login_user, update_my_profile  # noqa: E402
 
 
 class UserAccountIdentityTests(unittest.TestCase):
@@ -151,7 +151,10 @@ class UserAccountIdentityTests(unittest.TestCase):
         db.scalar.return_value = None
         admin = SimpleNamespace(id=1, workspace_id=7)
 
-        with patch("app.services.admin_service._replace_viewer_visible_tasks") as replace_scope:
+        with (
+            patch("app.services.admin_service._replace_viewer_visible_tasks") as replace_scope,
+            patch("app.services.admin_service.record_workspace_change") as record_change,
+        ):
             created = create_workspace_user(
                 db,
                 admin,  # type: ignore[arg-type]
@@ -168,6 +171,7 @@ class UserAccountIdentityTests(unittest.TestCase):
 
         self.assertTrue(created.view_all_tasks)
         replace_scope.assert_called_once()
+        self.assertGreaterEqual(record_change.call_count, 1)
         _, _, scoped_user = replace_scope.call_args.args
         self.assertIs(scoped_user, created)
         self.assertEqual(replace_scope.call_args.kwargs["view_all_tasks"], True)
@@ -191,7 +195,10 @@ class UserAccountIdentityTests(unittest.TestCase):
         db.scalar.side_effect = [user]
         admin = SimpleNamespace(id=1, workspace_id=7)
 
-        with patch("app.services.admin_service._replace_viewer_visible_tasks") as replace_scope:
+        with (
+            patch("app.services.admin_service._replace_viewer_visible_tasks") as replace_scope,
+            patch("app.services.admin_service.record_workspace_change") as record_change,
+        ):
             update_workspace_user(
                 db,
                 admin,  # type: ignore[arg-type]
@@ -209,7 +216,37 @@ class UserAccountIdentityTests(unittest.TestCase):
             )
 
         replace_scope.assert_called_once()
+        self.assertGreaterEqual(record_change.call_count, 1)
         self.assertEqual(replace_scope.call_args.kwargs["visible_task_ids"], [8])
+
+    def test_update_my_profile_records_profile_change(self) -> None:
+        db = Mock()
+        user = SimpleNamespace(
+            id=2,
+            workspace_id=7,
+            role=UserRole.admin,
+            display_name="旧名字",
+            avatar=None,
+            birthday=None,
+            hire_date=None,
+        )
+
+        with patch("app.services.auth_service.record_workspace_change") as record_change:
+            updated = update_my_profile(
+                db,
+                user,  # type: ignore[arg-type]
+                display_name="新名字",
+                avatar="https://example.com/avatar.png",
+                birthday=None,
+                hire_date=None,
+                fields_set={"display_name", "avatar"},
+            )
+
+        self.assertIs(updated, user)
+        self.assertEqual(user.display_name, "新名字")
+        self.assertEqual(user.avatar, "https://example.com/avatar.png")
+        record_change.assert_called_once()
+        self.assertEqual(record_change.call_args.kwargs["stream"], "profile")
 
     def test_list_workspace_users_includes_viewer_visible_task_ids(self) -> None:
         admin_user = SimpleNamespace(

@@ -86,9 +86,16 @@ def record_workspace_change(
         )
         .returning(WorkspaceChangeSequence.seq)
     )
-    seq = int(db.scalar(stmt) or 0)
-    db.add(
-        WorkspaceChangeLog(
+    result = db.execute(stmt)
+    seq_value: Any = None
+    scalar_one_or_none = getattr(result, "scalar_one_or_none", None)
+    if callable(scalar_one_or_none):
+        seq_value = scalar_one_or_none()
+    elif callable(getattr(result, "scalar", None)):
+        seq_value = result.scalar()
+    seq = _coerce_change_seq(seq_value)
+    db.execute(
+        insert(WorkspaceChangeLog).values(
             workspace_id=safe_workspace_id,
             stream=safe_stream,
             seq=seq,
@@ -189,3 +196,11 @@ def _decode_notify_payload(payload: str) -> dict[str, Any]:
     except Exception:
         return {}
     return decoded if isinstance(decoded, dict) else {}
+
+
+def _coerce_change_seq(value: Any) -> int:
+    try:
+        seq = int(value or 0)
+    except Exception:
+        return 0
+    return max(0, seq)

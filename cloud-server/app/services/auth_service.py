@@ -19,6 +19,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models import DeviceSession, EmailVerificationCode, RefreshToken, User, UserRole, Workspace
+from app.services.change_log_service import record_workspace_change
 from app.services.email_service import EmailDeliveryError, send_verification_code_email
 
 EMAIL_PURPOSE_ADMIN_REGISTER = "admin_register"
@@ -354,16 +355,29 @@ def update_my_profile(
     hire_date: date | None,
     fields_set: set[str],
 ) -> User:
+    profile_changed = False
     if "avatar" in fields_set:
         user.avatar = str(avatar or "").strip() or None
+        profile_changed = True
     if user.role == UserRole.admin:
         if "display_name" in fields_set:
             user.display_name = str(display_name or "").strip() or None
+            profile_changed = True
         if "birthday" in fields_set:
             user.birthday = birthday
+            profile_changed = True
         if "hire_date" in fields_set:
             user.hire_date = hire_date
+            profile_changed = True
     user.updated_at = utc_now()
+    if profile_changed:
+        record_workspace_change(
+            db,
+            workspace_id=user.workspace_id,
+            stream="profile",
+            kind="profile.updated",
+            ref_id=str(user.id),
+        )
     db.commit()
     db.refresh(user)
     return user
