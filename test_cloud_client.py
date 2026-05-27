@@ -74,6 +74,23 @@ class FakeStreamResponse:
         pass
 
 
+class FakeBinaryResponse:
+    status_code = 200
+    content = b""
+    text = ""
+
+    def __init__(self, chunks: list[bytes] | None = None) -> None:
+        self._chunks = chunks or [b"object-", b"bytes"]
+        self.closed = False
+
+    def iter_content(self, chunk_size: int = 1024):
+        del chunk_size
+        return iter(self._chunks)
+
+    def close(self):
+        self.closed = True
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -105,6 +122,12 @@ class FakeStreamSession(FakeSession):
     def request(self, method: str, url: str, **kwargs):
         self.calls.append({"method": method, "url": url, **kwargs})
         return FakeStreamResponse()
+
+
+class FakeBinarySession(FakeSession):
+    def request(self, method: str, url: str, **kwargs):
+        self.calls.append({"method": method, "url": url, **kwargs})
+        return FakeBinaryResponse()
 
 
 class FakeTimeoutSession(FakeSession):
@@ -366,6 +389,28 @@ class CloudClientTests(unittest.TestCase):
         self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
         self.assertEqual(session.calls[0]["headers"]["X-Trace-Id"], "object.trace")
         self.assertEqual(session.calls[0]["headers"]["X-Cloud-Capability"], "sync-v2,batch-v2,object-v1,state-delta-v1")
+
+    def test_iter_object_content_resolves_relative_url_with_authorization(self):
+        session = FakeBinarySession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        chunks = list(client.iter_object_content("access-token", "/api/v2/objects/object-1/content", trace_id="obj.1"))
+
+        self.assertEqual(chunks, [b"object-", b"bytes"])
+        self.assertEqual(session.calls[0]["method"], "GET")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v2/objects/object-1/content")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+        self.assertEqual(session.calls[0]["headers"]["X-Trace-Id"], "obj.1")
+        self.assertTrue(session.calls[0]["stream"])
+
+    def test_iter_object_content_external_presigned_url_omits_authorization(self):
+        session = FakeBinarySession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        list(client.iter_object_content("access-token", "https://cdn.example.com/object?sig=1"))
+
+        self.assertEqual(session.calls[0]["url"], "https://cdn.example.com/object?sig=1")
+        self.assertNotIn("Authorization", session.calls[0]["headers"])
 
     def test_trace_id_helpers_sanitize_values(self):
         self.assertEqual(normalize_trace_id(" abc/def! "), "abcdef")

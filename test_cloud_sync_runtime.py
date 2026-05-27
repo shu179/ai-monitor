@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import tempfile
+import hashlib
 from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -11,6 +12,7 @@ import core.history as history_module
 from core.cloud_agent_status_store import CloudAgentStatusStore
 from core.cloud_client import CloudClientError
 from core.cloud_content_state_store import CloudContentStateStore
+from core.cloud_object_cache import CloudObjectCache
 from core.cloud_state_delta_inbox import CloudStateDeltaInbox
 from core.cloud_sync_runtime import (
     AppCloudRuntimeSupport,
@@ -1240,6 +1242,7 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
         session_store_factory=lambda: session_store,
         outbox_factory=lambda: outbox,
         auto_sync_status_getter=lambda: auto_sync_status,
+        object_cache_factory=lambda: MagicMock(diagnostics=lambda: {"objects": 4, "bytes": 12345}),
     )
 
     with (
@@ -1268,11 +1271,107 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     assert health["summary"]["agent_status_total"] == 2
     assert health["summary"]["answers_cached"] == 7
     assert health["summary"]["assets_cached"] == 9
+    assert health["summary"]["object_cache_objects"] == 4
+    assert health["summary"]["object_cache_bytes"] == 12345
     assert health["summary"]["healthy"] is True
     assert health["auto_sync"] == auto_sync_status
     assert health["state_delta"] == {"cursors": {"tasks": 2}}
     bound_outbox.diagnostics.assert_called_once_with(failed_limit=3)
     inbox_cls.return_value.diagnostics.assert_called_once_with(failed_limit=3)
+
+
+def test_app_cloud_runtime_support_cache_object_downloads_to_file_cache():
+    owner = _support_owner()
+    data = b"downloaded object bytes"
+    sha256 = hashlib.sha256(data).hexdigest()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+
+    class FakeClient:
+        def __init__(self, base_url: str) -> None:
+            self.base_url = base_url
+
+        def create_object_download(self, token: str, object_id: str, *, trace_id: str = ""):
+            assert token == "access"
+            assert object_id == "object-1"
+            assert trace_id == "trace-1"
+            return {
+                "object_id": object_id,
+                "download_url": "/api/v2/objects/object-1/content",
+                "size_bytes": len(data),
+                "content_type": "text/plain",
+                "compression": "none",
+            }
+
+        def iter_object_content(self, token: str, download_url: str, *, trace_id: str = ""):
+            assert token == "access"
+            assert download_url == "/api/v2/objects/object-1/content"
+            assert trace_id == "trace-1"
+            return iter([data[:10], data[10:]])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = CloudObjectCache(Path(tmp) / "cache")
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            request_client_factory=FakeClient,
+            object_cache_factory=lambda: cache,
+        )
+
+        result = support.handle_command(
+            "cloud.cache_object",
+            {
+                "trace_id": "trace-1",
+                "object_ref": {
+                    "object_id": "object-1",
+                    "sha256": sha256,
+                    "size_bytes": len(data),
+                    "content_type": "text/plain",
+                },
+            },
+        )
+
+        assert result["ok"] is True
+        assert result["downloaded"] is True
+        assert Path(result["cached"]["path"]).read_bytes() == data
+
+
+def test_app_cloud_runtime_support_cache_object_reuses_valid_cached_file():
+    owner = _support_owner()
+    data = b"already cached"
+    ref = {
+        "object_id": "object-1",
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size_bytes": len(data),
+    }
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = CloudObjectCache(Path(tmp) / "cache")
+        cache.cache_bytes(ref, [data])
+        client_factory = MagicMock()
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            request_client_factory=client_factory,
+            object_cache_factory=lambda: cache,
+        )
+
+        result = support.handle_command("cloud.cache_object", {"object_ref": ref})
+
+        assert result["ok"] is True
+        assert result["downloaded"] is False
+        client_factory.assert_not_called()
 
 
 def test_app_cloud_runtime_support_command_returns_current_status_variants():

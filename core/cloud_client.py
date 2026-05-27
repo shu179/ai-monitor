@@ -6,6 +6,7 @@ from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -249,6 +250,61 @@ class SurfacedCloudClient:
             extra_headers={"X-Cloud-Capability": DEFAULT_CLOUD_CAPABILITY_HEADER},
         )
         return response if isinstance(response, dict) else {}
+
+    def iter_object_content(
+        self,
+        access_token: str,
+        download_url: str,
+        *,
+        trace_id: str = "",
+        chunk_size: int = 1024 * 1024,
+        read_timeout_seconds: float = 120.0,
+    ) -> Iterator[bytes]:
+        safe_url = _resolve_download_url(self.base_url, download_url)
+        if not safe_url:
+            raise CloudClientError("download_url is required")
+        headers = {"Accept": "application/octet-stream"}
+        token = str(access_token or "").strip()
+        if token and _should_authorize_download_url(self.base_url, safe_url, download_url):
+            headers["Authorization"] = f"Bearer {token}"
+        safe_trace_id = normalize_trace_id(trace_id)
+        if safe_trace_id:
+            headers["X-Trace-Id"] = safe_trace_id
+
+        try:
+            response = self._session.request(
+                "GET",
+                safe_url,
+                headers=headers,
+                stream=True,
+                timeout=(min(10.0, self.timeout_seconds), max(30.0, float(read_timeout_seconds or 120.0))),
+            )
+        except requests.RequestException as exc:
+            raise CloudClientError(_format_request_exception("云端对象下载", exc)) from exc
+
+        try:
+            body = None
+            if response.status_code >= 400:
+                body = _decode_response_body(response)
+                message = _extract_error_message(body) or f"云端对象下载失败：HTTP {response.status_code}"
+                raise CloudClientError(
+                    message,
+                    status_code=response.status_code,
+                    response_body=body,
+                    **_extract_backpressure_metadata(response, body),
+                )
+            safe_chunk_size = max(1, int(chunk_size or 1024 * 1024))
+            try:
+                for chunk in response.iter_content(chunk_size=safe_chunk_size):
+                    if chunk:
+                        yield bytes(chunk)
+            except requests.RequestException as exc:
+                raise CloudClientError(_format_request_exception("云端对象下载", exc)) from exc
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
 
     def list_tasks(self, access_token: str) -> list[dict[str, Any]]:
         payload = self._request("GET", "/api/v1/tasks", access_token=access_token)
@@ -727,6 +783,32 @@ def _header_value(headers: Any, key: str) -> Any:
     except Exception:
         return None
     return None
+
+
+def _resolve_download_url(base_url: str, download_url: str) -> str:
+    text = str(download_url or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        return text
+    if not base_url:
+        return text
+    if text.startswith("/"):
+        return f"{base_url}{text}"
+    return urljoin(f"{base_url}/", text)
+
+
+def _should_authorize_download_url(base_url: str, resolved_url: str, raw_url: str) -> bool:
+    raw_text = str(raw_url or "").strip()
+    if not raw_text:
+        return False
+    raw_parsed = urlparse(raw_text)
+    if not raw_parsed.scheme and not raw_parsed.netloc:
+        return True
+    base = urlparse(base_url)
+    target = urlparse(resolved_url)
+    return bool(base.scheme and base.netloc and base.scheme == target.scheme and base.netloc == target.netloc)
 
 
 def _parse_retry_after(value: Any) -> float | None:

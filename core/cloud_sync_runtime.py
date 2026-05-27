@@ -20,6 +20,7 @@ from core.cloud_article_sync import (
 from core.cloud_agent_status_store import CloudAgentStatusStore
 from core.cloud_client import CloudClientError, SurfacedCloudClient
 from core.cloud_content_state_store import CloudContentStateStore
+from core.cloud_object_cache import CloudObjectCache, CloudObjectCacheError, normalize_object_ref
 from core.cloud_sync_daemon import InProcessCloudSyncCommandClient
 from core.cloud_event_types import EVENT_PROFILE_UPDATE
 from core.cloud_outbox import CloudOutbox
@@ -142,6 +143,7 @@ class AppCloudRuntimeSupport:
         sleep_fn: Callable[[float], None] = time.sleep,
         status_client_factory: Callable[[str], Any] | None = None,
         request_client_factory: Callable[[str], Any] | None = None,
+        object_cache_factory: Callable[[], Any] | None = None,
         auto_sync_status_getter: Callable[[], dict[str, Any]] | None = None,
         current_account_config_path_getter: Callable[[], Any] = current_account_config_path,
         account_profile_dir_getter: Callable[[dict[str, Any] | None], Any] = account_profile_dir_from_session,
@@ -160,6 +162,7 @@ class AppCloudRuntimeSupport:
         self._sleep_fn = sleep_fn
         self._status_client_factory = status_client_factory or self._default_status_client_factory
         self._request_client_factory = request_client_factory or SurfacedCloudClient
+        self._object_cache_factory = object_cache_factory or CloudObjectCache
         self._auto_sync_status_getter = auto_sync_status_getter or (lambda: {})
         self._current_account_config_path_getter = current_account_config_path_getter
         self._account_profile_dir_getter = account_profile_dir_getter
@@ -393,6 +396,7 @@ class AppCloudRuntimeSupport:
         inbox = CloudStateDeltaInbox().diagnostics(failed_limit=failed_limit)
         agent_status = CloudAgentStatusStore().diagnostics(session)
         content_state = CloudContentStateStore().diagnostics(session)
+        object_cache = self._object_cache_factory().diagnostics()
         auto_sync = self._safe_auto_sync_status()
         return {
             "ok": True,
@@ -404,6 +408,7 @@ class AppCloudRuntimeSupport:
                     inbox=inbox,
                     agent_status=agent_status,
                     content_state=content_state,
+                    object_cache=object_cache,
                 ),
                 "auto_sync": auto_sync,
                 "outbox": outbox,
@@ -411,6 +416,7 @@ class AppCloudRuntimeSupport:
                 "inbox": inbox,
                 "agent_status": agent_status,
                 "content_state": content_state,
+                "object_cache": object_cache,
             },
         }
 
@@ -454,6 +460,10 @@ class AppCloudRuntimeSupport:
             return self.cloud_outbox_diagnostics(request_payload)
         if normalized in {"cloud.sync_health", "sync_health"}:
             return self.cloud_sync_health(request_payload)
+        if normalized in {"cloud.object_cache_diagnostics", "object_cache_diagnostics"}:
+            return {"ok": True, "object_cache": self._object_cache_factory().diagnostics()}
+        if normalized in {"cloud.cache_object", "cache_object"}:
+            return self.cache_cloud_object(request_payload)
         if normalized in {"cloud.pull_state_delta", "pull_state_delta"}:
             return self.pull_cloud_state_delta(request_payload)
         if normalized in {"cloud.state_delta_diagnostics", "state_delta_diagnostics"}:
@@ -506,6 +516,10 @@ class AppCloudRuntimeSupport:
             return self.cloud_outbox_diagnostics(request_payload)
         if normalized in {"cloud.sync_health", "sync_health"}:
             return self.cloud_sync_health(request_payload)
+        if normalized in {"cloud.object_cache_diagnostics", "object_cache_diagnostics"}:
+            return {"ok": True, "object_cache": self._object_cache_factory().diagnostics()}
+        if normalized in {"cloud.cache_object", "cache_object"}:
+            return self.cache_cloud_object(request_payload)
         if normalized in {"cloud.pull_state_delta", "pull_state_delta"}:
             return self.pull_cloud_state_delta(request_payload)
         if normalized in {"cloud.state_delta_diagnostics", "state_delta_diagnostics"}:
@@ -729,6 +743,46 @@ class AppCloudRuntimeSupport:
             include_failed=bool(request_payload.get("include_failed") or request_payload.get("includeFailed")),
         )
         return {"ok": bool(result.get("ok")), "state_delta_inbox": result}
+
+    def cache_cloud_object(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        object_ref_payload = request_payload.get("object_ref") or request_payload.get("objectRef")
+        object_ref = normalize_object_ref(object_ref_payload if isinstance(object_ref_payload, dict) else request_payload)
+        object_id = str(object_ref.get("object_id") or "").strip()
+        if not object_id:
+            return {"ok": False, "message": "object_id is required"}
+        try:
+            cache = self._object_cache_factory()
+            cached = cache.cached_object(object_ref)
+            if bool(cached.get("valid")) and not bool(request_payload.get("force")):
+                return {"ok": True, "cached": cached, "downloaded": False, "message": ""}
+        except CloudObjectCacheError as exc:
+            return {"ok": False, "message": str(exc)}
+
+        trace_id = str(request_payload.get("trace_id") or request_payload.get("traceId") or "").strip()
+
+        def operation(client: Any, token: str) -> Any:
+            download = client.create_object_download(token, object_id, trace_id=trace_id)
+            download_url = str(download.get("download_url") or download.get("downloadUrl") or "").strip()
+            if not download_url:
+                raise CloudClientError("object download_url missing")
+            merged_ref = dict(object_ref)
+            for key in ("size_bytes", "storage_size_bytes", "content_type", "compression"):
+                if not merged_ref.get(key) and download.get(key) is not None:
+                    merged_ref[key] = download.get(key)
+            return cache.cache_bytes(
+                merged_ref,
+                client.iter_object_content(token, download_url, trace_id=trace_id),
+                trace_id=trace_id,
+            )
+
+        try:
+            ok, response_payload, message = self.cloud_request_with_refresh(operation)
+        except CloudObjectCacheError as exc:
+            return {"ok": False, "message": str(exc)}
+        if not ok:
+            return {"ok": False, "message": message}
+        return {"ok": True, "cached": response_payload, "downloaded": True, "message": ""}
 
     def _build_state_delta_appliers(
         self,
@@ -1260,6 +1314,7 @@ def _cloud_sync_health_summary(
     inbox: dict[str, Any],
     agent_status: dict[str, Any],
     content_state: dict[str, Any],
+    object_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     session_payload = session if isinstance(session, dict) else {}
     outbox_stats = outbox.get("stats") if isinstance(outbox.get("stats"), dict) else {}
@@ -1271,6 +1326,7 @@ def _cloud_sync_health_summary(
     pending_inbox = _safe_int(inbox_by_status.get("pending"), 0)
     failed_inbox = _safe_int(inbox_by_status.get("failed"), 0)
     applied_inbox = _safe_int(inbox_by_status.get("applied"), 0)
+    cache_payload = object_cache if isinstance(object_cache, dict) else {}
     backpressure_until = str(auto_sync.get("upload_backpressure_until") or "")
     last_error = str(auto_sync.get("last_error") or auto_sync.get("last_state_delta_error") or "")
     return {
@@ -1303,6 +1359,8 @@ def _cloud_sync_health_summary(
         "agent_status_total": _safe_int(agent_status.get("total"), 0),
         "answers_cached": _safe_int(content_state.get("answers_total"), 0),
         "assets_cached": _safe_int(content_state.get("assets_total"), 0),
+        "object_cache_objects": _safe_int(cache_payload.get("objects"), 0),
+        "object_cache_bytes": _safe_int(cache_payload.get("bytes"), 0),
         "last_upload_at": str(auto_sync.get("last_upload_at") or ""),
         "last_pull_at": str(auto_sync.get("last_pull_at") or ""),
         "last_state_delta_at": str(auto_sync.get("last_state_delta_at") or ""),
