@@ -172,6 +172,75 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
 
             self.assertEqual(outbox.stats()["sent"], 1)
 
+    def test_upload_backpressure_pauses_flush_until_retry_after(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.example.com",
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+                }
+            )
+            outbox = CloudOutbox(Path(tmpdir) / "outbox.json")
+            outbox.enqueue(
+                event_type="run_record",
+                idempotency_key="run:backpressure",
+                payload={"task_id": 1, "result": {"rank": 1, "success": True}},
+            )
+            flush_calls: list[float] = []
+
+            def fake_flush(*, outbox=None, **_kwargs):
+                flush_calls.append(time.monotonic())
+                if len(flush_calls) == 1:
+                    return {
+                        "ok": False,
+                        "message": "queue overloaded",
+                        "metrics": {
+                            "retry_after_seconds": 0.8,
+                            "queue_depth_hint": 23000,
+                            "throttle_bucket": "sync_metadata",
+                        },
+                        "outbox": outbox.stats(),
+                    }
+                target_outbox = outbox
+                pending = target_outbox.pending()
+                target_outbox.mark_sent([item["idempotency_key"] for item in pending])
+                return {"ok": True, "outbox": target_outbox.stats(), "metrics": {"event_count": len(pending)}}
+
+            with patch("core.cloud_platform_auto_sync.flush_cloud_outbox", side_effect=fake_flush):
+                manager = CloudPlatformAutoSync(
+                    session_store=store,
+                    outbox=outbox,
+                    pull_tasks=lambda: {"ok": True},
+                    upload_retry_interval_seconds=5,
+                    pull_interval_seconds=3600,
+                    idle_interval_seconds=0.2,
+                    event_stream_enabled=False,
+                    logger=lambda _message: None,
+                )
+                manager.start()
+                try:
+                    deadline = time.time() + 0.55
+                    while time.time() < deadline:
+                        time.sleep(0.05)
+                    status = manager.get_status()
+                    self.assertEqual(len(flush_calls), 1)
+                    self.assertEqual(status["upload_backpressure_retry_after_seconds"], 0.8)
+                    self.assertEqual(status["upload_backpressure_queue_depth_hint"], 23000)
+                    self.assertEqual(status["upload_backpressure_bucket"], "sync_metadata")
+
+                    deadline = time.time() + 1.5
+                    while int(outbox.stats().get("sent") or 0) < 1 and time.time() < deadline:
+                        time.sleep(0.05)
+                finally:
+                    manager.stop()
+
+            self.assertGreaterEqual(len(flush_calls), 2)
+            self.assertEqual(outbox.stats()["sent"], 1)
+            self.assertEqual(manager.get_status()["upload_backpressure_until"], "")
+
     def test_initial_login_recovers_local_candidates_before_upload(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = CloudSessionStore(Path(tmpdir) / "session.json")

@@ -47,6 +47,20 @@ class FakeValidationErrorResponse:
         }
 
 
+class FakeBackpressureResponse:
+    status_code = 429
+    headers = {
+        "Retry-After": "12",
+        "X-Queue-Depth-Hint": "23000",
+        "X-Throttle-Bucket": "sync_metadata",
+    }
+    text = '{"detail":{"message":"queue overloaded"}}'
+    content = text.encode("utf-8")
+
+    def json(self):
+        return {"detail": {"message": "queue overloaded"}}
+
+
 class FakeStreamResponse:
     status_code = 200
     content = b""
@@ -79,6 +93,12 @@ class FakeValidationErrorSession(FakeSession):
     def request(self, method: str, url: str, **kwargs):
         self.calls.append({"method": method, "url": url, **kwargs})
         return FakeValidationErrorResponse()
+
+
+class FakeBackpressureSession(FakeSession):
+    def request(self, method: str, url: str, **kwargs):
+        self.calls.append({"method": method, "url": url, **kwargs})
+        return FakeBackpressureResponse()
 
 
 class FakeStreamSession(FakeSession):
@@ -123,6 +143,18 @@ class CloudClientTests(unittest.TestCase):
             list(client.stream_events("access-token"))
 
         self.assertEqual(str(caught.exception), "云端参数校验失败：last_event_id 超出长度限制")
+
+    def test_request_error_carries_backpressure_headers(self):
+        session = FakeBackpressureSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        with self.assertRaises(CloudClientError) as caught:
+            client.post_events("access-token", [{"event_type": "run_record"}])
+
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual(caught.exception.retry_after_seconds, 12.0)
+        self.assertEqual(caught.exception.queue_depth_hint, 23000)
+        self.assertEqual(caught.exception.throttle_bucket, "sync_metadata")
 
     def test_stream_events_skips_oversized_last_event_id_query(self):
         session = FakeStreamSession()

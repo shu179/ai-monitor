@@ -621,6 +621,9 @@ def flush_cloud_outbox(
         metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else None
         if metrics is not None:
             metrics["trace_id"] = trace_id
+            for key in ("retry_after_seconds", "queue_depth_hint", "throttle_bucket"):
+                if key in metrics:
+                    result[key] = metrics[key]
         return result
 
     base_url = str(session.get("base_url") or "").strip()
@@ -716,11 +719,16 @@ def flush_cloud_outbox(
                     operation="flush_cloud_outbox",
                     error=str(refresh_exc),
                 )
-                queue.mark_failed(event_keys, str(refresh_exc))
+                queue.mark_failed(event_keys, str(refresh_exc), retry_after_seconds=refresh_exc.retry_after_seconds)
                 outbox_stats = queue.stats()
                 _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
                 return finish(
-                    {"ok": False, "message": str(refresh_exc), "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)},
+                    {
+                        "ok": False,
+                        "message": str(refresh_exc),
+                        "outbox": outbox_stats,
+                        "metrics": _flush_metrics(started_at, len(events), 0, error=refresh_exc),
+                    },
                     batch_size=len(events),
                     http_status=refresh_exc.status_code,
                 )
@@ -749,11 +757,16 @@ def flush_cloud_outbox(
                     operation="flush_cloud_outbox",
                     error=str(refresh_exc),
                 )
-                queue.mark_failed(event_keys, str(refresh_exc))
+                queue.mark_failed(event_keys, str(refresh_exc), retry_after_seconds=refresh_exc.retry_after_seconds)
                 outbox_stats = queue.stats()
                 _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
                 return finish(
-                    {"ok": False, "message": str(refresh_exc), "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)},
+                    {
+                        "ok": False,
+                        "message": str(refresh_exc),
+                        "outbox": outbox_stats,
+                        "metrics": _flush_metrics(started_at, len(events), 0, error=refresh_exc),
+                    },
                     batch_size=len(events),
                     http_status=refresh_exc.status_code,
                 )
@@ -763,11 +776,16 @@ def flush_cloud_outbox(
                 operation="flush_cloud_outbox",
                 error=str(exc),
             )
-            queue.mark_failed(event_keys, str(exc))
+            queue.mark_failed(event_keys, str(exc), retry_after_seconds=exc.retry_after_seconds)
             outbox_stats = queue.stats()
             _maybe_warn_outbox_backlog(outbox_stats, base_url, identity)
             return finish(
-                {"ok": False, "message": str(exc), "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)},
+                {
+                    "ok": False,
+                    "message": str(exc),
+                    "outbox": outbox_stats,
+                    "metrics": _flush_metrics(started_at, len(events), 0, error=exc),
+                },
                 batch_size=len(events),
                 http_status=exc.status_code,
             )
@@ -878,13 +896,27 @@ def _collapse_profile_update_events(pending: list[dict[str, Any]]) -> tuple[list
     return collapsed, obsolete_keys
 
 
-def _flush_metrics(started_at: float, event_count: int, accepted_count: int) -> dict[str, int]:
-    return {
+def _flush_metrics(
+    started_at: float,
+    event_count: int,
+    accepted_count: int,
+    *,
+    error: CloudClientError | None = None,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
         "duration_ms": max(0, int(round((time.monotonic() - started_at) * 1000))),
         "event_count": max(0, int(event_count or 0)),
         "accepted_count": max(0, int(accepted_count or 0)),
         "request_count": 1 if int(event_count or 0) > 0 else 0,
     }
+    if error is not None:
+        if error.retry_after_seconds is not None:
+            metrics["retry_after_seconds"] = max(0.0, float(error.retry_after_seconds))
+        if error.queue_depth_hint is not None:
+            metrics["queue_depth_hint"] = max(0, int(error.queue_depth_hint))
+        if error.throttle_bucket:
+            metrics["throttle_bucket"] = error.throttle_bucket
+    return metrics
 
 
 def _record_cloud_task_id(record: dict[str, Any]) -> Any:

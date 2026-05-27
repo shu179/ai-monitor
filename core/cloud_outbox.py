@@ -197,7 +197,13 @@ class CloudOutbox:
                     item["last_error"] = ""
             self._save_locked(items)
 
-    def mark_failed(self, idempotency_keys: list[str] | set[str] | tuple[str, ...], message: str) -> None:
+    def mark_failed(
+        self,
+        idempotency_keys: list[str] | set[str] | tuple[str, ...],
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> None:
         keys = {str(key or "").strip() for key in idempotency_keys if str(key or "").strip()}
         if not keys:
             return
@@ -222,7 +228,7 @@ class CloudOutbox:
                     dead_letter_events.append(dict(item))
                 else:
                     item["status"] = "failed"
-                    next_ts = now_ts + _backoff_delay(attempts)
+                    next_ts = now_ts + _failure_retry_delay(attempts, retry_after_seconds=retry_after_seconds)
                     item["next_attempt_ts"] = next_ts
                     item["next_attempt_at"] = datetime.fromtimestamp(next_ts, tz=timezone.utc).isoformat(timespec="seconds")
             self._save_locked(items)
@@ -408,6 +414,15 @@ def _is_retry_ready(item: dict[str, Any], now: float) -> bool:
 
 def _empty_dropped() -> dict[str, Any]:
     return {"total": 0, "active": 0, "sent": 0, "dead_letter": 0, "overflow": False, "overflow_items": 0, "overflow_bytes": 0, "active_retained": 0}
+
+
+def _failure_retry_delay(attempts: int, *, retry_after_seconds: float | None = None) -> float:
+    try:
+        if retry_after_seconds is not None:
+            return max(0.0, float(retry_after_seconds))
+    except Exception:
+        pass
+    return _backoff_delay(attempts)
 
 
 def _outbox_sort_key(item: dict[str, Any]) -> str:

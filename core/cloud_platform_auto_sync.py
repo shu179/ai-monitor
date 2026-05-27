@@ -5,6 +5,7 @@ import os
 import random
 import threading
 import time
+from datetime import timedelta
 from typing import Any, Callable
 
 from .cloud_client import CloudClientError, SurfacedCloudClient
@@ -30,6 +31,22 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, default))
     except Exception:
         return int(default)
+
+
+def _optional_positive_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except Exception:
+        return None
+    return result if result > 0 else None
+
+
+def _optional_non_negative_int(value: Any) -> int | None:
+    try:
+        result = int(float(value))
+    except Exception:
+        return None
+    return max(0, result)
 
 
 class CloudPlatformAutoSync:
@@ -91,6 +108,7 @@ class CloudPlatformAutoSync:
         self._last_error_log_text = ""
         self._last_error_log_at = 0.0
         self._last_transient_error_log_at = 0.0
+        self._upload_backpressure_until_at = 0.0
         self._status: dict[str, Any] = {
             "running": False,
             "logged_in": False,
@@ -103,6 +121,10 @@ class CloudPlatformAutoSync:
             "last_error": "",
             "last_error_at": "",
             "last_upload_metrics": {},
+            "upload_backpressure_until": "",
+            "upload_backpressure_retry_after_seconds": 0.0,
+            "upload_backpressure_queue_depth_hint": 0,
+            "upload_backpressure_bucket": "",
             "last_pull_metrics": {},
             "last_pull_summary": {},
             "startup_recovery_running": False,
@@ -185,6 +207,45 @@ class CloudPlatformAutoSync:
             return self._upload_burst_interval_seconds
         return self._upload_retry_interval_seconds
 
+    def _refresh_upload_backpressure_status(self, now: float | None = None) -> bool:
+        current = time.monotonic() if now is None else float(now)
+        if self._upload_backpressure_until_at <= 0:
+            return False
+        remaining = self._upload_backpressure_until_at - current
+        if remaining <= 0:
+            self._clear_upload_backpressure()
+            return False
+        self._update_status(
+            upload_backpressure_until=(local_now() + timedelta(seconds=remaining)).isoformat(timespec="seconds"),
+        )
+        return True
+
+    def _apply_upload_backpressure(self, metrics: dict[str, Any], *, now: float | None = None) -> bool:
+        retry_after = _optional_positive_float(metrics.get("retry_after_seconds"))
+        if retry_after is None:
+            return False
+        current = time.monotonic() if now is None else float(now)
+        self._upload_backpressure_until_at = max(self._upload_backpressure_until_at, current + retry_after)
+        remaining = max(0.0, self._upload_backpressure_until_at - current)
+        queue_depth_hint = _optional_non_negative_int(metrics.get("queue_depth_hint"))
+        throttle_bucket = str(metrics.get("throttle_bucket") or "").strip()
+        self._update_status(
+            upload_backpressure_until=(local_now() + timedelta(seconds=remaining)).isoformat(timespec="seconds"),
+            upload_backpressure_retry_after_seconds=retry_after,
+            upload_backpressure_queue_depth_hint=queue_depth_hint if queue_depth_hint is not None else 0,
+            upload_backpressure_bucket=throttle_bucket,
+        )
+        return True
+
+    def _clear_upload_backpressure(self) -> None:
+        self._upload_backpressure_until_at = 0.0
+        self._update_status(
+            upload_backpressure_until="",
+            upload_backpressure_retry_after_seconds=0.0,
+            upload_backpressure_queue_depth_hint=0,
+            upload_backpressure_bucket="",
+        )
+
     def _finish_startup_recovery(
         self,
         recovery_result: dict[str, Any] | None,
@@ -244,6 +305,7 @@ class CloudPlatformAutoSync:
                     self._last_logged_in_key = login_key
                     self._last_upload_started_at = 0.0
                     self._last_pull_started_at = 0.0
+                    self._clear_upload_backpressure()
                     self._update_status(
                         startup_recovery_running=True,
                         last_startup_recovery_error="",
@@ -261,14 +323,18 @@ class CloudPlatformAutoSync:
                 pending_count = int(stats.get("pending") or 0) + int(stats.get("failed") or 0)
                 has_pending_upload = pending_count > 0
                 upload_result: dict[str, Any] | None = None
+                had_upload_backpressure = self._upload_backpressure_until_at > 0
+                upload_backpressure_active = self._refresh_upload_backpressure_status(now)
+                upload_backpressure_expired = had_upload_backpressure and not upload_backpressure_active
                 if first_sync_for_login:
                     self._last_upload_started_at = now
                     try:
                         upload_result = flush_cloud_outbox(outbox=active_outbox, limit=500)
                     except Exception as exc:
                         upload_result = {"ok": False, "message": f"运行数据恢复上传失败：{exc}", "metrics": {}}
-                elif has_pending_upload and (
+                elif has_pending_upload and not upload_backpressure_active and (
                     upload_wake_requested
+                    or upload_backpressure_expired
                     or self._last_upload_started_at <= 0
                     or now - self._last_upload_started_at >= self._effective_retry_interval(pending_count=pending_count)
                 ):
@@ -280,15 +346,18 @@ class CloudPlatformAutoSync:
 
                 if upload_result is not None:
                     upload_wake_requested = False
+                    upload_metrics = upload_result.get("metrics") if isinstance(upload_result.get("metrics"), dict) else {}
                     if upload_result.get("ok"):
                         self._update_status(
                             last_upload_at=local_now().isoformat(timespec="seconds"),
-                            last_upload_metrics=upload_result.get("metrics") if isinstance(upload_result.get("metrics"), dict) else {},
+                            last_upload_metrics=upload_metrics,
                         )
+                        self._clear_upload_backpressure()
                         self._clear_error()
                     else:
+                        self._apply_upload_backpressure(upload_metrics, now=time.monotonic())
                         self._update_status(
-                            last_upload_metrics=upload_result.get("metrics") if isinstance(upload_result.get("metrics"), dict) else {},
+                            last_upload_metrics=upload_metrics,
                         )
                         self._record_error(str(upload_result.get("message") or "运行数据自动上传失败"))
 

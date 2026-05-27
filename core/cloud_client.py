@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Iterable, Iterator
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import requests
@@ -11,10 +13,22 @@ from .cloud_session_store import normalize_cloud_base_url
 
 
 class CloudClientError(RuntimeError):
-    def __init__(self, message: str, *, status_code: int | None = None, response_body: Any = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        response_body: Any = None,
+        retry_after_seconds: float | None = None,
+        queue_depth_hint: int | None = None,
+        throttle_bucket: str = "",
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
+        self.retry_after_seconds = retry_after_seconds
+        self.queue_depth_hint = queue_depth_hint
+        self.throttle_bucket = str(throttle_bucket or "").strip()
 
 
 class SurfacedCloudClient:
@@ -475,7 +489,12 @@ class SurfacedCloudClient:
             if response.status_code >= 400:
                 body = _decode_response_body(response)
                 message = _extract_error_message(body) or f"云端事件连接失败：HTTP {response.status_code}"
-                raise CloudClientError(message, status_code=response.status_code, response_body=body)
+                raise CloudClientError(
+                    message,
+                    status_code=response.status_code,
+                    response_body=body,
+                    **_extract_backpressure_metadata(response, body),
+                )
             try:
                 for event in iter_sse_events(response.iter_lines(decode_unicode=True)):
                     yield event
@@ -524,7 +543,12 @@ class SurfacedCloudClient:
         body = _decode_response_body(response)
         if response.status_code >= 400:
             message = _extract_error_message(body) or f"云端请求失败：HTTP {response.status_code}"
-            raise CloudClientError(message, status_code=response.status_code, response_body=body)
+            raise CloudClientError(
+                message,
+                status_code=response.status_code,
+                response_body=body,
+                **_extract_backpressure_metadata(response, body),
+            )
         return body
 
 
@@ -566,6 +590,97 @@ def _extract_error_message(body: Any) -> str:
         if isinstance(message, str):
             return message
     return ""
+
+
+def _extract_backpressure_metadata(response: requests.Response, body: Any) -> dict[str, Any]:
+    headers = getattr(response, "headers", {}) or {}
+    retry_after_seconds = _parse_retry_after(_header_value(headers, "Retry-After"))
+    queue_depth_hint = _parse_int(_header_value(headers, "X-Queue-Depth-Hint"))
+    throttle_bucket = str(_header_value(headers, "X-Throttle-Bucket") or "").strip()
+
+    detail = body.get("detail") if isinstance(body, dict) else None
+    sources = [body if isinstance(body, dict) else {}, detail if isinstance(detail, dict) else {}]
+    if retry_after_seconds is None:
+        for source in sources:
+            retry_after_seconds = _parse_float(
+                source.get("retry_after_seconds")
+                or source.get("retry_after")
+                or source.get("retryAfterSeconds")
+            )
+            if retry_after_seconds is not None:
+                break
+    if queue_depth_hint is None:
+        for source in sources:
+            queue_depth_hint = _parse_int(
+                source.get("queue_depth_hint")
+                or source.get("queueDepthHint")
+            )
+            if queue_depth_hint is not None:
+                break
+    if not throttle_bucket:
+        for source in sources:
+            throttle_bucket = str(
+                source.get("throttle_bucket")
+                or source.get("throttleBucket")
+                or ""
+            ).strip()
+            if throttle_bucket:
+                break
+
+    return {
+        "retry_after_seconds": retry_after_seconds,
+        "queue_depth_hint": queue_depth_hint,
+        "throttle_bucket": throttle_bucket,
+    }
+
+
+def _header_value(headers: Any, key: str) -> Any:
+    try:
+        return headers.get(key)
+    except Exception:
+        pass
+    lower_key = key.lower()
+    try:
+        for raw_key, value in headers.items():
+            if str(raw_key).lower() == lower_key:
+                return value
+    except Exception:
+        return None
+    return None
+
+
+def _parse_retry_after(value: Any) -> float | None:
+    seconds = _parse_float(value)
+    if seconds is not None:
+        return max(0.0, seconds)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        when = parsedate_to_datetime(text)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
+def _parse_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _parse_int(value: Any) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        return int(float(value))
+    except Exception:
+        return None
 
 
 def _format_request_exception(prefix: str, exc: requests.RequestException) -> str:
