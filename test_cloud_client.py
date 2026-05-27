@@ -312,6 +312,49 @@ class CloudClientTests(unittest.TestCase):
 
         self.assertEqual(session.calls[0]["headers"]["X-Trace-Id"], "outbox.trace_1")
 
+    def test_capabilities_sends_v2_capability_header(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.capabilities("access-token", capabilities_header="sync-v2,state-delta-v1")
+
+        self.assertEqual(session.calls[0]["method"], "GET")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v2/capabilities")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+        self.assertEqual(session.calls[0]["headers"]["X-Cloud-Capability"], "sync-v2,state-delta-v1")
+
+    def test_state_delta_posts_v2_payload_and_headers(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.state_delta(
+            "access-token",
+            cursors={"tasks": 3, "articles": "7", "": 1},
+            limit=1500,
+            reset_token="reset-1",
+            bootstrap_cursor="boot-1",
+            device_id="device-a",
+            priority=["articles"],
+            trace_id="delta.trace!",
+        )
+
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v2/sync/state-delta")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+        self.assertEqual(session.calls[0]["headers"]["X-Trace-Id"], "delta.trace")
+        self.assertEqual(session.calls[0]["headers"]["X-Cloud-Capability"], "sync-v2,batch-v2,object-v1,state-delta-v1")
+        self.assertEqual(
+            session.calls[0]["json"],
+            {
+                "device_id": "device-a",
+                "cursors": {"tasks": 3, "articles": 7},
+                "limit": 1000,
+                "priority": ["articles"],
+                "reset_token": "reset-1",
+                "bootstrap_cursor": "boot-1",
+            },
+        )
+
     def test_trace_id_helpers_sanitize_values(self):
         self.assertEqual(normalize_trace_id(" abc/def! "), "abcdef")
         self.assertTrue(new_trace_id("Outbox").startswith("outbox-"))

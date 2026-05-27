@@ -22,6 +22,7 @@ from core.cloud_run_sync import (
     enqueue_recent_cloud_run_records_from_history,
     flush_cloud_outbox,
 )
+from core.cloud_state_delta import CloudStateDeltaStore, pull_cloud_state_delta
 from core.cloud_session_store import (
     CloudSessionChangedError,
     CloudSessionStore,
@@ -403,6 +404,10 @@ class AppCloudRuntimeSupport:
             return self.flush_cloud_outbox(request_payload)
         if normalized in {"cloud.outbox_diagnostics", "outbox_diagnostics"}:
             return self.cloud_outbox_diagnostics(request_payload)
+        if normalized in {"cloud.pull_state_delta", "pull_state_delta"}:
+            return self.pull_cloud_state_delta(request_payload)
+        if normalized in {"cloud.state_delta_diagnostics", "state_delta_diagnostics"}:
+            return self.cloud_state_delta_diagnostics(request_payload)
         if normalized in {"cloud.logout", "logout"}:
             return self.logout_cloud_account()
         if normalized in {"cloud.recover_uploads", "recover_uploads"}:
@@ -447,6 +452,10 @@ class AppCloudRuntimeSupport:
             return self._daemon_current_cloud_status()
         if normalized in {"cloud.outbox_diagnostics", "outbox_diagnostics"}:
             return self.cloud_outbox_diagnostics(request_payload)
+        if normalized in {"cloud.pull_state_delta", "pull_state_delta"}:
+            return self.pull_cloud_state_delta(request_payload)
+        if normalized in {"cloud.state_delta_diagnostics", "state_delta_diagnostics"}:
+            return self.cloud_state_delta_diagnostics(request_payload)
         delegate = getattr(self, "handle_command_for_main", None)
         if callable(delegate):
             return delegate(normalized, request_payload)
@@ -620,6 +629,20 @@ class AppCloudRuntimeSupport:
                 "validationError": validation_error,
             },
         }
+
+    def pull_cloud_state_delta(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        result = pull_cloud_state_delta(
+            limit=_safe_int(request_payload.get("limit"), 500),
+            max_pages=_safe_int(request_payload.get("max_pages") or request_payload.get("maxPages"), 5),
+        )
+        return {"ok": bool(result.get("ok")), "state_delta": result, "message": str(result.get("message") or "")}
+
+    def cloud_state_delta_diagnostics(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        del payload
+        session = self._session_store_factory().load()
+        diagnostics = CloudStateDeltaStore().diagnostics(session)
+        return {"ok": True, "state_delta": diagnostics}
 
     def cloud_request_with_refresh(self, operation: Callable[[Any, str], Any]) -> tuple[bool, Any, str]:
         store = self._session_store_factory()

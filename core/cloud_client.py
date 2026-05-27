@@ -11,6 +11,8 @@ import requests
 
 from .cloud_session_store import normalize_cloud_base_url
 
+DEFAULT_CLOUD_CAPABILITY_HEADER = "sync-v2,batch-v2,object-v1,state-delta-v1"
+
 
 class CloudClientError(RuntimeError):
     def __init__(
@@ -136,6 +138,20 @@ class SurfacedCloudClient:
     def me(self, access_token: str) -> dict[str, Any]:
         return self._request("GET", "/api/v1/auth/me", access_token=access_token)
 
+    def capabilities(
+        self,
+        access_token: str = "",
+        *,
+        capabilities_header: str = DEFAULT_CLOUD_CAPABILITY_HEADER,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            "/api/v2/capabilities",
+            access_token=access_token,
+            extra_headers={"X-Cloud-Capability": capabilities_header} if capabilities_header else None,
+        )
+        return response if isinstance(response, dict) else {}
+
     def update_me_profile(self, access_token: str, payload: dict[str, Any]) -> dict[str, Any]:
         response = self._request(
             "PATCH",
@@ -174,6 +190,44 @@ class SurfacedCloudClient:
                     for task_id, cursor in (task_day_status_cursors or {}).items()
                 },
             },
+        )
+        return response if isinstance(response, dict) else {}
+
+    def state_delta(
+        self,
+        access_token: str,
+        *,
+        cursors: dict[str, int] | None = None,
+        limit: int = 500,
+        reset_token: str | None = None,
+        bootstrap_cursor: str | None = None,
+        device_id: str = "",
+        priority: list[str] | None = None,
+        trace_id: str = "",
+    ) -> dict[str, Any]:
+        safe_cursors: dict[str, int] = {}
+        for key, value in (cursors or {}).items():
+            stream = str(key or "").strip()
+            if not stream:
+                continue
+            try:
+                safe_cursors[stream] = max(0, int(value or 0))
+            except Exception:
+                safe_cursors[stream] = 0
+        response = self._request(
+            "POST",
+            "/api/v2/sync/state-delta",
+            access_token=access_token,
+            json_body={
+                "device_id": str(device_id or "").strip() or None,
+                "cursors": safe_cursors,
+                "limit": max(1, min(int(limit or 500), 1000)),
+                "priority": [str(item) for item in (priority or []) if str(item or "").strip()],
+                "reset_token": str(reset_token or "").strip() or None,
+                "bootstrap_cursor": str(bootstrap_cursor or "").strip() or None,
+            },
+            trace_id=trace_id,
+            extra_headers={"X-Cloud-Capability": DEFAULT_CLOUD_CAPABILITY_HEADER},
         )
         return response if isinstance(response, dict) else {}
 
@@ -515,6 +569,7 @@ class SurfacedCloudClient:
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | list[tuple[str, str]] | None = None,
         trace_id: str = "",
+        extra_headers: dict[str, Any] | None = None,
     ) -> Any:
         if not self.base_url:
             raise CloudClientError("未配置云端地址")
@@ -527,6 +582,12 @@ class SurfacedCloudClient:
         safe_trace_id = normalize_trace_id(trace_id)
         if safe_trace_id:
             headers["X-Trace-Id"] = safe_trace_id
+        if isinstance(extra_headers, dict):
+            for key, value in extra_headers.items():
+                header_name = str(key or "").strip()
+                header_value = str(value or "").strip()
+                if header_name and header_value:
+                    headers[header_name] = header_value
 
         try:
             response = self._session.request(

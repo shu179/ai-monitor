@@ -115,6 +115,27 @@ def test_app_cloud_runtime_support_cloud_status_uses_injected_status_and_outbox(
     assert result["cloud"]["localProfile"]["configPath"] == "/tmp/config.yaml"
 
 
+def test_app_cloud_runtime_support_routes_state_delta_commands():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {"base_url": "https://api.example.com", "user": {"workspace_id": 1, "id": 2}}
+    support = AppCloudRuntimeSupport(owner=owner, session_store_factory=lambda: session_store)
+
+    with (
+        patch("core.cloud_sync_runtime.pull_cloud_state_delta", return_value={"ok": True, "changes": 3}) as pull_delta,
+        patch("core.cloud_sync_runtime.CloudStateDeltaStore") as store_cls,
+    ):
+        store_cls.return_value.diagnostics.return_value = {"cursors": {"tasks": 2}}
+
+        pull_result = support.handle_command("cloud.pull_state_delta", {"limit": 50, "max_pages": 2})
+        diagnostics = support.handle_command("cloud.state_delta_diagnostics")
+
+    assert pull_result == {"ok": True, "state_delta": {"ok": True, "changes": 3}, "message": ""}
+    pull_delta.assert_called_once_with(limit=50, max_pages=2)
+    assert diagnostics == {"ok": True, "state_delta": {"cursors": {"tasks": 2}}}
+    store_cls.return_value.diagnostics.assert_called_once_with(session_store.load.return_value)
+
+
 def test_app_cloud_runtime_support_retries_request_after_refresh():
     owner = _support_owner()
     session_store = MagicMock()

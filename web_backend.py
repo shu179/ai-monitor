@@ -442,6 +442,7 @@ GET_EXACT_RUNTIME_METHODS = {
     "/api/todos": "get_todos",
     "/api/cloud/status": "get_cloud_status",
     "/api/cloud/outbox-diagnostics": "get_cloud_outbox_diagnostics",
+    "/api/cloud/state-delta-diagnostics": "get_cloud_state_delta_diagnostics",
     "/api/cloud/admin/tasks": "list_cloud_admin_tasks",
     "/api/cloud/admin/users": "list_cloud_admin_users",
     "/api/cloud/admin/article-classification-jobs": "list_cloud_article_classification_jobs",
@@ -495,6 +496,7 @@ POST_JSON_RUNTIME_METHODS = {
     "/api/cloud/logout": "logout_cloud",
     "/api/cloud/flush-outbox": "flush_cloud_outbox",
     "/api/cloud/pull-tasks": "pull_cloud_tasks",
+    "/api/cloud/pull-state-delta": "pull_cloud_state_delta",
     "/api/cloud/admin/create-user": "create_cloud_admin_user",
     "/api/cloud/admin/update-user": "update_cloud_admin_user",
     "/api/cloud/admin/delete-user": "delete_cloud_admin_user",
@@ -4347,6 +4349,9 @@ return changedCount
     def get_cloud_outbox_diagnostics(self) -> dict[str, Any]:
         return self._cloud_runtime_command("cloud.outbox_diagnostics")
 
+    def get_cloud_state_delta_diagnostics(self) -> dict[str, Any]:
+        return self._cloud_runtime_command("cloud.state_delta_diagnostics")
+
     def _current_cloud_status(self) -> dict[str, Any]:
         return self._cloud_runtime_command("cloud.current_status")
 
@@ -4908,6 +4913,9 @@ return changedCount
 
     def flush_cloud_outbox(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._cloud_runtime_command("cloud.flush_outbox", payload)
+
+    def pull_cloud_state_delta(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._cloud_runtime_command("cloud.pull_state_delta", payload)
 
     def _recover_cloud_run_history_uploads(self) -> dict[str, Any]:
         return self._cloud_runtime_command("cloud.recover_uploads")
