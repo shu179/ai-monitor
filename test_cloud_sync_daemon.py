@@ -65,13 +65,14 @@ class CloudSyncDaemonTests(unittest.TestCase):
             try:
                 client = UnixSocketCloudSyncCommandClient(socket_path)
                 ping = client.send_command("cloud.daemon.ping")
-                unsupported = client.send_command("cloud.status")
+                status = client.send_command("cloud.status")
             finally:
                 daemon.stop()
 
         self.assertTrue(ping.get("ok"))
         self.assertTrue(ping.get("daemon"))
-        self.assertTrue(unsupported.get("unsupported_by_daemon"))
+        self.assertTrue(status.get("ok"))
+        self.assertIn("cloud", status)
 
     def test_run_cloud_sync_command_daemon_exports_supported_command_list(self) -> None:
         self.assertIn("cloud.flush_outbox", DAEMON_SUPPORTED_COMMANDS)
@@ -168,6 +169,16 @@ class CloudSyncDaemonTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True, "message": "local"})
         support.handle_command.assert_called_once_with("cloud.schedule_article_snapshot", None)
+
+    def test_app_runtime_cloud_status_merges_local_auto_sync_state(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_command_client = Mock(send_command=Mock(return_value={"ok": True, "cloud": {"loggedIn": True}}))
+        runtime._cloud_platform_auto_sync = Mock()
+        runtime._cloud_platform_auto_sync.get_status.return_value = {"running": True}
+
+        result = AppRuntime._cloud_runtime_command(runtime, "cloud.status")
+
+        self.assertEqual(result["cloud"]["autoSync"], {"running": True})
 
     def test_app_runtime_logout_stays_on_main_process_support(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)

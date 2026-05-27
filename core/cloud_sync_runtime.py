@@ -423,6 +423,37 @@ class AppCloudRuntimeSupport:
             return {"ok": True, "message": "云端账号空间已切换", "session": saved_session}
         return {"ok": False, "message": f"未知云同步命令: {normalized}"}
 
+    def daemon_handle_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        normalized = str(command or "").strip()
+        request_payload = payload if isinstance(payload, dict) else {}
+        if normalized in {"cloud.status", "status"}:
+            return self._daemon_get_cloud_status()
+        if normalized in {"cloud.current_status", "current_status"}:
+            return self._daemon_current_cloud_status()
+        if normalized in {"cloud.status_from_session", "status_from_session"}:
+            return self._daemon_cloud_status_from_session(request_payload.get("session"))
+        if normalized in {"cloud.validate_session", "validate_session"}:
+            self.validate_cloud_session_if_needed(force=bool(request_payload.get("force")))
+            return self._daemon_current_cloud_status()
+        return self.handle_command(normalized, request_payload)
+
+    def _daemon_get_cloud_status(self) -> dict[str, Any]:
+        self.validate_cloud_session_if_needed()
+        return self._daemon_current_cloud_status()
+
+    def _daemon_current_cloud_status(self) -> dict[str, Any]:
+        session = self._session_store_factory().load()
+        return self._daemon_cloud_status_from_session(session)
+
+    def _daemon_cloud_status_from_session(self, session: dict[str, Any] | None) -> dict[str, Any]:
+        result = self.cloud_status_from_session(session)
+        if isinstance(result, dict) and isinstance(result.get("cloud"), dict):
+            cloud = dict(result["cloud"])
+            cloud["autoSync"] = self._auto_sync_status_getter()
+            result = dict(result)
+            result["cloud"] = cloud
+        return result
+
     def login_cloud_account_space(
         self,
         *,

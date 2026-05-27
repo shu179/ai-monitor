@@ -4317,6 +4317,16 @@ return changedCount
         result = client.send_command(normalized, payload)
         if isinstance(result, dict) and (bool(result.get("unsupported_by_daemon")) or bool(result.get("daemon_unavailable"))):
             return self._ensure_cloud_runtime_support().handle_command(normalized, payload)
+        if normalized in {"cloud.status", "cloud.current_status", "cloud.status_from_session", "cloud.validate_session"}:
+            auto_sync_getter = getattr(getattr(self, "_cloud_platform_auto_sync", None), "get_status", None)
+            if callable(auto_sync_getter) and isinstance(result, dict):
+                cloud = result.get("cloud") if isinstance(result.get("cloud"), dict) else None
+                if isinstance(cloud, dict):
+                    merged = dict(result)
+                    merged_cloud = dict(cloud)
+                    merged_cloud["autoSync"] = auto_sync_getter()
+                    merged["cloud"] = merged_cloud
+                    return merged
         if isinstance(result, dict):
             return result
         return {"ok": False, "message": "云同步命令返回无效响应"}

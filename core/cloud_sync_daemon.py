@@ -20,6 +20,10 @@ from typing import Any, Callable
 
 DAEMON_SUPPORTED_COMMANDS = frozenset(
     {
+        "cloud.status",
+        "cloud.current_status",
+        "cloud.status_from_session",
+        "cloud.validate_session",
         "cloud.flush_outbox",
         "cloud.list_admin_users",
         "cloud.list_admin_article_classification_jobs",
@@ -328,7 +332,11 @@ def _build_daemon_runtime_support() -> Any:
         def __init__(self) -> None:
             self._lock = threading.RLock()
 
-    return AppCloudRuntimeSupport(
+    support = AppCloudRuntimeSupport(
         owner=_DaemonOwner(),
         auto_sync_status_getter=lambda: {},
     )
+    original_handle_command = support.handle_command
+    support.handle_command = support.daemon_handle_command  # type: ignore[assignment]
+    support.handle_command_for_main = original_handle_command  # type: ignore[attr-defined]
+    return support
