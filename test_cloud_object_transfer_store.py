@@ -53,3 +53,44 @@ def test_cloud_object_transfer_store_records_failure(tmp_path: Path):
     assert diagnostics["by_status"] == {"failed": 1}
     assert diagnostics["by_direction"] == {"download": {"failed": 1}}
     assert diagnostics["failed"][0]["last_error"] == "sha mismatch"
+
+
+def test_cloud_object_transfer_store_lists_retryable_failed_transfers(tmp_path: Path):
+    store = CloudObjectTransferStore(tmp_path / "transfers.sqlite3")
+
+    store.start_transfer(transfer_id="download-1", direction="download", object_id="object-1", sha256="a" * 64)
+    store.fail_transfer("download-1", "temporary")
+    store.start_transfer(transfer_id="upload-1", direction="upload", sha256="b" * 64)
+    store.fail_transfer("upload-1", "temporary")
+
+    downloads = store.retryable_transfers(direction="download")
+    diagnostics = store.diagnostics()
+
+    assert [item["transfer_id"] for item in downloads] == ["download-1"]
+    assert diagnostics["retryable_count"] == 2
+
+
+def test_cloud_object_transfer_store_excludes_transfers_over_attempt_budget(tmp_path: Path):
+    store = CloudObjectTransferStore(tmp_path / "transfers.sqlite3")
+
+    for _index in range(3):
+        store.start_transfer(transfer_id="download-1", direction="download", object_id="object-1")
+        store.fail_transfer("download-1", "temporary")
+
+    retryable = store.retryable_transfers(max_attempts=3)
+
+    assert retryable == []
+
+
+def test_cloud_object_transfer_store_lists_stale_running_transfers(tmp_path: Path):
+    store = CloudObjectTransferStore(tmp_path / "transfers.sqlite3")
+    store.start_transfer(transfer_id="download-1", direction="download", object_id="object-1")
+    with store._connection() as conn:
+        conn.execute(
+            "UPDATE object_transfers SET updated_at = ? WHERE transfer_id = ?",
+            ("2000-01-01T00:00:00+00:00", "download-1"),
+        )
+
+    retryable = store.retryable_transfers(stale_running_seconds=60)
+
+    assert [item["transfer_id"] for item in retryable] == ["download-1"]

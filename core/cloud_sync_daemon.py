@@ -29,6 +29,7 @@ DAEMON_SUPPORTED_COMMANDS = frozenset(
         "cloud.sync_health",
         "cloud.object_cache_diagnostics",
         "cloud.object_transfer_diagnostics",
+        "cloud.object_transfer_retry_candidates",
         "cloud.prune_object_cache",
         "cloud.cache_object",
         "cloud.pull_state_delta",

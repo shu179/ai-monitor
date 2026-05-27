@@ -1534,6 +1534,24 @@ def test_app_cloud_runtime_support_cache_object_records_failed_transfer():
     assert diagnostics["failed"][0]["last_error"] == "download unavailable"
 
 
+def test_app_cloud_runtime_support_lists_object_transfer_retry_candidates():
+    owner = _support_owner()
+    with tempfile.TemporaryDirectory() as tmp:
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        transfer_store.start_transfer(transfer_id="download-1", direction="download", object_id="object-1")
+        transfer_store.fail_transfer("download-1", "temporary")
+        support = AppCloudRuntimeSupport(owner=owner, object_transfer_store_factory=lambda: transfer_store)
+
+        result = support.handle_command(
+            "cloud.object_transfer_retry_candidates",
+            {"direction": "download", "limit": 5, "maxAttempts": 5},
+        )
+
+    assert result["ok"] is True
+    assert result["count"] == 1
+    assert result["retryable_transfers"][0]["transfer_id"] == "download-1"
+
+
 def test_app_cloud_runtime_support_prunes_object_cache():
     owner = _support_owner()
     data_a = b"a" * 10

@@ -471,6 +471,8 @@ class AppCloudRuntimeSupport:
         if normalized in {"cloud.object_transfer_diagnostics", "object_transfer_diagnostics"}:
             failed_limit = _safe_int(request_payload.get("failed_limit") or request_payload.get("failedLimit"), 10)
             return {"ok": True, "object_transfers": self._object_transfer_store_factory().diagnostics(failed_limit=failed_limit)}
+        if normalized in {"cloud.object_transfer_retry_candidates", "object_transfer_retry_candidates"}:
+            return self.object_transfer_retry_candidates(request_payload)
         if normalized in {"cloud.prune_object_cache", "prune_object_cache"}:
             return self.prune_cloud_object_cache(request_payload)
         if normalized in {"cloud.cache_object", "cache_object"}:
@@ -532,6 +534,8 @@ class AppCloudRuntimeSupport:
         if normalized in {"cloud.object_transfer_diagnostics", "object_transfer_diagnostics"}:
             failed_limit = _safe_int(request_payload.get("failed_limit") or request_payload.get("failedLimit"), 10)
             return {"ok": True, "object_transfers": self._object_transfer_store_factory().diagnostics(failed_limit=failed_limit)}
+        if normalized in {"cloud.object_transfer_retry_candidates", "object_transfer_retry_candidates"}:
+            return self.object_transfer_retry_candidates(request_payload)
         if normalized in {"cloud.prune_object_cache", "prune_object_cache"}:
             return self.prune_cloud_object_cache(request_payload)
         if normalized in {"cloud.cache_object", "cache_object"}:
@@ -861,6 +865,19 @@ class AppCloudRuntimeSupport:
         target_bytes = _safe_int(target, -1)
         result = self._object_cache_factory().prune(target_bytes=target_bytes if target_bytes >= 0 else None)
         return {"ok": bool(result.get("ok", True)), "object_cache": result}
+
+    def object_transfer_retry_candidates(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        transfers = self._object_transfer_store_factory().retryable_transfers(
+            limit=_safe_int(request_payload.get("limit"), 50),
+            direction=str(request_payload.get("direction") or ""),
+            max_attempts=_safe_int(request_payload.get("max_attempts") or request_payload.get("maxAttempts"), 5),
+            stale_running_seconds=_safe_float(
+                request_payload.get("stale_running_seconds") or request_payload.get("staleRunningSeconds"),
+                600.0,
+            ),
+        )
+        return {"ok": True, "retryable_transfers": transfers, "count": len(transfers)}
 
     def _build_state_delta_appliers(
         self,

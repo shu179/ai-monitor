@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,9 @@ from .time_utils import local_now
 
 
 DEFAULT_CLOUD_OBJECT_TRANSFER_DB_PATH = resolve_app_path("user_data/cloud_object_transfers.sqlite3")
+DEFAULT_RETRYABLE_TRANSFER_LIMIT = 50
+DEFAULT_TRANSFER_MAX_ATTEMPTS = 5
+DEFAULT_STALE_RUNNING_SECONDS = 10 * 60
 
 
 class CloudObjectTransferStore:
@@ -139,6 +143,7 @@ class CloudObjectTransferStore:
         return {"ok": int(cursor.rowcount or 0) > 0, "transfer_id": safe_transfer_id, "status": "failed"}
 
     def diagnostics(self, *, failed_limit: int = 10) -> dict[str, Any]:
+        retryable = self.retryable_transfers(limit=failed_limit)
         with self._connection() as conn:
             rows = conn.execute(
                 """
@@ -184,9 +189,49 @@ class CloudObjectTransferStore:
             "by_status": by_status,
             "by_direction": by_direction,
             "bytes_by_direction": bytes_by_direction,
+            "retryable_count": len(retryable),
+            "retryable": retryable,
             "newest": [_row_public(row) for row in newest],
             "failed": [_row_public(row) for row in failed],
         }
+
+    def retryable_transfers(
+        self,
+        *,
+        limit: int = DEFAULT_RETRYABLE_TRANSFER_LIMIT,
+        direction: str = "",
+        max_attempts: int = DEFAULT_TRANSFER_MAX_ATTEMPTS,
+        stale_running_seconds: float = DEFAULT_STALE_RUNNING_SECONDS,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit or DEFAULT_RETRYABLE_TRANSFER_LIMIT), 500))
+        safe_max_attempts = max(1, int(max_attempts or DEFAULT_TRANSFER_MAX_ATTEMPTS))
+        safe_direction = _normalize_optional_direction(direction)
+        cutoff = (local_now() - timedelta(
+            seconds=max(1.0, float(stale_running_seconds or DEFAULT_STALE_RUNNING_SECONDS))
+        )).isoformat(timespec="seconds")
+        params: list[Any] = [safe_max_attempts, cutoff, safe_max_attempts]
+        direction_sql = ""
+        if safe_direction:
+            direction_sql = "AND direction = ?"
+            params.append(safe_direction)
+        params.append(safe_limit)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT transfer_id, direction, status, object_id, sha256, size_bytes,
+                       path, attempts, updated_at, last_error
+                FROM object_transfers
+                WHERE (
+                    (status = 'failed' AND attempts < ?)
+                    OR (status = 'running' AND updated_at <= ? AND attempts < ?)
+                )
+                {direction_sql}
+                ORDER BY updated_at ASC, transfer_id ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [_row_public(row) for row in rows]
 
     def vacuum_wal_if_needed(self) -> bool:
         """Future daily-maintenance hook; startup maintenance is the current safety net."""
@@ -253,6 +298,11 @@ def _normalize_direction(value: str) -> str:
     if direction not in {"upload", "download"}:
         return "upload"
     return direction
+
+
+def _normalize_optional_direction(value: str) -> str:
+    direction = str(value or "").strip().lower()
+    return direction if direction in {"upload", "download"} else ""
 
 
 def _row_public(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
