@@ -355,6 +355,18 @@ class CloudClientTests(unittest.TestCase):
             },
         )
 
+    def test_create_object_download_posts_v2_request_and_headers(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.create_object_download("access-token", "object-1", trace_id="object.trace!")
+
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v2/objects/object-1:download")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+        self.assertEqual(session.calls[0]["headers"]["X-Trace-Id"], "object.trace")
+        self.assertEqual(session.calls[0]["headers"]["X-Cloud-Capability"], "sync-v2,batch-v2,object-v1,state-delta-v1")
+
     def test_trace_id_helpers_sanitize_values(self):
         self.assertEqual(normalize_trace_id(" abc/def! "), "abcdef")
         self.assertTrue(new_trace_id("Outbox").startswith("outbox-"))

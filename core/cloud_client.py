@@ -231,6 +231,25 @@ class SurfacedCloudClient:
         )
         return response if isinstance(response, dict) else {}
 
+    def create_object_download(
+        self,
+        access_token: str,
+        object_id: str,
+        *,
+        trace_id: str = "",
+    ) -> dict[str, Any]:
+        safe_object_id = str(object_id or "").strip()
+        if not safe_object_id:
+            raise CloudClientError("object_id is required")
+        response = self._request(
+            "POST",
+            f"/api/v2/objects/{safe_object_id}:download",
+            access_token=access_token,
+            trace_id=trace_id,
+            extra_headers={"X-Cloud-Capability": DEFAULT_CLOUD_CAPABILITY_HEADER},
+        )
+        return response if isinstance(response, dict) else {}
+
     def list_tasks(self, access_token: str) -> list[dict[str, Any]]:
         payload = self._request("GET", "/api/v1/tasks", access_token=access_token)
         return payload if isinstance(payload, list) else []
