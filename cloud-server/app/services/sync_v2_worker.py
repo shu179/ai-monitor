@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
@@ -15,6 +16,7 @@ from app.services.sync_v2_service import shard_advisory_lock_key
 WORKER_LEASE_SECONDS = 60
 WORKER_HEARTBEAT_SECONDS = 15
 MAX_MATERIALIZE_ATTEMPTS = 5
+logger = logging.getLogger(__name__)
 
 
 def claim_sync_batch_items(
@@ -210,6 +212,7 @@ def process_sync_batch_items_once(
     limit: int = 100,
     max_attempts: int = MAX_MATERIALIZE_ATTEMPTS,
 ) -> dict[str, int]:
+    started_at = time.monotonic()
     claimed = claim_sync_batch_items(db, worker_id=worker_id, shard_ids=shard_ids, limit=limit)
     stats = {"claimed": len(claimed), "done": 0, "retry": 0, "dead_letter": 0}
     if claimed:
@@ -232,6 +235,16 @@ def process_sync_batch_items_once(
         _refresh_batch_status(db, str(item.get("batch_id") or ""))
         db.commit()
         stats["done"] += 1
+    if stats["claimed"] or stats["retry"] or stats["dead_letter"]:
+        logger.info(
+            "[CloudSyncWorker] batch worker_id=%s claimed=%s done=%s retry=%s dead_letter=%s elapsed_ms=%s",
+            worker_id,
+            stats["claimed"],
+            stats["done"],
+            stats["retry"],
+            stats["dead_letter"],
+            int(round((time.monotonic() - started_at) * 1000)),
+        )
     return stats
 
 

@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from .cloud_client import CloudClientError, SurfacedCloudClient
+from .cloud_client import CloudClientError, SurfacedCloudClient, new_trace_id
 from .diagnostic_events import clear_consecutive_failure, record_consecutive_failure, record_event_safe
 from .cloud_event_types import (
     EVENT_ARTICLE_REFERENCE,
@@ -605,6 +605,7 @@ def flush_cloud_outbox(
     queue = (outbox or CloudOutbox()).bind_to_session(session)
     initial_stats = queue.stats()
     pending_before = int(initial_stats.get("pending") or 0) + int(initial_stats.get("failed") or 0)
+    trace_id = new_trace_id("outbox")
 
     def finish(result: dict[str, Any], *, batch_size: int, http_status: int | str | None) -> dict[str, Any]:
         final_stats = result.get("outbox") if isinstance(result.get("outbox"), dict) else queue.stats()
@@ -615,7 +616,11 @@ def flush_cloud_outbox(
             pending_after=int((final_stats or {}).get("pending") or 0) + int((final_stats or {}).get("failed") or 0),
             failed_count=int((final_stats or {}).get("failed") or 0),
             http_status=http_status,
+            trace_id=trace_id,
         )
+        metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else None
+        if metrics is not None:
+            metrics["trace_id"] = trace_id
         return result
 
     base_url = str(session.get("base_url") or "").strip()
@@ -655,7 +660,7 @@ def flush_cloud_outbox(
         for item in pending
     ]
     try:
-        response = target_client.post_events(access_token, events)
+        response = _post_events_with_trace(target_client, access_token, events, trace_id=trace_id)
     except CloudClientError as exc:
         if exc.status_code == 401 and refresh_token:
             try:
@@ -720,7 +725,7 @@ def flush_cloud_outbox(
                     http_status=refresh_exc.status_code,
                 )
             try:
-                response = target_client.post_events(refreshed_access_token, events)
+                response = _post_events_with_trace(target_client, refreshed_access_token, events, trace_id=trace_id)
             except CloudClientError as refresh_exc:
                 if refresh_exc.status_code == 401:
                     store.clear_if_current(
@@ -800,6 +805,15 @@ def _cloud_response_status(response: Any) -> int:
     return 200
 
 
+def _post_events_with_trace(client: Any, access_token: str, events: list[dict[str, Any]], *, trace_id: str) -> dict[str, Any]:
+    try:
+        return client.post_events(access_token, events, trace_id=trace_id)
+    except TypeError as exc:
+        if "trace_id" not in str(exc):
+            raise
+        return client.post_events(access_token, events)
+
+
 def _log_cloud_outbox_flush(
     *,
     started_at: float,
@@ -808,11 +822,13 @@ def _log_cloud_outbox_flush(
     pending_after: int,
     failed_count: int,
     http_status: int | str | None,
+    trace_id: str,
 ) -> None:
     elapsed_ms = max(0, int(round((time.monotonic() - started_at) * 1000)))
     status_text = "none" if http_status is None else str(http_status)
     print(
         "[CloudOutbox] flush "
+        f"trace_id={trace_id} "
         f"batch_size={max(0, int(batch_size or 0))} "
         f"elapsed_ms={elapsed_ms} "
         f"pending_before={max(0, int(pending_before or 0))} "

@@ -88,6 +88,7 @@ class CloudOutboxBurstModeTests(unittest.TestCase):
         self.assertEqual(len(logs), 1)
         self.assertIn("[CloudOutbox] flush", logs[0])
         for field in (
+            "trace_id=",
             "batch_size=",
             "elapsed_ms=",
             "pending_before=",

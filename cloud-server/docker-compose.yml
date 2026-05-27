@@ -4,6 +4,11 @@ services:
     restart: "no"
     env_file:
       - .env
+    logging: &default-logging
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     command: ["alembic", "upgrade", "head"]
     depends_on:
       postgres:
@@ -23,6 +28,7 @@ services:
       - "8080:8080"
     volumes:
       - /opt/surfaced/object-data:/opt/surfaced/object-data
+    logging: *default-logging
 
   worker:
     build: .
@@ -37,6 +43,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - /opt/surfaced/object-data:/opt/surfaced/object-data
+    logging: *default-logging
 
   postgres:
     image: postgres:16-alpine
@@ -45,6 +52,7 @@ services:
       - .env
     volumes:
       - surfaced_cloud_pg:/var/lib/postgresql/data
+    logging: *default-logging
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s

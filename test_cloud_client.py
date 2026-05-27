@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 import requests
 
-from core.cloud_client import CloudClientError, SurfacedCloudClient, iter_sse_events
+from core.cloud_client import CloudClientError, SurfacedCloudClient, iter_sse_events, new_trace_id, normalize_trace_id
 
 
 class FakeResponse:
@@ -271,6 +271,18 @@ class CloudClientTests(unittest.TestCase):
         self.assertEqual(session.calls[0]["method"], "GET")
         self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/tasks/deleted")
         self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+
+    def test_post_events_forwards_trace_header(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.post_events("access-token", [], trace_id="outbox.trace_1!")
+
+        self.assertEqual(session.calls[0]["headers"]["X-Trace-Id"], "outbox.trace_1")
+
+    def test_trace_id_helpers_sanitize_values(self):
+        self.assertEqual(normalize_trace_id(" abc/def! "), "abcdef")
+        self.assertTrue(new_trace_id("Outbox").startswith("outbox-"))
 
     def test_task_run_records_supports_since_id_cursor(self):
         session = FakeSession()

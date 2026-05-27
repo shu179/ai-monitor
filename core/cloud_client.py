@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Iterable, Iterator
 from typing import Any
 
@@ -130,12 +131,13 @@ class SurfacedCloudClient:
         )
         return response if isinstance(response, dict) else {}
 
-    def post_events(self, access_token: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+    def post_events(self, access_token: str, events: list[dict[str, Any]], *, trace_id: str = "") -> dict[str, Any]:
         return self._request(
             "POST",
             "/api/v1/sync/events",
             access_token=access_token,
             json_body={"events": events},
+            trace_id=trace_id,
         )
 
     def sync_changes(
@@ -493,6 +495,7 @@ class SurfacedCloudClient:
         access_token: str = "",
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | list[tuple[str, str]] | None = None,
+        trace_id: str = "",
     ) -> Any:
         if not self.base_url:
             raise CloudClientError("未配置云端地址")
@@ -502,6 +505,9 @@ class SurfacedCloudClient:
         token = str(access_token or "").strip()
         if token:
             headers["Authorization"] = f"Bearer {token}"
+        safe_trace_id = normalize_trace_id(trace_id)
+        if safe_trace_id:
+            headers["X-Trace-Id"] = safe_trace_id
 
         try:
             response = self._session.request(
@@ -520,6 +526,18 @@ class SurfacedCloudClient:
             message = _extract_error_message(body) or f"云端请求失败：HTTP {response.status_code}"
             raise CloudClientError(message, status_code=response.status_code, response_body=body)
         return body
+
+
+def new_trace_id(prefix: str = "local") -> str:
+    safe_prefix = "".join(ch for ch in str(prefix or "local").lower() if ch.isalnum() or ch in {"-", "_"})[:24]
+    return f"{safe_prefix or 'local'}-{uuid.uuid4().hex[:24]}"
+
+
+def normalize_trace_id(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return "".join(ch for ch in text if ch.isalnum() or ch in {"-", "_", "."})[:128]
 
 
 def _decode_response_body(response: requests.Response) -> Any:

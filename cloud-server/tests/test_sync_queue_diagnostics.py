@@ -1,0 +1,96 @@
+from __future__ import annotations
+
+import sys
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.services.sync_queue_diagnostics import build_sync_queue_report, format_sync_queue_report
+
+
+class SyncQueueDiagnosticsTests(unittest.TestCase):
+    def test_report_formats_healthy_queue(self) -> None:
+        db = _db(
+            status_rows=[
+                SimpleNamespace(status="pending", count=0),
+                SimpleNamespace(status="done", count=10),
+            ],
+            pending_age=None,
+            expired=0,
+            dead_letters=[],
+            shard_row=SimpleNamespace(total=2, active=2, expired=0),
+        )
+
+        report = build_sync_queue_report(db)
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["counts"]["done"], 10)
+        self.assertIn("status=ok", format_sync_queue_report(report))
+
+    def test_report_warns_on_dead_letters_and_expired_items(self) -> None:
+        db = _db(
+            status_rows=[
+                SimpleNamespace(status="pending", count=3),
+                SimpleNamespace(status="dead_letter", count=1),
+            ],
+            pending_age=120,
+            expired=2,
+            dead_letters=[
+                SimpleNamespace(
+                    workspace_id=7,
+                    count=1,
+                    latest_created_at=datetime(2026, 5, 27, tzinfo=timezone.utc),
+                )
+            ],
+            shard_row=SimpleNamespace(total=4, active=1, expired=3),
+        )
+
+        report = build_sync_queue_report(db)
+
+        self.assertEqual(report["status"], "warn")
+        self.assertEqual(report["expired_in_progress"], 2)
+        text = format_sync_queue_report(report)
+        self.assertIn("dead_letters_by_workspace:", text)
+        self.assertIn("workspace=7", text)
+
+
+def _db(*, status_rows, pending_age, expired, dead_letters, shard_row):
+    db = MagicMock()
+    calls = [
+        _FakeResult(rows=status_rows),
+        _FakeResult(scalar=pending_age),
+        _FakeResult(scalar=expired),
+        _FakeResult(rows=dead_letters),
+        _FakeResult(first=shard_row),
+    ]
+    db.execute.side_effect = calls
+    return db
+
+
+class _FakeResult:
+    def __init__(self, *, rows=None, scalar=None, first=None):
+        self._rows = rows or []
+        self._scalar = scalar
+        self._first = first
+
+    def all(self):
+        return self._rows
+
+    def scalar_one_or_none(self):
+        return self._scalar
+
+    def scalar_one(self):
+        return self._scalar
+
+    def first(self):
+        return self._first
+
+
+if __name__ == "__main__":
+    unittest.main()

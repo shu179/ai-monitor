@@ -101,6 +101,15 @@ SURFACED_CLOUD_WORKER_BATCH_LIMIT=100
 
 API 保持 5s statement timeout，worker 使用 60s statement timeout；迁移进程不设置 statement timeout。生产多实例部署时建议再加 PgBouncer transaction pooling，避免 `API workers × pool_size + worker pool` 把 Postgres 连接数打满。
 
+Cloud Sync v2 观测：
+
+```bash
+python -m scripts.sync_queue_doctor
+python -m scripts.sync_queue_doctor --json
+```
+
+本地 outbox flush 会打印 `[CloudOutbox] flush trace_id=... batch_size=... elapsed_ms=... pending_before=... pending_after=... failed_count=... http_status=...`。云端 API 会把 `X-Trace-Id` 回写到响应头，并记录 `[CloudAPI] request ...` 慢请求/同步请求日志；worker 消费队列时会记录 `[CloudSyncWorker] batch ...`。`docker-compose.yml` 已给所有容器加 `json-file` 日志轮转（单文件 10MB，最多 3 个），避免小盘服务器被日志吃满。
+
 Cloud Sync v2 的对象上传接口走 S3/R2-compatible presigned URL。生产优先使用 R2 + CDN 域名作为 endpoint，下行 URL 不从 API 服务器转发大文件：
 
 ```text

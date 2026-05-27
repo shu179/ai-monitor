@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import time
+
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse
 from sqlalchemy import select
@@ -41,6 +44,7 @@ from app.services.sync_v2_service import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/capabilities", response_model=CloudCapabilityResponse)
@@ -56,6 +60,7 @@ def capabilities(
 
 @router.post("/sync/batches", response_model=SyncBatchResponse)
 def sync_batch(payload: SyncBatchRequest, current_user: CurrentUser, db: DbSession, response: Response) -> SyncBatchResponse:
+    started_at = time.monotonic()
     try:
         result = accept_sync_batch(
             db,
@@ -84,6 +89,18 @@ def sync_batch(payload: SyncBatchRequest, current_user: CurrentUser, db: DbSessi
         queue_depth_hint=int(result.get("queue_depth_hint") or 0),
     ).items():
         response.headers[key] = value
+    logger.info(
+        "[CloudSync] batch workspace_id=%s events=%s accepted=%s duplicates=%s rejected=%s "
+        "queue_depth_hint=%s retry_after=%s elapsed_ms=%s",
+        current_user.workspace_id,
+        len(payload.events or []),
+        int(result.get("accepted") or 0),
+        int(result.get("duplicates") or 0),
+        int(result.get("rejected") or 0),
+        int(result.get("queue_depth_hint") or 0),
+        int(result.get("retry_after_seconds") or 0),
+        int(round((time.monotonic() - started_at) * 1000)),
+    )
     return SyncBatchResponse(**result)
 
 
