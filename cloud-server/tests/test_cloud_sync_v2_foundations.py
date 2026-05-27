@@ -351,6 +351,8 @@ class SyncV2WorkerSqlTests(unittest.TestCase):
 
         self.assertEqual(stats["claimed"], 1)
         self.assertEqual(stats["done"], 1)
+        self.assertIn("elapsed_ms", stats)
+        self.assertIn("max_item_ms", stats)
         materialize.assert_called_once()
         mark_done.assert_called_once()
         self.assertGreaterEqual(db.commit.call_count, 2)

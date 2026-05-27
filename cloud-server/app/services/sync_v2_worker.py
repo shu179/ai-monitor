@@ -214,13 +214,15 @@ def process_sync_batch_items_once(
 ) -> dict[str, int]:
     started_at = time.monotonic()
     claimed = claim_sync_batch_items(db, worker_id=worker_id, shard_ids=shard_ids, limit=limit)
-    stats = {"claimed": len(claimed), "done": 0, "retry": 0, "dead_letter": 0}
+    stats = {"claimed": len(claimed), "done": 0, "retry": 0, "dead_letter": 0, "elapsed_ms": 0, "max_item_ms": 0}
     if claimed:
         db.commit()
     for item in claimed:
+        item_started_at = time.monotonic()
         try:
             _materialize_claimed_item(db, item=item, worker_id=worker_id)
         except Exception as exc:
+            stats["max_item_ms"] = max(stats["max_item_ms"], int(round((time.monotonic() - item_started_at) * 1000)))
             db.rollback()
             attempts = int(item.get("attempts") or 0)
             if attempts >= max(1, int(max_attempts or MAX_MATERIALIZE_ATTEMPTS)):
@@ -234,16 +236,20 @@ def process_sync_batch_items_once(
         _mark_item_done(db, item=item, worker_id=worker_id)
         _refresh_batch_status(db, str(item.get("batch_id") or ""))
         db.commit()
+        stats["max_item_ms"] = max(stats["max_item_ms"], int(round((time.monotonic() - item_started_at) * 1000)))
         stats["done"] += 1
+    stats["elapsed_ms"] = int(round((time.monotonic() - started_at) * 1000))
     if stats["claimed"] or stats["retry"] or stats["dead_letter"]:
         logger.info(
-            "[CloudSyncWorker] batch worker_id=%s claimed=%s done=%s retry=%s dead_letter=%s elapsed_ms=%s",
+            "[CloudSyncWorker] batch worker_id=%s claimed=%s done=%s retry=%s dead_letter=%s "
+            "elapsed_ms=%s max_item_ms=%s",
             worker_id,
             stats["claimed"],
             stats["done"],
             stats["retry"],
             stats["dead_letter"],
-            int(round((time.monotonic() - started_at) * 1000)),
+            stats["elapsed_ms"],
+            stats["max_item_ms"],
         )
     return stats
 
