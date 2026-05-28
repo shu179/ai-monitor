@@ -281,7 +281,10 @@ class UnixSocketCloudSyncCommandServer:
                     response = {"ok": False, "message": "命令处理结果无效"}
         except Exception as exc:
             response = {"ok": False, "message": str(exc)}
-        conn.sendall(_encode_message(response))
+        try:
+            conn.sendall(_encode_message(response))
+        except BrokenPipeError:
+            pass
 
 
 def _encode_message(payload: dict[str, Any]) -> bytes:

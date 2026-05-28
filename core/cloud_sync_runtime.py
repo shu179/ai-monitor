@@ -11,7 +11,8 @@ import hashlib
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -73,6 +74,162 @@ class LocalCloudSyncRuntime:
 
     def auto_sync_status(self) -> dict[str, Any]:
         return self.platform_auto_sync.get_status()
+
+
+@dataclass
+class CloudCommandTransportState:
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    socket_path: Path | None = None
+    server: Any | None = None
+    daemon: Any | None = None
+    client: Any | None = None
+    recovery_thread: threading.Thread | None = None
+    recovery_timer: threading.Timer | None = None
+    last_recovery_attempt_at: float = 0.0
+    last_recovery_attempt: str = ""
+    last_recovery_reason: str = ""
+    last_recovery_completed_at: str = ""
+    last_recovery_result: str = ""
+    last_recovery_error: str = ""
+    next_recovery_at: float = 0.0
+    next_recovery_after: str = ""
+    recovery_interval_seconds: float = 30.0
+    stop_requested: bool = False
+    mode: str = "not_started"
+    error: str = ""
+    error_type: str = ""
+
+    def clear_recovery_timer(self) -> None:
+        timer = self.recovery_timer
+        self.recovery_timer = None
+        self.next_recovery_at = 0.0
+        self.next_recovery_after = ""
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+    def snapshot_status(
+        self,
+        *,
+        ping_fn: Callable[[Path], dict[str, Any]] | None = None,
+        now_monotonic: Callable[[], float] = time.monotonic,
+    ) -> dict[str, Any]:
+        daemon = self.daemon
+        server = self.server
+        client = self.client
+        socket_path = self.socket_path
+        mode = str(self.mode or "")
+        if not mode:
+            if daemon is not None:
+                mode = "child_daemon"
+            elif server is not None:
+                mode = "in_process_socket"
+            elif client is not None:
+                mode = "in_process_direct"
+            else:
+                mode = "not_started"
+        process = getattr(daemon, "process", None)
+        recovery_thread = self.recovery_thread
+        recovery_timer = self.recovery_timer
+        daemon_process_alive = bool(callable(getattr(process, "is_alive", None)) and process.is_alive())
+        recovery_running = bool(
+            recovery_thread is not None
+            and callable(getattr(recovery_thread, "is_alive", None))
+            and recovery_thread.is_alive()
+        )
+        recovery_scheduled = bool(
+            recovery_timer is not None
+            and callable(getattr(recovery_timer, "is_alive", None))
+            and recovery_timer.is_alive()
+        )
+        socket_ping: dict[str, Any] = {
+            "attempted": False,
+            "ok": None,
+            "elapsed_ms": None,
+            "daemon": False,
+            "pid": None,
+            "message": "",
+            "error_type": "",
+        }
+        if mode == "child_daemon" and socket_path and ping_fn is not None:
+            socket_ping = ping_fn(socket_path)
+        if mode == "child_daemon":
+            responsive = bool(socket_ping.get("ok"))
+        elif mode == "in_process_socket":
+            responsive = server is not None and client is not None
+        elif mode == "in_process_direct":
+            responsive = client is not None
+        else:
+            responsive = False
+        next_recovery_allowed_in_seconds = 0
+        now = now_monotonic()
+        if recovery_scheduled:
+            next_recovery_allowed_in_seconds = max(0, int((self.next_recovery_at - now) + 0.999))
+        elif mode == "in_process_direct" and not recovery_running and self.last_recovery_attempt_at > 0:
+            next_recovery_allowed_in_seconds = max(
+                0,
+                int((max(1.0, float(self.recovery_interval_seconds or 30.0)) - (now - self.last_recovery_attempt_at)) + 0.999),
+            )
+        return {
+            "mode": mode,
+            "socket_path": str(socket_path or ""),
+            "client_active": client is not None,
+            "daemon_active": daemon is not None,
+            "daemon_process_alive": daemon_process_alive,
+            "in_process_server_active": server is not None,
+            "responsive": responsive,
+            "socket_ping": socket_ping,
+            "recovery_running": recovery_running,
+            "recovery_scheduled": recovery_scheduled,
+            "last_recovery_attempt": self.last_recovery_attempt,
+            "last_recovery_reason": self.last_recovery_reason,
+            "last_recovery_completed_at": self.last_recovery_completed_at,
+            "last_recovery_result": self.last_recovery_result,
+            "last_recovery_error": self.last_recovery_error,
+            "next_recovery_after": self.next_recovery_after,
+            "next_recovery_allowed_in_seconds": next_recovery_allowed_in_seconds,
+            "last_error": self.error,
+            "last_error_type": self.error_type,
+        }
+
+    def schedule_recovery_timer(
+        self,
+        *,
+        reason: str,
+        delay_seconds: float,
+        on_fire: Callable[[str], None],
+        local_now_fn: Callable[[], Any],
+        timer_factory: Callable[[float, Callable[[], None]], threading.Timer] | None = None,
+    ) -> bool:
+        delay = max(1.0, float(delay_seconds or 0.0))
+        timer = self.recovery_timer
+        if timer is not None and callable(getattr(timer, "is_alive", None)) and timer.is_alive():
+            return False
+
+        def run_later() -> None:
+            with self.lock:
+                self.recovery_timer = None
+                self.next_recovery_at = 0.0
+                self.next_recovery_after = ""
+            on_fire(reason)
+        timer_cls = timer_factory or threading.Timer
+        timer = timer_cls(delay, run_later)
+        try:
+            timer.daemon = True
+        except Exception:
+            pass
+        self.recovery_timer = timer
+        self.next_recovery_at = time.monotonic() + delay
+        self.next_recovery_after = (local_now_fn() + timedelta(seconds=delay)).isoformat(timespec="seconds")
+        try:
+            timer.start()
+        except RuntimeError:
+            starter = getattr(timer, "start", None)
+            if callable(starter):
+                starter()
+        return True
 
 
 def create_in_process_cloud_sync_command_client(
