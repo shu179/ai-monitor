@@ -953,6 +953,38 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             self.assertEqual(calls, ["process", "process"])
             self.assertEqual(result["state_delta_inbox"]["batches"], 2)
             self.assertEqual(result["state_delta_inbox"]["claimed"], 1000)
+            self.assertTrue(result["state_delta_inbox"]["more_pending_possible"])
+            self.assertTrue(manager.get_status()["last_state_delta_inbox_metrics"]["more_pending_possible"])
+
+    def test_state_delta_pipeline_local_backlog_can_skip_remote_pull(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calls: list[str] = []
+
+            def process(_payload=None):
+                calls.append("process")
+                return {
+                    "ok": True,
+                    "claimed": 120,
+                    "applied": 120,
+                    "failed": 0,
+                }
+
+            manager = CloudPlatformAutoSync(
+                session_store=CloudSessionStore(Path(tmpdir) / "session.json"),
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda force=False: {"ok": True},
+                pull_state_delta=lambda _payload=None: calls.append("pull") or {"ok": True, "changes": 500},
+                process_state_delta_inbox=process,
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            result = manager._invoke_state_delta_pipeline(allow_pull=False)  # noqa: SLF001
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(calls, ["process"])
+            self.assertTrue(result["state_delta"]["skipped"])
+            self.assertEqual(result["state_delta_inbox"]["applied"], 120)
 
     def test_object_download_retry_failure_does_not_fail_state_delta_pipeline(self):
         with tempfile.TemporaryDirectory() as tmpdir:

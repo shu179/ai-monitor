@@ -17,6 +17,7 @@ from .cloud_outbox import CloudOutbox
 from .cloud_object_transfer_store import CloudObjectTransferStore
 from .cloud_run_sync import flush_cloud_outbox
 from .cloud_session_store import CloudSessionChangedError, CloudSessionStore, cloud_session_identity
+from .cloud_state_delta_inbox import CloudStateDeltaInbox
 from .time_utils import local_now
 
 T = TypeVar("T")
@@ -864,12 +865,40 @@ class CloudPlatformAutoSync:
                 if first_sync_for_login:
                     self._finish_startup_recovery(recovery_result, upload_result, pull_result, state_delta_result)
 
+                if (
+                    state_delta_result is None
+                    and callable(self._process_state_delta_inbox)
+                    and not self._refresh_state_delta_backpressure_status(time.monotonic())
+                ):
+                    last_inbox_metrics = self.get_status().get("last_state_delta_inbox_metrics")
+                    if isinstance(last_inbox_metrics, dict) and bool(last_inbox_metrics.get("more_pending_possible")):
+                        state_delta_result = self._run_active_operation(
+                            "state_delta_pipeline",
+                            lambda: self._invoke_state_delta_pipeline(allow_pull=False),
+                            detail={"source": "local_inbox_backlog"},
+                        )
+                        if state_delta_result.get("ok"):
+                            self._clear_error()
+                        else:
+                            self._record_error(str(state_delta_result.get("message") or "state-delta inbox 自动处理失败"))
+
                 if self._stop_event.wait(0.1):
                     break
                 upload_wake_requested = CloudOutbox.wait_for_change(self._idle_interval_seconds)
                 object_transfer_wake_requested = CloudObjectTransferStore.wait_for_change(0.0)
+                inbox_wake_requested = CloudStateDeltaInbox.wait_for_change(0.0)
                 object_upload_retry_wake_requested = object_transfer_wake_requested
                 object_download_retry_wake_requested = object_transfer_wake_requested
+                if inbox_wake_requested:
+                    state_delta_result = self._run_active_operation(
+                        "state_delta_pipeline",
+                        lambda: self._invoke_state_delta_pipeline(allow_pull=False),
+                        detail={"source": "inbox_wake"},
+                    )
+                    if state_delta_result.get("ok"):
+                        self._clear_error()
+                    else:
+                        self._record_error(str(state_delta_result.get("message") or "state-delta inbox 自动处理失败"))
         finally:
             self._update_status(running=False, event_stream_connected=False)
 
@@ -1149,7 +1178,7 @@ class CloudPlatformAutoSync:
             next_object_download_retry_after_seconds=_safe_int(payload.get("next_retry_after_seconds")),
         )
 
-    def _invoke_state_delta_pipeline(self) -> dict[str, Any]:
+    def _invoke_state_delta_pipeline(self, *, allow_pull: bool = True) -> dict[str, Any]:
         pull_handler = self._pull_state_delta
         process_handler = self._process_state_delta_inbox
         retry_downloads_handler = self._retry_object_downloads
@@ -1171,7 +1200,7 @@ class CloudPlatformAutoSync:
         pull_result: dict[str, Any] = {"ok": True, "message": "", "skipped": True}
         process_result: dict[str, Any] = {"ok": True, "message": "", "skipped": True}
         retry_downloads_result: dict[str, Any] = {"ok": True, "message": "", "skipped": True}
-        if callable(pull_handler) and not backpressure_active:
+        if callable(pull_handler) and allow_pull and not backpressure_active:
             try:
                 pull_result = _invoke_optional_payload_callback(
                     pull_handler,
@@ -1179,7 +1208,7 @@ class CloudPlatformAutoSync:
                 )
             except Exception as exc:
                 pull_result = {"ok": False, "message": f"state-delta 拉取失败：{exc}"}
-        elif callable(pull_handler) and backpressure_active:
+        elif callable(pull_handler) and allow_pull and backpressure_active:
             pull_result = {"ok": True, "message": "", "skipped": True, "backpressure_active": True}
         pull_metrics = _state_delta_metrics(pull_result)
         if not self._apply_state_delta_backpressure(pull_metrics, now=time.monotonic()) and not backpressure_active:
@@ -1253,6 +1282,11 @@ class CloudPlatformAutoSync:
                 break
             if _safe_int(batch_result.get("claimed")) < 500:
                 break
+        aggregate["more_pending_possible"] = bool(
+            aggregate.get("ok")
+            and _safe_int(aggregate.get("batches")) >= max_batches
+            and _safe_int(aggregate.get("claimed")) >= max_batches * 500
+        )
         return aggregate
 
 
@@ -1368,10 +1402,12 @@ def _state_delta_inbox_metrics(result: dict[str, Any]) -> dict[str, Any]:
         return {}
     return {
         "ok": bool(payload.get("ok", True)),
+        "batches": max(1, _safe_int(payload.get("batches"))),
         "claimed": _safe_int(payload.get("claimed")),
         "applied": _safe_int(payload.get("applied")),
         "failed": _safe_int(payload.get("failed")),
         "skipped_no_applier": _safe_int(payload.get("skipped_no_applier")),
+        "more_pending_possible": bool(payload.get("more_pending_possible")),
         "streams": dict(payload.get("streams") if isinstance(payload.get("streams"), dict) else {}),
     }
 

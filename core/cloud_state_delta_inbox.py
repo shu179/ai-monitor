@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -29,9 +30,22 @@ STATE_DELTA_APPLY_STREAM_ORDER = (
 class CloudStateDeltaInbox:
     """Durable local inbox for v2 state-delta changes before business appliers run."""
 
+    _change_event = threading.Event()
+
     def __init__(self, db_path: str | Path | None = None) -> None:
         self._explicit_path = Path(db_path) if db_path is not None else None
         self._startup_maintenance_done = False
+
+    @classmethod
+    def notify_changed(cls) -> None:
+        cls._change_event.set()
+
+    @classmethod
+    def wait_for_change(cls, timeout: float) -> bool:
+        changed = cls._change_event.wait(max(0.0, float(timeout or 0.0)))
+        if changed:
+            cls._change_event.clear()
+        return changed
 
     @property
     def db_path(self) -> Path:
@@ -93,6 +107,8 @@ class CloudStateDeltaInbox:
                     streams[stream] = streams.get(stream, 0) + 1
                 else:
                     duplicates += 1
+        if created > 0:
+            self.notify_changed()
         return {
             "requested": len(normalized),
             "created": created,

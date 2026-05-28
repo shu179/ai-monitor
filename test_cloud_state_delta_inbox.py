@@ -8,6 +8,20 @@ from core.cloud_state_delta_inbox import CloudStateDeltaInbox, process_state_del
 
 
 class CloudStateDeltaInboxTests(unittest.TestCase):
+    def test_record_changes_notifies_waiters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+
+            while CloudStateDeltaInbox.wait_for_change(0):
+                pass
+            inbox.record_changes(
+                identity_key="account-a",
+                changes=[{"stream": "tasks", "seq": 1, "kind": "task.changed", "ref_id": "task:1"}],
+            )
+
+            self.assertTrue(CloudStateDeltaInbox.wait_for_change(0))
+            self.assertFalse(CloudStateDeltaInbox.wait_for_change(0))
+
     def test_record_changes_is_idempotent_by_identity_stream_seq_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
