@@ -67,7 +67,12 @@ class UnixSocketCloudSyncCommandClient:
 
     def send_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         if not hasattr(socket, "AF_UNIX"):
-            return {"ok": False, "message": "当前平台不支持 Unix socket"}
+            return {
+                "ok": False,
+                "daemon_unavailable": True,
+                "daemon_error_type": "unsupported_platform",
+                "message": "当前平台不支持 Unix socket",
+            }
         request = {"command": str(command or "").strip(), "payload": payload if isinstance(payload, dict) else None}
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -76,9 +81,24 @@ class UnixSocketCloudSyncCommandClient:
                 sock.sendall(_encode_message(request))
                 sock.shutdown(socket.SHUT_WR)
                 response = _decode_message(_recv_until_eof(sock))
+        except TimeoutError as exc:
+            return _daemon_client_error("command_timeout", exc)
+        except socket.timeout as exc:
+            return _daemon_client_error("command_timeout", exc)
+        except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError, FileNotFoundError, OSError) as exc:
+            return _daemon_client_error("connect_failed", exc)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            return _daemon_client_error("response_invalid", exc)
         except Exception as exc:
-            return {"ok": False, "daemon_unavailable": True, "message": f"云同步 daemon 不可用: {exc}"}
-        return response if isinstance(response, dict) else {"ok": False, "message": "云同步 daemon 返回无效响应"}
+            return _daemon_client_error("unknown", exc)
+        if not isinstance(response, dict):
+            return {
+                "ok": False,
+                "daemon_unavailable": True,
+                "daemon_error_type": "response_invalid",
+                "message": "云同步 daemon 返回无效响应",
+            }
+        return response
 
 
 class CloudSyncCommandDaemonProcess:
@@ -273,6 +293,16 @@ def _decode_message(raw: bytes) -> Any:
     if not text:
         return {}
     return json.loads(text)
+
+
+def _daemon_client_error(error_type: str, exc: BaseException) -> dict[str, Any]:
+    safe_type = str(error_type or "unknown").strip() or "unknown"
+    return {
+        "ok": False,
+        "daemon_unavailable": True,
+        "daemon_error_type": safe_type,
+        "message": f"云同步 daemon 不可用: {exc}",
+    }
 
 
 def _recv_until_eof(sock: socket.socket) -> bytes:

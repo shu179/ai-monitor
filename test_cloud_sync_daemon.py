@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+import socket
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -56,6 +57,63 @@ class CloudSyncDaemonTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True, "echo": {"limit": 7}})
         self.assertEqual(seen, [("cloud.flush_outbox", {"limit": 7})])
+
+    @unittest.skipUnless(hasattr(__import__("socket"), "AF_UNIX"), "Unix socket unsupported on this platform")
+    def test_unix_socket_command_client_reports_connect_failure_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = UnixSocketCloudSyncCommandClient(Path(tmpdir) / "missing.sock", timeout_seconds=0.1)
+
+            result = client.send_command("cloud.status")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["daemon_unavailable"])
+        self.assertEqual(result["daemon_error_type"], "connect_failed")
+
+    @unittest.skipUnless(hasattr(__import__("socket"), "AF_UNIX"), "Unix socket unsupported on this platform")
+    def test_unix_socket_command_client_reports_timeout_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            socket_path = Path(tmpdir) / "slow.sock"
+            server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server_socket.bind(str(socket_path))
+            server_socket.listen(1)
+            accepted: list[socket.socket] = []
+
+            def accept_once() -> None:
+                conn, _addr = server_socket.accept()
+                accepted.append(conn)
+
+            thread = threading.Thread(target=accept_once, daemon=True)
+            thread.start()
+            try:
+                client = UnixSocketCloudSyncCommandClient(socket_path, timeout_seconds=0.1)
+                result = client.send_command("cloud.status")
+            finally:
+                for conn in accepted:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                server_socket.close()
+                thread.join(timeout=1.0)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["daemon_unavailable"])
+        self.assertEqual(result["daemon_error_type"], "command_timeout")
+
+    @unittest.skipUnless(hasattr(__import__("socket"), "AF_UNIX"), "Unix socket unsupported on this platform")
+    def test_unix_socket_command_client_reports_invalid_response_type(self) -> None:
+        fake_socket = Mock()
+        fake_socket.__enter__ = Mock(return_value=fake_socket)
+        fake_socket.__exit__ = Mock(return_value=False)
+        fake_socket.recv.side_effect = [b'"not-a-dict"\n', b""]
+
+        with patch("core.cloud_sync_daemon.socket.socket", return_value=fake_socket):
+            client = UnixSocketCloudSyncCommandClient("/tmp/invalid.sock")
+            result = client.send_command("cloud.status")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["daemon_unavailable"])
+        self.assertEqual(result["daemon_error_type"], "response_invalid")
 
     @unittest.skipUnless(hasattr(__import__("socket"), "AF_UNIX"), "Unix socket unsupported on this platform")
     def test_child_process_daemon_ping_and_supported_command(self) -> None:
