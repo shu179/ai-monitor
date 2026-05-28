@@ -13,6 +13,7 @@ from app.models import ObjectManifest, ObjectUploadPart, ObjectUploadSession
 from app.services.object_storage_diagnostics import build_object_storage_report
 from app.services.object_storage_service import (
     OBJECT_UPLOAD_STATUS_INITIATED,
+    OBJECT_MANIFEST_STATUS_DELETING,
     local_object_path,
 )
 from app.services.sync_v2_service import TTL_SECONDS
@@ -37,6 +38,7 @@ def run_cloud_maintenance(
     expired_uploads = _cleanup_expired_upload_sessions(db, now=now, dry_run=dry_run)
     dead_letters = _cleanup_expired_dead_letters(db, now=now, dry_run=dry_run)
     change_logs = _cleanup_expired_change_log(db, now=now, dry_run=dry_run)
+    soft_deleted_objects = _cleanup_soft_deleted_objects(db, now=now, settings=resolved_settings, dry_run=dry_run)
     orphan_files = _cleanup_orphan_local_files(db, settings=resolved_settings, dry_run=dry_run)
     if not dry_run:
         db.commit()
@@ -45,16 +47,20 @@ def run_cloud_maintenance(
         "expired_upload_sessions": expired_uploads,
         "dead_letters": dead_letters,
         "change_log": change_logs,
+        "soft_deleted_objects": soft_deleted_objects,
         "orphan_files": orphan_files,
     }
     logger.info(
         "[CloudMaintenance] dry_run=%s expired_upload_sessions=%s upload_parts=%s "
-        "dead_letters=%s change_log_rows=%s orphan_files=%s orphan_bytes=%s",
+        "dead_letters=%s change_log_rows=%s soft_deleted_objects=%s soft_deleted_bytes=%s "
+        "orphan_files=%s orphan_bytes=%s",
         bool(dry_run),
         expired_uploads["sessions"],
         expired_uploads["parts"],
         dead_letters["dead_letters"],
         change_logs["rows"],
+        soft_deleted_objects["objects"],
+        soft_deleted_objects["bytes"],
         orphan_files["files"],
         orphan_files["bytes"],
     )
@@ -140,6 +146,48 @@ def _cleanup_expired_change_log(db: Session, *, now: datetime, dry_run: bool) ->
             {"cutoff": cutoff},
         )
     return {"rows": count}
+
+
+def _cleanup_soft_deleted_objects(
+    db: Session,
+    *,
+    now: datetime,
+    settings: Settings,
+    dry_run: bool,
+) -> dict[str, int]:
+    manifests = list(
+        db.scalars(
+            select(ObjectManifest).where(
+                ObjectManifest.status == OBJECT_MANIFEST_STATUS_DELETING,
+                ObjectManifest.deleted_after.is_not(None),
+                ObjectManifest.deleted_after <= now,
+                ObjectManifest.ref_count <= 0,
+            )
+        )
+    )
+    deleted_objects = 0
+    deleted_bytes = 0
+    root = Path(str(settings.object_storage_local_dir or "/opt/surfaced/object-data")).resolve()
+    for manifest in manifests:
+        path = local_object_path(str(manifest.storage_key), settings=settings)
+        if root not in path.parents and path != root:
+            continue
+        size_bytes = int(manifest.storage_size_bytes or 0)
+        if not dry_run:
+            # Re-check the mutable fields immediately before deletion. This
+            # keeps the 7-day grace period safe if a reference was restored
+            # after this maintenance batch selected the row.
+            db.refresh(manifest)
+            if int(manifest.ref_count or 0) > 0 or str(manifest.status or "") != OBJECT_MANIFEST_STATUS_DELETING:
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            db.delete(manifest)
+        deleted_objects += 1
+        deleted_bytes += size_bytes
+    return {"objects": deleted_objects, "bytes": deleted_bytes}
 
 
 def _cleanup_orphan_local_files(db: Session, *, settings: Settings, dry_run: bool) -> dict[str, int]:

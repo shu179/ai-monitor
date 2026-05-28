@@ -29,6 +29,7 @@ class CloudMaintenanceResponse(BaseModel):
     expired_upload_sessions: dict[str, int]
     dead_letters: dict[str, int]
     change_log: dict[str, int]
+    soft_deleted_objects: dict[str, int] = Field(default_factory=dict)
     orphan_files: dict[str, int]
 
 

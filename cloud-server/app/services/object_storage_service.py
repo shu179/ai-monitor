@@ -26,6 +26,7 @@ from app.services.sync_v2_service import LIMITS, TTL_SECONDS, workspace_bucket_a
 OBJECT_UPLOAD_STATUS_INITIATED = "initiated"
 OBJECT_UPLOAD_STATUS_COMPLETED = "completed"
 OBJECT_MANIFEST_STATUS_ACTIVE = "active"
+OBJECT_MANIFEST_STATUS_DELETING = "deleting"
 INLINE_STRATEGY = "inline"
 ALREADY_EXISTS_STRATEGY = "already_exists"
 SINGLE_PUT_STRATEGY = "single_put"
@@ -445,6 +446,46 @@ def create_object_download(db: Session, user: User, *, object_id: str) -> dict[s
         "storage_size_bytes": int(manifest.storage_size_bytes),
         "compression": str(manifest.compression),
     }
+
+
+def retain_object_reference(db: Session, *, workspace_id: int, object_id: str, count: int = 1) -> bool:
+    """Increment an object's reference count and reactivate a pending soft delete."""
+    safe_count = max(1, int(count or 1))
+    manifest = db.scalar(
+        select(ObjectManifest).where(
+            ObjectManifest.workspace_id == int(workspace_id),
+            ObjectManifest.id == str(object_id),
+            ObjectManifest.status.in_((OBJECT_MANIFEST_STATUS_ACTIVE, OBJECT_MANIFEST_STATUS_DELETING)),
+        )
+    )
+    if manifest is None:
+        return False
+    manifest.ref_count = max(0, int(manifest.ref_count or 0)) + safe_count
+    manifest.status = OBJECT_MANIFEST_STATUS_ACTIVE
+    manifest.deleted_after = None
+    db.flush()
+    return True
+
+
+def release_object_reference(db: Session, *, workspace_id: int, object_id: str, count: int = 1) -> bool:
+    """Release an object reference and schedule soft-delete when the count hits zero."""
+    safe_count = max(1, int(count or 1))
+    manifest = db.scalar(
+        select(ObjectManifest).where(
+            ObjectManifest.workspace_id == int(workspace_id),
+            ObjectManifest.id == str(object_id),
+            ObjectManifest.status.in_((OBJECT_MANIFEST_STATUS_ACTIVE, OBJECT_MANIFEST_STATUS_DELETING)),
+        )
+    )
+    if manifest is None:
+        return False
+    next_ref_count = max(0, int(manifest.ref_count or 0) - safe_count)
+    manifest.ref_count = next_ref_count
+    if next_ref_count <= 0:
+        manifest.status = OBJECT_MANIFEST_STATUS_DELETING
+        manifest.deleted_after = datetime.now(timezone.utc) + timedelta(seconds=TTL_SECONDS["object_soft_delete"])
+    db.flush()
+    return True
 
 
 def object_storage_key(workspace_id: int, sha256: str) -> str:

@@ -9,7 +9,11 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.models import ObjectManifest
-from app.services.object_storage_service import OBJECT_MANIFEST_STATUS_ACTIVE, local_object_path
+from app.services.object_storage_service import (
+    OBJECT_MANIFEST_STATUS_ACTIVE,
+    OBJECT_MANIFEST_STATUS_DELETING,
+    local_object_path,
+)
 
 
 def build_object_storage_report(db: Session, *, settings: Settings | None = None) -> dict[str, Any]:
@@ -112,7 +116,7 @@ def _active_manifest_rows(db: Session) -> list[dict[str, Any]]:
             ObjectManifest.workspace_id,
             ObjectManifest.storage_key,
             ObjectManifest.storage_size_bytes,
-        ).where(ObjectManifest.status == OBJECT_MANIFEST_STATUS_ACTIVE)
+        ).where(ObjectManifest.status.in_((OBJECT_MANIFEST_STATUS_ACTIVE, OBJECT_MANIFEST_STATUS_DELETING)))
     ).all()
     return [
         {

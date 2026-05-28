@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.models import ObjectManifest  # noqa: E402
 from app.services.object_storage_service import (  # noqa: E402
     INLINE_STRATEGY,
     MULTIPART_STRATEGY,
@@ -21,6 +23,8 @@ from app.services.object_storage_service import (  # noqa: E402
     LocalDiskObjectStorageClient,
     normalize_compression,
     object_storage_key,
+    release_object_reference,
+    retain_object_reference,
     store_local_object_upload_content,
     upload_strategy_for_size,
 )
@@ -452,6 +456,56 @@ class ObjectUploadFlowTests(unittest.TestCase):
             expected_path = Path(tmp) / f"7/{sha[:2]}/{sha[2:4]}/{sha}"
             self.assertEqual(expected_path.read_bytes(), body)
             self.assertEqual(result["content_type"], "image/png")
+
+
+class ObjectReferenceLifecycleTests(unittest.TestCase):
+    def test_retain_reference_reactivates_pending_soft_delete(self) -> None:
+        manifest = ObjectManifest(
+            id="object-1",
+            workspace_id=7,
+            sha256=SHA,
+            size_bytes=10,
+            storage_size_bytes=10,
+            content_type="text/plain",
+            storage_key=f"7/{SHA[:2]}/{SHA[2:4]}/{SHA}",
+            compression="none",
+            ref_count=0,
+            status="deleting",
+            deleted_after=datetime.now(timezone.utc),
+        )
+        db = MagicMock()
+        db.scalar.return_value = manifest
+
+        self.assertTrue(retain_object_reference(db, workspace_id=7, object_id="object-1", count=2))
+
+        self.assertEqual(manifest.ref_count, 2)
+        self.assertEqual(manifest.status, "active")
+        self.assertIsNone(manifest.deleted_after)
+        db.flush.assert_called_once()
+
+    def test_release_reference_schedules_soft_delete_after_grace_period(self) -> None:
+        manifest = ObjectManifest(
+            id="object-1",
+            workspace_id=7,
+            sha256=SHA,
+            size_bytes=10,
+            storage_size_bytes=10,
+            content_type="text/plain",
+            storage_key=f"7/{SHA[:2]}/{SHA[2:4]}/{SHA}",
+            compression="none",
+            ref_count=1,
+            status="active",
+        )
+        db = MagicMock()
+        db.scalar.return_value = manifest
+
+        self.assertTrue(release_object_reference(db, workspace_id=7, object_id="object-1"))
+
+        self.assertEqual(manifest.ref_count, 0)
+        self.assertEqual(manifest.status, "deleting")
+        self.assertIsNotNone(manifest.deleted_after)
+        self.assertGreater(manifest.deleted_after, datetime.now(timezone.utc) + timedelta(days=6))
+        db.flush.assert_called_once()
 
 
 if __name__ == "__main__":
