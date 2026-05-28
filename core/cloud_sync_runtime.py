@@ -468,6 +468,37 @@ class AppCloudRuntimeSupport:
             return result
         return {"ok": False, "message": "云同步命令返回无效响应"}
 
+    @staticmethod
+    def merge_transport_status_into_sync_health(
+        result: dict[str, Any],
+        *,
+        transport_status: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(result, dict) or not isinstance(result.get("sync_health"), dict):
+            return result
+        sync_health = dict(result["sync_health"])
+        sync_health["cloud_command_transport"] = transport_status
+        summary = dict(sync_health.get("summary") if isinstance(sync_health.get("summary"), dict) else {})
+        summary["cloud_command_transport_blocked"] = bool(transport_status.get("transport_blocked"))
+        summary["cloud_command_transport_mode"] = str(transport_status.get("mode") or "")
+        summary["cloud_command_transport_next_action"] = dict(
+            transport_status.get("next_transport_action")
+            if isinstance(transport_status.get("next_transport_action"), dict)
+            else {}
+        )
+        summary["cloud_command_transport_last_recovery_result"] = str(
+            transport_status.get("last_recovery_result") or ""
+        )
+        summary["cloud_command_transport_last_recovery_error"] = str(
+            transport_status.get("last_recovery_error") or ""
+        )
+        summary["cloud_command_transport_last_error_type"] = str(transport_status.get("last_error_type") or "")
+        summary["deep_blocked"] = bool(summary.get("sync_blocked")) or bool(transport_status.get("transport_blocked"))
+        sync_health["summary"] = summary
+        merged = dict(result)
+        merged["sync_health"] = sync_health
+        return merged
+
     @property
     def last_article_cloud_enqueue_key(self) -> tuple[Any, ...] | None:
         return self._last_article_cloud_enqueue_key
