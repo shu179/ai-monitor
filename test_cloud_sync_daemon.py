@@ -169,6 +169,59 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True, "message": "ok"})
         client.send_command.assert_called_once_with("cloud.flush_outbox", {"limit": 7})
 
+    def test_app_runtime_cloud_command_uses_long_timeout_for_bulk_daemon_commands(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_command_socket_path = Path("/tmp/cloud-sync.sock")
+        runtime._cloud_command_transport_mode = "child_daemon"
+        socket_client = UnixSocketCloudSyncCommandClient("/tmp/old.sock")
+        command_client = Mock()
+        command_client.send_command.return_value = {"ok": True, "message": "ok"}
+
+        with patch("web_backend.UnixSocketCloudSyncCommandClient", return_value=command_client) as client_cls:
+            result = AppRuntime._send_cloud_command_via_transport(
+                runtime,
+                socket_client,
+                "cloud.flush_outbox",
+                {"limit": 500},
+            )
+
+        self.assertEqual(result, {"ok": True, "message": "ok"})
+        client_cls.assert_called_once_with(Path("/tmp/cloud-sync.sock"), timeout_seconds=60.0)
+        command_client.send_command.assert_called_once_with("cloud.flush_outbox", {"limit": 500})
+
+    def test_app_runtime_cloud_command_uses_short_timeout_for_status_daemon_commands(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_command_socket_path = Path("/tmp/cloud-sync.sock")
+        runtime._cloud_command_transport_mode = "child_daemon"
+        socket_client = UnixSocketCloudSyncCommandClient("/tmp/old.sock")
+        command_client = Mock()
+        command_client.send_command.return_value = {"ok": True, "cloud": {}}
+
+        with patch("web_backend.UnixSocketCloudSyncCommandClient", return_value=command_client) as client_cls:
+            result = AppRuntime._send_cloud_command_via_transport(runtime, socket_client, "cloud.status", None)
+
+        self.assertEqual(result, {"ok": True, "cloud": {}})
+        client_cls.assert_called_once_with(Path("/tmp/cloud-sync.sock"), timeout_seconds=5.0)
+
+    def test_app_runtime_cloud_command_keeps_in_process_client_timeoutless(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_command_socket_path = Path("/tmp/cloud-sync.sock")
+        runtime._cloud_command_transport_mode = "in_process_direct"
+        in_process_client = Mock()
+        in_process_client.send_command.return_value = {"ok": True}
+
+        with patch("web_backend.UnixSocketCloudSyncCommandClient") as client_cls:
+            result = AppRuntime._send_cloud_command_via_transport(
+                runtime,
+                in_process_client,
+                "cloud.flush_outbox",
+                None,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        client_cls.assert_not_called()
+        in_process_client.send_command.assert_called_once_with("cloud.flush_outbox", None)
+
     def test_app_runtime_start_and_stop_cloud_command_transport(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         runtime.config_path = Path("/tmp/aibrandmonitor-config.yaml")

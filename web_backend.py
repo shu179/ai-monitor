@@ -2158,6 +2158,43 @@ class AppRuntime:
         self._cloud_command_transport_error = ""
         return client
 
+    def _cloud_command_timeout_seconds(self, command: str) -> float:
+        normalized = str(command or "").strip()
+        if normalized in {
+            "cloud.status",
+            "cloud.current_status",
+            "cloud.status_from_session",
+            "cloud.validate_session",
+            "cloud.capabilities",
+            "cloud.outbox_diagnostics",
+            "cloud.sync_health",
+            "cloud.object_cache_diagnostics",
+            "cloud.object_transfer_diagnostics",
+            "cloud.object_transfer_retry_candidates",
+            "cloud.state_delta_diagnostics",
+        }:
+            return 5.0
+        if normalized in {
+            "cloud.flush_outbox",
+            "cloud.pull_state_delta",
+            "cloud.process_state_delta_inbox",
+            "cloud.retry_object_downloads",
+            "cloud.retry_object_uploads",
+            "cloud.prune_object_cache",
+            "cloud.cache_object",
+        }:
+            return 60.0
+        return 15.0
+
+    def _send_cloud_command_via_transport(self, client: Any, command: str, payload: dict[str, Any] | None) -> dict[str, Any]:
+        socket_path = getattr(self, "_cloud_command_socket_path", None)
+        if type(client).__name__ == "UnixSocketCloudSyncCommandClient" and socket_path:
+            client = UnixSocketCloudSyncCommandClient(
+                socket_path,
+                timeout_seconds=self._cloud_command_timeout_seconds(command),
+            )
+        return client.send_command(command, payload)
+
     def _start_cloud_command_transport(self) -> None:
         lock = getattr(self, "_cloud_command_transport_lock", None)
         if lock is None:
@@ -4540,7 +4577,7 @@ return changedCount
         if normalized not in DAEMON_SUPPORTED_COMMANDS or normalized == "cloud.logout":
             return self._ensure_cloud_runtime_support().handle_command(command, payload)
         client = self._ensure_cloud_command_client()
-        result = client.send_command(normalized, payload)
+        result = self._send_cloud_command_via_transport(client, normalized, payload)
         if isinstance(result, dict) and bool(result.get("daemon_unavailable")):
             error_type = str(result.get("daemon_error_type") or "unknown")
             self._degrade_cloud_command_transport(str(result.get("message") or "云同步 daemon 不可用"), error_type=error_type)
