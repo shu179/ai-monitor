@@ -33,6 +33,28 @@ class CloudMaintenanceResponse(BaseModel):
     orphan_files: dict[str, int]
 
 
+class CloudSyncQueueRequeueRequest(BaseModel):
+    workspace_id: int = Field(gt=0)
+    statuses: list[Literal["blocked", "dead_letter"]] = Field(
+        default_factory=lambda: ["blocked", "dead_letter"],
+        max_length=2,
+    )
+    partition_key: str | None = Field(default=None, max_length=256)
+    limit: int = Field(default=100, ge=1, le=1000)
+    dry_run: bool = True
+
+
+class CloudSyncQueueRequeueResponse(BaseModel):
+    dry_run: bool
+    workspace_id: int
+    statuses: list[str]
+    partition_key: str
+    limit: int
+    selected: int
+    requeued: int
+    items: list[dict[str, Any]]
+
+
 class UserPublic(BaseModel):
     id: int
     workspace_id: int

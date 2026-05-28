@@ -12,6 +12,8 @@ from app.schemas import (
     CloudMaintenanceResponse,
     CloudOpsReportResponse,
     CloudShadowReconcileResponse,
+    CloudSyncQueueRequeueRequest,
+    CloudSyncQueueRequeueResponse,
     CreateTaskRequest,
     CreateUserRequest,
     IgnoreArticleClassificationRequest,
@@ -44,6 +46,7 @@ from app.services.cloud_maintenance_service import run_cloud_maintenance
 from app.services.object_storage_diagnostics import build_object_storage_report, format_object_storage_report
 from app.services.shadow_reconcile_service import build_shadow_reconcile_report, format_shadow_reconcile_report
 from app.services.sync_queue_diagnostics import build_sync_queue_report, format_sync_queue_report
+from app.services.sync_queue_ops_service import requeue_sync_queue_items
 
 router = APIRouter()
 
@@ -58,6 +61,25 @@ def sync_queue_doctor(admin: AdminUser, db: DbSession) -> CloudOpsReportResponse
     del admin
     report = build_sync_queue_report(db)
     return CloudOpsReportResponse(report=report, text=format_sync_queue_report(report))
+
+
+@router.post("/ops/sync-queue/requeue", response_model=CloudSyncQueueRequeueResponse)
+def sync_queue_requeue(
+    payload: CloudSyncQueueRequeueRequest,
+    admin: AdminUser,
+    db: DbSession,
+) -> CloudSyncQueueRequeueResponse:
+    del admin
+    return CloudSyncQueueRequeueResponse(
+        **requeue_sync_queue_items(
+            db,
+            workspace_id=payload.workspace_id,
+            statuses=list(payload.statuses),
+            partition_key=payload.partition_key or "",
+            limit=payload.limit,
+            dry_run=payload.dry_run,
+        )
+    )
 
 
 @router.get("/ops/object-storage", response_model=CloudOpsReportResponse)
