@@ -1993,6 +1993,8 @@ def _cloud_sync_health_summary(
         "outbox_dead_letter": dead_letter,
         "outbox_upload_ready": upload_ready,
         "next_retry_after_seconds": _safe_int(outbox_stats.get("next_retry_after_seconds"), 0),
+        "outbox_wait_reason": str(auto_sync.get("outbox_wait_reason") or ""),
+        "next_upload_attempt_after_seconds": _safe_int(auto_sync.get("next_upload_attempt_after_seconds"), 0),
         "inbox_pending": pending_inbox,
         "inbox_failed": failed_inbox,
         "inbox_applied": applied_inbox,

@@ -129,6 +129,12 @@ class CloudPlatformAutoSync:
         self._status: dict[str, Any] = {
             "running": False,
             "logged_in": False,
+            "outbox_pending": 0,
+            "outbox_failed": 0,
+            "outbox_upload_ready": 0,
+            "outbox_next_retry_after_seconds": 0,
+            "outbox_wait_reason": "",
+            "next_upload_attempt_after_seconds": 0,
             "event_stream_connected": False,
             "event_reconnect_attempts": 0,
             "next_event_reconnect_seconds": 0.0,
@@ -486,7 +492,15 @@ class CloudPlatformAutoSync:
                 self._update_status(logged_in=logged_in)
                 if not logged_in:
                     self._last_logged_in_key = ""
-                    self._update_status(startup_recovery_running=False)
+                    self._update_status(
+                        startup_recovery_running=False,
+                        outbox_pending=0,
+                        outbox_failed=0,
+                        outbox_upload_ready=0,
+                        outbox_next_retry_after_seconds=0,
+                        outbox_wait_reason="not_logged_in",
+                        next_upload_attempt_after_seconds=0,
+                    )
                     self._stop_event.wait(self._idle_interval_seconds)
                     continue
 
@@ -523,6 +537,24 @@ class CloudPlatformAutoSync:
                 had_upload_backpressure = self._upload_backpressure_until_at > 0
                 upload_backpressure_active = self._refresh_upload_backpressure_status(now)
                 upload_backpressure_expired = had_upload_backpressure and not upload_backpressure_active
+                upload_wait_reason, next_upload_attempt_after_seconds = self._upload_wait_state(
+                    now=now,
+                    pending_count=pending_count,
+                    upload_ready_count=upload_ready_count,
+                    upload_backpressure_active=upload_backpressure_active,
+                    upload_backpressure_expired=upload_backpressure_expired,
+                    upload_wake_requested=upload_wake_requested,
+                    first_sync_for_login=first_sync_for_login,
+                    next_retry_after_seconds=int(stats.get("next_retry_after_seconds") or 0),
+                )
+                self._update_status(
+                    outbox_pending=int(stats.get("pending") or 0),
+                    outbox_failed=int(stats.get("failed") or 0),
+                    outbox_upload_ready=upload_ready_count,
+                    outbox_next_retry_after_seconds=int(stats.get("next_retry_after_seconds") or 0),
+                    outbox_wait_reason=upload_wait_reason,
+                    next_upload_attempt_after_seconds=next_upload_attempt_after_seconds,
+                )
                 if first_sync_for_login and has_upload_ready:
                     self._last_upload_started_at = now
                     try:
@@ -788,6 +820,37 @@ class CloudPlatformAutoSync:
             pull_metrics = _pull_metrics(pull_result)
             self._update_status(last_pull_metrics=pull_metrics, last_pull_summary=_pull_summary(pull_metrics))
             self._record_error(str(pull_result.get("message") or f"云端事件同步失败：{event_name}"))
+
+    def _upload_wait_state(
+        self,
+        *,
+        now: float,
+        pending_count: int,
+        upload_ready_count: int,
+        upload_backpressure_active: bool,
+        upload_backpressure_expired: bool,
+        upload_wake_requested: bool,
+        first_sync_for_login: bool,
+        next_retry_after_seconds: int,
+    ) -> tuple[str, int]:
+        if int(pending_count or 0) <= 0:
+            return "idle", 0
+        if upload_backpressure_active:
+            return "server_backpressure", max(0, int((self._upload_backpressure_until_at - now) + 0.999))
+        if int(upload_ready_count or 0) <= 0:
+            return "waiting_retry_backoff", max(0, int(next_retry_after_seconds or 0))
+        if (
+            first_sync_for_login
+            or upload_wake_requested
+            or upload_backpressure_expired
+            or self._last_upload_started_at <= 0
+        ):
+            return "ready", 0
+        interval = self._effective_retry_interval(pending_count=pending_count)
+        remaining = interval - (now - self._last_upload_started_at)
+        if remaining <= 0:
+            return "ready", 0
+        return "waiting_retry_interval", max(0, int(remaining + 0.999))
 
     def _invoke_pull_tasks(self, *, force: bool = False) -> dict[str, Any]:
         if force and _callable_accepts_keyword(self._pull_tasks, "force"):

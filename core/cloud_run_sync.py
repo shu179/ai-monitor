@@ -603,12 +603,18 @@ def flush_cloud_outbox(
     store = session_store or CloudSessionStore()
     session = store.load()
     queue = (outbox or CloudOutbox()).bind_to_session(session)
-    initial_stats = queue.stats()
+    initial_stats = queue.stats(include_retry=True)
     pending_before = int(initial_stats.get("pending") or 0) + int(initial_stats.get("failed") or 0)
     trace_id = new_trace_id("outbox")
 
-    def finish(result: dict[str, Any], *, batch_size: int, http_status: int | str | None) -> dict[str, Any]:
-        final_stats = result.get("outbox") if isinstance(result.get("outbox"), dict) else queue.stats()
+    def finish(
+        result: dict[str, Any],
+        *,
+        batch_size: int,
+        http_status: int | str | None,
+        reason: str,
+    ) -> dict[str, Any]:
+        final_stats = queue.stats(include_retry=True)
         _log_cloud_outbox_flush(
             started_at=started_at,
             batch_size=batch_size,
@@ -617,6 +623,9 @@ def flush_cloud_outbox(
             failed_count=int((final_stats or {}).get("failed") or 0),
             http_status=http_status,
             trace_id=trace_id,
+            reason=reason,
+            upload_ready=int((final_stats or {}).get("upload_ready") or 0),
+            next_retry_after_seconds=int((final_stats or {}).get("next_retry_after_seconds") or 0),
         )
         metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else None
         if metrics is not None:
@@ -634,14 +643,22 @@ def flush_cloud_outbox(
             {"ok": False, "message": "未登录云端", "outbox": queue.stats(), "metrics": _flush_metrics(started_at, 0, 0)},
             batch_size=0,
             http_status=None,
+            reason="not_logged_in",
         )
 
     pending = queue.pending(limit=limit)
     if not pending:
+        current_stats = queue.stats(include_retry=True)
+        wait_reason = (
+            "waiting_retry_backoff"
+            if int(current_stats.get("failed") or 0) > 0 and int(current_stats.get("upload_ready") or 0) <= 0
+            else "idle"
+        )
         return finish(
             {"ok": True, "message": "没有待上传数据", "outbox": queue.stats(), "metrics": _flush_metrics(started_at, 0, 0)},
             batch_size=0,
             http_status=None,
+            reason=wait_reason,
         )
     pending, obsolete_profile_keys = _collapse_profile_update_events(pending)
     if obsolete_profile_keys:
@@ -689,12 +706,14 @@ def flush_cloud_outbox(
                         {"ok": False, "message": "未登录云端", "outbox": outbox_stats, "metrics": _flush_metrics(started_at, len(events), 0)},
                         batch_size=len(events),
                         http_status=401,
+                        reason="attempted",
                     )
             except CloudSessionChangedError as changed_exc:
                 return finish(
                     {"ok": False, "message": str(changed_exc), "outbox": queue.stats(), "metrics": _flush_metrics(started_at, len(events), 0)},
                     batch_size=len(events),
                     http_status=401,
+                    reason="attempted",
                 )
             except CloudClientError as refresh_exc:
                 if refresh_exc.status_code == 401:
@@ -731,6 +750,7 @@ def flush_cloud_outbox(
                     },
                     batch_size=len(events),
                     http_status=refresh_exc.status_code,
+                    reason="attempted",
                 )
             try:
                 response = _post_events_with_trace(target_client, refreshed_access_token, events, trace_id=trace_id)
@@ -769,6 +789,7 @@ def flush_cloud_outbox(
                     },
                     batch_size=len(events),
                     http_status=refresh_exc.status_code,
+                    reason="attempted",
                 )
         else:
             record_consecutive_failure(
@@ -788,6 +809,7 @@ def flush_cloud_outbox(
                 },
                 batch_size=len(events),
                 http_status=exc.status_code,
+                reason="attempted",
             )
 
     queue.mark_sent(event_keys)
@@ -811,6 +833,7 @@ def flush_cloud_outbox(
         },
         batch_size=len(events),
         http_status=response_status,
+        reason="attempted",
     )
 
 
@@ -870,6 +893,9 @@ def _log_cloud_outbox_flush(
     failed_count: int,
     http_status: int | str | None,
     trace_id: str,
+    reason: str,
+    upload_ready: int,
+    next_retry_after_seconds: int,
 ) -> None:
     elapsed_ms = max(0, int(round((time.monotonic() - started_at) * 1000)))
     status_text = "none" if http_status is None else str(http_status)
@@ -881,7 +907,10 @@ def _log_cloud_outbox_flush(
         f"pending_before={max(0, int(pending_before or 0))} "
         f"pending_after={max(0, int(pending_after or 0))} "
         f"failed_count={max(0, int(failed_count or 0))} "
-        f"http_status={status_text}"
+        f"http_status={status_text} "
+        f"reason={str(reason or '').strip() or 'unknown'} "
+        f"upload_ready={max(0, int(upload_ready or 0))} "
+        f"next_retry_after_seconds={max(0, int(next_retry_after_seconds or 0))}"
     )
 
 

@@ -95,6 +95,9 @@ class CloudOutboxBurstModeTests(unittest.TestCase):
             "pending_after=",
             "failed_count=",
             "http_status=",
+            "reason=",
+            "upload_ready=",
+            "next_retry_after_seconds=",
         ):
             self.assertIn(field, logs[0])
 

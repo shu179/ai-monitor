@@ -1442,6 +1442,8 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
         "object_upload_retry_backpressure_retry_after_seconds": 15.0,
         "object_upload_retry_backpressure_queue_depth_hint": 25,
         "object_upload_retry_backpressure_bucket": "object_upload",
+        "outbox_wait_reason": "waiting_retry_backoff",
+        "next_upload_attempt_after_seconds": 12,
         "last_upload_at": "2026-05-28T09:59:00",
         "last_pull_at": "2026-05-28T09:59:03",
         "last_state_delta_at": "2026-05-28T09:59:04",
@@ -1518,6 +1520,8 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     assert health["summary"]["outbox_failed"] == 1
     assert health["summary"]["outbox_upload_ready"] == 3
     assert health["summary"]["next_retry_after_seconds"] == 12
+    assert health["summary"]["outbox_wait_reason"] == "waiting_retry_backoff"
+    assert health["summary"]["next_upload_attempt_after_seconds"] == 12
     assert health["summary"]["inbox_pending"] == 5
     assert health["summary"]["agent_status_total"] == 2
     assert health["summary"]["answers_cached"] == 7

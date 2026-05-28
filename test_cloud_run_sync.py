@@ -195,6 +195,35 @@ class CloudRunSyncTests(unittest.TestCase):
             self.assertEqual(duplicate_result["queued"], 0)
             self.assertEqual(outbox.stats()["pending"], 6)
 
+    def test_flush_cloud_outbox_logs_waiting_retry_backoff_reason(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            outbox = CloudOutbox(root / "outbox.json")
+            store = CloudSessionStore(root / "session.json")
+            store.save({
+                "base_url": "https://api.example.com",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+            })
+            outbox.enqueue(
+                event_type="run_record",
+                idempotency_key="run:retry-backoff",
+                payload={"task_id": 1, "platform": "kimi"},
+            )
+            outbox.mark_failed(["run:retry-backoff"], "timeout")
+            logs: list[str] = []
+
+            with patch("core.cloud_run_sync.print", side_effect=logs.append):
+                result = flush_cloud_outbox(session_store=store, outbox=outbox)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["message"], "没有待上传数据")
+        self.assertEqual(len(logs), 1)
+        self.assertIn("reason=waiting_retry_backoff", logs[0])
+        self.assertIn("upload_ready=0", logs[0])
+        self.assertRegex(logs[0], r"next_retry_after_seconds=[1-9]\d*")
+
     def test_history_record_to_run_event_requires_cloud_task_id_and_omits_screenshot(self):
         record = {
             "id": "history-1",

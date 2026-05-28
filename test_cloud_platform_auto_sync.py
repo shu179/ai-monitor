@@ -439,6 +439,8 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
                     self.assertEqual(status["upload_backpressure_retry_after_seconds"], 0.8)
                     self.assertEqual(status["upload_backpressure_queue_depth_hint"], 23000)
                     self.assertEqual(status["upload_backpressure_bucket"], "sync_metadata")
+                    self.assertEqual(status["outbox_wait_reason"], "server_backpressure")
+                    self.assertGreaterEqual(int(status["next_upload_attempt_after_seconds"] or 0), 0)
 
                     deadline = time.time() + 1.5
                     while int(outbox.stats().get("sent") or 0) < 1 and time.time() < deadline:
@@ -562,11 +564,15 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
                 manager.start()
                 try:
                     time.sleep(0.8)
+                    status = manager.get_status()
                 finally:
                     manager.stop()
 
             self.assertEqual(flush_calls, [])
             self.assertEqual(outbox.stats()["failed"], 1)
+            self.assertEqual(status["outbox_wait_reason"], "waiting_retry_backoff")
+            self.assertGreaterEqual(int(status["outbox_next_retry_after_seconds"] or 0), 1)
+            self.assertGreaterEqual(int(status["next_upload_attempt_after_seconds"] or 0), 1)
 
     def test_initial_login_recovers_local_candidates_before_upload(self):
         with tempfile.TemporaryDirectory() as tmpdir:
