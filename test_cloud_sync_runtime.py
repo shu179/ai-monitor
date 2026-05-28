@@ -133,6 +133,108 @@ def test_app_cloud_runtime_support_cloud_status_uses_injected_status_and_outbox(
     assert result["cloud"]["localProfile"]["configPath"] == "/tmp/config.yaml"
 
 
+def test_app_cloud_runtime_support_fetches_and_caches_cloud_capabilities():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 2, "workspace_id": 3},
+    }
+
+    class FakeClient:
+        calls = 0
+
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        def capabilities(self, token: str):
+            assert token == "access"
+            FakeClient.calls += 1
+            return {
+                "capabilities": ["sync-v2", "object-v1"],
+                "limits": {
+                    "object_storage_total_quota_bytes": 10 * 1024 * 1024 * 1024,
+                    "object_storage_workspace_quota_bytes": 5 * 1024 * 1024 * 1024,
+                    "object_storage_max_file_bytes": 512 * 1024 * 1024,
+                    "object_storage_min_free_bytes": 8 * 1024 * 1024 * 1024,
+                    "inline_blob_max_bytes": 32 * 1024,
+                    "single_put_max_bytes": 5 * 1024 * 1024,
+                    "multipart_part_bytes": 8 * 1024 * 1024,
+                },
+                "ttl_seconds": {"upload_presigned_url": 900},
+                "object_storage_backend": "local",
+            }
+
+    support = AppCloudRuntimeSupport(
+        owner=owner,
+        session_store_factory=lambda: session_store,
+        request_client_factory=FakeClient,
+        capability_cache_ttl_seconds=300,
+    )
+
+    first = support.handle_command("cloud.capabilities")
+    second = support.handle_command("cloud.capabilities")
+    forced = support.handle_command("cloud.capabilities", {"force": True})
+
+    assert first["ok"] is True
+    assert first["capabilities"]["cached"] is False
+    assert second["ok"] is True
+    assert second["capabilities"]["cached"] is True
+    assert forced["ok"] is True
+    assert forced["capabilities"]["cached"] is False
+    assert FakeClient.calls == 2
+    limits = first["capabilities"]["limits"]
+    assert limits["object_storage_total_quota_bytes"] == 10 * 1024 * 1024 * 1024
+    assert limits["object_storage_workspace_quota_bytes"] == 5 * 1024 * 1024 * 1024
+    assert limits["object_storage_max_file_bytes"] == 512 * 1024 * 1024
+    assert limits["object_storage_min_free_bytes"] == 8 * 1024 * 1024 * 1024
+    assert first["capabilities"]["object_storage_backend"] == "local"
+
+
+def test_app_cloud_runtime_support_capability_cache_is_scoped_to_cloud_identity():
+    owner = _support_owner()
+    session_store = MagicMock()
+    sessions = [
+        {
+            "base_url": "https://api.example.com",
+            "access_token": "access-a",
+            "refresh_token": "refresh",
+            "user": {"id": 2, "workspace_id": 3},
+        },
+        {
+            "base_url": "https://api.example.com",
+            "access_token": "access-b",
+            "refresh_token": "refresh",
+            "user": {"id": 2, "workspace_id": 4},
+        },
+    ]
+    session_store.load.side_effect = lambda: sessions[0]
+
+    class FakeClient:
+        tokens: list[str] = []
+
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        def capabilities(self, token: str):
+            self.tokens.append(token)
+            return {"capabilities": ["sync-v2"], "limits": {}, "ttl_seconds": {}, "object_storage_backend": "local"}
+
+    support = AppCloudRuntimeSupport(
+        owner=owner,
+        session_store_factory=lambda: session_store,
+        request_client_factory=FakeClient,
+    )
+
+    assert support.handle_command("cloud.capabilities")["ok"] is True
+    sessions[0] = sessions[1]
+    assert support.handle_command("cloud.capabilities")["ok"] is True
+
+    assert FakeClient.tokens == ["access-a", "access-b"]
+
+
 def test_app_cloud_runtime_support_routes_state_delta_commands():
     owner = _support_owner()
     session_store = MagicMock()
@@ -1344,11 +1446,33 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
         "last_pull_at": "2026-05-28T09:59:03",
         "last_state_delta_at": "2026-05-28T09:59:04",
     }
+    class FakeClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        def capabilities(self, token: str):
+            assert token == "access"
+            return {
+                "capabilities": ["sync-v2", "batch-v2", "object-v1", "state-delta-v1"],
+                "limits": {
+                    "object_storage_total_quota_bytes": 10 * 1024 * 1024 * 1024,
+                    "object_storage_workspace_quota_bytes": 5 * 1024 * 1024 * 1024,
+                    "object_storage_max_file_bytes": 512 * 1024 * 1024,
+                    "object_storage_min_free_bytes": 8 * 1024 * 1024 * 1024,
+                    "inline_blob_max_bytes": 32 * 1024,
+                    "single_put_max_bytes": 5 * 1024 * 1024,
+                    "multipart_part_bytes": 8 * 1024 * 1024,
+                },
+                "ttl_seconds": {"multipart_upload_session": 24 * 60 * 60},
+                "object_storage_backend": "local",
+            }
+
     support = AppCloudRuntimeSupport(
         owner=owner,
         session_store_factory=lambda: session_store,
         outbox_factory=lambda: outbox,
         auto_sync_status_getter=lambda: auto_sync_status,
+        request_client_factory=FakeClient,
         object_cache_factory=lambda: MagicMock(diagnostics=lambda: {"objects": 4, "bytes": 12345}),
         object_transfer_store_factory=lambda: MagicMock(
             diagnostics=lambda failed_limit=10: {"total": 3, "by_status": {"failed": 1, "running": 1}}
@@ -1395,8 +1519,19 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     assert health["summary"]["object_transfers_total"] == 3
     assert health["summary"]["object_transfers_failed"] == 1
     assert health["summary"]["object_transfers_running"] == 1
+    assert health["summary"]["capabilities_ok"] is True
+    assert health["summary"]["capabilities_cached"] is False
+    assert health["summary"]["object_storage_backend"] == "local"
+    assert health["summary"]["object_storage_total_quota_bytes"] == 10 * 1024 * 1024 * 1024
+    assert health["summary"]["object_storage_workspace_quota_bytes"] == 5 * 1024 * 1024 * 1024
+    assert health["summary"]["object_storage_max_file_bytes"] == 512 * 1024 * 1024
+    assert health["summary"]["object_storage_min_free_bytes"] == 8 * 1024 * 1024 * 1024
+    assert health["summary"]["inline_blob_max_bytes"] == 32 * 1024
+    assert health["summary"]["single_put_max_bytes"] == 5 * 1024 * 1024
+    assert health["summary"]["multipart_part_bytes"] == 8 * 1024 * 1024
     assert health["summary"]["healthy"] is True
     assert health["auto_sync"] == auto_sync_status
+    assert health["capabilities"]["limits"]["object_storage_total_quota_bytes"] == 10 * 1024 * 1024 * 1024
     assert health["state_delta"] == {"cursors": {"tasks": 2}}
     bound_outbox.diagnostics.assert_called_once_with(failed_limit=3)
     inbox_cls.return_value.diagnostics.assert_called_once_with(failed_limit=3)

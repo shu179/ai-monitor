@@ -52,6 +52,8 @@ from core.cloud_sync import CloudSyncManager
 from core.local_account_space import account_profile_dir_from_session, current_account_config_path, ensure_account_space
 from core.sync_service import build_sync_bundle
 
+DEFAULT_CLOUD_CAPABILITIES_CACHE_TTL_SECONDS = 300.0
+
 
 @dataclass
 class LocalCloudSyncRuntime:
@@ -161,6 +163,7 @@ class AppCloudRuntimeSupport:
         state_delta_appliers: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
         article_snapshot_startup_delay_seconds: float = 5.0,
         article_deferred_retry_seconds: float = 2.0,
+        capability_cache_ttl_seconds: float = DEFAULT_CLOUD_CAPABILITIES_CACHE_TTL_SECONDS,
     ) -> None:
         self._owner = owner
         self._session_store_factory = session_store_factory
@@ -181,6 +184,7 @@ class AppCloudRuntimeSupport:
         self._state_delta_appliers = self._build_state_delta_appliers(state_delta_appliers)
         self._article_snapshot_startup_delay_seconds = float(article_snapshot_startup_delay_seconds or 0.0)
         self._article_deferred_retry_seconds = float(article_deferred_retry_seconds or 0.0)
+        self._capability_cache_ttl_seconds = max(0.0, float(capability_cache_ttl_seconds or 0.0))
         self._stop_event = threading.Event()
         self._article_cloud_enqueue_lock = threading.RLock()
         self._last_article_cloud_enqueue_key: tuple[Any, ...] | None = None
@@ -191,6 +195,11 @@ class AppCloudRuntimeSupport:
         self._cloud_status_validated_identity = ""
         self._cloud_status_validated_at = 0.0
         self._cloud_status_validation_error = ""
+        self._cloud_capability_lock = threading.RLock()
+        self._cloud_capability_identity = ""
+        self._cloud_capability_fetched_at = 0.0
+        self._cloud_capability_payload: dict[str, Any] | None = None
+        self._cloud_capability_error = ""
 
     @property
     def last_article_cloud_enqueue_key(self) -> tuple[Any, ...] | None:
@@ -209,6 +218,7 @@ class AppCloudRuntimeSupport:
     def reset_transient_state(self) -> None:
         self._reset_article_snapshot_state()
         self._reset_validation_state()
+        self._reset_cloud_capability_cache()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -397,6 +407,11 @@ class AppCloudRuntimeSupport:
         diagnostics = outbox.diagnostics(failed_limit=failed_limit)
         return {"ok": True, "outbox": diagnostics}
 
+    def cloud_capabilities(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        result = self._cloud_capabilities_cached(force=bool(request_payload.get("force")))
+        return {"ok": bool(result.get("ok")), "capabilities": result}
+
     def cloud_sync_health(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
         failed_limit = _safe_int(request_payload.get("failed_limit", request_payload.get("failedLimit", 10)), 10)
@@ -409,6 +424,7 @@ class AppCloudRuntimeSupport:
         object_cache = self._object_cache_factory().diagnostics()
         object_transfers = self._object_transfer_store_factory().diagnostics(failed_limit=failed_limit)
         auto_sync = self._safe_auto_sync_status()
+        capabilities = self._cloud_capabilities_cached()
         return {
             "ok": True,
             "sync_health": {
@@ -421,8 +437,10 @@ class AppCloudRuntimeSupport:
                     content_state=content_state,
                     object_cache=object_cache,
                     object_transfers=object_transfers,
+                    capabilities=capabilities,
                 ),
                 "auto_sync": auto_sync,
+                "capabilities": capabilities,
                 "outbox": outbox,
                 "state_delta": state_delta,
                 "inbox": inbox,
@@ -473,6 +491,8 @@ class AppCloudRuntimeSupport:
             return self.cloud_outbox_diagnostics(request_payload)
         if normalized in {"cloud.sync_health", "sync_health"}:
             return self.cloud_sync_health(request_payload)
+        if normalized in {"cloud.capabilities", "capabilities"}:
+            return self.cloud_capabilities(request_payload)
         if normalized in {"cloud.object_cache_diagnostics", "object_cache_diagnostics"}:
             return {"ok": True, "object_cache": self._object_cache_factory().diagnostics()}
         if normalized in {"cloud.object_transfer_diagnostics", "object_transfer_diagnostics"}:
@@ -540,6 +560,8 @@ class AppCloudRuntimeSupport:
             return self.cloud_outbox_diagnostics(request_payload)
         if normalized in {"cloud.sync_health", "sync_health"}:
             return self.cloud_sync_health(request_payload)
+        if normalized in {"cloud.capabilities", "capabilities"}:
+            return self.cloud_capabilities(request_payload)
         if normalized in {"cloud.object_cache_diagnostics", "object_cache_diagnostics"}:
             return {"ok": True, "object_cache": self._object_cache_factory().diagnostics()}
         if normalized in {"cloud.object_transfer_diagnostics", "object_transfer_diagnostics"}:
@@ -741,6 +763,61 @@ class AppCloudRuntimeSupport:
                 "validationError": validation_error,
             },
         }
+
+    def _cloud_capabilities_cached(self, *, force: bool = False) -> dict[str, Any]:
+        session = self._session_store_factory().load()
+        base_url = str(session.get("base_url") or "").strip()
+        access_token = str(session.get("access_token") or "").strip()
+        if not base_url or not access_token:
+            self._reset_cloud_capability_cache()
+            return {"ok": False, "cached": False, "message": "未登录云端"}
+        identity_key = cloud_session_identity_key(session)
+        now_ts = time.monotonic()
+        with self._cloud_capability_lock:
+            if (
+                not force
+                and self._cloud_capability_payload is not None
+                and self._cloud_capability_identity == identity_key
+                and now_ts - self._cloud_capability_fetched_at < self._capability_cache_ttl_seconds
+            ):
+                cached = dict(self._cloud_capability_payload)
+                cached["ok"] = True
+                cached["cached"] = True
+                cached["fetched_at_monotonic"] = self._cloud_capability_fetched_at
+                cached["cache_ttl_seconds"] = self._capability_cache_ttl_seconds
+                return cached
+
+        def operation(client: Any, token: str) -> Any:
+            return client.capabilities(token)
+
+        ok, response_payload, message = self.cloud_request_with_refresh(operation)
+        fetched_at = time.monotonic()
+        if not ok:
+            with self._cloud_capability_lock:
+                self._cloud_capability_error = str(message or "")
+                if self._cloud_capability_payload is not None and self._cloud_capability_identity == identity_key:
+                    stale = dict(self._cloud_capability_payload)
+                    stale["ok"] = False
+                    stale["cached"] = True
+                    stale["stale"] = True
+                    stale["message"] = str(message or "")
+                    stale["fetched_at_monotonic"] = self._cloud_capability_fetched_at
+                    stale["cache_ttl_seconds"] = self._capability_cache_ttl_seconds
+                    return stale
+            return {"ok": False, "cached": False, "message": str(message or "云端能力读取失败")}
+        payload = response_payload if isinstance(response_payload, dict) else {}
+        normalized = _normalize_cloud_capabilities_payload(payload)
+        with self._cloud_capability_lock:
+            self._cloud_capability_identity = identity_key
+            self._cloud_capability_fetched_at = fetched_at
+            self._cloud_capability_payload = normalized
+            self._cloud_capability_error = ""
+        result = dict(normalized)
+        result["ok"] = True
+        result["cached"] = False
+        result["fetched_at_monotonic"] = fetched_at
+        result["cache_ttl_seconds"] = self._capability_cache_ttl_seconds
+        return result
 
     def pull_cloud_state_delta(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
@@ -1528,6 +1605,13 @@ class AppCloudRuntimeSupport:
             self._cloud_status_validated_at = 0.0
             self._cloud_status_validation_error = ""
 
+    def _reset_cloud_capability_cache(self) -> None:
+        with self._cloud_capability_lock:
+            self._cloud_capability_identity = ""
+            self._cloud_capability_fetched_at = 0.0
+            self._cloud_capability_payload = None
+            self._cloud_capability_error = ""
+
     @staticmethod
     def _join_thread_if_possible(thread: Any) -> None:
         if (
@@ -1616,6 +1700,38 @@ def _cloud_backpressure_fields(metadata: dict[str, Any] | None) -> dict[str, Any
     if throttle_bucket:
         fields["throttle_bucket"] = throttle_bucket
     return fields
+
+
+def _normalize_cloud_capabilities_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    source = payload if isinstance(payload, dict) else {}
+    limits = source.get("limits") if isinstance(source.get("limits"), dict) else {}
+    ttl_seconds = source.get("ttl_seconds") if isinstance(source.get("ttl_seconds"), dict) else {}
+    capabilities = source.get("capabilities") if isinstance(source.get("capabilities"), list) else []
+    return {
+        "capabilities": [str(item) for item in capabilities if str(item or "").strip()],
+        "limits": {str(key): _safe_int(value, 0) for key, value in limits.items()},
+        "ttl_seconds": {str(key): _safe_int(value, 0) for key, value in ttl_seconds.items()},
+        "object_storage_backend": str(source.get("object_storage_backend") or "").strip(),
+    }
+
+
+def _cloud_capability_summary(capabilities: dict[str, Any] | None) -> dict[str, Any]:
+    payload = capabilities if isinstance(capabilities, dict) else {}
+    limits = payload.get("limits") if isinstance(payload.get("limits"), dict) else {}
+    return {
+        "capabilities_ok": bool(payload.get("ok")),
+        "capabilities_cached": bool(payload.get("cached")),
+        "capabilities_stale": bool(payload.get("stale")),
+        "capabilities_message": str(payload.get("message") or ""),
+        "object_storage_backend": str(payload.get("object_storage_backend") or ""),
+        "object_storage_total_quota_bytes": _safe_int(limits.get("object_storage_total_quota_bytes"), 0),
+        "object_storage_workspace_quota_bytes": _safe_int(limits.get("object_storage_workspace_quota_bytes"), 0),
+        "object_storage_max_file_bytes": _safe_int(limits.get("object_storage_max_file_bytes"), 0),
+        "object_storage_min_free_bytes": _safe_int(limits.get("object_storage_min_free_bytes"), 0),
+        "inline_blob_max_bytes": _safe_int(limits.get("inline_blob_max_bytes"), 0),
+        "single_put_max_bytes": _safe_int(limits.get("single_put_max_bytes"), 0),
+        "multipart_part_bytes": _safe_int(limits.get("multipart_part_bytes"), 0),
+    }
 
 
 def _merge_failure_backpressure(failures: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1714,6 +1830,7 @@ def _cloud_sync_health_summary(
     content_state: dict[str, Any],
     object_cache: dict[str, Any] | None = None,
     object_transfers: dict[str, Any] | None = None,
+    capabilities: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     session_payload = session if isinstance(session, dict) else {}
     outbox_stats = outbox.get("stats") if isinstance(outbox.get("stats"), dict) else {}
@@ -1732,7 +1849,7 @@ def _cloud_sync_health_summary(
     object_download_retry_backpressure_until = str(auto_sync.get("object_download_retry_backpressure_until") or "")
     object_upload_retry_backpressure_until = str(auto_sync.get("object_upload_retry_backpressure_until") or "")
     last_error = str(auto_sync.get("last_error") or auto_sync.get("last_state_delta_error") or "")
-    return {
+    summary = {
         "logged_in": bool(
             session_payload.get("base_url")
             and session_payload.get("access_token")
@@ -1806,3 +1923,5 @@ def _cloud_sync_health_summary(
             ]
         ),
     }
+    summary.update(_cloud_capability_summary(capabilities))
+    return summary
