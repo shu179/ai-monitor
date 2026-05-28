@@ -1739,6 +1739,62 @@ def test_app_cloud_runtime_support_skips_object_upload_retry_when_source_changed
     client_factory.assert_not_called()
 
 
+def test_app_cloud_runtime_support_retry_object_uploads_returns_backpressure_metadata():
+    owner = _support_owner()
+    body = b"retry upload bytes"
+    sha256 = hashlib.sha256(body).hexdigest()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+
+    class BusyClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        def create_object_upload(self, _token: str, **_kwargs):
+            raise CloudClientError(
+                "object storage busy",
+                status_code=429,
+                retry_after_seconds=7.5,
+                queue_depth_hint=42,
+                throttle_bucket="object_upload",
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "answer.txt"
+        source.write_bytes(body)
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        transfer_store.start_transfer(
+            transfer_id="upload-1",
+            direction="upload",
+            sha256=sha256,
+            size_bytes=len(body),
+            path=str(source),
+            content_type="text/plain",
+        )
+        transfer_store.fail_transfer("upload-1", "temporary")
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            request_client_factory=BusyClient,
+            object_transfer_store_factory=lambda: transfer_store,
+        )
+
+        result = support.handle_command("cloud.retry_object_uploads", {"limit": 5})
+
+    assert result["ok"] is False
+    assert result["attempted"] == 1
+    assert result["failed"] == 1
+    assert result["retry_after_seconds"] == 7.5
+    assert result["queue_depth_hint"] == 42
+    assert result["throttle_bucket"] == "object_upload"
+    assert result["failures"][0]["retry_after_seconds"] == 7.5
+
+
 def test_app_cloud_runtime_support_prunes_object_cache():
     owner = _support_owner()
     data_a = b"a" * 10

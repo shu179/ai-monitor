@@ -123,6 +123,7 @@ class CloudPlatformAutoSync:
         self._last_error_log_at = 0.0
         self._last_transient_error_log_at = 0.0
         self._upload_backpressure_until_at = 0.0
+        self._object_upload_retry_backpressure_until_at = 0.0
         self._state_delta_backpressure_until_at = 0.0
         self._status: dict[str, Any] = {
             "running": False,
@@ -149,6 +150,10 @@ class CloudPlatformAutoSync:
             "last_object_upload_retry_at": "",
             "last_object_upload_retry_metrics": {},
             "last_object_upload_retry_error": "",
+            "object_upload_retry_backpressure_until": "",
+            "object_upload_retry_backpressure_retry_after_seconds": 0.0,
+            "object_upload_retry_backpressure_queue_depth_hint": 0,
+            "object_upload_retry_backpressure_bucket": "",
             "last_state_delta_error": "",
             "state_delta_backpressure_until": "",
             "state_delta_backpressure_retry_after_seconds": 0.0,
@@ -340,6 +345,48 @@ class CloudPlatformAutoSync:
             state_delta_backpressure_bucket="",
         )
 
+    def _refresh_object_upload_retry_backpressure_status(self, now: float | None = None) -> bool:
+        current = time.monotonic() if now is None else float(now)
+        if self._object_upload_retry_backpressure_until_at <= 0:
+            return False
+        remaining = self._object_upload_retry_backpressure_until_at - current
+        if remaining <= 0:
+            self._clear_object_upload_retry_backpressure()
+            return False
+        self._update_status(
+            object_upload_retry_backpressure_until=(local_now() + timedelta(seconds=remaining)).isoformat(timespec="seconds"),
+        )
+        return True
+
+    def _apply_object_upload_retry_backpressure(self, metrics: dict[str, Any], *, now: float | None = None) -> bool:
+        retry_after = _optional_positive_float(metrics.get("retry_after_seconds"))
+        if retry_after is None:
+            return False
+        current = time.monotonic() if now is None else float(now)
+        self._object_upload_retry_backpressure_until_at = max(
+            self._object_upload_retry_backpressure_until_at,
+            current + retry_after,
+        )
+        remaining = max(0.0, self._object_upload_retry_backpressure_until_at - current)
+        queue_depth_hint = _optional_non_negative_int(metrics.get("queue_depth_hint"))
+        throttle_bucket = str(metrics.get("throttle_bucket") or "").strip()
+        self._update_status(
+            object_upload_retry_backpressure_until=(local_now() + timedelta(seconds=remaining)).isoformat(timespec="seconds"),
+            object_upload_retry_backpressure_retry_after_seconds=retry_after,
+            object_upload_retry_backpressure_queue_depth_hint=queue_depth_hint if queue_depth_hint is not None else 0,
+            object_upload_retry_backpressure_bucket=throttle_bucket,
+        )
+        return True
+
+    def _clear_object_upload_retry_backpressure(self) -> None:
+        self._object_upload_retry_backpressure_until_at = 0.0
+        self._update_status(
+            object_upload_retry_backpressure_until="",
+            object_upload_retry_backpressure_retry_after_seconds=0.0,
+            object_upload_retry_backpressure_queue_depth_hint=0,
+            object_upload_retry_backpressure_bucket="",
+        )
+
     def _finish_startup_recovery(
         self,
         recovery_result: dict[str, Any] | None,
@@ -405,6 +452,7 @@ class CloudPlatformAutoSync:
                     self._last_pull_started_at = 0.0
                     self._last_object_upload_retry_started_at = 0.0
                     self._clear_upload_backpressure()
+                    self._clear_object_upload_retry_backpressure()
                     self._update_status(
                         startup_recovery_running=True,
                         last_startup_recovery_error="",
@@ -464,25 +512,36 @@ class CloudPlatformAutoSync:
                         self._record_error(str(upload_result.get("message") or "运行数据自动上传失败"))
 
                 object_upload_retry_result: dict[str, Any] | None = None
+                had_object_upload_retry_backpressure = self._object_upload_retry_backpressure_until_at > 0
+                object_upload_retry_backpressure_active = self._refresh_object_upload_retry_backpressure_status(now)
+                object_upload_retry_backpressure_expired = (
+                    had_object_upload_retry_backpressure and not object_upload_retry_backpressure_active
+                )
                 if (
                     callable(self._retry_object_uploads)
+                    and not object_upload_retry_backpressure_active
                     and (
                         first_sync_for_login
+                        or object_upload_retry_backpressure_expired
                         or self._last_object_upload_retry_started_at <= 0
                         or now - self._last_object_upload_retry_started_at >= self._object_upload_retry_interval_seconds
                     )
                 ):
                     self._last_object_upload_retry_started_at = now
                     object_upload_retry_result = self._invoke_object_upload_retry()
+                    object_upload_retry_metrics = _object_upload_retry_metrics(object_upload_retry_result)
                     if object_upload_retry_result.get("ok"):
                         self._update_status(
                             last_object_upload_retry_at=local_now().isoformat(timespec="seconds"),
-                            last_object_upload_retry_metrics=_object_upload_retry_metrics(object_upload_retry_result),
+                            last_object_upload_retry_metrics=object_upload_retry_metrics,
                             last_object_upload_retry_error="",
                         )
+                        if not self._apply_object_upload_retry_backpressure(object_upload_retry_metrics, now=time.monotonic()):
+                            self._clear_object_upload_retry_backpressure()
                     else:
+                        self._apply_object_upload_retry_backpressure(object_upload_retry_metrics, now=time.monotonic())
                         self._update_status(
-                            last_object_upload_retry_metrics=_object_upload_retry_metrics(object_upload_retry_result),
+                            last_object_upload_retry_metrics=object_upload_retry_metrics,
                             last_object_upload_retry_error=str(
                                 object_upload_retry_result.get("message") or "对象上传恢复失败"
                             ),
@@ -894,6 +953,9 @@ def _object_download_retry_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "recovered": _safe_int(payload.get("recovered")),
         "failed": _safe_int(payload.get("failed")),
         "skipped": _safe_int(payload.get("skipped")),
+        "retry_after_seconds": _safe_float(payload.get("retry_after_seconds") or payload.get("next_retry_after_seconds")),
+        "queue_depth_hint": _safe_int(payload.get("queue_depth_hint")),
+        "throttle_bucket": str(payload.get("throttle_bucket") or ""),
     }
 
 
@@ -907,6 +969,9 @@ def _object_upload_retry_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "recovered": _safe_int(payload.get("recovered")),
         "failed": _safe_int(payload.get("failed")),
         "skipped": _safe_int(payload.get("skipped")),
+        "retry_after_seconds": _safe_float(payload.get("retry_after_seconds") or payload.get("next_retry_after_seconds")),
+        "queue_depth_hint": _safe_int(payload.get("queue_depth_hint")),
+        "throttle_bucket": str(payload.get("throttle_bucket") or ""),
     }
 
 

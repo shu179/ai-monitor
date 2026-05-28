@@ -320,6 +320,67 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             self.assertEqual(status["last_object_upload_retry_error"], "upload still unavailable")
             self.assertEqual(status["last_error"], "")
 
+    def test_object_upload_retry_backpressure_pauses_next_retry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.example.com",
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+                }
+            )
+            calls: list[float] = []
+
+            def retry_uploads(_payload=None):
+                calls.append(time.monotonic())
+                if len(calls) == 1:
+                    return {
+                        "ok": False,
+                        "attempted": 1,
+                        "recovered": 0,
+                        "failed": 1,
+                        "skipped": 0,
+                        "message": "object storage busy",
+                        "retry_after_seconds": 0.8,
+                        "queue_depth_hint": 120,
+                        "throttle_bucket": "object_upload",
+                    }
+                return {"ok": True, "attempted": 1, "recovered": 1, "failed": 0, "skipped": 0}
+
+            manager = CloudPlatformAutoSync(
+                session_store=store,
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                retry_object_uploads=retry_uploads,
+                object_upload_retry_interval_seconds=5,
+                pull_interval_seconds=3600,
+                idle_interval_seconds=0.2,
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            manager.start()
+            try:
+                deadline = time.time() + 0.55
+                while time.time() < deadline:
+                    time.sleep(0.05)
+                status = manager.get_status()
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(status["object_upload_retry_backpressure_retry_after_seconds"], 0.8)
+                self.assertEqual(status["object_upload_retry_backpressure_queue_depth_hint"], 120)
+                self.assertEqual(status["object_upload_retry_backpressure_bucket"], "object_upload")
+
+                deadline = time.time() + 1.5
+                while len(calls) < 2 and time.time() < deadline:
+                    time.sleep(0.05)
+            finally:
+                manager.stop()
+
+            self.assertGreaterEqual(len(calls), 2)
+            self.assertEqual(manager.get_status()["object_upload_retry_backpressure_until"], "")
+
     def test_upload_backpressure_pauses_flush_until_retry_after(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = CloudSessionStore(Path(tmpdir) / "session.json")

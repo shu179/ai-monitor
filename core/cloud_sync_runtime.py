@@ -1015,7 +1015,10 @@ class AppCloudRuntimeSupport:
                 )
 
             try:
-                ok, response_payload, message = self.cloud_request_with_refresh(operation)
+                ok, response_payload, message, backpressure = self.cloud_request_with_refresh(
+                    operation,
+                    include_error_metadata=True,
+                )
             except Exception as exc:
                 failed += 1
                 failure_message = str(exc or "upload retry failed")
@@ -1029,8 +1032,10 @@ class AppCloudRuntimeSupport:
             response_dict = response_payload if isinstance(response_payload, dict) else {}
             failure_message = str(message or response_dict.get("message") or "upload retry failed")
             transfer_store.fail_transfer(transfer_id, failure_message)
-            failures.append({"transfer_id": transfer_id, "path": str(path), "message": failure_message})
-        return {
+            failure = {"transfer_id": transfer_id, "path": str(path), "message": failure_message}
+            failure.update(_cloud_backpressure_fields(backpressure))
+            failures.append(failure)
+        result = {
             "ok": failed == 0,
             "attempted": attempted,
             "recovered": recovered,
@@ -1038,6 +1043,8 @@ class AppCloudRuntimeSupport:
             "skipped": skipped,
             "failures": failures[:10],
         }
+        result.update(_merge_failure_backpressure(failures))
+        return result
 
     def _build_state_delta_appliers(
         self,
@@ -1292,25 +1299,40 @@ class AppCloudRuntimeSupport:
         if callable(invalidate_articles):
             invalidate_articles()
 
-    def cloud_request_with_refresh(self, operation: Callable[[Any, str], Any]) -> tuple[bool, Any, str]:
+    def cloud_request_with_refresh(
+        self,
+        operation: Callable[[Any, str], Any],
+        *,
+        include_error_metadata: bool = False,
+    ) -> tuple[bool, Any, str] | tuple[bool, Any, str, dict[str, Any]]:
+        def finish(
+            ok: bool,
+            payload: Any,
+            message: str,
+            error: CloudClientError | None = None,
+        ) -> tuple[bool, Any, str] | tuple[bool, Any, str, dict[str, Any]]:
+            if include_error_metadata:
+                return ok, payload, message, _cloud_client_error_metadata(error)
+            return ok, payload, message
+
         store = self._session_store_factory()
         session = store.load()
         base_url = str(session.get("base_url") or "").strip()
         access_token = str(session.get("access_token") or "").strip()
         refresh_token = str(session.get("refresh_token") or "").strip()
         if not base_url or not access_token:
-            return False, None, "未登录云端"
+            return finish(False, None, "未登录云端")
         initial_identity_key = cloud_session_identity_key(session)
         identity = cloud_session_identity(session)
         client = self._request_client_factory(base_url)
         try:
             payload = operation(client, access_token)
             if cloud_session_identity_key(store.load()) != initial_identity_key:
-                return False, None, "云端账号已切换，本次操作已中止"
-            return True, payload, ""
+                return finish(False, None, "云端账号已切换，本次操作已中止")
+            return finish(True, payload, "")
         except CloudClientError as exc:
             if exc.status_code != 401 or not refresh_token:
-                return False, None, str(exc)
+                return finish(False, None, str(exc), exc)
         try:
             refreshed_session = store.refresh_login_if_current(
                 base_url=base_url,
@@ -1321,7 +1343,7 @@ class AppCloudRuntimeSupport:
                 user_id=identity["user_id"],
             )
         except CloudSessionChangedError as changed_exc:
-            return False, None, str(changed_exc)
+            return finish(False, None, str(changed_exc))
         except CloudClientError as refresh_exc:
             if refresh_exc.status_code == 401:
                 store.clear_if_current(
@@ -1331,15 +1353,15 @@ class AppCloudRuntimeSupport:
                     workspace_id=identity["workspace_id"],
                     user_id=identity["user_id"],
                 )
-            return False, None, str(refresh_exc)
+            return finish(False, None, str(refresh_exc), refresh_exc)
         refreshed_access_token = str(refreshed_session.get("access_token") or "").strip()
         if not refreshed_access_token:
-            return False, None, "未登录云端"
+            return finish(False, None, "未登录云端")
         try:
             payload = operation(client, refreshed_access_token)
             if cloud_session_identity_key(store.load()) != initial_identity_key:
-                return False, None, "云端账号已切换，本次操作已中止"
-            return True, payload, ""
+                return finish(False, None, "云端账号已切换，本次操作已中止")
+            return finish(True, payload, "")
         except CloudClientError as retry_exc:
             refreshed_identity = cloud_session_identity(refreshed_session)
             if retry_exc.status_code == 401:
@@ -1350,7 +1372,7 @@ class AppCloudRuntimeSupport:
                     workspace_id=refreshed_identity["workspace_id"],
                     user_id=refreshed_identity["user_id"],
                 )
-            return False, None, str(retry_exc)
+            return finish(False, None, str(retry_exc), retry_exc)
 
     def _run_cloud_api_request(self, operation_name: str, request_payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = request_payload if isinstance(request_payload, dict) else {}
@@ -1559,6 +1581,53 @@ def _safe_float(value: Any, default: float) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _cloud_client_error_metadata(error: CloudClientError | None) -> dict[str, Any]:
+    if error is None:
+        return {}
+    metadata: dict[str, Any] = {}
+    if error.retry_after_seconds is not None:
+        metadata["retry_after_seconds"] = max(0.0, float(error.retry_after_seconds))
+    if error.queue_depth_hint is not None:
+        metadata["queue_depth_hint"] = max(0, int(error.queue_depth_hint))
+    if error.throttle_bucket:
+        metadata["throttle_bucket"] = str(error.throttle_bucket)
+    return metadata
+
+
+def _cloud_backpressure_fields(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    payload = metadata if isinstance(metadata, dict) else {}
+    fields: dict[str, Any] = {}
+    retry_after = _safe_float(payload.get("retry_after_seconds"), 0.0)
+    queue_depth = _safe_int(payload.get("queue_depth_hint"), 0)
+    throttle_bucket = str(payload.get("throttle_bucket") or "").strip()
+    if retry_after > 0:
+        fields["retry_after_seconds"] = retry_after
+    if queue_depth > 0:
+        fields["queue_depth_hint"] = queue_depth
+    if throttle_bucket:
+        fields["throttle_bucket"] = throttle_bucket
+    return fields
+
+
+def _merge_failure_backpressure(failures: list[dict[str, Any]]) -> dict[str, Any]:
+    retry_after = 0.0
+    queue_depth = 0
+    throttle_bucket = ""
+    for failure in failures:
+        retry_after = max(retry_after, _safe_float(failure.get("retry_after_seconds"), 0.0))
+        queue_depth = max(queue_depth, _safe_int(failure.get("queue_depth_hint"), 0))
+        if not throttle_bucket:
+            throttle_bucket = str(failure.get("throttle_bucket") or "").strip()
+    fields: dict[str, Any] = {}
+    if retry_after > 0:
+        fields["retry_after_seconds"] = retry_after
+    if queue_depth > 0:
+        fields["queue_depth_hint"] = queue_depth
+    if throttle_bucket:
+        fields["throttle_bucket"] = throttle_bucket
+    return fields
 
 
 def _file_sha256_and_size(path: Path, *, chunk_bytes: int = 1024 * 1024) -> tuple[str, int]:
