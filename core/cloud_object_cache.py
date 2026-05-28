@@ -76,6 +76,7 @@ class CloudObjectCache:
 
         target = self.object_path(normalized)
         meta_path = self.metadata_path(normalized)
+        pre_prune_result = self._prune_for_incoming(target=target, incoming_bytes=expected_size)
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp")
         tmp_path = Path(tmp_name)
@@ -139,10 +140,12 @@ class CloudObjectCache:
                 pass
             raise
 
-        prune_result = self.prune() if self.diagnostics()["bytes"] > self.max_cache_bytes else {
+        post_prune_result = self.prune() if self.diagnostics()["bytes"] > self.max_cache_bytes else {
             "pruned": 0,
             "bytes_removed": 0,
         }
+        pruned = int(pre_prune_result.get("pruned") or 0) + int(post_prune_result.get("pruned") or 0)
+        bytes_removed = int(pre_prune_result.get("bytes_removed") or 0) + int(post_prune_result.get("bytes_removed") or 0)
         cached_exists = target.is_file()
         return {
             "ok": True,
@@ -152,8 +155,8 @@ class CloudObjectCache:
             "path": str(target),
             "metadata_path": str(meta_path),
             "cached": cached_exists,
-            "pruned": int(prune_result.get("pruned") or 0),
-            "bytes_removed": int(prune_result.get("bytes_removed") or 0),
+            "pruned": pruned,
+            "bytes_removed": bytes_removed,
         }
 
     def object_path(self, object_ref: dict[str, Any]) -> Path:
@@ -216,6 +219,32 @@ class CloudObjectCache:
                 "after_bytes": before_bytes,
                 "target_bytes": safe_target,
             }
+        return self._prune_entries(entries, target_bytes=safe_target, before_bytes=before_bytes)
+
+    def _prune_for_incoming(self, *, target: Path, incoming_bytes: int) -> dict[str, Any]:
+        safe_incoming = max(0, int(incoming_bytes or 0))
+        if safe_incoming <= 0:
+            return {"ok": True, "pruned": 0, "bytes_removed": 0}
+        entries = self._entries()
+        target_resolved = target.resolve()
+        prunable_entries = [entry for entry in entries if entry.path.resolve() != target_resolved]
+        before_bytes = sum(entry.size_bytes for entry in prunable_entries)
+        if before_bytes + safe_incoming <= self.max_cache_bytes:
+            return {"ok": True, "pruned": 0, "bytes_removed": 0}
+        target_bytes = max(0, self.max_cache_bytes - safe_incoming)
+        result = self._prune_entries(prunable_entries, target_bytes=target_bytes, before_bytes=before_bytes)
+        if int(result.get("after_bytes") or 0) + safe_incoming > self.max_cache_bytes:
+            raise CloudObjectCacheError("not enough local cache space after pruning")
+        return result
+
+    def _prune_entries(
+        self,
+        entries: list["_CacheEntry"],
+        *,
+        target_bytes: int,
+        before_bytes: int,
+    ) -> dict[str, Any]:
+        safe_target = max(0, min(int(target_bytes or 0), self.max_cache_bytes))
         after_bytes = before_bytes
         pruned = 0
         removed = 0
