@@ -73,6 +73,7 @@ class CloudPlatformAutoSync:
         event_reconnect_jitter_ratio: float = 0.2,
         pull_state_delta: Callable[..., dict[str, Any]] | None = None,
         process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
+        state_delta_inbox_max_batches_per_cycle: int = 3,
         retry_object_downloads: Callable[..., dict[str, Any]] | None = None,
         object_download_retry_status: Callable[..., dict[str, Any]] | None = None,
         retry_object_uploads: Callable[..., dict[str, Any]] | None = None,
@@ -86,6 +87,13 @@ class CloudPlatformAutoSync:
         self._recover_upload_candidates = recover_upload_candidates
         self._pull_state_delta = pull_state_delta
         self._process_state_delta_inbox = process_state_delta_inbox
+        self._state_delta_inbox_max_batches_per_cycle = max(
+            1,
+            _env_int(
+                "AIBRANDMONITOR_CLOUD_STATE_DELTA_INBOX_MAX_BATCHES_PER_CYCLE",
+                state_delta_inbox_max_batches_per_cycle,
+            ),
+        )
         self._retry_object_downloads = retry_object_downloads
         self._object_download_retry_status = object_download_retry_status
         self._retry_object_uploads = retry_object_uploads
@@ -1177,13 +1185,7 @@ class CloudPlatformAutoSync:
         if not self._apply_state_delta_backpressure(pull_metrics, now=time.monotonic()) and not backpressure_active:
             self._clear_state_delta_backpressure()
         if pull_result.get("ok") and callable(process_handler):
-            try:
-                process_result = _invoke_optional_payload_callback(
-                    process_handler,
-                    {"limit": 500, "source": "auto_sync"},
-                )
-            except Exception as exc:
-                process_result = {"ok": False, "message": f"state-delta inbox 处理失败：{exc}"}
+            process_result = self._invoke_state_delta_inbox_batches(process_handler)
         if (
             pull_result.get("ok")
             and process_result.get("ok")
@@ -1225,6 +1227,33 @@ class CloudPlatformAutoSync:
             "state_delta_inbox": process_result,
             "object_download_retry": retry_downloads_result,
         }
+
+    def _invoke_state_delta_inbox_batches(self, process_handler: Callable[..., dict[str, Any]]) -> dict[str, Any]:
+        aggregate: dict[str, Any] = {
+            "ok": True,
+            "message": "",
+            "batches": 0,
+            "claimed": 0,
+            "applied": 0,
+            "failed": 0,
+            "skipped_no_applier": 0,
+            "streams": {},
+        }
+        max_batches = max(1, int(self._state_delta_inbox_max_batches_per_cycle or 1))
+        for _ in range(max_batches):
+            try:
+                batch_result = _invoke_optional_payload_callback(
+                    process_handler,
+                    {"limit": 500, "source": "auto_sync"},
+                )
+            except Exception as exc:
+                batch_result = {"ok": False, "message": f"state-delta inbox 处理失败：{exc}"}
+            _merge_state_delta_inbox_batch(aggregate, batch_result)
+            if not bool(batch_result.get("ok")):
+                break
+            if _safe_int(batch_result.get("claimed")) < 500:
+                break
+        return aggregate
 
 
 def _callable_accepts_keyword(callback: Callable[..., Any], keyword: str) -> bool:
@@ -1345,6 +1374,27 @@ def _state_delta_inbox_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "skipped_no_applier": _safe_int(payload.get("skipped_no_applier")),
         "streams": dict(payload.get("streams") if isinstance(payload.get("streams"), dict) else {}),
     }
+
+
+def _merge_state_delta_inbox_batch(aggregate: dict[str, Any], batch_result: dict[str, Any]) -> None:
+    payload = batch_result if isinstance(batch_result, dict) else {"ok": False, "message": "invalid state-delta inbox result"}
+    aggregate["batches"] = _safe_int(aggregate.get("batches")) + 1
+    aggregate["ok"] = bool(aggregate.get("ok", True)) and bool(payload.get("ok", True))
+    if not bool(payload.get("ok")) and not str(aggregate.get("message") or ""):
+        aggregate["message"] = str(payload.get("message") or "state-delta inbox processing failed")
+    for key in ("claimed", "applied", "failed", "skipped_no_applier"):
+        aggregate[key] = _safe_int(aggregate.get(key)) + _safe_int(payload.get(key))
+    aggregate_streams = aggregate.get("streams") if isinstance(aggregate.get("streams"), dict) else {}
+    payload_streams = payload.get("streams") if isinstance(payload.get("streams"), dict) else {}
+    for stream, row in payload_streams.items():
+        stream_key = str(stream or "").strip()
+        if not stream_key:
+            continue
+        target = aggregate_streams.setdefault(stream_key, {})
+        row_payload = row if isinstance(row, dict) else {}
+        for key in ("claimed", "applied", "failed"):
+            target[key] = _safe_int(target.get(key)) + _safe_int(row_payload.get(key))
+    aggregate["streams"] = aggregate_streams
 
 
 def _object_download_retry_metrics(result: dict[str, Any]) -> dict[str, Any]:

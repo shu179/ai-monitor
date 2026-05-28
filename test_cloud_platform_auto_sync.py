@@ -877,6 +877,83 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             self.assertEqual(calls, ["pull", "state_delta", "process"])
             self.assertEqual(manager.get_status()["last_state_delta_inbox_metrics"]["applied"], 1)
 
+    def test_state_delta_pipeline_processes_multiple_full_inbox_batches(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calls: list[str] = []
+            batches = [
+                {
+                    "ok": True,
+                    "claimed": 500,
+                    "applied": 500,
+                    "failed": 0,
+                    "streams": {"tasks": {"claimed": 500, "applied": 500, "failed": 0}},
+                },
+                {
+                    "ok": True,
+                    "claimed": 125,
+                    "applied": 125,
+                    "failed": 0,
+                    "streams": {"runs": {"claimed": 125, "applied": 125, "failed": 0}},
+                },
+            ]
+
+            def process(_payload=None):
+                calls.append("process")
+                return batches.pop(0)
+
+            manager = CloudPlatformAutoSync(
+                session_store=CloudSessionStore(Path(tmpdir) / "session.json"),
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda force=False: {"ok": True},
+                pull_state_delta=lambda _payload=None: calls.append("state_delta") or {"ok": True, "changes": 625},
+                process_state_delta_inbox=process,
+                state_delta_inbox_max_batches_per_cycle=3,
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            result = manager._invoke_state_delta_pipeline()  # noqa: SLF001
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(calls, ["state_delta", "process", "process"])
+            inbox = result["state_delta_inbox"]
+            self.assertEqual(inbox["batches"], 2)
+            self.assertEqual(inbox["claimed"], 625)
+            self.assertEqual(inbox["applied"], 625)
+            self.assertEqual(inbox["streams"]["tasks"]["applied"], 500)
+            self.assertEqual(inbox["streams"]["runs"]["applied"], 125)
+            status = manager.get_status()
+            self.assertEqual(status["last_state_delta_inbox_metrics"]["claimed"], 625)
+            self.assertEqual(status["last_state_delta_inbox_metrics"]["applied"], 625)
+            self.assertEqual(status["last_state_delta_inbox_metrics"]["streams"]["runs"]["applied"], 125)
+
+    def test_state_delta_pipeline_stops_inbox_batches_at_cycle_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calls: list[str] = []
+
+            manager = CloudPlatformAutoSync(
+                session_store=CloudSessionStore(Path(tmpdir) / "session.json"),
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda force=False: {"ok": True},
+                pull_state_delta=lambda _payload=None: {"ok": True, "changes": 1500},
+                process_state_delta_inbox=lambda _payload=None: calls.append("process") or {
+                    "ok": True,
+                    "claimed": 500,
+                    "applied": 500,
+                    "failed": 0,
+                },
+                state_delta_inbox_max_batches_per_cycle=2,
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            result = manager._invoke_state_delta_pipeline()  # noqa: SLF001
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(calls, ["process", "process"])
+            self.assertEqual(result["state_delta_inbox"]["batches"], 2)
+            self.assertEqual(result["state_delta_inbox"]["claimed"], 1000)
+
     def test_object_download_retry_failure_does_not_fail_state_delta_pipeline(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = CloudPlatformAutoSync(
