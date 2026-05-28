@@ -1554,6 +1554,8 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
         "retry_after_seconds": 6,
     }
     assert health["summary"]["inbox_pending"] == 5
+    assert health["summary"]["inbox_batches_last_cycle"] == 0
+    assert health["summary"]["inbox_more_pending_possible"] is False
     assert health["summary"]["agent_status_total"] == 2
     assert health["summary"]["answers_cached"] == 7
     assert health["summary"]["assets_cached"] == 9
@@ -1677,6 +1679,37 @@ def test_cloud_sync_health_summary_reports_state_delta_backpressure():
         "kind": "state_delta_pipeline",
         "reason": "server_backpressure",
         "retry_after_seconds": 18,
+    }
+
+
+def test_cloud_sync_health_summary_prioritizes_local_inbox_backlog_when_present():
+    summary = _cloud_sync_health_summary(
+        session={
+            "base_url": "https://api.example.com",
+            "access_token": "access",
+            "refresh_token": "refresh",
+        },
+        auto_sync={
+            "running": True,
+            "last_state_delta_inbox_metrics": {
+                "batches": 2,
+                "claimed": 1000,
+                "applied": 1000,
+                "more_pending_possible": True,
+            },
+        },
+        outbox={"stats": {"pending": 0, "failed": 0, "dead_letter": 0, "upload_ready": 0}},
+        inbox={"by_status": {"pending": 500, "failed": 0, "applied": 1000}},
+        agent_status={"total": 0},
+        content_state={"answers_total": 0, "assets_total": 0},
+    )
+
+    assert summary["inbox_batches_last_cycle"] == 2
+    assert summary["inbox_more_pending_possible"] is True
+    assert summary["next_sync_action"] == {
+        "kind": "state_delta_pipeline",
+        "reason": "local_inbox_backlog",
+        "retry_after_seconds": 0,
     }
 
 

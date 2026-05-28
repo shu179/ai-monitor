@@ -2171,6 +2171,21 @@ def _cloud_sync_health_summary(
         "inbox_pending": pending_inbox,
         "inbox_failed": failed_inbox,
         "inbox_applied": applied_inbox,
+        "inbox_batches_last_cycle": _safe_int(
+            (
+                auto_sync.get("last_state_delta_inbox_metrics", {})
+                if isinstance(auto_sync.get("last_state_delta_inbox_metrics"), dict)
+                else {}
+            ).get("batches"),
+            0,
+        ),
+        "inbox_more_pending_possible": bool(
+            (
+                auto_sync.get("last_state_delta_inbox_metrics", {})
+                if isinstance(auto_sync.get("last_state_delta_inbox_metrics"), dict)
+                else {}
+            ).get("more_pending_possible")
+        ),
         "agent_status_total": _safe_int(agent_status.get("total"), 0),
         "answers_cached": _safe_int(content_state.get("answers_total"), 0),
         "assets_cached": _safe_int(content_state.get("assets_total"), 0),
@@ -2376,6 +2391,13 @@ def _cloud_sync_action_summary(summary: dict[str, Any]) -> dict[str, Any]:
             "server_backpressure",
             summary.get("state_delta_backpressure_retry_after_seconds"),
         )
+    elif (
+        not bool(summary.get("object_download_retry_backpressure_active"))
+        and not bool(summary.get("object_upload_retry_backpressure_active"))
+        and not bool(summary.get("upload_backpressure_active"))
+        and (bool(summary.get("inbox_more_pending_possible")) or _safe_int(summary.get("inbox_pending"), 0) > 0)
+    ):
+        add_action("state_delta_pipeline", "local_inbox_backlog", 0)
 
     running_actions = [item for item in actions if str(item.get("reason") or "") == "running"]
     pending_actions = [item for item in actions if _safe_int(item.get("retry_after_seconds"), 0) > 0]
