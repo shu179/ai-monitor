@@ -4,6 +4,8 @@ import base64
 import hashlib
 import json
 import math
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -81,6 +83,7 @@ QUEUE_REJECT_PENDING_THRESHOLD = 20_000
 SYNC_METADATA_BUCKET = "sync_metadata"
 SYNC_METADATA_RATE_LIMIT_CAPACITY = 1_000
 SYNC_METADATA_RATE_LIMIT_REFILL_PER_SECOND = 100
+SOFT_RATE_LIMIT_MAX_GRANT_SECONDS = 2
 EVENT_STREAMS = {
     EVENT_ARTICLE_REFERENCE: STREAM_REFERENCES,
     EVENT_ARTICLE_TASK_LINKS: STREAM_ARTICLES,
@@ -89,6 +92,8 @@ EVENT_STREAMS = {
     EVENT_RUN_RECORD: STREAM_RUNS,
     EVENT_TASK_DAY_STATUS: STREAM_RUNS,
 }
+_SOFT_RATE_LIMIT_LOCK = threading.Lock()
+_SOFT_RATE_LIMIT_BUCKETS: dict[tuple[int, str, int, int], dict[str, float]] = {}
 
 
 class SyncBackpressureError(RuntimeError):
@@ -1066,6 +1071,48 @@ def consume_workspace_rate_limit(
     safe_cost = max(1, int(cost or 1))
     safe_capacity = max(1, int(capacity or 1))
     safe_refill_rate = max(1, int(refill_rate_per_second or 1))
+    soft_key = (safe_workspace_id, safe_bucket, safe_capacity, safe_refill_rate)
+    soft_result = _consume_soft_rate_limit(soft_key, cost=safe_cost)
+    if soft_result is not None:
+        return soft_result
+
+    grant_cost = _soft_rate_limit_grant_cost(
+        cost=safe_cost,
+        capacity=safe_capacity,
+        refill_rate_per_second=safe_refill_rate,
+    )
+    db_result = _consume_workspace_rate_limit_db(
+        db,
+        workspace_id=safe_workspace_id,
+        bucket=safe_bucket,
+        cost=grant_cost,
+        capacity=safe_capacity,
+        refill_rate_per_second=safe_refill_rate,
+    )
+    if not db_result.get("allowed"):
+        return db_result
+    reserved_tokens = max(0, grant_cost - safe_cost)
+    if reserved_tokens > 0:
+        _store_soft_rate_limit_tokens(soft_key, reserved_tokens)
+    db_result["soft_reserved_tokens"] = reserved_tokens
+    db_result["source"] = "db"
+    return db_result
+
+
+def _consume_workspace_rate_limit_db(
+    db: Session,
+    *,
+    workspace_id: int,
+    bucket: str,
+    cost: int,
+    capacity: int,
+    refill_rate_per_second: int,
+) -> dict[str, Any]:
+    safe_workspace_id = int(workspace_id)
+    safe_bucket = str(bucket or SYNC_METADATA_BUCKET).strip()[:64] or SYNC_METADATA_BUCKET
+    safe_cost = max(1, int(cost or 1))
+    safe_capacity = max(1, int(capacity or 1))
+    safe_refill_rate = max(1, int(refill_rate_per_second or 1))
     try:
         db.execute(
             text("SELECT pg_advisory_xact_lock(:lock_key)"),
@@ -1155,6 +1202,59 @@ def consume_workspace_rate_limit(
         # must not make the sync API unavailable. Hard queue-depth backpressure is
         # still enforced before this function is called.
         return _allow_rate_limit_result()
+
+
+def _soft_rate_limit_grant_cost(*, cost: int, capacity: int, refill_rate_per_second: int) -> int:
+    safe_cost = max(1, int(cost or 1))
+    safe_capacity = max(1, int(capacity or 1))
+    safe_refill_rate = max(1, int(refill_rate_per_second or 1))
+    grant_window = max(1, min(SOFT_RATE_LIMIT_MAX_GRANT_SECONDS, 10))
+    grant = max(safe_cost, safe_refill_rate * grant_window, safe_capacity // 10)
+    return min(safe_capacity, max(safe_cost, int(grant)))
+
+
+def _consume_soft_rate_limit(
+    key: tuple[int, str, int, int],
+    *,
+    cost: int,
+) -> dict[str, Any] | None:
+    safe_cost = max(1, int(cost or 1))
+    now = time.monotonic()
+    with _SOFT_RATE_LIMIT_LOCK:
+        state = _SOFT_RATE_LIMIT_BUCKETS.get(key)
+        if not state:
+            return None
+        tokens = float(state.get("tokens") or 0.0)
+        if tokens < safe_cost:
+            state["tokens"] = max(0.0, tokens)
+            state["last_used"] = now
+            return None
+        tokens -= safe_cost
+        state["tokens"] = tokens
+        state["last_used"] = now
+        return {
+            "allowed": True,
+            "retry_after_seconds": 0,
+            "remaining_tokens": tokens,
+            "source": "soft",
+        }
+
+
+def _store_soft_rate_limit_tokens(key: tuple[int, str, int, int], tokens: int | float) -> None:
+    safe_tokens = max(0.0, float(tokens or 0.0))
+    if safe_tokens <= 0:
+        return
+    now = time.monotonic()
+    capacity = max(1, int(key[2]))
+    with _SOFT_RATE_LIMIT_LOCK:
+        state = _SOFT_RATE_LIMIT_BUCKETS.setdefault(key, {"tokens": 0.0, "last_used": now})
+        state["tokens"] = min(float(capacity), float(state.get("tokens") or 0.0) + safe_tokens)
+        state["last_used"] = now
+
+
+def _reset_soft_rate_limit_buckets_for_tests() -> None:
+    with _SOFT_RATE_LIMIT_LOCK:
+        _SOFT_RATE_LIMIT_BUCKETS.clear()
 
 
 def _allow_rate_limit_result() -> dict[str, Any]:

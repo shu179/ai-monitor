@@ -28,9 +28,8 @@ class MarkFailedBackoffTests(unittest.TestCase):
             self.assertEqual(stats["retry_ready"], 0)
             self.assertGreaterEqual(stats["next_retry_after_seconds"], 50)
 
-            # Read raw file to inspect fields
-            with open(Path(tmpdir) / "outbox.json") as f:
-                raw = json.load(f)
+            # Inspect the SQLite-backed item.
+            raw = outbox._load_locked()
             item = raw[0]
             self.assertEqual(item["status"], "failed")
             self.assertEqual(item["attempts"], 1)
@@ -46,12 +45,10 @@ class MarkFailedBackoffTests(unittest.TestCase):
             outbox.enqueue(event_type="run", idempotency_key="evt-1", payload={"n": 1})
             outbox.mark_failed(["evt-1"], "timeout")
 
-            # Manually set next_attempt_ts to past
-            with open(Path(tmpdir) / "outbox.json") as f:
-                raw = json.load(f)
+            # Manually set next_attempt_ts to past.
+            raw = outbox._load_locked()
             raw[0]["next_attempt_ts"] = time.time() - 10
-            with open(Path(tmpdir) / "outbox.json", "w") as f:
-                json.dump(raw, f)
+            outbox._save_locked(raw)
 
             items = outbox.pending(limit=10)
             self.assertEqual(len(items), 1)
@@ -67,13 +64,11 @@ class MarkFailedBackoffTests(unittest.TestCase):
             outbox.enqueue(event_type="run", idempotency_key="evt-1", payload={"n": 1})
             outbox.mark_failed(["evt-1"], "old error")
 
-            # Simulate old format: remove next_attempt_ts
-            with open(Path(tmpdir) / "outbox.json") as f:
-                raw = json.load(f)
+            # Simulate old format: remove next_attempt_ts.
+            raw = outbox._load_locked()
             del raw[0]["next_attempt_ts"]
             del raw[0]["next_attempt_at"]
-            with open(Path(tmpdir) / "outbox.json", "w") as f:
-                json.dump(raw, f)
+            outbox._save_locked(raw)
 
             items = outbox.pending(limit=10)
             self.assertEqual(len(items), 1, "old failed events without next_attempt_ts should be pending")
@@ -96,16 +91,14 @@ class DeadLetterTests(unittest.TestCase):
             for i in range(DEFAULT_MAX_ATTEMPTS - 1):
                 outbox.mark_failed(["evt-1"], f"error {i + 1}")
 
-            with open(Path(tmpdir) / "outbox.json") as f:
-                raw = json.load(f)
+            raw = outbox._load_locked()
             self.assertEqual(raw[0]["status"], "failed")
             self.assertEqual(raw[0]["attempts"], DEFAULT_MAX_ATTEMPTS - 1)
 
             # Final failure should dead-letter
             outbox.mark_failed(["evt-1"], "final error")
 
-            with open(Path(tmpdir) / "outbox.json") as f:
-                raw = json.load(f)
+            raw = outbox._load_locked()
             item = raw[0]
             self.assertEqual(item["status"], "dead_letter")
             self.assertEqual(item["attempts"], DEFAULT_MAX_ATTEMPTS)
@@ -319,8 +312,7 @@ class OldFormatCompatibilityTests(unittest.TestCase):
             self.assertEqual(len(items), 1, "old failed without next_attempt_ts should be pending")
 
             outbox.mark_failed(["old-failed"], "new error")
-            with open(path) as f:
-                raw = json.load(f)
+            raw = outbox._load_locked()
             self.assertEqual(raw[0]["attempts"], 1)
             self.assertEqual(raw[0]["status"], "failed")
             self.assertIsNotNone(raw[0].get("next_attempt_ts"))

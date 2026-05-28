@@ -12,9 +12,13 @@ from core.cloud_sync_daemon import (
     CloudSyncCommandDaemonProcess,
     InProcessCloudSyncCommandClient,
     DAEMON_SUPPORTED_COMMANDS,
+    NamedPipeCloudSyncCommandClient,
+    NamedPipeCloudSyncCommandServer,
     UnixSocketCloudSyncCommandClient,
     UnixSocketCloudSyncCommandServer,
     build_cloud_sync_socket_path,
+    create_cloud_sync_command_client,
+    create_cloud_sync_command_server,
     run_cloud_sync_command_daemon,
 )
 from core.cloud_sync_runtime import CloudCommandTransportState
@@ -78,6 +82,13 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertEqual(left, right)
         self.assertNotEqual(left, other)
         self.assertLess(len(str(left)), 108)
+
+    def test_build_cloud_sync_socket_path_uses_named_pipe_on_windows(self) -> None:
+        with patch("core.cloud_sync_daemon.os.name", "nt"):
+            path = build_cloud_sync_socket_path("C:/Users/example/config.yaml")
+
+        self.assertIn("pipe", str(path).lower())
+        self.assertIn("aibrandmonitor-cloud-sync", str(path))
 
     def test_in_process_command_client_forwards_payload(self) -> None:
         seen: list[tuple[str, dict[str, object] | None]] = []
@@ -164,6 +175,51 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertTrue(result["daemon_unavailable"])
         self.assertEqual(result["daemon_error_type"], "response_invalid")
 
+    def test_windows_named_pipe_factories_are_selected_on_windows(self) -> None:
+        with patch("core.cloud_sync_daemon.os.name", "nt"):
+            client = create_cloud_sync_command_client("//./pipe/aibrandmonitor-cloud-sync-test")
+            server = create_cloud_sync_command_server(
+                "//./pipe/aibrandmonitor-cloud-sync-test",
+                command_handler=lambda _command, _payload: {"ok": True},
+            )
+
+        self.assertIsInstance(client, NamedPipeCloudSyncCommandClient)
+        self.assertIsInstance(server, NamedPipeCloudSyncCommandServer)
+
+    def test_named_pipe_command_client_uses_af_pipe_connection(self) -> None:
+        fake_conn = Mock()
+        fake_conn.recv_bytes.return_value = b'{"ok":true,"daemon":true}\n'
+
+        with (
+            patch("core.cloud_sync_daemon.os.name", "nt"),
+            patch("core.cloud_sync_daemon.multiprocessing.connection.Client", return_value=fake_conn) as client_fn,
+            patch("core.cloud_sync_daemon.multiprocessing.connection.wait", return_value=[fake_conn]) as wait_fn,
+        ):
+            client = NamedPipeCloudSyncCommandClient("//./pipe/aibrandmonitor-cloud-sync-test", timeout_seconds=0.25)
+            result = client.send_command("cloud.daemon.ping")
+
+        self.assertEqual(result, {"ok": True, "daemon": True})
+        client_fn.assert_called_once_with("//./pipe/aibrandmonitor-cloud-sync-test", family="AF_PIPE")
+        wait_fn.assert_called_once_with([fake_conn], timeout=0.25)
+        fake_conn.send_bytes.assert_called_once()
+        fake_conn.close.assert_called_once()
+
+    def test_named_pipe_command_client_reports_timeout_type(self) -> None:
+        fake_conn = Mock()
+
+        with (
+            patch("core.cloud_sync_daemon.os.name", "nt"),
+            patch("core.cloud_sync_daemon.multiprocessing.connection.Client", return_value=fake_conn),
+            patch("core.cloud_sync_daemon.multiprocessing.connection.wait", return_value=[]),
+        ):
+            client = NamedPipeCloudSyncCommandClient("//./pipe/aibrandmonitor-cloud-sync-test", timeout_seconds=0.25)
+            result = client.send_command("cloud.daemon.ping")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["daemon_unavailable"])
+        self.assertEqual(result["daemon_error_type"], "command_timeout")
+        fake_conn.close.assert_called_once()
+
     @unittest.skipUnless(hasattr(__import__("socket"), "AF_UNIX"), "Unix socket unsupported on this platform")
     def test_child_process_daemon_ping_and_supported_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -227,7 +283,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         command_client = Mock()
         command_client.send_command.return_value = {"ok": True, "message": "ok"}
 
-        with patch("web_backend.UnixSocketCloudSyncCommandClient", return_value=command_client) as client_cls:
+        with patch("web_backend.create_cloud_sync_command_client", return_value=command_client) as client_cls:
             result = AppRuntime._send_cloud_command_via_transport(
                 runtime,
                 socket_client,
@@ -247,7 +303,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         command_client = Mock()
         command_client.send_command.return_value = {"ok": True, "cloud": {}}
 
-        with patch("web_backend.UnixSocketCloudSyncCommandClient", return_value=command_client) as client_cls:
+        with patch("web_backend.create_cloud_sync_command_client", return_value=command_client) as client_cls:
             result = AppRuntime._send_cloud_command_via_transport(runtime, socket_client, "cloud.status", None)
 
         self.assertEqual(result, {"ok": True, "cloud": {}})
@@ -260,7 +316,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         in_process_client = Mock()
         in_process_client.send_command.return_value = {"ok": True}
 
-        with patch("web_backend.UnixSocketCloudSyncCommandClient") as client_cls:
+        with patch("web_backend.create_cloud_sync_command_client") as client_cls:
             result = AppRuntime._send_cloud_command_via_transport(
                 runtime,
                 in_process_client,
@@ -291,7 +347,8 @@ class CloudSyncDaemonTests(unittest.TestCase):
             patch("web_backend.create_in_process_cloud_sync_command_client", return_value=fallback_client),
             patch("web_backend.build_cloud_sync_socket_path", return_value=Path("/tmp/cloud-sync.sock")) as build_path,
             patch("web_backend.CloudSyncCommandDaemonProcess", return_value=daemon) as daemon_cls,
-            patch("web_backend.UnixSocketCloudSyncCommandClient", return_value=socket_client) as client_cls,
+            patch("web_backend.cloud_sync_ipc_supported", return_value=True),
+            patch("web_backend.create_cloud_sync_command_client", return_value=socket_client) as client_cls,
         ):
             runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
             AppRuntime._start_cloud_command_transport(runtime)
@@ -333,8 +390,9 @@ class CloudSyncDaemonTests(unittest.TestCase):
             patch("web_backend.create_in_process_cloud_sync_command_client", return_value=fallback_client),
             patch("web_backend.build_cloud_sync_socket_path", return_value=Path("/tmp/cloud-sync.sock")),
             patch("web_backend.CloudSyncCommandDaemonProcess", return_value=daemon),
-            patch("web_backend.UnixSocketCloudSyncCommandClient", return_value=socket_client),
-            patch("web_backend.UnixSocketCloudSyncCommandServer", return_value=server) as server_cls,
+            patch("web_backend.cloud_sync_ipc_supported", return_value=True),
+            patch("web_backend.create_cloud_sync_command_client", return_value=socket_client),
+            patch("web_backend.create_cloud_sync_command_server", return_value=server) as server_cls,
         ):
             runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
             AppRuntime._start_cloud_command_transport(runtime)
@@ -415,7 +473,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         ping_client = Mock()
         ping_client.send_command.return_value = {"ok": True, "daemon": True, "pid": 1234}
 
-        with patch("web_backend.UnixSocketCloudSyncCommandClient", return_value=ping_client) as client_cls:
+        with patch("web_backend.create_cloud_sync_command_client", return_value=ping_client) as client_cls:
             status = AppRuntime._cloud_command_transport_status(runtime)
 
         client_cls.assert_called_once_with(Path("/tmp/cloud-sync.sock"), timeout_seconds=0.25)
@@ -445,7 +503,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
             "message": "云同步 daemon 不可用: timed out",
         }
 
-        with patch("web_backend.UnixSocketCloudSyncCommandClient", return_value=ping_client):
+        with patch("web_backend.create_cloud_sync_command_client", return_value=ping_client):
             status = AppRuntime._cloud_command_transport_status(runtime)
 
         self.assertFalse(status["responsive"])

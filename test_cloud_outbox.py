@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+import json
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -18,7 +19,8 @@ class CloudOutboxCompactionTests(unittest.TestCase):
             self.assertIsInstance(outbox._lock, CrossProcessRLock)
             outbox.enqueue(event_type="run", idempotency_key="event-1", payload={"n": 1})
 
-            self.assertTrue(path.with_name("outbox.json.lock").exists())
+            self.assertTrue(outbox.db_path.exists())
+            self.assertTrue(outbox.db_path.with_name(f"{outbox.db_path.name}.lock").exists())
 
     def test_two_instances_for_same_path_preserve_both_enqueues(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -118,6 +120,40 @@ class CloudOutboxCompactionTests(unittest.TestCase):
             self.assertEqual(result["created"], 2)
             self.assertEqual(result["requested"], 3)
             self.assertEqual(outbox.stats()["pending"], 2)
+
+    def test_legacy_json_is_migrated_once_to_sqlite_with_marker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "outbox.json"
+            path.write_text(
+                json.dumps([
+                    {
+                        "event_type": "run",
+                        "idempotency_key": "legacy-1",
+                        "payload": {"n": 1},
+                        "created_at": "2026-01-01T00:00:00",
+                        "updated_at": "2026-01-01T00:00:00",
+                    }
+                ]),
+                encoding="utf-8",
+            )
+            outbox = CloudOutbox(path)
+
+            self.assertEqual([item["idempotency_key"] for item in outbox.pending(limit=10)], ["legacy-1"])
+            self.assertTrue(outbox.db_path.exists())
+            self.assertTrue(path.with_name("outbox.json.migrated-to-sqlite").exists())
+
+            path.write_text(
+                json.dumps([
+                    {
+                        "event_type": "run",
+                        "idempotency_key": "legacy-2",
+                        "payload": {"n": 2},
+                    }
+                ]),
+                encoding="utf-8",
+            )
+
+            self.assertEqual([item["idempotency_key"] for item in outbox.pending(limit=10)], ["legacy-1"])
 
     def test_sent_retention_compaction_is_quiet(self):
         with tempfile.TemporaryDirectory() as tmpdir:

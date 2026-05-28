@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing
+import multiprocessing.connection
 import os
 import socket
 import tempfile
@@ -43,9 +44,47 @@ DAEMON_SUPPORTED_COMMANDS = frozenset(
 
 
 def build_cloud_sync_socket_path(scope_hint: str | os.PathLike[str]) -> Path:
-    """Build a short, stable Unix-socket path for a given account/runtime scope."""
+    """Build a short, stable local IPC path for a given account/runtime scope."""
     digest = hashlib.sha1(os.fsdecode(scope_hint).encode("utf-8", errors="ignore")).hexdigest()[:16]
+    if os.name == "nt":
+        return Path(f"//./pipe/aibrandmonitor-cloud-sync-{digest}")
     return Path(tempfile.gettempdir()) / f"aibrandmonitor-cloud-sync-{digest}.sock"
+
+
+def cloud_sync_ipc_supported() -> bool:
+    """Return whether the platform can run the daemon IPC transport."""
+    if os.name == "nt":
+        return True
+    return hasattr(socket, "AF_UNIX")
+
+
+def create_cloud_sync_command_client(
+    socket_path: str | os.PathLike[str],
+    *,
+    timeout_seconds: float = 5.0,
+) -> Any:
+    if os.name == "nt":
+        return NamedPipeCloudSyncCommandClient(socket_path, timeout_seconds=timeout_seconds)
+    return UnixSocketCloudSyncCommandClient(socket_path, timeout_seconds=timeout_seconds)
+
+
+def create_cloud_sync_command_server(
+    socket_path: str | os.PathLike[str],
+    *,
+    command_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
+    thread_factory: Callable[..., Any] = threading.Thread,
+) -> Any:
+    if os.name == "nt":
+        return NamedPipeCloudSyncCommandServer(
+            socket_path,
+            command_handler=command_handler,
+            thread_factory=thread_factory,
+        )
+    return UnixSocketCloudSyncCommandServer(
+        socket_path,
+        command_handler=command_handler,
+        thread_factory=thread_factory,
+    )
 
 
 class InProcessCloudSyncCommandClient:
@@ -101,6 +140,55 @@ class UnixSocketCloudSyncCommandClient:
         return response
 
 
+class NamedPipeCloudSyncCommandClient:
+    """Command client for a Windows named-pipe cloud sync daemon."""
+
+    def __init__(self, pipe_name: str | os.PathLike[str], *, timeout_seconds: float = 5.0) -> None:
+        self.pipe_name = os.fspath(pipe_name)
+        self.timeout_seconds = max(0.1, float(timeout_seconds or 5.0))
+
+    def send_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        if os.name != "nt":
+            return {
+                "ok": False,
+                "daemon_unavailable": True,
+                "daemon_error_type": "unsupported_platform",
+                "message": "当前平台不支持 Windows named pipe",
+            }
+        request = {"command": str(command or "").strip(), "payload": payload if isinstance(payload, dict) else None}
+        conn = None
+        try:
+            conn = multiprocessing.connection.Client(self.pipe_name, family="AF_PIPE")
+            conn.send_bytes(_encode_message(request))
+            if self.timeout_seconds > 0:
+                ready = multiprocessing.connection.wait([conn], timeout=self.timeout_seconds)
+                if not ready:
+                    raise TimeoutError("timed out waiting for named-pipe response")
+            response = _decode_message(conn.recv_bytes())
+        except TimeoutError as exc:
+            return _daemon_client_error("command_timeout", exc)
+        except (EOFError, BrokenPipeError, FileNotFoundError, ConnectionRefusedError, ConnectionResetError, OSError) as exc:
+            return _daemon_client_error("connect_failed", exc)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            return _daemon_client_error("response_invalid", exc)
+        except Exception as exc:
+            return _daemon_client_error("unknown", exc)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        if not isinstance(response, dict):
+            return {
+                "ok": False,
+                "daemon_unavailable": True,
+                "daemon_error_type": "response_invalid",
+                "message": "云同步 daemon 返回无效响应",
+            }
+        return response
+
+
 class CloudSyncCommandDaemonProcess:
     """Manage a child-process Unix-socket daemon for cloud sync commands."""
 
@@ -124,11 +212,7 @@ class CloudSyncCommandDaemonProcess:
         process = self._process
         if process is not None and process.is_alive():
             return
-        try:
-            if self.socket_path.exists():
-                self.socket_path.unlink()
-        except FileNotFoundError:
-            pass
+        self._cleanup_socket_path()
         ctx = multiprocessing.get_context("spawn")
         process = ctx.Process(
             target=run_cloud_sync_command_daemon,
@@ -148,7 +232,7 @@ class CloudSyncCommandDaemonProcess:
             return
         try:
             if process.is_alive():
-                client = UnixSocketCloudSyncCommandClient(self.socket_path, timeout_seconds=0.5)
+                client = create_cloud_sync_command_client(self.socket_path, timeout_seconds=0.5)
                 client.send_command("cloud.daemon.shutdown")
                 process.join(timeout=2.0)
             if process.is_alive():
@@ -159,13 +243,13 @@ class CloudSyncCommandDaemonProcess:
 
     def _wait_until_ready(self) -> None:
         deadline = time.monotonic() + self.startup_timeout_seconds
-        client = UnixSocketCloudSyncCommandClient(self.socket_path, timeout_seconds=0.2)
+        client = create_cloud_sync_command_client(self.socket_path, timeout_seconds=0.2)
         last_error = "daemon startup timed out"
         while time.monotonic() < deadline:
             process = self._process
             if process is not None and not process.is_alive():
                 raise RuntimeError("云同步 daemon 启动失败：子进程已退出")
-            if self.socket_path.exists():
+            if os.name == "nt" or self.socket_path.exists():
                 result = client.send_command("cloud.daemon.ping")
                 if bool(result.get("ok")) and bool(result.get("daemon")):
                     return
@@ -174,6 +258,8 @@ class CloudSyncCommandDaemonProcess:
         raise RuntimeError(f"云同步 daemon 启动超时: {last_error}")
 
     def _cleanup_socket_path(self) -> None:
+        if os.name == "nt":
+            return
         try:
             if self.socket_path.exists():
                 self.socket_path.unlink()
@@ -287,6 +373,98 @@ class UnixSocketCloudSyncCommandServer:
             pass
 
 
+class NamedPipeCloudSyncCommandServer:
+    """Tiny JSON-over-Windows-named-pipe server for local cloud sync commands."""
+
+    def __init__(
+        self,
+        pipe_name: str | os.PathLike[str],
+        *,
+        command_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
+        thread_factory: Callable[..., Any] = threading.Thread,
+    ) -> None:
+        self.pipe_name = os.fspath(pipe_name)
+        self._command_handler = command_handler
+        self._thread_factory = thread_factory
+        self._listener: Any = None
+        self._thread: Any = None
+        self._stop_event = threading.Event()
+
+    def start(self) -> None:
+        if self._listener is not None:
+            return
+        if os.name != "nt":
+            raise RuntimeError("当前平台不支持 Windows named pipe")
+        self._listener = multiprocessing.connection.Listener(self.pipe_name, family="AF_PIPE", backlog=16)
+        self._stop_event.clear()
+        self._thread = self._thread_factory(
+            target=self._serve_loop,
+            name="cloud-sync-daemon-ipc",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        listener = self._listener
+        self._listener = None
+        if listener is not None:
+            try:
+                listener.close()
+            except Exception:
+                pass
+        thread = self._thread
+        if (
+            thread is not None
+            and thread is not threading.current_thread()
+            and callable(getattr(thread, "join", None))
+        ):
+            try:
+                thread.join(timeout=1.0)
+            except Exception:
+                pass
+        self._thread = None
+
+    def _serve_loop(self) -> None:
+        while not self._stop_event.is_set():
+            listener = self._listener
+            if listener is None:
+                return
+            try:
+                conn = listener.accept()
+            except (EOFError, OSError):
+                if self._stop_event.is_set():
+                    return
+                continue
+            try:
+                self._handle_connection(conn)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _handle_connection(self, conn: Any) -> None:
+        try:
+            request = _decode_message(conn.recv_bytes())
+            if not isinstance(request, dict):
+                response = {"ok": False, "message": "请求格式无效"}
+            else:
+                command = str(request.get("command") or "").strip()
+                payload = request.get("payload")
+                if payload is not None and not isinstance(payload, dict):
+                    payload = None
+                response = self._command_handler(command, payload)
+                if not isinstance(response, dict):
+                    response = {"ok": False, "message": "命令处理结果无效"}
+        except Exception as exc:
+            response = {"ok": False, "message": str(exc)}
+        try:
+            conn.send_bytes(_encode_message(response))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+
+
 def _encode_message(payload: dict[str, Any]) -> bytes:
     return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
@@ -325,7 +503,7 @@ def run_cloud_sync_command_daemon(
     """Run the child-process cloud sync daemon until a shutdown command arrives."""
     stop_event = threading.Event()
     allowed = {str(item or "").strip() for item in (supported_commands or DAEMON_SUPPORTED_COMMANDS)}
-    server_holder: dict[str, UnixSocketCloudSyncCommandServer | None] = {"server": None}
+    server_holder: dict[str, Any | None] = {"server": None}
     support = _build_daemon_runtime_support()
 
     def command_handler(command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -347,7 +525,7 @@ def run_cloud_sync_command_daemon(
             }
         return support.daemon_handle_command(normalized, payload)
 
-    server = UnixSocketCloudSyncCommandServer(
+    server = create_cloud_sync_command_server(
         socket_path,
         command_handler=command_handler,
     )

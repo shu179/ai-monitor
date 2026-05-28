@@ -80,6 +80,7 @@ SURFACED_CLOUD_TENCENT_SES_TEMPLATE_ID=腾讯云邮件模板 ID
 ```bash
 cd cloud-server
 cp .env.example .env
+sudo install -d -m 700 -o 999 -g 999 /opt/surfaced/postgres-wal /opt/surfaced/backups
 docker compose up -d --build
 docker compose exec api alembic upgrade head
 ```
@@ -92,4 +93,4 @@ docker compose exec api alembic upgrade head
 docker compose exec postgres pg_dump -U surfaced surfaced_cloud > surfaced_cloud.sql
 ```
 
-正式生产建议把备份上传到 R2 `backups/`，并保留最近 7 天每日备份和最近 6 个月月度备份。
+当前本地盘模式已经支持 PostgreSQL WAL 归档和 base backup，恢复演练步骤见 [PITR_DR.md](PITR_DR.md)。正式生产建议后续把 `/opt/surfaced/backups` 和 `/opt/surfaced/postgres-wal` 再复制到 R2 `backups/`，并保留最近 7 天每日备份和最近 6 个月月度备份。

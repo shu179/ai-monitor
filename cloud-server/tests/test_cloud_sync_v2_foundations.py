@@ -32,6 +32,7 @@ from app.services.sync_v2_service import (  # noqa: E402
     LIMITS,
     _partition_key_for_event,
     _reserve_idempotency_key,
+    _reset_soft_rate_limit_buckets_for_tests,
     _retry_after_for_queue_depth,
     build_state_delta,
     consume_workspace_rate_limit,
@@ -181,6 +182,7 @@ class SyncV2ServiceTests(unittest.TestCase):
         self.assertEqual(headers["X-Throttle-Bucket"], "sync_metadata")
 
     def test_rate_limit_uses_distributed_advisory_lock_and_token_row(self) -> None:
+        _reset_soft_rate_limit_buckets_for_tests()
         db = MagicMock()
         db.execute.side_effect = [
             MagicMock(),
@@ -209,6 +211,44 @@ class SyncV2ServiceTests(unittest.TestCase):
         bucket_sql = str(db.execute.call_args_list[1].args[0]).lower()
         self.assertIn("insert into workspace_rate_limits", bucket_sql)
         self.assertIn("on conflict (workspace_id, bucket)", bucket_sql)
+
+    def test_rate_limit_reuses_soft_bucket_before_db_lock(self) -> None:
+        _reset_soft_rate_limit_buckets_for_tests()
+        db = MagicMock()
+        db.execute.side_effect = [
+            MagicMock(),
+            MagicMock(mappings=MagicMock(return_value=MagicMock(first=MagicMock(return_value={
+                "tokens": 100.0,
+                "capacity": 100.0,
+                "refill_rate_per_second": 10.0,
+            })))),
+            MagicMock(mappings=MagicMock(return_value=MagicMock(first=MagicMock(return_value={
+                "tokens": 80.0,
+            })))),
+        ]
+
+        first = consume_workspace_rate_limit(
+            db,
+            workspace_id=3,
+            bucket="sync_metadata",
+            cost=10,
+            capacity=100,
+            refill_rate_per_second=10,
+        )
+        second = consume_workspace_rate_limit(
+            db,
+            workspace_id=3,
+            bucket="sync_metadata",
+            cost=10,
+            capacity=100,
+            refill_rate_per_second=10,
+        )
+
+        self.assertTrue(first["allowed"])
+        self.assertEqual(first["source"], "db")
+        self.assertTrue(second["allowed"])
+        self.assertEqual(second["source"], "soft")
+        self.assertEqual(db.execute.call_count, 3)
 
     def test_reserve_idempotency_key_uses_postgres_on_conflict(self) -> None:
         db = MagicMock()

@@ -212,9 +212,10 @@ from core.cloud_run_sync import (
 from core.cloud_sync_daemon import (
     CloudSyncCommandDaemonProcess,
     DAEMON_SUPPORTED_COMMANDS,
-    UnixSocketCloudSyncCommandClient,
-    UnixSocketCloudSyncCommandServer,
     build_cloud_sync_socket_path,
+    cloud_sync_ipc_supported,
+    create_cloud_sync_command_client,
+    create_cloud_sync_command_server,
 )
 from core.cloud_sync_runtime import (
     AppCloudRuntimeSupport,
@@ -2145,14 +2146,14 @@ class AppRuntime:
             client,
             command,
             payload,
-            socket_client_factory=UnixSocketCloudSyncCommandClient,
+            socket_client_factory=create_cloud_sync_command_client,
         )
 
     def _start_cloud_command_transport(self) -> None:
         state = self._cloud_command_transport_state()
         with state.lock:
             fallback_client = self._build_in_process_cloud_command_client()
-            if not state.prepare_start(fallback_client=fallback_client, af_unix_available=hasattr(socket, "AF_UNIX")):
+            if not state.prepare_start(fallback_client=fallback_client, af_unix_available=cloud_sync_ipc_supported()):
                 return
             socket_path = self._build_cloud_command_socket_path()
             daemon = CloudSyncCommandDaemonProcess(
@@ -2161,7 +2162,7 @@ class AppRuntime:
             )
             try:
                 daemon.start()
-                client = UnixSocketCloudSyncCommandClient(socket_path)
+                client = create_cloud_sync_command_client(socket_path)
             except Exception as exc:
                 try:
                     daemon.stop()
@@ -2172,13 +2173,13 @@ class AppRuntime:
             else:
                 state.activate_child_daemon(socket_path=socket_path, daemon=daemon, client=client)
                 return
-            server = UnixSocketCloudSyncCommandServer(
+            server = create_cloud_sync_command_server(
                 socket_path,
                 command_handler=self._ensure_cloud_runtime_support().build_daemon_command_handler(),
             )
             try:
                 server.start()
-                client = UnixSocketCloudSyncCommandClient(socket_path)
+                client = create_cloud_sync_command_client(socket_path)
             except Exception as exc:
                 try:
                     server.stop()
@@ -4455,7 +4456,7 @@ return changedCount
         state = self._cloud_command_transport_state()
 
         def ping_socket(socket_path: Path) -> dict[str, Any]:
-            return UnixSocketCloudSyncCommandClient(socket_path, timeout_seconds=0.25).send_command("cloud.daemon.ping")
+            return create_cloud_sync_command_client(socket_path, timeout_seconds=0.25).send_command("cloud.daemon.ping")
 
         return state.snapshot_status_with_action_summary(ping_fn=ping_socket)
 

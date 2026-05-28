@@ -52,8 +52,19 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "archive_mode=on"
+      - "-c"
+      - "archive_command=test -d /opt/surfaced/postgres-wal && (test ! -f /opt/surfaced/postgres-wal/%f && cp %p /opt/surfaced/postgres-wal/%f || test -f /opt/surfaced/postgres-wal/%f)"
+      - "-c"
+      - "archive_timeout=60s"
     volumes:
       - surfaced_cloud_pg:/var/lib/postgresql/data
+      - /opt/surfaced/postgres-wal:/opt/surfaced/postgres-wal
     logging: *default-logging
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]

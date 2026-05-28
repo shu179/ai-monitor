@@ -213,7 +213,7 @@ class CloudCommandTransportState:
     ) -> dict[str, Any]:
         socket_path = self.socket_path
         factory = socket_client_factory or type(client)
-        if type(client).__name__ == "UnixSocketCloudSyncCommandClient" and socket_path:
+        if type(client).__name__ in {"UnixSocketCloudSyncCommandClient", "NamedPipeCloudSyncCommandClient"} and socket_path:
             client = factory(
                 socket_path,
                 timeout_seconds=self.command_timeout_seconds(command),

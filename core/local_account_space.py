@@ -32,6 +32,7 @@ ACCOUNT_SCOPED_RELATIVE_PATHS = (
     "logs/account_crawl_state.json",
     "logs/diagnostics.json",
     "user_data/cloud_outbox.json",
+    "user_data/cloud_outbox.sqlite3",
     "user_data/daily_task_status.json",
     "user_data/runtime_state.json",
     "user_data/scheduler_state.json",
