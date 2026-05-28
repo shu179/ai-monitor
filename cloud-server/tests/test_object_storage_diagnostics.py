@@ -77,6 +77,24 @@ class ObjectStorageDiagnosticsTests(unittest.TestCase):
         self.assertIn("missing_files:", text)
         self.assertIn("orphan_files:", text)
 
+    def test_report_flags_impossible_capacity_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _db_with_manifests([])
+
+            with (
+                patch("app.services.object_storage_diagnostics.get_settings", return_value=_settings(tmp)),
+                patch("app.services.object_storage_diagnostics.shutil.disk_usage") as disk_usage,
+            ):
+                disk_usage.return_value = SimpleNamespace(total=12_000, used=2_000, free=10_000)
+                report = build_object_storage_report(db)
+
+        self.assertEqual(report["status"], "error")
+        self.assertTrue(report["writable"])
+        self.assertIn("total_quota_exceeds_disk_capacity_after_min_free", report["capacity_errors"])
+        self.assertIn("not_enough_free_space_for_max_file_upload", report["capacity_errors"])
+        text = format_object_storage_report(report)
+        self.assertIn("capacity_errors=", text)
+
 
 def _db_with_manifests(manifests: list[ObjectManifest]):
     db = MagicMock()

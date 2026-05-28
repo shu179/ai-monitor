@@ -6,12 +6,18 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+DEFAULT_TOTAL_OBJECT_QUOTA_BYTES = 10 * 1024 * 1024 * 1024
+DEFAULT_WORKSPACE_OBJECT_QUOTA_BYTES = 5 * 1024 * 1024 * 1024
+DEFAULT_MAX_OBJECT_FILE_BYTES = 512 * 1024 * 1024
+DEFAULT_MIN_OBJECT_FREE_BYTES = 8 * 1024 * 1024 * 1024
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,9 +54,26 @@ def build_deploy_check_report(*, base_url: str = "http://127.0.0.1:8080") -> dic
     ]
     object_dir = Path(env_values.get("SURFACED_CLOUD_OBJECT_STORAGE_LOCAL_DIR") or "/opt/surfaced/object-data")
     backup_dir = Path(env_values.get("SURFACED_CLOUD_BACKUP_DIR") or "/opt/surfaced/backups")
-    min_free = _safe_int(env_values.get("SURFACED_CLOUD_OBJECT_STORAGE_MIN_FREE_BYTES"), default=8 * 1024 * 1024 * 1024)
+    object_limits = {
+        "total_quota_bytes": _safe_int(
+            env_values.get("SURFACED_CLOUD_OBJECT_STORAGE_TOTAL_QUOTA_BYTES"),
+            default=DEFAULT_TOTAL_OBJECT_QUOTA_BYTES,
+        ),
+        "workspace_quota_bytes": _safe_int(
+            env_values.get("SURFACED_CLOUD_OBJECT_STORAGE_WORKSPACE_QUOTA_BYTES"),
+            default=DEFAULT_WORKSPACE_OBJECT_QUOTA_BYTES,
+        ),
+        "max_file_bytes": _safe_int(
+            env_values.get("SURFACED_CLOUD_OBJECT_STORAGE_MAX_FILE_BYTES"),
+            default=DEFAULT_MAX_OBJECT_FILE_BYTES,
+        ),
+        "min_free_bytes": _safe_int(
+            env_values.get("SURFACED_CLOUD_OBJECT_STORAGE_MIN_FREE_BYTES"),
+            default=DEFAULT_MIN_OBJECT_FREE_BYTES,
+        ),
+    }
     dirs = {
-        "object_storage": _dir_report(object_dir, min_free_bytes=min_free),
+        "object_storage": _object_storage_dir_report(object_dir, limits=object_limits),
         "backups": _dir_report(backup_dir, min_free_bytes=0),
     }
     compose = _compose_report()
@@ -75,8 +98,20 @@ def format_deploy_check_report(report: dict) -> str:
     for name, item in report["directories"].items():
         lines.append(
             f"{name}_dir path={item['path']} exists={item['exists']} "
+            f"writable={item.get('writable', False)} total_bytes={item.get('total_bytes', 0)} "
             f"free_bytes={item['free_bytes']} min_free_bytes={item['min_free_bytes']} status={item['status']}"
         )
+        if name == "object_storage":
+            limits = item.get("limits", {})
+            lines.append(
+                "object_storage_limits "
+                f"total_quota_bytes={limits.get('total_quota_bytes', 0)} "
+                f"workspace_quota_bytes={limits.get('workspace_quota_bytes', 0)} "
+                f"max_file_bytes={limits.get('max_file_bytes', 0)} "
+                f"min_free_bytes={limits.get('min_free_bytes', item['min_free_bytes'])}"
+            )
+            capacity_errors = item.get("capacity_errors") or []
+            lines.append(f"object_storage_capacity_errors={','.join(capacity_errors) or 'none'}")
     compose = report["compose"]
     lines.append(
         "compose="
@@ -107,17 +142,68 @@ def _dir_report(path: Path, *, min_free_bytes: int) -> dict:
     probe_path = path if exists else path.parent
     try:
         usage = shutil.disk_usage(probe_path)
+        total_bytes = int(usage.total)
+        used_bytes = int(usage.used)
         free_bytes = int(usage.free)
     except Exception:
+        total_bytes = 0
+        used_bytes = 0
         free_bytes = 0
-    status = "ok" if exists and free_bytes >= int(min_free_bytes or 0) else "error"
+    writable = _path_is_writable(path) if exists else False
+    status = "ok" if exists and writable and free_bytes >= int(min_free_bytes or 0) else "error"
     return {
         "path": str(path),
         "exists": exists,
+        "writable": writable,
+        "total_bytes": total_bytes,
+        "used_bytes": used_bytes,
         "free_bytes": free_bytes,
         "min_free_bytes": int(min_free_bytes or 0),
         "status": status,
     }
+
+
+def _object_storage_dir_report(path: Path, *, limits: dict[str, int]) -> dict:
+    report = _dir_report(path, min_free_bytes=int(limits["min_free_bytes"]))
+    capacity_errors = _object_storage_capacity_errors(
+        total_bytes=int(report["total_bytes"]),
+        free_bytes=int(report["free_bytes"]),
+        limits=limits,
+    )
+    report["limits"] = {key: int(value or 0) for key, value in limits.items()}
+    report["capacity_errors"] = capacity_errors
+    if capacity_errors:
+        report["status"] = "error"
+    return report
+
+
+def _object_storage_capacity_errors(*, total_bytes: int, free_bytes: int, limits: dict[str, int]) -> list[str]:
+    total_quota = int(limits.get("total_quota_bytes") or 0)
+    workspace_quota = int(limits.get("workspace_quota_bytes") or 0)
+    max_file = int(limits.get("max_file_bytes") or 0)
+    min_free = int(limits.get("min_free_bytes") or 0)
+    errors: list[str] = []
+    if total_quota > 0 and workspace_quota > total_quota:
+        errors.append("workspace_quota_exceeds_total_quota")
+    if workspace_quota > 0 and max_file > workspace_quota:
+        errors.append("max_file_exceeds_workspace_quota")
+    if total_quota > 0 and max_file > total_quota:
+        errors.append("max_file_exceeds_total_quota")
+    if total_bytes > 0 and total_quota > 0 and total_quota + min_free > total_bytes:
+        errors.append("total_quota_exceeds_disk_capacity_after_min_free")
+    if free_bytes > 0 and max_file > 0 and free_bytes - max_file < min_free:
+        errors.append("not_enough_free_space_for_max_file_upload")
+    return errors
+
+
+def _path_is_writable(path: Path) -> bool:
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".deploy-check-", dir=str(path), delete=True) as handle:
+            handle.write(b"ok")
+            handle.flush()
+        return True
+    except Exception:
+        return False
 
 
 def _compose_report() -> dict:

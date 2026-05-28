@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ def build_object_storage_report(db: Session, *, settings: Settings | None = None
     root = Path(str(resolved_settings.object_storage_local_dir or "/opt/surfaced/object-data")).resolve()
     root.mkdir(parents=True, exist_ok=True)
     usage = shutil.disk_usage(root)
+    writable = _path_is_writable(root)
     local_size = _directory_size(root)
     active_manifests = _active_manifest_rows(db)
     manifest_total = sum(int(row["storage_size_bytes"]) for row in active_manifests)
@@ -33,11 +35,18 @@ def build_object_storage_report(db: Session, *, settings: Settings | None = None
         "max_file_bytes": int(resolved_settings.object_storage_max_file_bytes or 0),
         "min_free_bytes": int(resolved_settings.object_storage_min_free_bytes or 0),
     }
+    capacity_errors = _capacity_errors(
+        total_bytes=int(usage.total),
+        free_bytes=int(usage.free),
+        limits=limits,
+    )
     status = _status(
+        writable=writable,
         disk_free_bytes=int(usage.free),
         local_size_bytes=local_size,
         manifest_total_bytes=manifest_total,
         limits=limits,
+        capacity_error_count=len(capacity_errors),
         missing_count=len(missing_files),
         orphan_count=len(orphan_files),
     )
@@ -49,7 +58,9 @@ def build_object_storage_report(db: Session, *, settings: Settings | None = None
             "used_bytes": int(usage.used),
             "free_bytes": int(usage.free),
         },
+        "writable": writable,
         "limits": limits,
+        "capacity_errors": capacity_errors,
         "local_size_bytes": local_size,
         "manifest_total_bytes": manifest_total,
         "manifest_count": len(active_manifests),
@@ -69,6 +80,7 @@ def format_object_storage_report(report: dict[str, Any]) -> str:
         f"total={_format_bytes(disk['total_bytes'])} "
         f"used={_format_bytes(disk['used_bytes'])} "
         f"free={_format_bytes(disk['free_bytes'])}",
+        f"writable={report.get('writable', False)}",
         "limits="
         f"total_quota={_format_bytes(limits['total_quota_bytes'])} "
         f"workspace_quota={_format_bytes(limits['workspace_quota_bytes'])} "
@@ -79,6 +91,10 @@ def format_object_storage_report(report: dict[str, Any]) -> str:
         f"manifests={_format_bytes(report['manifest_total_bytes'])} "
         f"manifest_count={report['manifest_count']}",
     ]
+    if report.get("capacity_errors"):
+        lines.append("capacity_errors=" + ",".join(str(item) for item in report["capacity_errors"]))
+    else:
+        lines.append("capacity_errors=none")
     if report["workspace_usage"]:
         lines.append("workspace_usage:")
         for row in report["workspace_usage"]:
@@ -194,13 +210,19 @@ def _directory_size(root: Path) -> int:
 
 def _status(
     *,
+    writable: bool,
     disk_free_bytes: int,
     local_size_bytes: int,
     manifest_total_bytes: int,
     limits: dict[str, int],
+    capacity_error_count: int,
     missing_count: int,
     orphan_count: int,
 ) -> str:
+    if not writable:
+        return "error"
+    if capacity_error_count:
+        return "error"
     if missing_count:
         return "error"
     if disk_free_bytes < int(limits["min_free_bytes"]):
@@ -210,6 +232,35 @@ def _status(
     if orphan_count or local_size_bytes != manifest_total_bytes:
         return "warn"
     return "ok"
+
+
+def _capacity_errors(*, total_bytes: int, free_bytes: int, limits: dict[str, int]) -> list[str]:
+    total_quota = int(limits.get("total_quota_bytes") or 0)
+    workspace_quota = int(limits.get("workspace_quota_bytes") or 0)
+    max_file = int(limits.get("max_file_bytes") or 0)
+    min_free = int(limits.get("min_free_bytes") or 0)
+    errors: list[str] = []
+    if total_quota > 0 and workspace_quota > total_quota:
+        errors.append("workspace_quota_exceeds_total_quota")
+    if workspace_quota > 0 and max_file > workspace_quota:
+        errors.append("max_file_exceeds_workspace_quota")
+    if total_quota > 0 and max_file > total_quota:
+        errors.append("max_file_exceeds_total_quota")
+    if total_bytes > 0 and total_quota > 0 and total_quota + min_free > total_bytes:
+        errors.append("total_quota_exceeds_disk_capacity_after_min_free")
+    if free_bytes > 0 and max_file > 0 and free_bytes - max_file < min_free:
+        errors.append("not_enough_free_space_for_max_file_upload")
+    return errors
+
+
+def _path_is_writable(path: Path) -> bool:
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".object-storage-doctor-", dir=str(path), delete=True) as handle:
+            handle.write(b"ok")
+            handle.flush()
+        return True
+    except Exception:
+        return False
 
 
 def _format_bytes(value: int) -> str:

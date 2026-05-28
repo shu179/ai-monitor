@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,13 +65,24 @@ def test_format_report_contains_key_sections() -> None:
             "object_storage": {
                 "path": "/opt/surfaced/object-data",
                 "exists": True,
+                "writable": True,
+                "total_bytes": 100,
                 "free_bytes": 10,
                 "min_free_bytes": 1,
+                "limits": {
+                    "total_quota_bytes": 50,
+                    "workspace_quota_bytes": 25,
+                    "max_file_bytes": 10,
+                    "min_free_bytes": 1,
+                },
+                "capacity_errors": [],
                 "status": "ok",
             },
             "backups": {
                 "path": "/opt/surfaced/backups",
                 "exists": True,
+                "writable": True,
+                "total_bytes": 100,
                 "free_bytes": 10,
                 "min_free_bytes": 0,
                 "status": "ok",
@@ -84,5 +96,42 @@ def test_format_report_contains_key_sections() -> None:
 
     assert "Deploy check: status=warn" in text
     assert "object_storage_dir" in text
+    assert "object_storage_limits" in text
+    assert "object_storage_capacity_errors=none" in text
     assert "compose=" in text
     assert "health url=" in text
+
+
+def test_object_storage_capacity_errors_detect_impossible_disk_budget() -> None:
+    errors = deploy_check._object_storage_capacity_errors(
+        total_bytes=12_000,
+        free_bytes=10_000,
+        limits={
+            "total_quota_bytes": 10_000,
+            "workspace_quota_bytes": 5_000,
+            "max_file_bytes": 3_000,
+            "min_free_bytes": 8_000,
+        },
+    )
+
+    assert "total_quota_exceeds_disk_capacity_after_min_free" in errors
+    assert "not_enough_free_space_for_max_file_upload" in errors
+
+
+def test_object_storage_dir_report_marks_capacity_errors_as_error() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with patch("scripts.deploy_check.shutil.disk_usage") as disk_usage:
+            disk_usage.return_value = SimpleNamespace(total=12_000, used=2_000, free=10_000)
+            report = deploy_check._object_storage_dir_report(
+                Path(tmp),
+                limits={
+                    "total_quota_bytes": 10_000,
+                    "workspace_quota_bytes": 5_000,
+                    "max_file_bytes": 3_000,
+                    "min_free_bytes": 8_000,
+                },
+            )
+
+    assert report["status"] == "error"
+    assert report["writable"] is True
+    assert "total_quota_exceeds_disk_capacity_after_min_free" in report["capacity_errors"]
