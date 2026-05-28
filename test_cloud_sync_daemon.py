@@ -89,7 +89,9 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertIn("cloud.pull_state_delta", DAEMON_SUPPORTED_COMMANDS)
         self.assertIn("cloud.state_delta_diagnostics", DAEMON_SUPPORTED_COMMANDS)
         self.assertIn("cloud.process_state_delta_inbox", DAEMON_SUPPORTED_COMMANDS)
-        self.assertIn("cloud.admin_object_storage_report", DAEMON_SUPPORTED_COMMANDS)
+        self.assertNotIn("cloud.admin_object_storage_report", DAEMON_SUPPORTED_COMMANDS)
+        self.assertNotIn("cloud.update_admin_task", DAEMON_SUPPORTED_COMMANDS)
+        self.assertNotIn("cloud.delete_admin_task", DAEMON_SUPPORTED_COMMANDS)
 
     def test_app_runtime_cloud_command_uses_transport_client(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
@@ -554,6 +556,18 @@ class CloudSyncDaemonTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True, "message": "local"})
         support.handle_command.assert_called_once_with("cloud.schedule_article_snapshot", None)
+
+    def test_app_runtime_cloud_runtime_command_keeps_admin_task_updates_on_main_process(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        support = Mock()
+        support.handle_command.return_value = {"ok": True, "message": "main process"}
+        runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
+        runtime._cloud_command_client = Mock(send_command=Mock(side_effect=AssertionError("daemon should not be used")))
+
+        result = AppRuntime._cloud_runtime_command(runtime, "cloud.update_admin_task", {"task_id": "task-1"})
+
+        self.assertEqual(result, {"ok": True, "message": "main process"})
+        support.handle_command.assert_called_once_with("cloud.update_admin_task", {"task_id": "task-1"})
 
     def test_app_runtime_cloud_status_merges_local_auto_sync_state(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
