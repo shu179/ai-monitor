@@ -55,11 +55,12 @@ def build_sync_queue_report(db: Session) -> dict[str, Any]:
                 count(*) FILTER (WHERE status = 'pending') AS pending,
                 count(*) FILTER (WHERE status = 'in_progress') AS in_progress,
                 count(*) FILTER (WHERE status = 'dead_letter') AS dead_letter,
+                count(*) FILTER (WHERE status = 'blocked') AS blocked,
                 EXTRACT(EPOCH FROM (now() - min(created_at)))::bigint AS oldest_age_seconds
             FROM sync_batch_items
-            WHERE status IN ('pending', 'in_progress', 'dead_letter')
+            WHERE status IN ('pending', 'in_progress', 'dead_letter', 'blocked')
             GROUP BY workspace_id
-            ORDER BY (count(*) FILTER (WHERE status IN ('pending', 'in_progress', 'dead_letter'))) DESC,
+            ORDER BY (count(*) FILTER (WHERE status IN ('pending', 'in_progress', 'dead_letter', 'blocked'))) DESC,
                      workspace_id
             LIMIT 20
             """
@@ -102,6 +103,7 @@ def build_sync_queue_report(db: Session) -> dict[str, Any]:
     pending_count = int(counts.get("pending") or 0)
     in_progress_count = int(counts.get("in_progress") or 0)
     dead_letter_count = int(counts.get("dead_letter") or 0)
+    blocked_count = int(counts.get("blocked") or 0)
     expired_count = int(in_progress_expired or 0)
     active_leases = int(getattr(shard_rows, "active", 0) or 0)
     worker_state = _worker_state(
@@ -112,6 +114,7 @@ def build_sync_queue_report(db: Session) -> dict[str, Any]:
     return {
         "status": _status(
             dead_letter=dead_letter_count,
+            blocked=blocked_count,
             expired_in_progress=expired_count,
             worker_state=worker_state,
         ),
@@ -120,6 +123,7 @@ def build_sync_queue_report(db: Session) -> dict[str, Any]:
             "in_progress": in_progress_count,
             "done": int(counts.get("done") or 0),
             "dead_letter": dead_letter_count,
+            "blocked": blocked_count,
         },
         "oldest_pending_age_seconds": int(pending_age or 0),
         "oldest_in_progress_age_seconds": int(in_progress_age or 0),
@@ -142,6 +146,7 @@ def build_sync_queue_report(db: Session) -> dict[str, Any]:
                 "pending": int(row.pending or 0),
                 "in_progress": int(row.in_progress or 0),
                 "dead_letter": int(row.dead_letter or 0),
+                "blocked": int(getattr(row, "blocked", 0) or 0),
                 "oldest_age_seconds": int(row.oldest_age_seconds or 0),
             }
             for row in workspace_rows
@@ -167,7 +172,8 @@ def format_sync_queue_report(report: dict[str, Any]) -> str:
         f"pending={counts['pending']} "
         f"in_progress={counts['in_progress']} "
         f"done={counts['done']} "
-        f"dead_letter={counts['dead_letter']}",
+        f"dead_letter={counts['dead_letter']} "
+        f"blocked={counts['blocked']}",
         f"oldest_pending_age_seconds={report['oldest_pending_age_seconds']}",
         f"oldest_in_progress_age_seconds={report['oldest_in_progress_age_seconds']}",
         f"expired_in_progress={report['expired_in_progress']}",
@@ -191,6 +197,7 @@ def format_sync_queue_report(report: dict[str, Any]) -> str:
                 f"pending={row['pending']} "
                 f"in_progress={row['in_progress']} "
                 f"dead_letter={row['dead_letter']} "
+                f"blocked={row['blocked']} "
                 f"oldest_age_seconds={row['oldest_age_seconds']}"
             )
     else:
@@ -219,8 +226,8 @@ def _worker_state(*, pending: int, in_progress: int, active_leases: int) -> str:
     return "idle"
 
 
-def _status(*, dead_letter: int, expired_in_progress: int, worker_state: str) -> str:
-    if int(dead_letter or 0) or int(expired_in_progress or 0):
+def _status(*, dead_letter: int, blocked: int, expired_in_progress: int, worker_state: str) -> str:
+    if int(dead_letter or 0) or int(blocked or 0) or int(expired_in_progress or 0):
         return "warn"
     if worker_state in {"stalled_no_active_worker", "stalled_in_progress_no_active_worker"}:
         return "warn"

@@ -48,6 +48,7 @@ from app.services.sync_v2_service import (  # noqa: E402
 )
 from app.services.sync_v2_worker import (  # noqa: E402
     _apply_statement_timeout,
+    _block_partition_pending_items,
     _mark_item_dead_letter,
     _mark_item_done,
     _mirror_legacy_sync_event,
@@ -343,6 +344,9 @@ class SyncV2WorkerSqlTests(unittest.TestCase):
         self.assertIn("virtual_shard = any", sql)
         self.assertIn("not exists", sql)
         self.assertIn("prior.seq < item.seq", sql)
+        self.assertIn("blocker.status in ('dead_letter', 'blocked')", sql)
+        self.assertIn("blocker.seq < item.seq", sql)
+        self.assertIn("prior.status <> 'done'", sql)
 
     @patch("app.services.sync_v2_worker.renew_sync_worker_shard_leases")
     def test_claim_skips_shard_lease_when_queue_has_no_pending_items(self, renew) -> None:
@@ -422,6 +426,33 @@ class SyncV2WorkerSqlTests(unittest.TestCase):
         sql_calls = "\n".join(str(call.args[0]).lower() for call in db.execute.call_args_list)
         self.assertIn("insert into dead_letter_attempts", sql_calls)
         self.assertIn("status = 'dead_letter'", sql_calls)
+        self.assertIn("status = 'blocked'", sql_calls)
+
+    def test_block_partition_pending_items_marks_same_entity_chain_blocked(self) -> None:
+        db = MagicMock()
+        db.execute.return_value.rowcount = 3
+        item = {
+            "id": 7,
+            "created_at": "2026-05-26T00:00:00Z",
+            "workspace_id": 3,
+            "partition_key": "3:article:abc",
+            "seq": 2,
+        }
+
+        self.assertEqual(_block_partition_pending_items(db, item=item, error="boom"), 3)
+
+        sql = str(db.execute.call_args.args[0]).lower()
+        params = db.execute.call_args.args[1]
+        self.assertIn("status = 'blocked'", sql)
+        self.assertIn("partition_key = :partition_key", sql)
+        self.assertIn("status = 'pending'", sql)
+        self.assertIn("seq > :seq", sql)
+        self.assertIn("id > :id", sql)
+        self.assertEqual(params["workspace_id"], 3)
+        self.assertEqual(params["partition_key"], "3:article:abc")
+        self.assertEqual(params["seq"], 2)
+        self.assertEqual(params["id"], 7)
+        self.assertIn("blocked by earlier dead-lettered sync item", params["error"])
 
     def test_mirror_legacy_sync_event_returns_false_for_duplicate(self) -> None:
         db = MagicMock()

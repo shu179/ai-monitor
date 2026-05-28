@@ -34,18 +34,21 @@ class SyncQueueDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "ok")
         self.assertEqual(report["counts"]["done"], 10)
+        self.assertEqual(report["counts"]["blocked"], 0)
         self.assertEqual(report["worker_state"], "active")
         text = format_sync_queue_report(report)
         self.assertIn("status=ok", text)
+        self.assertIn("blocked=0", text)
         self.assertIn("worker_state=active", text)
         self.assertIn("recent_done_latency_ms=", text)
         self.assertIn("queue_by_workspace: none", text)
 
-    def test_report_warns_on_dead_letters_and_expired_items(self) -> None:
+    def test_report_warns_on_dead_letters_blocked_and_expired_items(self) -> None:
         db = _db(
             status_rows=[
                 SimpleNamespace(status="pending", count=3),
                 SimpleNamespace(status="dead_letter", count=1),
+                SimpleNamespace(status="blocked", count=2),
             ],
             pending_age=120,
             expired=2,
@@ -55,6 +58,7 @@ class SyncQueueDiagnosticsTests(unittest.TestCase):
                     pending=3,
                     in_progress=2,
                     dead_letter=1,
+                    blocked=2,
                     oldest_age_seconds=180,
                 )
             ],
@@ -74,12 +78,15 @@ class SyncQueueDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "warn")
         self.assertEqual(report["worker_state"], "active")
+        self.assertEqual(report["counts"]["blocked"], 2)
         self.assertEqual(report["expired_in_progress"], 2)
         self.assertEqual(report["oldest_in_progress_age_seconds"], 90)
         self.assertEqual(report["recent_done_latency_ms"]["max"], 120)
         self.assertEqual(report["queue_by_workspace"][0]["pending"], 3)
+        self.assertEqual(report["queue_by_workspace"][0]["blocked"], 2)
         text = format_sync_queue_report(report)
         self.assertIn("queue_by_workspace:", text)
+        self.assertIn("blocked=2", text)
         self.assertIn("oldest_in_progress_age_seconds=90", text)
         self.assertIn("dead_letters_by_workspace:", text)
         self.assertIn("workspace=7", text)
@@ -113,6 +120,7 @@ class SyncQueueDiagnosticsTests(unittest.TestCase):
                     pending=8,
                     in_progress=0,
                     dead_letter=0,
+                    blocked=0,
                     oldest_age_seconds=15,
                 )
             ],

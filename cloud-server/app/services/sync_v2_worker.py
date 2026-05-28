@@ -63,11 +63,37 @@ def claim_sync_batch_items(
                   )
                   AND NOT EXISTS (
                     SELECT 1
+                    FROM sync_batch_items AS blocker
+                    WHERE blocker.workspace_id = item.workspace_id
+                      AND blocker.partition_key = item.partition_key
+                      AND blocker.status IN ('dead_letter', 'blocked')
+                      AND (
+                        blocker.seq < item.seq
+                        OR (
+                          blocker.seq = item.seq
+                          AND (
+                            blocker.created_at < item.created_at
+                            OR (blocker.created_at = item.created_at AND blocker.id <= item.id)
+                          )
+                        )
+                      )
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
                     FROM sync_batch_items AS prior
                     WHERE prior.workspace_id = item.workspace_id
                       AND prior.partition_key = item.partition_key
-                      AND prior.seq < item.seq
-                      AND prior.status NOT IN ('done', 'dead_letter')
+                      AND prior.status <> 'done'
+                      AND (
+                        prior.seq < item.seq
+                        OR (
+                          prior.seq = item.seq
+                          AND (
+                            prior.created_at < item.created_at
+                            OR (prior.created_at = item.created_at AND prior.id < item.id)
+                          )
+                        )
+                      )
                   )
                 ORDER BY item.virtual_shard, item.partition_key, item.seq, item.created_at, item.id
                 FOR UPDATE OF item SKIP LOCKED
@@ -499,7 +525,49 @@ def _mark_item_dead_letter(db: Session, *, item: dict[str, Any], worker_id: str,
         ),
         params,
     )
+    _block_partition_pending_items(db, item=item, error=str(error or ""))
     _refresh_batch_status(db, str(item.get("batch_id") or ""))
+    return int(result.rowcount or 0)
+
+
+def _block_partition_pending_items(db: Session, *, item: dict[str, Any], error: str) -> int:
+    workspace_id = int(item.get("workspace_id") or 0)
+    partition_key = str(item.get("partition_key") or "")
+    if workspace_id <= 0 or not partition_key:
+        return 0
+    result = db.execute(
+        text(
+            """
+            UPDATE sync_batch_items
+            SET status = 'blocked',
+                worker_id = NULL,
+                leased_until = NULL,
+                last_error = :error,
+                updated_at = now()
+            WHERE workspace_id = :workspace_id
+              AND partition_key = :partition_key
+              AND status = 'pending'
+              AND (
+                seq > :seq
+                OR (
+                  seq = :seq
+                  AND (
+                    created_at > :created_at
+                    OR (created_at = :created_at AND id > :id)
+                  )
+                )
+              )
+            """
+        ),
+        {
+            "workspace_id": workspace_id,
+            "partition_key": partition_key,
+            "seq": int(item.get("seq") or 0),
+            "created_at": item.get("created_at"),
+            "id": int(item.get("id") or 0),
+            "error": f"blocked by earlier dead-lettered sync item: {str(error or '')}"[:4000],
+        },
+    )
     return int(result.rowcount or 0)
 
 
@@ -514,7 +582,7 @@ def _refresh_batch_status(db: Session, batch_id: str) -> None:
                 WHEN EXISTS (
                     SELECT 1 FROM sync_batch_items
                     WHERE batch_id = :batch_id
-                      AND status = 'dead_letter'
+                      AND status IN ('dead_letter', 'blocked')
                 ) THEN 'completed_with_errors'
                 ELSE 'done'
             END
