@@ -45,6 +45,8 @@ class ObjectStorageDiagnosticsTests(unittest.TestCase):
         self.assertEqual(report["local_size_bytes"], 5)
         self.assertEqual(report["manifest_total_bytes"], 5)
         self.assertEqual(report["workspace_usage"][0]["workspace_id"], 7)
+        self.assertIn("max_safe_upload_bytes", report["pressure"])
+        self.assertEqual(report["pressure"]["warnings"], [])
         self.assertIn("status=ok", format_object_storage_report(report))
 
     def test_report_flags_missing_and_orphan_files(self) -> None:
@@ -94,6 +96,44 @@ class ObjectStorageDiagnosticsTests(unittest.TestCase):
         self.assertIn("not_enough_free_space_for_max_file_upload", report["capacity_errors"])
         text = format_object_storage_report(report)
         self.assertIn("capacity_errors=", text)
+
+    def test_report_warns_when_quota_pressure_is_high(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sha = "f" * 64
+            path = Path(tmp) / f"7/{sha[:2]}/{sha[2:4]}/{sha}"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"123456789")
+            db = _db_with_manifests(
+                [
+                    ObjectManifest(
+                        id="object-1",
+                        workspace_id=7,
+                        sha256=sha,
+                        size_bytes=9,
+                        storage_size_bytes=9,
+                        content_type="text/plain",
+                        storage_key=f"7/{sha[:2]}/{sha[2:4]}/{sha}",
+                        compression="none",
+                        status="active",
+                    )
+                ]
+            )
+            settings = _settings(tmp)
+            settings.object_storage_total_quota_bytes = 10
+            settings.object_storage_workspace_quota_bytes = 10
+            settings.object_storage_max_file_bytes = 1
+            settings.object_storage_min_free_bytes = 1
+
+            with patch("app.services.object_storage_diagnostics.get_settings", return_value=settings):
+                report = build_object_storage_report(db)
+
+        self.assertEqual(report["status"], "warn")
+        self.assertIn("total_quota_above_80_percent", report["pressure"]["warnings"])
+        self.assertIn("workspace_7_quota_above_80_percent", report["pressure"]["warnings"])
+        self.assertEqual(report["workspace_usage"][0]["remaining_quota_bytes"], 1)
+        text = format_object_storage_report(report)
+        self.assertIn("pressure=", text)
+        self.assertIn("quota_used=", text)
 
 
 def _db_with_manifests(manifests: list[ObjectManifest]):

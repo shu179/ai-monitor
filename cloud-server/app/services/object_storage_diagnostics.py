@@ -40,6 +40,12 @@ def build_object_storage_report(db: Session, *, settings: Settings | None = None
         free_bytes=int(usage.free),
         limits=limits,
     )
+    pressure = _pressure_metrics(
+        disk_free_bytes=int(usage.free),
+        manifest_total_bytes=manifest_total,
+        workspace_usage=workspace_usage,
+        limits=limits,
+    )
     status = _status(
         writable=writable,
         disk_free_bytes=int(usage.free),
@@ -47,6 +53,7 @@ def build_object_storage_report(db: Session, *, settings: Settings | None = None
         manifest_total_bytes=manifest_total,
         limits=limits,
         capacity_error_count=len(capacity_errors),
+        warning_count=len(pressure["warnings"]),
         missing_count=len(missing_files),
         orphan_count=len(orphan_files),
     )
@@ -61,6 +68,7 @@ def build_object_storage_report(db: Session, *, settings: Settings | None = None
         "writable": writable,
         "limits": limits,
         "capacity_errors": capacity_errors,
+        "pressure": pressure,
         "local_size_bytes": local_size,
         "manifest_total_bytes": manifest_total,
         "manifest_count": len(active_manifests),
@@ -95,6 +103,16 @@ def format_object_storage_report(report: dict[str, Any]) -> str:
         lines.append("capacity_errors=" + ",".join(str(item) for item in report["capacity_errors"]))
     else:
         lines.append("capacity_errors=none")
+    pressure = report.get("pressure") if isinstance(report.get("pressure"), dict) else {}
+    lines.append(
+        "pressure="
+        f"total_quota_used={float(pressure.get('total_quota_used_ratio') or 0.0):.3f} "
+        f"disk_headroom_bytes={int(pressure.get('disk_headroom_bytes') or 0)} "
+        f"max_safe_upload_bytes={int(pressure.get('max_safe_upload_bytes') or 0)} "
+        f"max_file_upload_slots={int(pressure.get('max_file_upload_slots') or 0)}"
+    )
+    warnings = [str(item) for item in pressure.get("warnings", [])] if isinstance(pressure, dict) else []
+    lines.append("pressure_warnings=" + (",".join(warnings) if warnings else "none"))
     if report["workspace_usage"]:
         lines.append("workspace_usage:")
         for row in report["workspace_usage"]:
@@ -102,6 +120,8 @@ def format_object_storage_report(report: dict[str, Any]) -> str:
                 "  "
                 f"workspace={row['workspace_id']} "
                 f"bytes={_format_bytes(row['storage_size_bytes'])} "
+                f"quota_used={float(row.get('quota_used_ratio') or 0.0):.3f} "
+                f"remaining={_format_bytes(int(row.get('remaining_quota_bytes') or 0))} "
                 f"objects={row['object_count']}"
             )
     else:
@@ -216,6 +236,7 @@ def _status(
     manifest_total_bytes: int,
     limits: dict[str, int],
     capacity_error_count: int,
+    warning_count: int,
     missing_count: int,
     orphan_count: int,
 ) -> str:
@@ -231,7 +252,59 @@ def _status(
         return "error"
     if orphan_count or local_size_bytes != manifest_total_bytes:
         return "warn"
+    if warning_count:
+        return "warn"
     return "ok"
+
+
+def _pressure_metrics(
+    *,
+    disk_free_bytes: int,
+    manifest_total_bytes: int,
+    workspace_usage: list[dict[str, int]],
+    limits: dict[str, int],
+) -> dict[str, Any]:
+    total_quota = int(limits.get("total_quota_bytes") or 0)
+    workspace_quota = int(limits.get("workspace_quota_bytes") or 0)
+    max_file = int(limits.get("max_file_bytes") or 0)
+    min_free = int(limits.get("min_free_bytes") or 0)
+    disk_headroom = max(0, int(disk_free_bytes) - min_free)
+    total_quota_remaining = max(0, total_quota - int(manifest_total_bytes)) if total_quota > 0 else disk_headroom
+    safe_upload_candidates = [disk_headroom]
+    if total_quota > 0:
+        safe_upload_candidates.append(total_quota_remaining)
+    if max_file > 0:
+        safe_upload_candidates.append(max_file)
+    max_safe_upload = min(safe_upload_candidates)
+    warnings: list[str] = []
+    if max_file > 0 and disk_headroom < max_file:
+        warnings.append("disk_headroom_below_max_file")
+    if total_quota > 0 and total_quota_remaining < max_file:
+        warnings.append("total_quota_remaining_below_max_file")
+    total_quota_used_ratio = (int(manifest_total_bytes) / total_quota) if total_quota > 0 else 0.0
+    if total_quota > 0 and total_quota_used_ratio >= 0.8:
+        warnings.append("total_quota_above_80_percent")
+    enriched_workspaces: list[dict[str, Any]] = []
+    for row in workspace_usage:
+        used = int(row.get("storage_size_bytes") or 0)
+        remaining = max(0, workspace_quota - used) if workspace_quota > 0 else 0
+        ratio = (used / workspace_quota) if workspace_quota > 0 else 0.0
+        workspace_row = dict(row)
+        workspace_row["remaining_quota_bytes"] = remaining
+        workspace_row["quota_used_ratio"] = ratio
+        if workspace_quota > 0 and ratio >= 0.8:
+            workspace_row["warning"] = "workspace_quota_above_80_percent"
+            warnings.append(f"workspace_{int(row['workspace_id'])}_quota_above_80_percent")
+        enriched_workspaces.append(workspace_row)
+    workspace_usage[:] = enriched_workspaces
+    return {
+        "disk_headroom_bytes": disk_headroom,
+        "total_quota_remaining_bytes": total_quota_remaining,
+        "max_safe_upload_bytes": max_safe_upload,
+        "max_file_upload_slots": int(max_safe_upload // max_file) if max_file > 0 else 0,
+        "total_quota_used_ratio": total_quota_used_ratio,
+        "warnings": warnings,
+    }
 
 
 def _capacity_errors(*, total_bytes: int, free_bytes: int, limits: dict[str, int]) -> list[str]:
