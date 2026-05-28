@@ -2010,6 +2010,13 @@ def _cloud_sync_health_summary(
         "object_upload_retry_backpressure_bucket": str(
             auto_sync.get("object_upload_retry_backpressure_bucket") or ""
         ),
+        "object_upload_retry_ready_count": _safe_int(auto_sync.get("object_upload_retry_ready_count"), 0),
+        "object_upload_retry_waiting_count": _safe_int(auto_sync.get("object_upload_retry_waiting_count"), 0),
+        "object_upload_retry_wait_reason": str(auto_sync.get("object_upload_retry_wait_reason") or ""),
+        "next_object_upload_retry_after_seconds": _safe_int(
+            auto_sync.get("next_object_upload_retry_after_seconds"),
+            0,
+        ),
         "outbox_pending": pending_outbox,
         "outbox_failed": failed_outbox,
         "outbox_dead_letter": dead_letter,

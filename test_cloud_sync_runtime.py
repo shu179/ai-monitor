@@ -1444,6 +1444,10 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
         "object_upload_retry_backpressure_retry_after_seconds": 15.0,
         "object_upload_retry_backpressure_queue_depth_hint": 25,
         "object_upload_retry_backpressure_bucket": "object_upload",
+        "object_upload_retry_ready_count": 0,
+        "object_upload_retry_waiting_count": 1,
+        "object_upload_retry_wait_reason": "waiting_retry_backoff",
+        "next_object_upload_retry_after_seconds": 7,
         "outbox_wait_reason": "waiting_retry_backoff",
         "next_upload_attempt_after_seconds": 12,
         "last_upload_at": "2026-05-28T09:59:00",
@@ -1518,6 +1522,10 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     assert health["summary"]["object_upload_retry_backpressure_retry_after_seconds"] == 15.0
     assert health["summary"]["object_upload_retry_backpressure_queue_depth_hint"] == 25
     assert health["summary"]["object_upload_retry_backpressure_bucket"] == "object_upload"
+    assert health["summary"]["object_upload_retry_ready_count"] == 0
+    assert health["summary"]["object_upload_retry_waiting_count"] == 1
+    assert health["summary"]["object_upload_retry_wait_reason"] == "waiting_retry_backoff"
+    assert health["summary"]["next_object_upload_retry_after_seconds"] == 7
     assert health["summary"]["outbox_pending"] == 2
     assert health["summary"]["outbox_failed"] == 1
     assert health["summary"]["outbox_upload_ready"] == 3
