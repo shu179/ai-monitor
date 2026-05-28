@@ -2200,6 +2200,36 @@ class AppRuntime:
             self._cloud_command_transport_mode = "in_process_socket"
             self._cloud_command_transport_error = ""
 
+    def _degrade_cloud_command_transport(self, reason: str) -> None:
+        """Switch future cloud commands back to the in-process handler."""
+        fallback_client = self._build_in_process_cloud_command_client()
+        lock = getattr(self, "_cloud_command_transport_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._cloud_command_transport_lock = lock
+        reason_text = str(reason or "云同步 daemon 不可用")
+        daemon = None
+        server = None
+        with lock:
+            daemon = getattr(self, "_cloud_command_daemon", None)
+            server = getattr(self, "_cloud_command_server", None)
+            self._cloud_command_daemon = None
+            self._cloud_command_server = None
+            self._cloud_command_socket_path = None
+            self._cloud_command_client = fallback_client
+            self._cloud_command_transport_mode = "in_process_direct"
+            self._cloud_command_transport_error = reason_text
+        if daemon is not None:
+            try:
+                daemon.stop()
+            except Exception:
+                pass
+        if server is not None:
+            try:
+                server.stop()
+            except Exception:
+                pass
+
     def _stop_cloud_command_transport(self) -> None:
         lock = getattr(self, "_cloud_command_transport_lock", None)
         if lock is None:
@@ -4349,7 +4379,10 @@ return changedCount
             return self._ensure_cloud_runtime_support().handle_command(command, payload)
         client = self._ensure_cloud_command_client()
         result = client.send_command(normalized, payload)
-        if isinstance(result, dict) and (bool(result.get("unsupported_by_daemon")) or bool(result.get("daemon_unavailable"))):
+        if isinstance(result, dict) and bool(result.get("daemon_unavailable")):
+            self._degrade_cloud_command_transport(str(result.get("message") or "云同步 daemon 不可用"))
+            return self._ensure_cloud_runtime_support().handle_command(normalized, payload)
+        if isinstance(result, dict) and bool(result.get("unsupported_by_daemon")):
             return self._ensure_cloud_runtime_support().handle_command(normalized, payload)
         if normalized in {"cloud.status", "cloud.current_status", "cloud.status_from_session", "cloud.validate_session"}:
             auto_sync_getter = getattr(getattr(self, "_cloud_platform_auto_sync", None), "get_status", None)

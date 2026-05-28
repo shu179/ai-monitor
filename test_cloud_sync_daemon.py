@@ -208,6 +208,39 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True, "cloud": {"loggedIn": True}})
         support.handle_command.assert_called_once_with("cloud.status", None)
 
+    def test_app_runtime_cloud_runtime_command_degrades_when_daemon_unavailable(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_command_transport_lock = threading.RLock()
+        runtime._cloud_command_client = Mock(
+            send_command=Mock(
+                return_value={
+                    "ok": False,
+                    "daemon_unavailable": True,
+                    "message": "云同步 daemon 不可用: timed out",
+                }
+            )
+        )
+        runtime._cloud_command_daemon = Mock()
+        runtime._cloud_command_server = None
+        runtime._cloud_command_socket_path = Path("/tmp/cloud-sync.sock")
+        runtime._cloud_command_transport_mode = "child_daemon"
+        runtime._cloud_command_transport_error = ""
+        support = Mock()
+        support.handle_command.return_value = {"ok": True, "message": "local fallback"}
+        fallback_client = Mock()
+
+        with patch("web_backend.create_in_process_cloud_sync_command_client", return_value=fallback_client):
+            runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
+            result = AppRuntime._cloud_runtime_command(runtime, "cloud.flush_outbox")
+
+        self.assertEqual(result, {"ok": True, "message": "local fallback"})
+        self.assertIs(runtime._cloud_command_client, fallback_client)
+        self.assertIsNone(runtime._cloud_command_daemon)
+        self.assertIsNone(runtime._cloud_command_socket_path)
+        self.assertEqual(runtime._cloud_command_transport_mode, "in_process_direct")
+        self.assertIn("timed out", runtime._cloud_command_transport_error)
+        support.handle_command.assert_called_once_with("cloud.flush_outbox", None)
+
     def test_app_runtime_cloud_runtime_command_skips_daemon_for_unsupported_command(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         support = Mock()
