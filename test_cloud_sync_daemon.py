@@ -27,6 +27,49 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertIsInstance(state, CloudCommandTransportState)
         return state
 
+    def _support_with_transport_runner(
+        self,
+        *,
+        handle_result: dict[str, object] | None = None,
+    ) -> Mock:
+        support = Mock()
+        support.handle_command.return_value = handle_result if handle_result is not None else {"ok": True}
+
+        def run_transport_command(
+            command: str,
+            payload: dict[str, object] | None = None,
+            *,
+            supported_commands,
+            send_via_transport,
+            fallback_to_main,
+            on_transport_unavailable,
+            auto_sync_status_getter=None,
+        ):
+            normalized = str(command or "").strip()
+            if normalized not in supported_commands or normalized == "cloud.logout":
+                return fallback_to_main(command, payload)
+            result = send_via_transport(normalized, payload)
+            if isinstance(result, dict) and bool(result.get("daemon_unavailable")):
+                on_transport_unavailable(
+                    str(result.get("message") or "云同步 daemon 不可用"),
+                    str(result.get("daemon_error_type") or "unknown"),
+                )
+                return fallback_to_main(normalized, payload)
+            if isinstance(result, dict) and bool(result.get("unsupported_by_daemon")):
+                return fallback_to_main(normalized, payload)
+            if normalized in {"cloud.status", "cloud.current_status", "cloud.status_from_session", "cloud.validate_session"}:
+                cloud = result.get("cloud") if isinstance(result, dict) and isinstance(result.get("cloud"), dict) else None
+                if isinstance(cloud, dict) and callable(auto_sync_status_getter):
+                    merged = dict(result)
+                    merged_cloud = dict(cloud)
+                    merged_cloud["autoSync"] = auto_sync_status_getter()
+                    merged["cloud"] = merged_cloud
+                    return merged
+            return result
+
+        support.run_transport_command.side_effect = run_transport_command
+        return support
+
     def test_build_cloud_sync_socket_path_is_stable_and_short(self) -> None:
         left = build_cloud_sync_socket_path("/tmp/account-a")
         right = build_cloud_sync_socket_path("/tmp/account-a")
@@ -168,7 +211,9 @@ class CloudSyncDaemonTests(unittest.TestCase):
             "web_backend.create_in_process_cloud_sync_command_client",
             return_value=client,
         ):
-            runtime._ensure_cloud_runtime_support = Mock(return_value=Mock(handle_command=Mock()))  # type: ignore[method-assign]
+            runtime._ensure_cloud_runtime_support = Mock(
+                return_value=self._support_with_transport_runner()
+            )  # type: ignore[method-assign]
             result = AppRuntime._cloud_runtime_command(runtime, "cloud.flush_outbox", {"limit": 7})
 
         self.assertEqual(result, {"ok": True, "message": "ok"})
@@ -501,8 +546,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
                 }
             )
         )
-        support = Mock()
-        support.handle_command.return_value = {"ok": True, "cloud": {"loggedIn": True}}
+        support = self._support_with_transport_runner(handle_result={"ok": True, "cloud": {"loggedIn": True}})
         runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
 
         result = AppRuntime._cloud_runtime_command(runtime, "cloud.status")
@@ -527,8 +571,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
             socket_path=Path("/tmp/cloud-sync.sock"),
             mode="child_daemon",
         )
-        support = Mock()
-        support.handle_command.return_value = {"ok": True, "message": "local fallback"}
+        support = self._support_with_transport_runner(handle_result={"ok": True, "message": "local fallback"})
         fallback_client = Mock()
 
         with (
@@ -688,8 +731,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
 
     def test_app_runtime_cloud_runtime_command_skips_daemon_for_unsupported_command(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
-        support = Mock()
-        support.handle_command.return_value = {"ok": True, "message": "local"}
+        support = self._support_with_transport_runner(handle_result={"ok": True, "message": "local"})
         runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
         runtime._cloud_command_client = Mock(send_command=Mock(side_effect=AssertionError("daemon should not be used")))
 
@@ -700,8 +742,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
 
     def test_app_runtime_cloud_runtime_command_keeps_admin_task_updates_on_main_process(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
-        support = Mock()
-        support.handle_command.return_value = {"ok": True, "message": "main process"}
+        support = self._support_with_transport_runner(handle_result={"ok": True, "message": "main process"})
         runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
         runtime._cloud_command_client = Mock(send_command=Mock(side_effect=AssertionError("daemon should not be used")))
 
@@ -722,8 +763,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
 
     def test_app_runtime_logout_stays_on_main_process_support(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
-        support = Mock()
-        support.handle_command.return_value = {"ok": True, "message": "local logout"}
+        support = self._support_with_transport_runner(handle_result={"ok": True, "message": "local logout"})
         runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
         runtime._cloud_command_client = Mock(send_command=Mock(side_effect=AssertionError("daemon should not be used")))
 

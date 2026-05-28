@@ -432,6 +432,42 @@ class AppCloudRuntimeSupport:
         self._cloud_capability_error = ""
         self.handle_command_for_main: Callable[[str, dict[str, Any] | None], dict[str, Any]] = self.handle_command
 
+    def run_transport_command(
+        self,
+        command: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        supported_commands: set[str] | frozenset[str] | tuple[str, ...] | list[str],
+        send_via_transport: Callable[[str, dict[str, Any] | None], dict[str, Any]],
+        fallback_to_main: Callable[[str, dict[str, Any] | None], dict[str, Any]],
+        on_transport_unavailable: Callable[[str, str], None],
+        auto_sync_status_getter: Callable[[], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        normalized = str(command or "").strip()
+        if normalized not in supported_commands or normalized == "cloud.logout":
+            return fallback_to_main(command, payload)
+        result = send_via_transport(normalized, payload)
+        if isinstance(result, dict) and bool(result.get("daemon_unavailable")):
+            message = str(result.get("message") or "云同步 daemon 不可用")
+            error_type = str(result.get("daemon_error_type") or "unknown")
+            on_transport_unavailable(message, error_type)
+            return fallback_to_main(normalized, payload)
+        if isinstance(result, dict) and bool(result.get("unsupported_by_daemon")):
+            return fallback_to_main(normalized, payload)
+        if normalized in {"cloud.status", "cloud.current_status", "cloud.status_from_session", "cloud.validate_session"}:
+            status_getter = auto_sync_status_getter or self._safe_auto_sync_status
+            if callable(status_getter) and isinstance(result, dict):
+                cloud = result.get("cloud") if isinstance(result.get("cloud"), dict) else None
+                if isinstance(cloud, dict):
+                    merged = dict(result)
+                    merged_cloud = dict(cloud)
+                    merged_cloud["autoSync"] = status_getter()
+                    merged["cloud"] = merged_cloud
+                    return merged
+        if isinstance(result, dict):
+            return result
+        return {"ok": False, "message": "云同步命令返回无效响应"}
+
     @property
     def last_article_cloud_enqueue_key(self) -> tuple[Any, ...] | None:
         return self._last_article_cloud_enqueue_key

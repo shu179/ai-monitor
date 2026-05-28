@@ -4547,33 +4547,23 @@ return changedCount
         return {"ok": True, "cloud_sync": self._cloud_sync_manager.get_status()}
 
     def _cloud_runtime_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        normalized = str(command or "").strip()
-        if normalized not in DAEMON_SUPPORTED_COMMANDS or normalized == "cloud.logout":
-            return self._ensure_cloud_runtime_support().handle_command(command, payload)
-        client = self._ensure_cloud_command_client()
-        result = self._send_cloud_command_via_transport(client, normalized, payload)
-        if isinstance(result, dict) and bool(result.get("daemon_unavailable")):
-            error_type = str(result.get("daemon_error_type") or "unknown")
-            self._degrade_cloud_command_transport(str(result.get("message") or "云同步 daemon 不可用"), error_type=error_type)
-            self._schedule_cloud_command_transport_recovery(
-                str(result.get("message") or "云同步 daemon 不可用"),
-            )
-            return self._ensure_cloud_runtime_support().handle_command(normalized, payload)
-        if isinstance(result, dict) and bool(result.get("unsupported_by_daemon")):
-            return self._ensure_cloud_runtime_support().handle_command(normalized, payload)
-        if normalized in {"cloud.status", "cloud.current_status", "cloud.status_from_session", "cloud.validate_session"}:
-            auto_sync_getter = getattr(getattr(self, "_cloud_platform_auto_sync", None), "get_status", None)
-            if callable(auto_sync_getter) and isinstance(result, dict):
-                cloud = result.get("cloud") if isinstance(result.get("cloud"), dict) else None
-                if isinstance(cloud, dict):
-                    merged = dict(result)
-                    merged_cloud = dict(cloud)
-                    merged_cloud["autoSync"] = auto_sync_getter()
-                    merged["cloud"] = merged_cloud
-                    return merged
-        if isinstance(result, dict):
-            return result
-        return {"ok": False, "message": "云同步命令返回无效响应"}
+        support = self._ensure_cloud_runtime_support()
+        return support.run_transport_command(
+            command,
+            payload,
+            supported_commands=DAEMON_SUPPORTED_COMMANDS,
+            send_via_transport=lambda normalized, request_payload: self._send_cloud_command_via_transport(
+                self._ensure_cloud_command_client(),
+                normalized,
+                request_payload,
+            ),
+            fallback_to_main=lambda normalized, request_payload: support.handle_command(normalized, request_payload),
+            on_transport_unavailable=lambda message, error_type: (
+                self._degrade_cloud_command_transport(message, error_type=error_type),
+                self._schedule_cloud_command_transport_recovery(message),
+            ),
+            auto_sync_status_getter=getattr(getattr(self, "_cloud_platform_auto_sync", None), "get_status", None),
+        )
 
     def _cloud_command_transport_status(self) -> dict[str, Any]:
         state = self._cloud_command_transport_state()
