@@ -283,6 +283,16 @@ class CloudCommandTransportState:
         self.last_recovery_completed_at = ""
         return {"action": "start", "reason": reason_text}
 
+    def current_recovery_cooldown_seconds(self, *, now_monotonic: float | None = None) -> int:
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        if self.recovery_timer is not None and callable(getattr(self.recovery_timer, "is_alive", None)) and self.recovery_timer.is_alive():
+            next_recovery_at = float(self.next_recovery_at or 0.0)
+            return max(0, int((next_recovery_at - now) + 0.999))
+        if str(self.mode or "") == "in_process_direct" and self.last_recovery_attempt_at > 0:
+            interval = max(1.0, float(self.recovery_interval_seconds or 30.0))
+            return max(0, int((interval - (now - self.last_recovery_attempt_at)) + 0.999))
+        return 0
+
     def snapshot_status(
         self,
         *,
@@ -336,15 +346,7 @@ class CloudCommandTransportState:
             responsive = client is not None
         else:
             responsive = False
-        next_recovery_allowed_in_seconds = 0
-        now = now_monotonic()
-        if recovery_scheduled:
-            next_recovery_allowed_in_seconds = max(0, int((self.next_recovery_at - now) + 0.999))
-        elif mode == "in_process_direct" and not recovery_running and self.last_recovery_attempt_at > 0:
-            next_recovery_allowed_in_seconds = max(
-                0,
-                int((max(1.0, float(self.recovery_interval_seconds or 30.0)) - (now - self.last_recovery_attempt_at)) + 0.999),
-            )
+        next_recovery_allowed_in_seconds = self.current_recovery_cooldown_seconds(now_monotonic=now_monotonic())
         return {
             "mode": mode,
             "socket_path": str(socket_path or ""),
