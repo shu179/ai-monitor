@@ -1636,6 +1636,107 @@ def test_app_cloud_runtime_support_retry_object_downloads_skips_uploads():
     client_factory.assert_not_called()
 
 
+def test_app_cloud_runtime_support_retries_failed_object_uploads_when_source_matches():
+    owner = _support_owner()
+    body = b"retry upload bytes"
+    sha256 = hashlib.sha256(body).hexdigest()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+
+    class FakeClient:
+        def __init__(self, _base_url: str) -> None:
+            self.uploaded = b""
+
+        def create_object_upload(self, _token: str, **kwargs):
+            assert kwargs["sha256"] == sha256
+            assert kwargs["size_bytes"] == len(body)
+            return {
+                "strategy": "single_put",
+                "session_id": "session-1",
+                "sha256": kwargs["sha256"],
+                "size_bytes": kwargs["size_bytes"],
+                "storage_size_bytes": kwargs["storage_size_bytes"],
+                "content_type": kwargs["content_type"],
+                "compression": "none",
+                "upload": {"url": "/api/v2/objects/uploads/session-1/content", "headers": {}},
+            }
+
+        def upload_object_content(self, _token: str, _upload_url: str, chunks, **_kwargs):
+            self.uploaded = b"".join(chunks)
+            return {"ok": True}
+
+        def complete_object_upload(self, _token: str, _session_id: str, **_kwargs):
+            return {"object_id": "object-1", "status": "active"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "answer.txt"
+        source.write_bytes(body)
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        transfer_store.start_transfer(
+            transfer_id="upload-1",
+            direction="upload",
+            sha256=sha256,
+            size_bytes=len(body),
+            path=str(source),
+            content_type="text/plain",
+        )
+        transfer_store.fail_transfer("upload-1", "temporary")
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            request_client_factory=FakeClient,
+            object_transfer_store_factory=lambda: transfer_store,
+        )
+
+        result = support.handle_command("cloud.retry_object_uploads", {"limit": 5})
+        diagnostics = transfer_store.diagnostics()
+
+    assert result["ok"] is True
+    assert result["attempted"] == 1
+    assert result["recovered"] == 1
+    assert diagnostics["by_status"] == {"active": 1}
+    assert diagnostics["newest"][0]["object_id"] == "object-1"
+
+
+def test_app_cloud_runtime_support_skips_object_upload_retry_when_source_changed():
+    owner = _support_owner()
+    original = b"original bytes"
+    sha256 = hashlib.sha256(original).hexdigest()
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "answer.txt"
+        source.write_bytes(b"changed bytes")
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        transfer_store.start_transfer(
+            transfer_id="upload-1",
+            direction="upload",
+            sha256=sha256,
+            size_bytes=len(original),
+            path=str(source),
+            content_type="text/plain",
+        )
+        transfer_store.fail_transfer("upload-1", "temporary")
+        client_factory = MagicMock()
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            request_client_factory=client_factory,
+            object_transfer_store_factory=lambda: transfer_store,
+        )
+
+        result = support.handle_command("cloud.retry_object_uploads", {"limit": 5})
+        diagnostics = transfer_store.diagnostics()
+
+    assert result["ok"] is True
+    assert result["attempted"] == 0
+    assert result["skipped"] == 1
+    assert "source changed" in diagnostics["failed"][0]["last_error"]
+    client_factory.assert_not_called()
+
+
 def test_app_cloud_runtime_support_prunes_object_cache():
     owner = _support_owner()
     data_a = b"a" * 10

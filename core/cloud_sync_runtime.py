@@ -7,10 +7,12 @@ spreading web_backend.py dependencies.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from core.cloud_article_sync import (
@@ -21,6 +23,7 @@ from core.cloud_agent_status_store import CloudAgentStatusStore
 from core.cloud_client import CloudClientError, SurfacedCloudClient
 from core.cloud_content_state_store import CloudContentStateStore
 from core.cloud_object_cache import CloudObjectCache, CloudObjectCacheError, normalize_object_ref
+from core.cloud_object_transfer import upload_cloud_object_file
 from core.cloud_object_transfer_store import CloudObjectTransferStore
 from core.cloud_sync_daemon import InProcessCloudSyncCommandClient
 from core.cloud_event_types import EVENT_PROFILE_UPDATE
@@ -477,6 +480,8 @@ class AppCloudRuntimeSupport:
             return self.object_transfer_retry_candidates(request_payload)
         if normalized in {"cloud.retry_object_downloads", "retry_object_downloads"}:
             return self.retry_object_downloads(request_payload)
+        if normalized in {"cloud.retry_object_uploads", "retry_object_uploads"}:
+            return self.retry_object_uploads(request_payload)
         if normalized in {"cloud.prune_object_cache", "prune_object_cache"}:
             return self.prune_cloud_object_cache(request_payload)
         if normalized in {"cloud.cache_object", "cache_object"}:
@@ -542,6 +547,8 @@ class AppCloudRuntimeSupport:
             return self.object_transfer_retry_candidates(request_payload)
         if normalized in {"cloud.retry_object_downloads", "retry_object_downloads"}:
             return self.retry_object_downloads(request_payload)
+        if normalized in {"cloud.retry_object_uploads", "retry_object_uploads"}:
+            return self.retry_object_uploads(request_payload)
         if normalized in {"cloud.prune_object_cache", "prune_object_cache"}:
             return self.prune_cloud_object_cache(request_payload)
         if normalized in {"cloud.cache_object", "cache_object"}:
@@ -944,6 +951,89 @@ class AppCloudRuntimeSupport:
             "recovered": recovered,
             "failed": failed,
             "skipped": max(0, len(transfers) - attempted),
+            "failures": failures[:10],
+        }
+
+    def retry_object_uploads(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        limit = _safe_int(request_payload.get("limit"), 10)
+        transfers = self._object_transfer_store_factory().retryable_transfers(
+            limit=limit,
+            direction="upload",
+            max_attempts=_safe_int(request_payload.get("max_attempts") or request_payload.get("maxAttempts"), 5),
+            stale_running_seconds=_safe_float(
+                request_payload.get("stale_running_seconds") or request_payload.get("staleRunningSeconds"),
+                600.0,
+            ),
+        )
+        attempted = 0
+        recovered = 0
+        failed = 0
+        skipped = 0
+        failures: list[dict[str, Any]] = []
+        transfer_store = self._object_transfer_store_factory()
+        for item in transfers:
+            transfer_id = str(item.get("transfer_id") or "").strip()
+            path = Path(str(item.get("path") or "").strip())
+            expected_sha256 = str(item.get("sha256") or "").strip().lower()
+            expected_size = _safe_int(item.get("size_bytes"), 0)
+            content_type = str(item.get("content_type") or "application/octet-stream").strip() or "application/octet-stream"
+            if not transfer_id or not expected_sha256 or expected_size <= 0 or not path.is_file():
+                skipped += 1
+                message = "upload source is missing or incomplete"
+                if transfer_id:
+                    transfer_store.fail_transfer(transfer_id, message)
+                failures.append({"transfer_id": transfer_id, "path": str(path), "message": message})
+                continue
+            try:
+                actual_sha256, actual_size = _file_sha256_and_size(path)
+            except Exception as exc:
+                skipped += 1
+                message = f"upload source cannot be read: {exc}"
+                transfer_store.fail_transfer(transfer_id, message)
+                failures.append({"transfer_id": transfer_id, "path": str(path), "message": message})
+                continue
+            if actual_sha256 != expected_sha256 or actual_size != expected_size:
+                skipped += 1
+                message = "upload source changed since failed transfer"
+                transfer_store.fail_transfer(transfer_id, message)
+                failures.append({"transfer_id": transfer_id, "path": str(path), "message": message})
+                continue
+            attempted += 1
+
+            def operation(client: Any, token: str) -> dict[str, Any]:
+                return upload_cloud_object_file(
+                    client,
+                    token,
+                    path,
+                    content_type=content_type,
+                    compression="auto",
+                    trace_id=transfer_id,
+                    transfer_store=transfer_store,
+                )
+
+            try:
+                ok, response_payload, message = self.cloud_request_with_refresh(operation)
+            except Exception as exc:
+                failed += 1
+                failure_message = str(exc or "upload retry failed")
+                transfer_store.fail_transfer(transfer_id, failure_message)
+                failures.append({"transfer_id": transfer_id, "path": str(path), "message": failure_message})
+                continue
+            if ok and isinstance(response_payload, dict) and bool(response_payload.get("ok")):
+                recovered += 1
+                continue
+            failed += 1
+            response_dict = response_payload if isinstance(response_payload, dict) else {}
+            failure_message = str(message or response_dict.get("message") or "upload retry failed")
+            transfer_store.fail_transfer(transfer_id, failure_message)
+            failures.append({"transfer_id": transfer_id, "path": str(path), "message": failure_message})
+        return {
+            "ok": failed == 0,
+            "attempted": attempted,
+            "recovered": recovered,
+            "failed": failed,
+            "skipped": skipped,
             "failures": failures[:10],
         }
 
@@ -1467,6 +1557,19 @@ def _safe_float(value: Any, default: float) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _file_sha256_and_size(path: Path, *, chunk_bytes: int = 1024 * 1024) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(max(1, int(chunk_bytes or 1024 * 1024)))
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+    return digest.hexdigest(), size
 
 
 def _object_refs_from_inbox_item(item: dict[str, Any]) -> list[dict[str, Any]]:
