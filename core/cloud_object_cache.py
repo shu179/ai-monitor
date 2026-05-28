@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -17,6 +18,7 @@ DEFAULT_CLOUD_OBJECT_CACHE_DIR = resolve_app_path("user_data/cloud_object_cache"
 MAX_CACHE_OBJECT_BYTES = 512 * 1024 * 1024
 DEFAULT_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_PRUNE_TARGET_RATIO = 0.85
+DEFAULT_DECODE_CHUNK_BYTES = 1024 * 1024
 _SHA256_HEX_LENGTH = 64
 
 
@@ -79,9 +81,20 @@ class CloudObjectCache:
         tmp_path = Path(tmp_name)
         digest = hashlib.sha256()
         total = 0
+        storage_total = 0
+
+        def count_storage_bytes(size: int) -> None:
+            nonlocal storage_total
+            storage_total += max(0, int(size or 0))
+
+        decoded_chunks = _decode_cached_object_chunks(
+            chunks,
+            compression=str(normalized.get("compression") or "none"),
+            storage_counter=count_storage_bytes,
+        )
         try:
             with os.fdopen(fd, "wb") as handle:
-                for chunk in chunks:
+                for chunk in decoded_chunks:
                     if not chunk:
                         continue
                     data = bytes(chunk)
@@ -99,6 +112,9 @@ class CloudObjectCache:
                 raise CloudObjectCacheError("object sha256 mismatch")
             if expected_size and total != expected_size:
                 raise CloudObjectCacheError("object size mismatch")
+            expected_storage_size = int(normalized.get("storage_size_bytes") or 0)
+            if expected_storage_size and storage_total != expected_storage_size:
+                raise CloudObjectCacheError("object storage size mismatch")
 
             os.replace(tmp_path, target)
             _write_json_atomic(
@@ -108,8 +124,10 @@ class CloudObjectCache:
                     "sha256": sha256,
                     "size_bytes": total,
                     "expected_size_bytes": expected_size,
+                    "storage_size_bytes": storage_total,
+                    "expected_storage_size_bytes": expected_storage_size,
                     "content_type": str(normalized.get("content_type") or ""),
-                    "compression": str(normalized.get("compression") or ""),
+                    "compression": _normalize_compression(str(normalized.get("compression") or "none")),
                     "cached_at": local_now().isoformat(timespec="seconds"),
                     "trace_id": str(trace_id or "").strip(),
                 },
@@ -258,8 +276,67 @@ def normalize_object_ref(object_ref: dict[str, Any]) -> dict[str, Any]:
         "size_bytes": _safe_int(payload.get("size_bytes") or payload.get("sizeBytes")),
         "storage_size_bytes": _safe_int(payload.get("storage_size_bytes") or payload.get("storageSizeBytes")),
         "content_type": str(payload.get("content_type") or payload.get("contentType") or "").strip(),
-        "compression": str(payload.get("compression") or "").strip(),
+        "compression": _normalize_compression(str(payload.get("compression") or "none")),
     }
+
+
+def _decode_cached_object_chunks(
+    chunks: Iterable[bytes],
+    *,
+    compression: str,
+    storage_counter: Any | None = None,
+) -> Iterator[bytes]:
+    safe_compression = _normalize_compression(compression)
+    if safe_compression == "none":
+        for chunk in chunks:
+            data = bytes(chunk)
+            if storage_counter is not None:
+                storage_counter(len(data))
+            yield data
+        return
+    if safe_compression != "zstd":
+        raise CloudObjectCacheError(f"unsupported object compression: {safe_compression}")
+    try:
+        import compression.zstd as zstd
+    except Exception as exc:  # pragma: no cover - Python 3.14+ ships this module.
+        raise CloudObjectCacheError("zstd object compression is not available in this Python runtime") from exc
+
+    decompressor = zstd.ZstdDecompressor()
+    try:
+        for chunk in chunks:
+            data = bytes(chunk)
+            if not data:
+                continue
+            if storage_counter is not None:
+                storage_counter(len(data))
+            if decompressor.eof:
+                raise CloudObjectCacheError("zstd object has trailing data")
+            piece = decompressor.decompress(data, DEFAULT_DECODE_CHUNK_BYTES)
+            if piece:
+                yield piece
+            if decompressor.eof and getattr(decompressor, "unused_data", b""):
+                raise CloudObjectCacheError("zstd object has trailing data")
+            while not decompressor.needs_input and not decompressor.eof:
+                piece = decompressor.decompress(b"", DEFAULT_DECODE_CHUNK_BYTES)
+                if piece:
+                    yield piece
+            if decompressor.eof and getattr(decompressor, "unused_data", b""):
+                raise CloudObjectCacheError("zstd object has trailing data")
+    except CloudObjectCacheError:
+        raise
+    except Exception as exc:
+        raise CloudObjectCacheError(f"zstd object decompression failed: {exc}") from exc
+    if not decompressor.eof:
+        raise CloudObjectCacheError("zstd object ended before the frame was complete")
+
+
+def _normalize_compression(value: str | None) -> str:
+    text = str(value or "none").strip().lower()
+    if text in {"", "identity"}:
+        return "none"
+    if text in {"none", "zstd"}:
+        return text
+    raise CloudObjectCacheError(f"unsupported object compression: {text}")
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
