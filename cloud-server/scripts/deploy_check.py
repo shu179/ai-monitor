@@ -54,6 +54,7 @@ def build_deploy_check_report(*, base_url: str = "http://127.0.0.1:8080") -> dic
     ]
     object_dir = Path(env_values.get("SURFACED_CLOUD_OBJECT_STORAGE_LOCAL_DIR") or "/opt/surfaced/object-data")
     backup_dir = Path(env_values.get("SURFACED_CLOUD_BACKUP_DIR") or "/opt/surfaced/backups")
+    wal_archive_dir = Path(env_values.get("SURFACED_CLOUD_PITR_WAL_ARCHIVE_DIR") or "/opt/surfaced/postgres-wal")
     object_limits = {
         "total_quota_bytes": _safe_int(
             env_values.get("SURFACED_CLOUD_OBJECT_STORAGE_TOTAL_QUOTA_BYTES"),
@@ -75,6 +76,7 @@ def build_deploy_check_report(*, base_url: str = "http://127.0.0.1:8080") -> dic
     dirs = {
         "object_storage": _object_storage_dir_report(object_dir, limits=object_limits),
         "backups": _dir_report(backup_dir, min_free_bytes=0),
+        "wal_archive": _dir_report(wal_archive_dir, min_free_bytes=0),
     }
     compose = _compose_report()
     health = _health_report(base_url)

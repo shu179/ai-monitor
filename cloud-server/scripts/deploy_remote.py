@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 
 DEFAULT_REMOTE_DIR = "/opt/surfaced/cloud-server"
 DEFAULT_BACKUP_DIR = "/opt/surfaced/backups"
+DEFAULT_WAL_ARCHIVE_DIR = "/opt/surfaced/postgres-wal"
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8080"
 RSYNC_EXCLUDES = (
     ".env",
@@ -42,6 +43,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Remote backup directory.",
     )
     parser.add_argument(
+        "--wal-archive-dir",
+        default=os.environ.get("SURFACED_CLOUD_DEPLOY_WAL_ARCHIVE_DIR", DEFAULT_WAL_ARCHIVE_DIR),
+        help="Remote PostgreSQL WAL archive directory.",
+    )
+    parser.add_argument(
         "--health-url",
         default=os.environ.get("SURFACED_CLOUD_DEPLOY_HEALTH_URL", DEFAULT_HEALTH_URL),
         help="Remote health-check base URL.",
@@ -59,6 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     remote_script = render_remote_script(
         remote_dir=args.remote_dir,
         backup_dir=args.backup_dir,
+        wal_archive_dir=args.wal_archive_dir,
         health_url=args.health_url,
         db_backup=not bool(args.skip_db_backup),
         code_backup=not bool(args.skip_code_backup),
@@ -89,6 +96,7 @@ def render_remote_script(
     *,
     remote_dir: str,
     backup_dir: str,
+    wal_archive_dir: str = DEFAULT_WAL_ARCHIVE_DIR,
     health_url: str,
     db_backup: bool,
     code_backup: bool,
@@ -96,16 +104,19 @@ def render_remote_script(
 ) -> str:
     remote_q = shlex.quote(str(remote_dir))
     backup_q = shlex.quote(str(backup_dir))
+    wal_archive_q = shlex.quote(str(wal_archive_dir))
     health_q = shlex.quote(str(health_url))
     lines = [
         "set -euo pipefail",
         f"REMOTE_DIR={remote_q}",
         f"BACKUP_DIR={backup_q}",
+        f"WAL_ARCHIVE_DIR={wal_archive_q}",
         f"HEALTH_URL={health_q}",
         "TS=$(date +%Y%m%d-%H%M%S)",
         'echo "remote_dir=$REMOTE_DIR"',
         'echo "backup_dir=$BACKUP_DIR"',
         'sudo mkdir -p "$BACKUP_DIR"',
+        'sudo install -d -m 700 -o 70 -g 70 "$WAL_ARCHIVE_DIR"',
         'find "$REMOTE_DIR" \\( -name "._*" -o -name ".DS_Store" \\) -delete',
     ]
     if db_backup:

@@ -80,7 +80,8 @@ SURFACED_CLOUD_TENCENT_SES_TEMPLATE_ID=腾讯云邮件模板 ID
 ```bash
 cd cloud-server
 cp .env.example .env
-sudo install -d -m 700 -o 999 -g 999 /opt/surfaced/postgres-wal /opt/surfaced/backups
+sudo install -d -m 700 -o 70 -g 70 /opt/surfaced/postgres-wal
+sudo mkdir -p /opt/surfaced/backups
 docker compose up -d --build
 docker compose exec api alembic upgrade head
 ```

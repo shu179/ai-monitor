@@ -37,6 +37,7 @@ def test_render_remote_script_includes_backup_cleanup_and_rebuild_steps() -> Non
     )
 
     assert 'find "$REMOTE_DIR" \\( -name "._*" -o -name ".DS_Store" \\) -delete' in script
+    assert 'sudo install -d -m 700 -o 70 -g 70 "$WAL_ARCHIVE_DIR"' in script
     assert 'step=db_backup' in script
     assert 'docker compose exec -T postgres' in script
     assert 'step=code_backup' in script

@@ -21,8 +21,8 @@ archive_command=test -d /opt/surfaced/postgres-wal && (test ! -f /opt/surfaced/p
 首次启动前在服务器上创建目录，并确保 Postgres 容器用户可写：
 
 ```bash
-sudo install -d -m 700 -o 999 -g 999 /opt/surfaced/postgres-wal
-sudo install -d -m 700 -o 999 -g 999 /opt/surfaced/backups
+sudo install -d -m 700 -o 70 -g 70 /opt/surfaced/postgres-wal
+sudo mkdir -p /opt/surfaced/backups
 ```
 
 ## 日常备份
