@@ -137,11 +137,96 @@ class CloudStateDeltaTests(unittest.TestCase):
                 client=client,
                 session_store=FakeSessionStore(_session()),
                 state_store=store,
+                max_pages=1,
             )
             state = store.load(_session())
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["reset_required"])
+        self.assertEqual(state["reset_token"], "reset-token")
+        self.assertEqual(state["bootstrap_cursor"], "boot-cursor")
+
+    def test_pull_continues_reset_bootstrap_with_remaining_page_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CloudStateDeltaStore(Path(tmp) / "state.json")
+            client = FakeStateDeltaClient(
+                [
+                    {
+                        "changes": [],
+                        "next_cursors": {"tasks": 1},
+                        "has_more": True,
+                        "object_refs": [],
+                        "reset_required": True,
+                        "reset_token": "reset-token",
+                        "bootstrap_cursor": "boot-cursor",
+                        "retry_after_seconds": 5,
+                    },
+                    {
+                        "changes": [{"stream": "tasks", "seq": 9}],
+                        "next_cursors": {"tasks": 9},
+                        "has_more": False,
+                        "object_refs": [],
+                        "reset_required": False,
+                        "reset_token": None,
+                        "bootstrap_cursor": None,
+                        "retry_after_seconds": 0,
+                    },
+                ]
+            )
+            inbox = CloudStateDeltaInbox(Path(tmp) / "inbox.sqlite3")
+
+            result = pull_cloud_state_delta(
+                client=client,
+                session_store=FakeSessionStore(_session()),
+                state_store=store,
+                inbox=inbox,
+                max_pages=2,
+            )
+            state = store.load(_session())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "reset")
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(result["changes"], 1)
+        self.assertEqual(result["inbox_created"], 1)
+        self.assertTrue(result["reset_required"])
+        self.assertFalse(result["has_more"])
+        self.assertEqual(state["cursors"], {"tasks": 9})
+        self.assertEqual(state["reset_token"], "")
+        self.assertEqual(state["bootstrap_cursor"], "")
+        self.assertIsNone(client.calls[0]["reset_token"])
+        self.assertEqual(client.calls[1]["reset_token"], "reset-token")
+        self.assertEqual(client.calls[1]["bootstrap_cursor"], "boot-cursor")
+
+    def test_pull_saves_reset_token_when_page_budget_is_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CloudStateDeltaStore(Path(tmp) / "state.json")
+            client = FakeStateDeltaClient(
+                [
+                    {
+                        "changes": [],
+                        "next_cursors": {"tasks": 1},
+                        "has_more": True,
+                        "object_refs": [],
+                        "reset_required": True,
+                        "reset_token": "reset-token",
+                        "bootstrap_cursor": "boot-cursor",
+                    },
+                ]
+            )
+
+            result = pull_cloud_state_delta(
+                client=client,
+                session_store=FakeSessionStore(_session()),
+                state_store=store,
+                max_pages=1,
+            )
+            state = store.load(_session())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["pages"], 1)
+        self.assertTrue(result["reset_required"])
+        self.assertTrue(result["has_more"])
         self.assertEqual(state["reset_token"], "reset-token")
         self.assertEqual(state["bootstrap_cursor"], "boot-cursor")
 

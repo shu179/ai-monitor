@@ -247,7 +247,9 @@ def pull_cloud_state_delta(
                 has_more = True
                 mode = "reset"
                 state_updated = True
-                break
+                if not state["reset_token"] or pages >= pages_limit:
+                    break
+                continue
 
             inbox_result = inbox_store.record_changes(
                 identity_key=identity_key,
