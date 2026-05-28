@@ -1982,6 +1982,7 @@ def _cloud_sync_health_summary(
     backpressure_until = str(auto_sync.get("upload_backpressure_until") or "")
     object_download_retry_backpressure_until = str(auto_sync.get("object_download_retry_backpressure_until") or "")
     object_upload_retry_backpressure_until = str(auto_sync.get("object_upload_retry_backpressure_until") or "")
+    state_delta_backpressure_until = str(auto_sync.get("state_delta_backpressure_until") or "")
     active_operation = str(auto_sync.get("active_operation") or "")
     last_error = str(auto_sync.get("last_error") or auto_sync.get("last_state_delta_error") or "")
     summary = {
@@ -2046,6 +2047,17 @@ def _cloud_sync_health_summary(
         "object_upload_retry_backpressure_bucket": str(
             auto_sync.get("object_upload_retry_backpressure_bucket") or ""
         ),
+        "state_delta_backpressure_active": bool(state_delta_backpressure_until),
+        "state_delta_backpressure_until": state_delta_backpressure_until,
+        "state_delta_backpressure_retry_after_seconds": _safe_float(
+            auto_sync.get("state_delta_backpressure_retry_after_seconds"),
+            0.0,
+        ),
+        "state_delta_backpressure_queue_depth_hint": _safe_int(
+            auto_sync.get("state_delta_backpressure_queue_depth_hint"),
+            0,
+        ),
+        "state_delta_backpressure_bucket": str(auto_sync.get("state_delta_backpressure_bucket") or ""),
         "object_upload_retry_ready_count": _safe_int(auto_sync.get("object_upload_retry_ready_count"), 0),
         "object_upload_retry_waiting_count": _safe_int(auto_sync.get("object_upload_retry_waiting_count"), 0),
         "object_upload_retry_wait_reason": str(auto_sync.get("object_upload_retry_wait_reason") or ""),
@@ -2154,6 +2166,14 @@ def _cloud_sync_action_summary(summary: dict[str, Any]) -> dict[str, Any]:
             queue_depth_hint=_safe_int(summary.get("object_download_retry_backpressure_queue_depth_hint"), 0),
             throttle_bucket=str(summary.get("object_download_retry_backpressure_bucket") or ""),
         )
+    if bool(summary.get("state_delta_backpressure_active")):
+        add_blocker(
+            "state_delta_backpressure",
+            "state-delta pull is throttled by the cloud",
+            summary.get("state_delta_backpressure_retry_after_seconds"),
+            queue_depth_hint=_safe_int(summary.get("state_delta_backpressure_queue_depth_hint"), 0),
+            throttle_bucket=str(summary.get("state_delta_backpressure_bucket") or ""),
+        )
 
     active_operation = str(summary.get("active_operation") or "")
     if active_operation:
@@ -2211,6 +2231,13 @@ def _cloud_sync_action_summary(summary: dict[str, Any]) -> dict[str, Any]:
             "retry_object_downloads",
             object_download_reason or "waiting_retry_backoff",
             summary.get("next_object_download_retry_after_seconds"),
+        )
+
+    if bool(summary.get("state_delta_backpressure_active")):
+        add_action(
+            "state_delta_pipeline",
+            "server_backpressure",
+            summary.get("state_delta_backpressure_retry_after_seconds"),
         )
 
     running_actions = [item for item in actions if str(item.get("reason") or "") == "running"]

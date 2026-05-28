@@ -1641,6 +1641,45 @@ def test_cloud_sync_health_summary_prioritizes_active_operation():
     }
 
 
+def test_cloud_sync_health_summary_reports_state_delta_backpressure():
+    summary = _cloud_sync_health_summary(
+        session={
+            "base_url": "https://api.example.com",
+            "access_token": "access",
+            "refresh_token": "refresh",
+        },
+        auto_sync={
+            "running": True,
+            "state_delta_backpressure_until": "2026-05-28T10:01:00",
+            "state_delta_backpressure_retry_after_seconds": 18.0,
+            "state_delta_backpressure_queue_depth_hint": 900,
+            "state_delta_backpressure_bucket": "state_delta",
+        },
+        outbox={"stats": {"pending": 0, "failed": 0, "dead_letter": 0, "upload_ready": 0}},
+        inbox={"by_status": {"pending": 0, "failed": 0, "applied": 0}},
+        agent_status={"total": 0},
+        content_state={"answers_total": 0, "assets_total": 0},
+    )
+
+    assert summary["state_delta_backpressure_active"] is True
+    assert summary["state_delta_backpressure_until"] == "2026-05-28T10:01:00"
+    assert summary["state_delta_backpressure_retry_after_seconds"] == 18.0
+    assert summary["state_delta_backpressure_queue_depth_hint"] == 900
+    assert summary["state_delta_backpressure_bucket"] == "state_delta"
+    assert {
+        "kind": "state_delta_backpressure",
+        "message": "state-delta pull is throttled by the cloud",
+        "retry_after_seconds": 18,
+        "queue_depth_hint": 900,
+        "throttle_bucket": "state_delta",
+    } in summary["sync_blockers"]
+    assert summary["next_sync_action"] == {
+        "kind": "state_delta_pipeline",
+        "reason": "server_backpressure",
+        "retry_after_seconds": 18,
+    }
+
+
 def test_app_cloud_runtime_support_sync_health_can_include_cloud_object_storage_report():
     owner = _support_owner()
     session_store = MagicMock()
