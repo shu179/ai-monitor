@@ -88,6 +88,15 @@ docker compose up -d --build
 
 `docker compose` 会先运行一次 `migrate` 服务执行 `alembic upgrade head`，成功后再启动 `api` 和 `worker`。`api` 默认用 gunicorn + uvicorn worker 多进程运行，`worker` 独立消费 Cloud Sync v2 队列，避免后台 materialize 抢占 API 进程。
 
+如果你是从本机通过 SSH 往远端服务器发布，可以直接用：
+
+```bash
+python -m scripts.deploy_remote --ssh-host tencent
+python -m scripts.deploy_remote --ssh-host tencent --dry-run
+```
+
+这个脚本会先 `rsync` 代码（保留远端 `.env` / `.venv`），再在远端执行数据库备份、代码目录备份、AppleDouble 垃圾文件清理、`docker compose up -d --build`，最后跑 `scripts.deploy_check` 做健康验收。
+
 关键运行参数：
 
 ```text
