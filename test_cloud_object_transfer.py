@@ -25,7 +25,17 @@ class FakeUploadClient:
                 "compression": "none",
             }
         if self.strategy == "multipart":
-            return {"strategy": "multipart", "session_id": "session-1"}
+            return {
+                "strategy": "multipart",
+                "session_id": "session-1",
+                "sha256": kwargs["sha256"],
+                "size_bytes": kwargs["size_bytes"],
+                "storage_size_bytes": kwargs["storage_size_bytes"],
+                "content_type": kwargs["content_type"],
+                "compression": "none",
+                "part_size_bytes": 4,
+                "parts_total": 3,
+            }
         return {
             "strategy": "single_put",
             "session_id": "session-1",
@@ -50,6 +60,47 @@ class FakeUploadClient:
             )
         )
         return {"object_id": "object-1"}
+
+    def presign_object_upload_parts(self, token: str, session_id: str, part_numbers: list[int], **kwargs):
+        self.calls.append(("presign_parts", {"token": token, "session_id": session_id, "part_numbers": part_numbers, **kwargs}))
+        return {
+            "session_id": session_id,
+            "part_size_bytes": 4,
+            "parts_total": 3,
+            "upload_urls": [
+                {
+                    "part_number": part_number,
+                    "url": f"https://storage.example.com/part-{part_number}",
+                    "headers": {"X-Part": str(part_number)},
+                }
+                for part_number in part_numbers
+            ],
+        }
+
+    def upload_object_part_content(self, token: str, upload_url: str, chunks, **kwargs):
+        body = b"".join(chunks)
+        part_number = int(upload_url.rsplit("-", 1)[-1])
+        self.calls.append(
+            (
+                "upload_part",
+                {
+                    "token": token,
+                    "upload_url": upload_url,
+                    "body": body,
+                    **kwargs,
+                },
+            )
+        )
+        return {"etag": f'"etag-{part_number}"'}
+
+    def record_object_upload_part(self, token: str, session_id: str, **kwargs):
+        self.calls.append(("record_part", {"token": token, "session_id": session_id, **kwargs}))
+        return {
+            "session_id": session_id,
+            "part_number": kwargs["part_number"],
+            "parts_completed": kwargs["part_number"],
+            "parts_total": 3,
+        }
 
     def complete_object_upload(self, token: str, session_id: str, **kwargs):
         self.calls.append(("complete", {"token": token, "session_id": session_id, **kwargs}))
@@ -101,18 +152,50 @@ def test_upload_cloud_object_file_returns_existing_manifest_without_upload(tmp_p
     assert [name for name, _payload in client.calls] == ["create"]
 
 
-def test_upload_cloud_object_file_rejects_unsupported_multipart_for_now(tmp_path: Path):
+def test_upload_cloud_object_file_multipart_uploads_parts_and_completes(tmp_path: Path):
     path = tmp_path / "large.bin"
-    path.write_bytes(b"x" * 10)
+    path.write_bytes(b"abcdefghij")
     client = FakeUploadClient(strategy="multipart")
     store = CloudObjectTransferStore(tmp_path / "transfers.sqlite3")
 
-    with pytest.raises(CloudObjectTransferError, match="unsupported object upload strategy"):
-        upload_cloud_object_file(client, "access", path, transfer_store=store)
+    result = upload_cloud_object_file(
+        client,
+        "access",
+        path,
+        content_type="application/octet-stream",
+        compression="none",
+        trace_id="trace-multipart",
+        transfer_store=store,
+    )
 
     diagnostics = store.diagnostics()
-    assert diagnostics["by_status"] == {"failed": 1}
-    assert "unsupported object upload strategy" in diagnostics["failed"][0]["last_error"]
+    assert result["ok"] is True
+    assert result["uploaded"] is True
+    assert result["strategy"] == "multipart"
+    assert [name for name, _payload in client.calls] == [
+        "create",
+        "presign_parts",
+        "upload_part",
+        "record_part",
+        "presign_parts",
+        "upload_part",
+        "record_part",
+        "presign_parts",
+        "upload_part",
+        "record_part",
+        "complete",
+    ]
+    assert client.calls[2][1]["body"] == b"abcd"
+    assert client.calls[5][1]["body"] == b"efgh"
+    assert client.calls[8][1]["body"] == b"ij"
+    assert client.calls[3][1]["etag"] == '"etag-1"'
+    assert client.calls[3][1]["size_bytes"] == 4
+    assert client.calls[3][1]["sha256"] == hashlib.sha256(b"abcd").hexdigest()
+    assert client.calls[9][1]["size_bytes"] == 2
+    assert client.calls[-1][1]["session_id"] == "session-1"
+    assert client.calls[-1][1]["storage_size_bytes"] == len(path.read_bytes())
+    assert diagnostics["by_status"] == {"active": 1}
+    assert diagnostics["newest"][0]["object_id"] == "object-1"
 
 
 def test_upload_cloud_object_file_rejects_empty_file(tmp_path: Path):

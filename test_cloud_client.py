@@ -8,6 +8,7 @@ from core.cloud_client import CloudClientError, SurfacedCloudClient, iter_sse_ev
 
 class FakeResponse:
     status_code = 200
+    headers = {}
     content = b'{"id": 7, "config_version": 4}'
     text = '{"id": 7, "config_version": 4}'
 
@@ -131,13 +132,27 @@ class FakeBinarySession(FakeSession):
 
 
 class FakeUploadSession(FakeSession):
+    def __init__(self, *, response: FakeResponse | None = None) -> None:
+        super().__init__()
+        self.response = response or FakeResponse()
+
     def request(self, method: str, url: str, **kwargs):
         captured = {"method": method, "url": url, **kwargs}
         data = kwargs.get("data")
         if data is not None:
             captured["body"] = b"".join(data)
         self.calls.append(captured)
-        return FakeResponse()
+        return self.response
+
+
+class FakeUploadPartResponse:
+    status_code = 200
+    headers = {"ETag": '"part-etag"'}
+    content = b""
+    text = ""
+
+    def json(self):
+        raise ValueError("no json")
 
 
 class FakeTimeoutSession(FakeSession):
@@ -471,6 +486,56 @@ class CloudClientTests(unittest.TestCase):
         self.assertEqual(session.calls[0]["url"], "https://storage.example.com/upload?sig=1")
         self.assertNotIn("Authorization", session.calls[0]["headers"])
         self.assertEqual(session.calls[0]["body"], b"body")
+
+    def test_presign_object_upload_parts_posts_v2_request(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.presign_object_upload_parts("access-token", "session-1", [2, 1], trace_id="part.trace!")
+
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v2/objects/uploads/session-1/parts:presign")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+        self.assertEqual(session.calls[0]["headers"]["X-Trace-Id"], "part.trace")
+        self.assertEqual(session.calls[0]["headers"]["X-Cloud-Capability"], "sync-v2,batch-v2,object-v1,state-delta-v1")
+        self.assertEqual(session.calls[0]["json"], {"part_numbers": [2, 1]})
+
+    def test_upload_object_part_content_returns_etag_header(self):
+        session = FakeUploadSession(response=FakeUploadPartResponse())
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        result = client.upload_object_part_content(
+            "access-token",
+            "https://storage.example.com/upload?partNumber=1",
+            [b"part-body"],
+            trace_id="part.1",
+        )
+
+        self.assertEqual(result["etag"], '"part-etag"')
+        self.assertEqual(session.calls[0]["url"], "https://storage.example.com/upload?partNumber=1")
+        self.assertNotIn("Authorization", session.calls[0]["headers"])
+        self.assertEqual(session.calls[0]["body"], b"part-body")
+
+    def test_record_object_upload_part_posts_v2_request(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        client.record_object_upload_part(
+            "access-token",
+            "session-1",
+            part_number=3,
+            etag='"etag-3"',
+            size_bytes=99,
+            sha256="b" * 64,
+            trace_id="part.done",
+        )
+
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v2/objects/uploads/session-1/parts")
+        self.assertEqual(
+            session.calls[0]["json"],
+            {"part_number": 3, "etag": '"etag-3"', "size_bytes": 99, "sha256": "b" * 64},
+        )
 
     def test_complete_object_upload_posts_v2_request(self):
         session = FakeSession()

@@ -289,6 +289,105 @@ class SurfacedCloudClient:
         trace_id: str = "",
         read_timeout_seconds: float = 120.0,
     ) -> dict[str, Any]:
+        body, _headers = self._put_object_content(
+            access_token,
+            upload_url,
+            chunks,
+            content_type=content_type,
+            headers=headers,
+            trace_id=trace_id,
+            read_timeout_seconds=read_timeout_seconds,
+        )
+        return body if isinstance(body, dict) else {}
+
+    def presign_object_upload_parts(
+        self,
+        access_token: str,
+        session_id: str,
+        part_numbers: list[int],
+        *,
+        trace_id: str = "",
+    ) -> dict[str, Any]:
+        safe_session_id = str(session_id or "").strip()
+        if not safe_session_id:
+            raise CloudClientError("session_id is required")
+        response = self._request(
+            "POST",
+            f"/api/v2/objects/uploads/{safe_session_id}/parts:presign",
+            access_token=access_token,
+            json_body={"part_numbers": [int(item) for item in part_numbers]},
+            trace_id=trace_id,
+            extra_headers={"X-Cloud-Capability": DEFAULT_CLOUD_CAPABILITY_HEADER},
+        )
+        return response if isinstance(response, dict) else {}
+
+    def upload_object_part_content(
+        self,
+        access_token: str,
+        upload_url: str,
+        chunks: Iterable[bytes],
+        *,
+        content_type: str = "application/octet-stream",
+        headers: dict[str, Any] | None = None,
+        trace_id: str = "",
+        read_timeout_seconds: float = 120.0,
+    ) -> dict[str, Any]:
+        body, response_headers = self._put_object_content(
+            access_token,
+            upload_url,
+            chunks,
+            content_type=content_type,
+            headers=headers,
+            trace_id=trace_id,
+            read_timeout_seconds=read_timeout_seconds,
+        )
+        result = body if isinstance(body, dict) else {}
+        etag = _header_value(response_headers, "ETag") or result.get("etag") or result.get("ETag")
+        if etag:
+            result = dict(result)
+            result["etag"] = str(etag).strip()
+        return result
+
+    def record_object_upload_part(
+        self,
+        access_token: str,
+        session_id: str,
+        *,
+        part_number: int,
+        etag: str,
+        size_bytes: int,
+        sha256: str | None = None,
+        trace_id: str = "",
+    ) -> dict[str, Any]:
+        safe_session_id = str(session_id or "").strip()
+        if not safe_session_id:
+            raise CloudClientError("session_id is required")
+        response = self._request(
+            "POST",
+            f"/api/v2/objects/uploads/{safe_session_id}/parts",
+            access_token=access_token,
+            json_body={
+                "part_number": int(part_number),
+                "etag": str(etag or "").strip(),
+                "size_bytes": int(size_bytes or 0),
+                "sha256": str(sha256).strip() if sha256 else None,
+            },
+            trace_id=trace_id,
+            extra_headers={"X-Cloud-Capability": DEFAULT_CLOUD_CAPABILITY_HEADER},
+        )
+        return response if isinstance(response, dict) else {}
+
+    def _put_object_content(
+        self,
+        access_token: str,
+        upload_url: str,
+        chunks: Iterable[bytes],
+        *,
+        content_type: str = "application/octet-stream",
+        headers: dict[str, Any] | None = None,
+        trace_id: str = "",
+        read_timeout_seconds: float = 120.0,
+    ) -> tuple[Any, Any]:
         safe_url = _resolve_transfer_url(self.base_url, upload_url)
         if not safe_url:
             raise CloudClientError("upload_url is required")
@@ -328,7 +427,7 @@ class SurfacedCloudClient:
                 response_body=body,
                 **_extract_backpressure_metadata(response, body),
             )
-        return body if isinstance(body, dict) else {}
+        return body, getattr(response, "headers", {}) or {}
 
     def complete_object_upload(
         self,

@@ -1120,7 +1120,7 @@ class AppCloudRuntimeSupport:
                     token,
                     path,
                     content_type=content_type,
-                    compression="auto",
+                    compression="none",
                     trace_id=transfer_id,
                     transfer_store=transfer_store,
                 )
