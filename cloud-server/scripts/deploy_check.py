@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shutil
+import stat as stat_module
 import subprocess
 import sys
 import tempfile
@@ -76,7 +77,7 @@ def build_deploy_check_report(*, base_url: str = "http://127.0.0.1:8080") -> dic
     dirs = {
         "object_storage": _object_storage_dir_report(object_dir, limits=object_limits),
         "backups": _dir_report(backup_dir, min_free_bytes=0),
-        "wal_archive": _dir_report(wal_archive_dir, min_free_bytes=0),
+        "wal_archive": _wal_archive_dir_report(wal_archive_dir),
     }
     compose = _compose_report()
     health = _health_report(base_url)
@@ -176,6 +177,26 @@ def _object_storage_dir_report(path: Path, *, limits: dict[str, int]) -> dict:
     report["capacity_errors"] = capacity_errors
     if capacity_errors:
         report["status"] = "error"
+    return report
+
+
+def _wal_archive_dir_report(path: Path) -> dict:
+    report = _dir_report(path, min_free_bytes=0)
+    postgres_owner_writable = False
+    try:
+        info = path.stat()
+        postgres_owner_writable = (
+            path.exists()
+            and path.is_dir()
+            and int(info.st_uid) == 70
+            and int(info.st_gid) == 70
+            and bool(int(info.st_mode) & stat_module.S_IWUSR)
+        )
+    except Exception:
+        postgres_owner_writable = False
+    report["postgres_owner_writable"] = postgres_owner_writable
+    if report["exists"] and (report.get("writable") or postgres_owner_writable):
+        report["status"] = "ok"
     return report
 
 

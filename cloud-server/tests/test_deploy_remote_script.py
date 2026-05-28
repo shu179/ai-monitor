@@ -40,6 +40,7 @@ def test_render_remote_script_includes_backup_cleanup_and_rebuild_steps() -> Non
     assert 'sudo install -d -m 700 -o 70 -g 70 "$WAL_ARCHIVE_DIR"' in script
     assert 'step=db_backup' in script
     assert 'docker compose exec -T postgres' in script
+    assert '</dev/null | gzip' in script
     assert 'step=code_backup' in script
     assert 'cloud-server-code-${TS}.tar.gz' in script
     assert 'step=rebuild' in script

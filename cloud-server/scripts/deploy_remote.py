@@ -124,7 +124,7 @@ def render_remote_script(
             [
                 'echo "step=db_backup"',
                 'cd "$REMOTE_DIR"',
-                'sudo docker compose exec -T postgres sh -lc \'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"\' '
+                'sudo -n docker compose exec -T postgres sh -lc \'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"\' </dev/null '
                 '| gzip | sudo tee "$BACKUP_DIR/surfaced_cloud-${TS}.sql.gz" >/dev/null',
                 'ls -lh "$BACKUP_DIR/surfaced_cloud-${TS}.sql.gz"',
             ]

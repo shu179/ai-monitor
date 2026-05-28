@@ -135,3 +135,23 @@ def test_object_storage_dir_report_marks_capacity_errors_as_error() -> None:
     assert report["status"] == "error"
     assert report["writable"] is True
     assert "total_quota_exceeds_disk_capacity_after_min_free" in report["capacity_errors"]
+
+
+def test_wal_archive_dir_accepts_postgres_owned_directory() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp)
+        fake_stat = SimpleNamespace(
+            st_uid=70,
+            st_gid=70,
+            st_mode=0o040700,
+            st_mtime=0,
+        )
+        with (
+            patch("scripts.deploy_check._path_is_writable", return_value=False),
+            patch.object(Path, "stat", return_value=fake_stat),
+        ):
+            report = deploy_check._wal_archive_dir_report(path)
+
+    assert report["status"] == "ok"
+    assert report["writable"] is False
+    assert report["postgres_owner_writable"] is True
