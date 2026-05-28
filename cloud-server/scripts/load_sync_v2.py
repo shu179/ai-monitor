@@ -12,7 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import httpx
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -140,6 +140,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         if workspace_ids and not args.keep:
+            _wait_for_workspace_queue_idle(
+                workspace_ids,
+                timeout_seconds=min(60.0, max(5.0, float(args.timeout_seconds or 0.0))),
+            )
             _cleanup_workspaces(workspace_ids)
 
 
@@ -369,6 +373,37 @@ def _cleanup_workspaces(workspace_ids: list[int]) -> None:
     with SessionLocal() as db:
         db.execute(delete(Workspace).where(Workspace.id.in_([int(item) for item in workspace_ids])))
         db.commit()
+
+
+def _wait_for_workspace_queue_idle(workspace_ids: list[int], *, timeout_seconds: float) -> dict[str, int]:
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds or 0.0))
+    counts: dict[str, int] = {}
+    while True:
+        counts = _workspace_active_queue_counts(workspace_ids)
+        if sum(counts.values()) <= 0:
+            return counts
+        if time.monotonic() >= deadline:
+            return counts
+        time.sleep(0.5)
+
+
+def _workspace_active_queue_counts(workspace_ids: list[int]) -> dict[str, int]:
+    safe_ids = [int(item) for item in workspace_ids if int(item or 0) > 0]
+    if not safe_ids:
+        return {}
+    from app.db.session import SessionLocal
+    from app.models import SyncBatchItem
+
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(SyncBatchItem.status, func.count())
+            .where(
+                SyncBatchItem.workspace_id.in_(safe_ids),
+                SyncBatchItem.status.in_(["pending", "in_progress"]),
+            )
+            .group_by(SyncBatchItem.status)
+        ).all()
+    return {str(status): int(count or 0) for status, count in rows}
 
 
 def _metric(started_at: float, *, status_code: int, accepted: int = 0, error: str = "", retry_after: str = "", queue_depth: str = "") -> dict:

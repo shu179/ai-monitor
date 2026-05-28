@@ -94,6 +94,16 @@ class LoadSyncV2ScriptTests(unittest.TestCase):
         evaluation = load_sync_v2.evaluate_thresholds(result, {"batches_p95_ms": 1000})
         self.assertFalse(evaluation["passed"])
 
+    def test_wait_for_workspace_queue_idle_polls_until_clear(self) -> None:
+        with (
+            patch("scripts.load_sync_v2._workspace_active_queue_counts", side_effect=[{"pending": 2}, {}]),
+            patch("scripts.load_sync_v2.time.sleep") as sleep,
+        ):
+            counts = load_sync_v2._wait_for_workspace_queue_idle([1], timeout_seconds=5)
+
+        self.assertEqual(counts, {})
+        sleep.assert_called_once_with(0.5)
+
 
 if __name__ == "__main__":
     unittest.main()
