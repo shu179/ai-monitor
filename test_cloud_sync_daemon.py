@@ -151,6 +151,34 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertIsNone(runtime._cloud_command_daemon)
         self.assertIsNone(runtime._cloud_command_socket_path)
 
+    def test_app_runtime_stop_cloud_command_transport_cancels_recovery_timer_and_joins_thread(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_command_transport_lock = threading.RLock()
+        server = Mock()
+        daemon = Mock()
+        recovery_thread = Mock()
+        recovery_thread.join = Mock()
+        timer = Mock()
+        runtime._cloud_command_server = server
+        runtime._cloud_command_daemon = daemon
+        runtime._cloud_command_client = Mock()
+        runtime._cloud_command_socket_path = Path("/tmp/cloud-sync.sock")
+        runtime._cloud_command_transport_recovery_thread = recovery_thread
+        runtime._cloud_command_transport_recovery_timer = timer
+        runtime._cloud_command_transport_next_recovery_at = time.monotonic() + 30
+        runtime._cloud_command_transport_next_recovery_after = "2026-05-28T12:00:30"
+
+        AppRuntime._stop_cloud_command_transport(runtime)
+
+        timer.cancel.assert_called_once()
+        recovery_thread.join.assert_called_once_with(timeout=1.0)
+        daemon.stop.assert_called_once()
+        server.stop.assert_called_once()
+        self.assertIsNone(runtime._cloud_command_transport_recovery_timer)
+        self.assertEqual(runtime._cloud_command_transport_next_recovery_at, 0.0)
+        self.assertEqual(runtime._cloud_command_transport_next_recovery_after, "")
+        self.assertEqual(runtime._cloud_command_transport_mode, "stopped")
+
     def test_app_runtime_cloud_command_transport_status_reports_child_daemon(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         process = Mock()

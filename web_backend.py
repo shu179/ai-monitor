@@ -2362,6 +2362,8 @@ class AppRuntime:
     def _clear_cloud_command_transport_recovery_timer_locked(self) -> None:
         timer = getattr(self, "_cloud_command_transport_recovery_timer", None)
         self._cloud_command_transport_recovery_timer = None
+        self._cloud_command_transport_next_recovery_at = 0.0
+        self._cloud_command_transport_next_recovery_after = ""
         if timer is not None:
             try:
                 timer.cancel()
@@ -2381,8 +2383,6 @@ class AppRuntime:
             daemon = getattr(self, "_cloud_command_daemon", None)
             recovery_thread = getattr(self, "_cloud_command_transport_recovery_thread", None)
             self._clear_cloud_command_transport_recovery_timer_locked()
-            self._cloud_command_transport_next_recovery_at = 0.0
-            self._cloud_command_transport_next_recovery_after = ""
             self._cloud_command_server = None
             self._cloud_command_daemon = None
             self._cloud_command_transport_recovery_thread = None
