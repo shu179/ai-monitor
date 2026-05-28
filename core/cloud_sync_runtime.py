@@ -473,6 +473,8 @@ class AppCloudRuntimeSupport:
             return {"ok": True, "object_transfers": self._object_transfer_store_factory().diagnostics(failed_limit=failed_limit)}
         if normalized in {"cloud.object_transfer_retry_candidates", "object_transfer_retry_candidates"}:
             return self.object_transfer_retry_candidates(request_payload)
+        if normalized in {"cloud.retry_object_downloads", "retry_object_downloads"}:
+            return self.retry_object_downloads(request_payload)
         if normalized in {"cloud.prune_object_cache", "prune_object_cache"}:
             return self.prune_cloud_object_cache(request_payload)
         if normalized in {"cloud.cache_object", "cache_object"}:
@@ -536,6 +538,8 @@ class AppCloudRuntimeSupport:
             return {"ok": True, "object_transfers": self._object_transfer_store_factory().diagnostics(failed_limit=failed_limit)}
         if normalized in {"cloud.object_transfer_retry_candidates", "object_transfer_retry_candidates"}:
             return self.object_transfer_retry_candidates(request_payload)
+        if normalized in {"cloud.retry_object_downloads", "retry_object_downloads"}:
+            return self.retry_object_downloads(request_payload)
         if normalized in {"cloud.prune_object_cache", "prune_object_cache"}:
             return self.prune_cloud_object_cache(request_payload)
         if normalized in {"cloud.cache_object", "cache_object"}:
@@ -878,6 +882,68 @@ class AppCloudRuntimeSupport:
             ),
         )
         return {"ok": True, "retryable_transfers": transfers, "count": len(transfers)}
+
+    def retry_object_downloads(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        limit = _safe_int(request_payload.get("limit"), 10)
+        transfers = self._object_transfer_store_factory().retryable_transfers(
+            limit=limit,
+            direction="download",
+            max_attempts=_safe_int(request_payload.get("max_attempts") or request_payload.get("maxAttempts"), 5),
+            stale_running_seconds=_safe_float(
+                request_payload.get("stale_running_seconds") or request_payload.get("staleRunningSeconds"),
+                600.0,
+            ),
+        )
+        attempted = 0
+        recovered = 0
+        failed = 0
+        failures: list[dict[str, Any]] = []
+        for item in transfers:
+            object_id = str(item.get("object_id") or "").strip()
+            sha256 = str(item.get("sha256") or "").strip()
+            if not object_id or not sha256:
+                failed += 1
+                failures.append(
+                    {
+                        "transfer_id": str(item.get("transfer_id") or ""),
+                        "object_id": object_id,
+                        "message": "missing object_id or sha256",
+                    }
+                )
+                continue
+            attempted += 1
+            result = self.cache_cloud_object(
+                {
+                    "trace_id": str(item.get("transfer_id") or ""),
+                    "object_ref": {
+                        "object_id": object_id,
+                        "sha256": sha256,
+                        "size_bytes": _safe_int(item.get("size_bytes"), 0),
+                        "content_type": str(item.get("content_type") or ""),
+                    },
+                    "force": True,
+                }
+            )
+            if bool(result.get("ok")):
+                recovered += 1
+                continue
+            failed += 1
+            failures.append(
+                {
+                    "transfer_id": str(item.get("transfer_id") or ""),
+                    "object_id": object_id,
+                    "message": str(result.get("message") or "download retry failed"),
+                }
+            )
+        return {
+            "ok": failed == 0,
+            "attempted": attempted,
+            "recovered": recovered,
+            "failed": failed,
+            "skipped": max(0, len(transfers) - attempted),
+            "failures": failures[:10],
+        }
 
     def _build_state_delta_appliers(
         self,

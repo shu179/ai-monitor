@@ -80,6 +80,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertIn("cloud.object_cache_diagnostics", DAEMON_SUPPORTED_COMMANDS)
         self.assertIn("cloud.object_transfer_diagnostics", DAEMON_SUPPORTED_COMMANDS)
         self.assertIn("cloud.object_transfer_retry_candidates", DAEMON_SUPPORTED_COMMANDS)
+        self.assertIn("cloud.retry_object_downloads", DAEMON_SUPPORTED_COMMANDS)
         self.assertIn("cloud.prune_object_cache", DAEMON_SUPPORTED_COMMANDS)
         self.assertIn("cloud.cache_object", DAEMON_SUPPORTED_COMMANDS)
         self.assertIn("cloud.pull_state_delta", DAEMON_SUPPORTED_COMMANDS)

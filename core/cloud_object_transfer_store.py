@@ -156,7 +156,7 @@ class CloudObjectTransferStore:
             newest = conn.execute(
                 """
                 SELECT transfer_id, direction, status, object_id, sha256, size_bytes,
-                       path, attempts, updated_at, last_error
+                       path, content_type, attempts, updated_at, last_error
                 FROM object_transfers
                 ORDER BY updated_at DESC, transfer_id DESC
                 LIMIT 10
@@ -165,7 +165,7 @@ class CloudObjectTransferStore:
             failed = conn.execute(
                 """
                 SELECT transfer_id, direction, status, object_id, sha256, size_bytes,
-                       path, attempts, updated_at, last_error
+                       path, content_type, attempts, updated_at, last_error
                 FROM object_transfers
                 WHERE status = 'failed'
                 ORDER BY updated_at DESC, transfer_id DESC
@@ -219,7 +219,7 @@ class CloudObjectTransferStore:
             rows = conn.execute(
                 f"""
                 SELECT transfer_id, direction, status, object_id, sha256, size_bytes,
-                       path, attempts, updated_at, last_error
+                       path, content_type, attempts, updated_at, last_error
                 FROM object_transfers
                 WHERE (
                     (status = 'failed' AND attempts < ?)
@@ -314,7 +314,8 @@ def _row_public(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
         "sha256": str(row[4] or ""),
         "size_bytes": int(row[5] or 0),
         "path": str(row[6] or ""),
-        "attempts": int(row[7] or 0),
-        "updated_at": str(row[8] or ""),
-        "last_error": str(row[9] or ""),
+        "content_type": str(row[7] or ""),
+        "attempts": int(row[8] or 0),
+        "updated_at": str(row[9] or ""),
+        "last_error": str(row[10] or ""),
     }

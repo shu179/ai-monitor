@@ -1552,6 +1552,88 @@ def test_app_cloud_runtime_support_lists_object_transfer_retry_candidates():
     assert result["retryable_transfers"][0]["transfer_id"] == "download-1"
 
 
+def test_app_cloud_runtime_support_retries_failed_object_downloads():
+    owner = _support_owner()
+    data = b"retry object bytes"
+    sha256 = hashlib.sha256(data).hexdigest()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+
+    class FakeClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        def create_object_download(self, _token: str, object_id: str, *, trace_id: str = ""):
+            assert object_id == "object-1"
+            assert trace_id == "download-1"
+            return {
+                "object_id": object_id,
+                "download_url": "/api/v2/objects/object-1/content",
+                "size_bytes": len(data),
+                "content_type": "text/plain",
+                "compression": "none",
+            }
+
+        def iter_object_content(self, _token: str, _download_url: str, *, trace_id: str = ""):
+            return iter([data])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = CloudObjectCache(Path(tmp) / "cache")
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        transfer_store.start_transfer(
+            transfer_id="download-1",
+            direction="download",
+            object_id="object-1",
+            sha256=sha256,
+            size_bytes=len(data),
+            content_type="text/plain",
+        )
+        transfer_store.fail_transfer("download-1", "temporary")
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            request_client_factory=FakeClient,
+            object_cache_factory=lambda: cache,
+            object_transfer_store_factory=lambda: transfer_store,
+        )
+
+        result = support.handle_command("cloud.retry_object_downloads", {"limit": 5})
+        diagnostics = transfer_store.diagnostics()
+        cached = cache.cached_object({"sha256": sha256, "size_bytes": len(data)})
+
+    assert result["ok"] is True
+    assert result["attempted"] == 1
+    assert result["recovered"] == 1
+    assert diagnostics["by_status"] == {"completed": 1}
+    assert cached["valid"] is True
+
+
+def test_app_cloud_runtime_support_retry_object_downloads_skips_uploads():
+    owner = _support_owner()
+    with tempfile.TemporaryDirectory() as tmp:
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        transfer_store.start_transfer(transfer_id="upload-1", direction="upload", sha256="a" * 64)
+        transfer_store.fail_transfer("upload-1", "temporary")
+        client_factory = MagicMock()
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            request_client_factory=client_factory,
+            object_transfer_store_factory=lambda: transfer_store,
+        )
+
+        result = support.handle_command("cloud.retry_object_downloads", {"limit": 5})
+
+    assert result["ok"] is True
+    assert result["attempted"] == 0
+    assert result["recovered"] == 0
+    client_factory.assert_not_called()
+
+
 def test_app_cloud_runtime_support_prunes_object_cache():
     owner = _support_owner()
     data_a = b"a" * 10

@@ -27,6 +27,7 @@ def test_cloud_object_transfer_store_records_success_and_diagnostics(tmp_path: P
     assert diagnostics["bytes_by_direction"] == {"upload": 123}
     assert diagnostics["newest"][0]["object_id"] == "object-1"
     assert diagnostics["newest"][0]["attempts"] == 1
+    assert diagnostics["newest"][0]["content_type"] == "text/plain"
 
 
 def test_cloud_object_transfer_store_retries_increment_attempts(tmp_path: Path):
