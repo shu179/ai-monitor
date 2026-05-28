@@ -99,6 +99,42 @@ class CloudCommandTransportState:
     error: str = ""
     error_type: str = ""
 
+    @classmethod
+    def from_owner(cls, owner: Any) -> "CloudCommandTransportState":
+        state = getattr(owner, "_cloud_command_transport", None)
+        if isinstance(state, cls):
+            return state
+        state = cls()
+        state.socket_path = getattr(owner, "_cloud_command_socket_path", None)
+        state.server = getattr(owner, "_cloud_command_server", None)
+        state.daemon = getattr(owner, "_cloud_command_daemon", None)
+        state.client = getattr(owner, "_cloud_command_client", None)
+        state.recovery_thread = getattr(owner, "_cloud_command_transport_recovery_thread", None)
+        state.recovery_timer = getattr(owner, "_cloud_command_transport_recovery_timer", None)
+        state.last_recovery_attempt_at = float(getattr(owner, "_cloud_command_transport_last_recovery_attempt_at", 0.0) or 0.0)
+        state.last_recovery_attempt = str(getattr(owner, "_cloud_command_transport_last_recovery_attempt", "") or "")
+        state.last_recovery_reason = str(getattr(owner, "_cloud_command_transport_last_recovery_reason", "") or "")
+        state.last_recovery_completed_at = str(
+            getattr(owner, "_cloud_command_transport_last_recovery_completed_at", "") or ""
+        )
+        state.last_recovery_result = str(getattr(owner, "_cloud_command_transport_last_recovery_result", "") or "")
+        state.last_recovery_error = str(getattr(owner, "_cloud_command_transport_last_recovery_error", "") or "")
+        state.next_recovery_at = float(getattr(owner, "_cloud_command_transport_next_recovery_at", 0.0) or 0.0)
+        state.next_recovery_after = str(getattr(owner, "_cloud_command_transport_next_recovery_after", "") or "")
+        state.recovery_interval_seconds = max(
+            1.0,
+            float(getattr(owner, "_cloud_command_transport_recovery_interval_seconds", 30.0) or 30.0),
+        )
+        state.stop_requested = bool(getattr(owner, "_cloud_command_transport_stop_requested", False))
+        state.mode = str(getattr(owner, "_cloud_command_transport_mode", "") or "")
+        state.error = str(getattr(owner, "_cloud_command_transport_error", "") or "")
+        state.error_type = str(getattr(owner, "_cloud_command_transport_error_type", "") or "")
+        legacy_lock = getattr(owner, "_cloud_command_transport_lock", None)
+        if legacy_lock is not None:
+            state.lock = legacy_lock
+        setattr(owner, "_cloud_command_transport", state)
+        return state
+
     @staticmethod
     def command_timeout_seconds(command: str) -> float:
         normalized = str(command or "").strip()
