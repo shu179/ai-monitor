@@ -342,7 +342,7 @@ def run_cloud_sync_command_daemon(
                 "unsupported_by_daemon": True,
                 "message": f"命令仍需由主进程处理: {normalized}",
             }
-        return support.handle_command(normalized, payload)
+        return support.daemon_handle_command(normalized, payload)
 
     server = UnixSocketCloudSyncCommandServer(
         socket_path,
@@ -365,11 +365,7 @@ def _build_daemon_runtime_support() -> Any:
         def __init__(self) -> None:
             self._lock = threading.RLock()
 
-    support = AppCloudRuntimeSupport(
+    return AppCloudRuntimeSupport(
         owner=_DaemonOwner(),
         auto_sync_status_getter=lambda: {},
     )
-    original_handle_command = support.handle_command
-    support.handle_command = support.daemon_handle_command  # type: ignore[assignment]
-    support.handle_command_for_main = original_handle_command  # type: ignore[attr-defined]
-    return support

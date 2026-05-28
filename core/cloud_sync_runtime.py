@@ -204,6 +204,7 @@ class AppCloudRuntimeSupport:
         self._cloud_capability_fetched_at = 0.0
         self._cloud_capability_payload: dict[str, Any] | None = None
         self._cloud_capability_error = ""
+        self.handle_command_for_main: Callable[[str, dict[str, Any] | None], dict[str, Any]] = self.handle_command
 
     @property
     def last_article_cloud_enqueue_key(self) -> tuple[Any, ...] | None:
@@ -622,6 +623,10 @@ class AppCloudRuntimeSupport:
         if callable(delegate):
             return delegate(normalized, request_payload)
         return {"ok": False, "message": f"未知云同步命令: {normalized}"}
+
+    def build_daemon_command_handler(self) -> Callable[[str, dict[str, Any] | None], dict[str, Any]]:
+        self.handle_command_for_main = self.handle_command
+        return self.daemon_handle_command
 
     def _daemon_get_cloud_status(self) -> dict[str, Any]:
         self.validate_cloud_session_if_needed()

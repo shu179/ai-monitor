@@ -2243,7 +2243,7 @@ class AppRuntime:
                 return
             server = UnixSocketCloudSyncCommandServer(
                 socket_path,
-                command_handler=self._ensure_cloud_runtime_support().handle_command,
+                command_handler=self._ensure_cloud_runtime_support().build_daemon_command_handler(),
             )
             try:
                 server.start()

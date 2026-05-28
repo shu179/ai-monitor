@@ -2824,6 +2824,17 @@ def test_app_cloud_runtime_support_daemon_handles_outbox_diagnostics_locally():
     support.cloud_outbox_diagnostics.assert_called_once_with({"failed_limit": 3})
 
 
+def test_app_cloud_runtime_support_build_daemon_command_handler_refreshes_main_delegate():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+    original_handle = support.handle_command
+
+    handler = support.build_daemon_command_handler()
+
+    assert handler == support.daemon_handle_command
+    assert support.handle_command_for_main == original_handle
+
+
 def test_app_cloud_runtime_support_command_resolves_article_classification_job():
     owner = _support_owner()
     support = AppCloudRuntimeSupport(owner=owner)

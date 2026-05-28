@@ -264,6 +264,44 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertIsNone(runtime._cloud_command_daemon)
         self.assertIsNone(runtime._cloud_command_socket_path)
 
+    def test_app_runtime_start_cloud_command_transport_uses_daemon_handler_for_socket_fallback(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime.config_path = Path("/tmp/aibrandmonitor-config.yaml")
+        runtime._cloud_command_transport_lock = threading.RLock()
+        runtime._cloud_command_client = None
+        runtime._cloud_command_server = None
+        runtime._cloud_command_daemon = None
+        runtime._cloud_command_socket_path = None
+
+        support = Mock()
+        daemon_handler = Mock(return_value={"ok": True})
+        support.build_daemon_command_handler.return_value = daemon_handler
+        fallback_client = Mock()
+        socket_client = Mock()
+        daemon = Mock()
+        daemon.start.side_effect = RuntimeError("child unavailable")
+        server = Mock()
+
+        with (
+            patch("web_backend.create_in_process_cloud_sync_command_client", return_value=fallback_client),
+            patch("web_backend.build_cloud_sync_socket_path", return_value=Path("/tmp/cloud-sync.sock")),
+            patch("web_backend.CloudSyncCommandDaemonProcess", return_value=daemon),
+            patch("web_backend.UnixSocketCloudSyncCommandClient", return_value=socket_client),
+            patch("web_backend.UnixSocketCloudSyncCommandServer", return_value=server) as server_cls,
+        ):
+            runtime._ensure_cloud_runtime_support = Mock(return_value=support)  # type: ignore[method-assign]
+            AppRuntime._start_cloud_command_transport(runtime)
+
+        support.build_daemon_command_handler.assert_called_once_with()
+        server_cls.assert_called_once_with(
+            Path("/tmp/cloud-sync.sock"),
+            command_handler=daemon_handler,
+        )
+        server.start.assert_called_once()
+        self.assertIs(runtime._cloud_command_server, server)
+        self.assertIs(runtime._cloud_command_client, socket_client)
+        self.assertEqual(runtime._cloud_command_transport_mode, "in_process_socket")
+
     def test_app_runtime_stop_cloud_command_transport_cancels_recovery_timer_and_joins_thread(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         runtime._cloud_command_transport_lock = threading.RLock()
