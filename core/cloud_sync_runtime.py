@@ -91,6 +91,7 @@ def create_local_cloud_sync_runtime(
     pull_state_delta: Callable[..., dict[str, Any]] | None = None,
     process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
     retry_object_downloads: Callable[..., dict[str, Any]] | None = None,
+    retry_object_uploads: Callable[..., dict[str, Any]] | None = None,
 ) -> LocalCloudSyncRuntime:
     manager = CloudSyncManager(
         config_getter=config_getter,
@@ -108,6 +109,7 @@ def create_local_cloud_sync_runtime(
         pull_state_delta=pull_state_delta,
         process_state_delta_inbox=process_state_delta_inbox,
         retry_object_downloads=retry_object_downloads,
+        retry_object_uploads=retry_object_uploads,
         upload_burst_interval_seconds=_env_float("AIBRANDMONITOR_CLOUD_UPLOAD_BURST_INTERVAL_SECONDS", 1.0),
         upload_burst_pending_threshold=_env_int("AIBRANDMONITOR_CLOUD_UPLOAD_BURST_PENDING_THRESHOLD", 100),
         logger=logger,

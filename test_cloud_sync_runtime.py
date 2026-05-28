@@ -44,6 +44,7 @@ def test_create_local_cloud_sync_runtime_wires_burst_env(monkeypatch):
             pull_state_delta=lambda _payload=None: {"ok": True},
             process_state_delta_inbox=lambda _payload=None: {"ok": True},
             retry_object_downloads=lambda _payload=None: {"ok": True},
+            retry_object_uploads=lambda _payload=None: {"ok": True},
             logger=lambda _message: None,
         )
 
@@ -54,6 +55,7 @@ def test_create_local_cloud_sync_runtime_wires_burst_env(monkeypatch):
     assert callable(auto_sync_cls.call_args.kwargs["pull_state_delta"])
     assert callable(auto_sync_cls.call_args.kwargs["process_state_delta_inbox"])
     assert callable(auto_sync_cls.call_args.kwargs["retry_object_downloads"])
+    assert callable(auto_sync_cls.call_args.kwargs["retry_object_uploads"])
 
 
 def test_create_in_process_cloud_sync_command_client_wraps_handler():

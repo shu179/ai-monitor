@@ -241,6 +241,85 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
 
             self.assertEqual(outbox.stats()["sent"], 1)
 
+    def test_logged_in_session_retries_object_uploads_after_initial_login(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.example.com",
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+                }
+            )
+            calls: list[dict[str, object]] = []
+            manager = CloudPlatformAutoSync(
+                session_store=store,
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                retry_object_uploads=lambda payload=None: calls.append(dict(payload or {})) or {
+                    "ok": True,
+                    "attempted": 1,
+                    "recovered": 1,
+                    "failed": 0,
+                    "skipped": 0,
+                },
+                event_stream_enabled=False,
+                pull_interval_seconds=3600,
+                idle_interval_seconds=0.2,
+                logger=lambda _message: None,
+            )
+
+            manager.start()
+            try:
+                deadline = time.time() + 2.0
+                while not calls and time.time() < deadline:
+                    time.sleep(0.05)
+            finally:
+                manager.stop()
+
+            self.assertEqual(calls[0]["limit"], 5)
+            self.assertEqual(calls[0]["source"], "auto_sync")
+            status = manager.get_status()
+            self.assertTrue(status["last_object_upload_retry_at"])
+            self.assertEqual(status["last_object_upload_retry_metrics"]["recovered"], 1)
+            self.assertEqual(status["last_object_upload_retry_error"], "")
+
+    def test_object_upload_retry_failure_is_status_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CloudPlatformAutoSync(
+                session_store=CloudSessionStore(Path(tmpdir) / "session.json"),
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                retry_object_uploads=lambda payload=None: {
+                    "ok": False,
+                    "attempted": 1,
+                    "recovered": 0,
+                    "failed": 1,
+                    "skipped": 0,
+                    "message": "upload still unavailable",
+                },
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            result = manager._invoke_object_upload_retry()  # noqa: SLF001
+            manager._update_status(  # noqa: SLF001
+                last_object_upload_retry_metrics={
+                    "attempted": result["attempted"],
+                    "recovered": result["recovered"],
+                    "failed": result["failed"],
+                    "skipped": result["skipped"],
+                },
+                last_object_upload_retry_error=str(result.get("message") or ""),
+            )
+
+            status = manager.get_status()
+            self.assertFalse(result["ok"])
+            self.assertEqual(status["last_object_upload_retry_metrics"]["failed"], 1)
+            self.assertEqual(status["last_object_upload_retry_error"], "upload still unavailable")
+            self.assertEqual(status["last_error"], "")
+
     def test_upload_backpressure_pauses_flush_until_retry_after(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = CloudSessionStore(Path(tmpdir) / "session.json")

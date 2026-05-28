@@ -71,6 +71,8 @@ class CloudPlatformAutoSync:
         pull_state_delta: Callable[..., dict[str, Any]] | None = None,
         process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
         retry_object_downloads: Callable[..., dict[str, Any]] | None = None,
+        retry_object_uploads: Callable[..., dict[str, Any]] | None = None,
+        object_upload_retry_interval_seconds: float = 60.0,
         client_factory: Callable[[str], SurfacedCloudClient] | None = None,
         logger: Callable[[str], None] | None = None,
     ) -> None:
@@ -79,6 +81,7 @@ class CloudPlatformAutoSync:
         self._pull_state_delta = pull_state_delta
         self._process_state_delta_inbox = process_state_delta_inbox
         self._retry_object_downloads = retry_object_downloads
+        self._retry_object_uploads = retry_object_uploads
         self._session_store = session_store or CloudSessionStore()
         self._outbox = outbox or CloudOutbox()
         self._upload_retry_interval_seconds = max(5.0, float(upload_retry_interval_seconds or 20.0))
@@ -91,6 +94,10 @@ class CloudPlatformAutoSync:
             _env_int("AIBRANDMONITOR_CLOUD_UPLOAD_BURST_PENDING_THRESHOLD", upload_burst_pending_threshold),
         )
         self._pull_interval_seconds = max(30.0, float(pull_interval_seconds or 300.0))
+        self._object_upload_retry_interval_seconds = max(
+            5.0,
+            _env_float("AIBRANDMONITOR_CLOUD_OBJECT_UPLOAD_RETRY_INTERVAL_SECONDS", object_upload_retry_interval_seconds),
+        )
         self._idle_interval_seconds = max(0.2, float(idle_interval_seconds or 1.0))
         self._event_stream_enabled = bool(event_stream_enabled)
         self._event_reconnect_seconds = max(1.0, float(event_reconnect_seconds or 5.0))
@@ -110,6 +117,7 @@ class CloudPlatformAutoSync:
         self._event_thread: threading.Thread | None = None
         self._last_upload_started_at = 0.0
         self._last_pull_started_at = 0.0
+        self._last_object_upload_retry_started_at = 0.0
         self._last_logged_in_key = ""
         self._last_error_log_text = ""
         self._last_error_log_at = 0.0
@@ -138,6 +146,9 @@ class CloudPlatformAutoSync:
             "last_state_delta_metrics": {},
             "last_state_delta_inbox_metrics": {},
             "last_object_download_retry_metrics": {},
+            "last_object_upload_retry_at": "",
+            "last_object_upload_retry_metrics": {},
+            "last_object_upload_retry_error": "",
             "last_state_delta_error": "",
             "state_delta_backpressure_until": "",
             "state_delta_backpressure_retry_after_seconds": 0.0,
@@ -186,10 +197,12 @@ class CloudPlatformAutoSync:
         pull_state_delta: Callable[..., dict[str, Any]] | None = None,
         process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
         retry_object_downloads: Callable[..., dict[str, Any]] | None = None,
+        retry_object_uploads: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self._pull_state_delta = pull_state_delta
         self._process_state_delta_inbox = process_state_delta_inbox
         self._retry_object_downloads = retry_object_downloads
+        self._retry_object_uploads = retry_object_uploads
 
     def _update_status(self, **patch: Any) -> None:
         with self._lock:
@@ -390,6 +403,7 @@ class CloudPlatformAutoSync:
                     self._last_logged_in_key = login_key
                     self._last_upload_started_at = 0.0
                     self._last_pull_started_at = 0.0
+                    self._last_object_upload_retry_started_at = 0.0
                     self._clear_upload_backpressure()
                     self._update_status(
                         startup_recovery_running=True,
@@ -448,6 +462,31 @@ class CloudPlatformAutoSync:
                             last_upload_metrics=upload_metrics,
                         )
                         self._record_error(str(upload_result.get("message") or "运行数据自动上传失败"))
+
+                object_upload_retry_result: dict[str, Any] | None = None
+                if (
+                    callable(self._retry_object_uploads)
+                    and (
+                        first_sync_for_login
+                        or self._last_object_upload_retry_started_at <= 0
+                        or now - self._last_object_upload_retry_started_at >= self._object_upload_retry_interval_seconds
+                    )
+                ):
+                    self._last_object_upload_retry_started_at = now
+                    object_upload_retry_result = self._invoke_object_upload_retry()
+                    if object_upload_retry_result.get("ok"):
+                        self._update_status(
+                            last_object_upload_retry_at=local_now().isoformat(timespec="seconds"),
+                            last_object_upload_retry_metrics=_object_upload_retry_metrics(object_upload_retry_result),
+                            last_object_upload_retry_error="",
+                        )
+                    else:
+                        self._update_status(
+                            last_object_upload_retry_metrics=_object_upload_retry_metrics(object_upload_retry_result),
+                            last_object_upload_retry_error=str(
+                                object_upload_retry_result.get("message") or "对象上传恢复失败"
+                            ),
+                        )
 
                 pull_result: dict[str, Any] | None = None
                 state_delta_result: dict[str, Any] | None = None
@@ -648,6 +687,18 @@ class CloudPlatformAutoSync:
             return self._pull_tasks(force=True)
         return self._pull_tasks()
 
+    def _invoke_object_upload_retry(self) -> dict[str, Any]:
+        retry_uploads_handler = self._retry_object_uploads
+        if not callable(retry_uploads_handler):
+            return {"ok": True, "message": "", "skipped": True}
+        try:
+            return _invoke_optional_payload_callback(
+                retry_uploads_handler,
+                {"limit": 5, "source": "auto_sync"},
+            )
+        except Exception as exc:
+            return {"ok": False, "message": f"对象上传恢复失败：{exc}"}
+
     def _invoke_state_delta_pipeline(self) -> dict[str, Any]:
         pull_handler = self._pull_state_delta
         process_handler = self._process_state_delta_inbox
@@ -835,6 +886,19 @@ def _state_delta_inbox_metrics(result: dict[str, Any]) -> dict[str, Any]:
 
 def _object_download_retry_metrics(result: dict[str, Any]) -> dict[str, Any]:
     payload = result.get("object_download_retry") if isinstance(result.get("object_download_retry"), dict) else result
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "ok": bool(payload.get("ok", True)),
+        "attempted": _safe_int(payload.get("attempted")),
+        "recovered": _safe_int(payload.get("recovered")),
+        "failed": _safe_int(payload.get("failed")),
+        "skipped": _safe_int(payload.get("skipped")),
+    }
+
+
+def _object_upload_retry_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    payload = result.get("object_upload_retry") if isinstance(result.get("object_upload_retry"), dict) else result
     if not isinstance(payload, dict):
         return {}
     return {
