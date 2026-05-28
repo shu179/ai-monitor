@@ -36,6 +36,7 @@ DEFAULT_TOTAL_OBJECT_QUOTA_BYTES = 10 * 1024 * 1024 * 1024
 DEFAULT_WORKSPACE_OBJECT_QUOTA_BYTES = 5 * 1024 * 1024 * 1024
 DEFAULT_MAX_FILE_BYTES = 512 * 1024 * 1024
 DEFAULT_MIN_FREE_BYTES = 8 * 1024 * 1024 * 1024
+CONTENT_MAGIC_SAMPLE_BYTES = 512
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ALLOWED_CONTENT_TYPES = {
@@ -203,6 +204,7 @@ async def store_local_object_upload_content(
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + f".tmp-{uuid4().hex}")
     digest = hashlib.sha256()
+    magic_sample = bytearray()
     actual_size = 0
     try:
         with tmp_path.open("wb") as handle:
@@ -214,6 +216,9 @@ async def store_local_object_upload_content(
                     raise ObjectStorageError(f"upload size exceeds expected {expected_size}")
                 if actual_size > _max_file_bytes(settings):
                     raise ObjectStorageQuotaExceeded("object exceeds local max file size")
+                if len(magic_sample) < CONTENT_MAGIC_SAMPLE_BYTES:
+                    remaining_sample_bytes = CONTENT_MAGIC_SAMPLE_BYTES - len(magic_sample)
+                    magic_sample.extend(chunk[:remaining_sample_bytes])
                 digest.update(chunk)
                 handle.write(chunk)
                 _enforce_local_disk_headroom(max(0, expected_size - actual_size), settings=settings)
@@ -221,6 +226,7 @@ async def store_local_object_upload_content(
             raise ObjectStorageError(f"upload size mismatch: expected {expected_size}, got {actual_size}")
         if digest.hexdigest() != str(upload_session.sha256):
             raise ObjectStorageError("upload sha256 mismatch")
+        _validate_content_magic(str(upload_session.content_type), bytes(magic_sample))
         os.replace(tmp_path, path)
     finally:
         if tmp_path.exists():
@@ -478,6 +484,34 @@ def normalize_compression(value: str | None, *, content_type: str, size_bytes: i
     if text not in {"none", "zstd"}:
         raise ObjectStorageError("compression must be none, zstd, or auto")
     return text
+
+
+def _validate_content_magic(content_type: str, sample: bytes) -> None:
+    safe_content_type = normalize_content_type(content_type)
+    payload = bytes(sample or b"")
+    mismatch = False
+    if safe_content_type == "image/png":
+        mismatch = not payload.startswith(b"\x89PNG\r\n\x1a\n")
+    elif safe_content_type == "image/jpeg":
+        mismatch = not payload.startswith(b"\xff\xd8\xff")
+    elif safe_content_type == "image/gif":
+        mismatch = not (payload.startswith(b"GIF87a") or payload.startswith(b"GIF89a"))
+    elif safe_content_type == "image/webp":
+        mismatch = len(payload) < 12 or not (payload.startswith(b"RIFF") and payload[8:12] == b"WEBP")
+    elif safe_content_type == "application/pdf":
+        mismatch = not payload.lstrip().startswith(b"%PDF-")
+    elif safe_content_type == "application/zstd":
+        mismatch = not payload.startswith(b"\x28\xb5\x2f\xfd")
+    elif safe_content_type in {"text/csv", "text/markdown", "text/plain", "application/json", "application/x-ndjson"}:
+        mismatch = b"\x00" in payload
+
+    if mismatch:
+        logger.warning(
+            "[ObjectStorage] reject_upload reason=content_type_mismatch content_type=%s sample_bytes=%s",
+            safe_content_type,
+            len(payload),
+        )
+        raise ObjectStorageError("upload content does not match declared content_type")
 
 
 def object_storage_client(settings: Settings | None = None) -> "S3CompatibleObjectStorageClient":

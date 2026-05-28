@@ -15,6 +15,7 @@ from app.services.object_storage_service import (  # noqa: E402
     INLINE_STRATEGY,
     MULTIPART_STRATEGY,
     SINGLE_PUT_STRATEGY,
+    ObjectStorageError,
     ObjectStorageQuotaExceeded,
     S3CompatibleObjectStorageClient,
     LocalDiskObjectStorageClient,
@@ -363,6 +364,94 @@ class ObjectUploadFlowTests(unittest.TestCase):
             self.assertGreaterEqual(len(calls), 2)
             self.assertFalse(list(Path(tmp).rglob("*.tmp-*")))
             self.assertFalse((Path(tmp) / f"7/{sha[:2]}/{sha[2:4]}/{sha}").exists())
+
+    def test_local_upload_rejects_content_type_magic_mismatch_and_cleans_tmp(self) -> None:
+        from app.models import ObjectUploadSession
+
+        body = b"not a png file"
+        sha = __import__("hashlib").sha256(body).hexdigest()
+        user = SimpleNamespace(workspace_id=7)
+        upload_session = ObjectUploadSession(
+            id="session-1",
+            workspace_id=7,
+            sha256=sha,
+            size_bytes=len(body),
+            content_type="image/png",
+            storage_provider_upload_id="local:upload-1",
+            status="initiated",
+            part_size_bytes=LIMITS["multipart_part_bytes"],
+            parts_total=1,
+            parts_completed=0,
+            expires_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+            + __import__("datetime").timedelta(minutes=10),
+        )
+        db = MagicMock()
+        db.scalar.return_value = upload_session
+
+        async def chunks():
+            yield body
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings_with_local_dir(tmp)
+            with patch("app.services.object_storage_service.get_settings", return_value=settings):
+                with self.assertLogs("app.services.object_storage_service", level="WARNING") as logs:
+                    with self.assertRaises(ObjectStorageError):
+                        __import__("asyncio").run(
+                            store_local_object_upload_content(
+                                db,
+                                user,  # type: ignore[arg-type]
+                                session_id="session-1",
+                                chunks=chunks(),
+                            )
+                        )
+
+            self.assertTrue(any("reason=content_type_mismatch" in line for line in logs.output))
+            self.assertFalse(list(Path(tmp).rglob("*.tmp-*")))
+            self.assertFalse((Path(tmp) / f"7/{sha[:2]}/{sha[2:4]}/{sha}").exists())
+
+    def test_local_upload_accepts_matching_image_magic(self) -> None:
+        from app.models import ObjectUploadSession
+
+        body = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        sha = __import__("hashlib").sha256(body).hexdigest()
+        user = SimpleNamespace(workspace_id=7)
+        upload_session = ObjectUploadSession(
+            id="session-1",
+            workspace_id=7,
+            sha256=sha,
+            size_bytes=len(body),
+            content_type="image/png",
+            storage_provider_upload_id="local:upload-1",
+            status="initiated",
+            part_size_bytes=LIMITS["multipart_part_bytes"],
+            parts_total=1,
+            parts_completed=0,
+            expires_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+            + __import__("datetime").timedelta(minutes=10),
+        )
+        db = MagicMock()
+        db.scalar.side_effect = [upload_session, upload_session, None, 0, 0]
+        db.refresh.side_effect = lambda _obj: None
+
+        async def chunks():
+            yield body[:4]
+            yield body[4:]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings_with_local_dir(tmp)
+            with patch("app.services.object_storage_service.get_settings", return_value=settings):
+                result = __import__("asyncio").run(
+                    store_local_object_upload_content(
+                        db,
+                        user,  # type: ignore[arg-type]
+                        session_id="session-1",
+                        chunks=chunks(),
+                    )
+                )
+
+            expected_path = Path(tmp) / f"7/{sha[:2]}/{sha[2:4]}/{sha}"
+            self.assertEqual(expected_path.read_bytes(), body)
+            self.assertEqual(result["content_type"], "image/png")
 
 
 if __name__ == "__main__":
