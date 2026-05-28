@@ -47,8 +47,10 @@ class CloudObjectTransferStore:
         object_id: str = "",
         sha256: str = "",
         size_bytes: int = 0,
+        storage_size_bytes: int = 0,
         path: str = "",
         content_type: str = "",
+        compression: str = "",
         trace_id: str = "",
     ) -> dict[str, Any]:
         safe_transfer_id = str(transfer_id or "").strip()
@@ -60,18 +62,21 @@ class CloudObjectTransferStore:
             conn.execute(
                 """
                 INSERT INTO object_transfers(
-                    transfer_id, direction, object_id, sha256, size_bytes, path,
-                    content_type, status, attempts, trace_id, last_error,
+                    transfer_id, direction, object_id, sha256, size_bytes,
+                    storage_size_bytes, path, content_type, compression,
+                    status, attempts, trace_id, last_error,
                     started_at, updated_at, completed_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, 'running', 1, ?, '', ?, ?, '')
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 1, ?, '', ?, ?, '')
                 ON CONFLICT(transfer_id) DO UPDATE SET
                     direction=excluded.direction,
                     object_id=excluded.object_id,
                     sha256=excluded.sha256,
                     size_bytes=excluded.size_bytes,
+                    storage_size_bytes=excluded.storage_size_bytes,
                     path=excluded.path,
                     content_type=excluded.content_type,
+                    compression=excluded.compression,
                     status='running',
                     attempts=object_transfers.attempts + 1,
                     trace_id=excluded.trace_id,
@@ -85,8 +90,10 @@ class CloudObjectTransferStore:
                     str(object_id or "").strip(),
                     str(sha256 or "").strip(),
                     max(0, int(size_bytes or 0)),
+                    max(0, int(storage_size_bytes or 0)),
                     str(path or "").strip(),
                     str(content_type or "").strip(),
+                    str(compression or "").strip(),
                     str(trace_id or "").strip(),
                     now,
                     now,
@@ -123,6 +130,52 @@ class CloudObjectTransferStore:
             )
         return {"ok": int(cursor.rowcount or 0) > 0, "transfer_id": safe_transfer_id, "status": safe_status}
 
+    def update_transfer_metadata(
+        self,
+        transfer_id: str,
+        *,
+        object_id: str = "",
+        sha256: str = "",
+        size_bytes: int | None = None,
+        storage_size_bytes: int | None = None,
+        path: str = "",
+        content_type: str = "",
+        compression: str = "",
+    ) -> dict[str, Any]:
+        safe_transfer_id = str(transfer_id or "").strip()
+        if not safe_transfer_id:
+            return {"ok": False, "message": "transfer_id is required"}
+        now = local_now().isoformat(timespec="seconds")
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE object_transfers
+                SET object_id = COALESCE(NULLIF(?, ''), object_id),
+                    sha256 = COALESCE(NULLIF(?, ''), sha256),
+                    size_bytes = CASE WHEN ? >= 0 THEN ? ELSE size_bytes END,
+                    storage_size_bytes = CASE WHEN ? >= 0 THEN ? ELSE storage_size_bytes END,
+                    path = COALESCE(NULLIF(?, ''), path),
+                    content_type = COALESCE(NULLIF(?, ''), content_type),
+                    compression = COALESCE(NULLIF(?, ''), compression),
+                    updated_at = ?
+                WHERE transfer_id = ?
+                """,
+                (
+                    str(object_id or "").strip(),
+                    str(sha256 or "").strip(),
+                    int(size_bytes) if size_bytes is not None else -1,
+                    max(0, int(size_bytes or 0)),
+                    int(storage_size_bytes) if storage_size_bytes is not None else -1,
+                    max(0, int(storage_size_bytes or 0)),
+                    str(path or "").strip(),
+                    str(content_type or "").strip(),
+                    str(compression or "").strip(),
+                    now,
+                    safe_transfer_id,
+                ),
+            )
+        return {"ok": int(cursor.rowcount or 0) > 0, "transfer_id": safe_transfer_id}
+
     def fail_transfer(self, transfer_id: str, message: str) -> dict[str, Any]:
         safe_transfer_id = str(transfer_id or "").strip()
         if not safe_transfer_id:
@@ -156,7 +209,8 @@ class CloudObjectTransferStore:
             newest = conn.execute(
                 """
                 SELECT transfer_id, direction, status, object_id, sha256, size_bytes,
-                       path, content_type, attempts, updated_at, last_error
+                       storage_size_bytes, path, content_type, compression,
+                       attempts, updated_at, last_error
                 FROM object_transfers
                 ORDER BY updated_at DESC, transfer_id DESC
                 LIMIT 10
@@ -165,7 +219,8 @@ class CloudObjectTransferStore:
             failed = conn.execute(
                 """
                 SELECT transfer_id, direction, status, object_id, sha256, size_bytes,
-                       path, content_type, attempts, updated_at, last_error
+                       storage_size_bytes, path, content_type, compression,
+                       attempts, updated_at, last_error
                 FROM object_transfers
                 WHERE status = 'failed'
                 ORDER BY updated_at DESC, transfer_id DESC
@@ -219,7 +274,8 @@ class CloudObjectTransferStore:
             rows = conn.execute(
                 f"""
                 SELECT transfer_id, direction, status, object_id, sha256, size_bytes,
-                       path, content_type, attempts, updated_at, last_error
+                       storage_size_bytes, path, content_type, compression,
+                       attempts, updated_at, last_error
                 FROM object_transfers
                 WHERE (
                     (status = 'failed' AND attempts < ?)
@@ -263,8 +319,10 @@ class CloudObjectTransferStore:
                     object_id TEXT NOT NULL,
                     sha256 TEXT NOT NULL,
                     size_bytes INTEGER NOT NULL DEFAULT 0,
+                    storage_size_bytes INTEGER NOT NULL DEFAULT 0,
                     path TEXT NOT NULL,
                     content_type TEXT NOT NULL,
+                    compression TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     trace_id TEXT NOT NULL DEFAULT '',
@@ -275,6 +333,8 @@ class CloudObjectTransferStore:
                 )
                 """
             )
+            _ensure_object_transfer_column(conn, "storage_size_bytes", "INTEGER NOT NULL DEFAULT 0")
+            _ensure_object_transfer_column(conn, "compression", "TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_object_transfers_status_updated
@@ -313,9 +373,17 @@ def _row_public(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
         "object_id": str(row[3] or ""),
         "sha256": str(row[4] or ""),
         "size_bytes": int(row[5] or 0),
-        "path": str(row[6] or ""),
-        "content_type": str(row[7] or ""),
-        "attempts": int(row[8] or 0),
-        "updated_at": str(row[9] or ""),
-        "last_error": str(row[10] or ""),
+        "storage_size_bytes": int(row[6] or 0),
+        "path": str(row[7] or ""),
+        "content_type": str(row[8] or ""),
+        "compression": str(row[9] or ""),
+        "attempts": int(row[10] or 0),
+        "updated_at": str(row[11] or ""),
+        "last_error": str(row[12] or ""),
     }
+
+
+def _ensure_object_transfer_column(conn: sqlite3.Connection, name: str, definition: str) -> None:
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(object_transfers)").fetchall()}
+    if name not in columns:
+        conn.execute(f"ALTER TABLE object_transfers ADD COLUMN {name} {definition}")

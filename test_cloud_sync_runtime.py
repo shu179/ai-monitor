@@ -1757,6 +1757,65 @@ def test_app_cloud_runtime_support_cache_object_records_failed_transfer():
     assert diagnostics["failed"][0]["last_error"] == "download unavailable"
 
 
+def test_app_cloud_runtime_support_records_download_metadata_before_cache_failure():
+    owner = _support_owner()
+    data = b"bad compressed bytes"
+    sha256 = "d" * 64
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+
+    class FakeClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        def create_object_download(self, _token: str, object_id: str, *, trace_id: str = ""):
+            return {
+                "object_id": object_id,
+                "download_url": "/api/v2/objects/object-1/content",
+                "size_bytes": 100,
+                "storage_size_bytes": len(data),
+                "content_type": "text/plain",
+                "compression": "zstd",
+            }
+
+        def iter_object_content(self, _token: str, _download_url: str, *, trace_id: str = ""):
+            return iter([data])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = CloudObjectCache(Path(tmp) / "cache")
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            request_client_factory=FakeClient,
+            object_cache_factory=lambda: cache,
+            object_transfer_store_factory=lambda: transfer_store,
+        )
+
+        result = support.handle_command(
+            "cloud.cache_object",
+            {
+                "trace_id": "download-zstd-fail",
+                "object_ref": {
+                    "object_id": "object-1",
+                    "sha256": sha256,
+                    "size_bytes": 100,
+                    "content_type": "text/plain",
+                },
+            },
+        )
+        diagnostics = transfer_store.diagnostics()
+
+    assert result["ok"] is False
+    assert diagnostics["failed"][0]["compression"] == "zstd"
+    assert diagnostics["failed"][0]["storage_size_bytes"] == len(data)
+
+
 def test_app_cloud_runtime_support_lists_object_transfer_retry_candidates():
     owner = _support_owner()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1834,6 +1893,75 @@ def test_app_cloud_runtime_support_retries_failed_object_downloads():
     assert result["recovered"] == 1
     assert diagnostics["by_status"] == {"completed": 1}
     assert cached["valid"] is True
+
+
+def test_app_cloud_runtime_support_retries_failed_zstd_object_downloads_with_transfer_metadata():
+    import compression.zstd as zstd
+
+    owner = _support_owner()
+    data = b"retry compressed object bytes" * 20
+    compressed = zstd.compress(data)
+    sha256 = hashlib.sha256(data).hexdigest()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+
+    class FakeClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        def create_object_download(self, _token: str, object_id: str, *, trace_id: str = ""):
+            assert object_id == "object-1"
+            assert trace_id == "download-zstd-1"
+            return {
+                "object_id": object_id,
+                "download_url": "/api/v2/objects/object-1/content",
+                "size_bytes": len(data),
+                "storage_size_bytes": len(compressed),
+                "content_type": "text/plain",
+                "compression": "zstd",
+            }
+
+        def iter_object_content(self, _token: str, _download_url: str, *, trace_id: str = ""):
+            return iter([compressed[:5], compressed[5:]])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = CloudObjectCache(Path(tmp) / "cache")
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        transfer_store.start_transfer(
+            transfer_id="download-zstd-1",
+            direction="download",
+            object_id="object-1",
+            sha256=sha256,
+            size_bytes=len(data),
+            storage_size_bytes=len(compressed),
+            content_type="text/plain",
+            compression="zstd",
+        )
+        transfer_store.fail_transfer("download-zstd-1", "temporary")
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            request_client_factory=FakeClient,
+            object_cache_factory=lambda: cache,
+            object_transfer_store_factory=lambda: transfer_store,
+        )
+
+        result = support.handle_command("cloud.retry_object_downloads", {"limit": 5})
+        cached = cache.cached_object({"sha256": sha256, "size_bytes": len(data)})
+        diagnostics = transfer_store.diagnostics()
+        cached_bytes = Path(cached["path"]).read_bytes()
+
+    assert result["ok"] is True
+    assert result["recovered"] == 1
+    assert cached["valid"] is True
+    assert cached_bytes == data
+    assert diagnostics["newest"][0]["compression"] == "zstd"
+    assert diagnostics["newest"][0]["storage_size_bytes"] == len(compressed)
 
 
 def test_app_cloud_runtime_support_retry_object_downloads_skips_uploads():

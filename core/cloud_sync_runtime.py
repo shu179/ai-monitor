@@ -933,7 +933,9 @@ class AppCloudRuntimeSupport:
             object_id=object_id,
             sha256=str(object_ref.get("sha256") or ""),
             size_bytes=_safe_int(object_ref.get("size_bytes"), 0),
+            storage_size_bytes=_safe_int(object_ref.get("storage_size_bytes"), 0),
             content_type=str(object_ref.get("content_type") or ""),
+            compression=str(object_ref.get("compression") or ""),
             trace_id=trace_id,
         )
 
@@ -944,8 +946,17 @@ class AppCloudRuntimeSupport:
                 raise CloudClientError("object download_url missing")
             merged_ref = dict(object_ref)
             for key in ("size_bytes", "storage_size_bytes", "content_type", "compression"):
-                if not merged_ref.get(key) and download.get(key) is not None:
+                if download.get(key) not in (None, ""):
                     merged_ref[key] = download.get(key)
+            transfer_store.update_transfer_metadata(
+                transfer_id,
+                object_id=object_id,
+                sha256=str(merged_ref.get("sha256") or ""),
+                size_bytes=_safe_int(merged_ref.get("size_bytes"), 0),
+                storage_size_bytes=_safe_int(merged_ref.get("storage_size_bytes"), 0),
+                content_type=str(merged_ref.get("content_type") or ""),
+                compression=str(merged_ref.get("compression") or ""),
+            )
             cached_result = cache.cache_bytes(
                 merged_ref,
                 client.iter_object_content(token, download_url, trace_id=trace_id),
@@ -1031,7 +1042,9 @@ class AppCloudRuntimeSupport:
                         "object_id": object_id,
                         "sha256": sha256,
                         "size_bytes": _safe_int(item.get("size_bytes"), 0),
+                        "storage_size_bytes": _safe_int(item.get("storage_size_bytes"), 0),
                         "content_type": str(item.get("content_type") or ""),
+                        "compression": str(item.get("compression") or ""),
                     },
                     "force": True,
                 }

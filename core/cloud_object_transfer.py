@@ -50,8 +50,10 @@ def upload_cloud_object_file(
             direction="upload",
             sha256=sha256,
             size_bytes=size,
+            storage_size_bytes=size,
             path=str(path),
             content_type=content_type,
+            compression=compression,
             trace_id=trace_id,
         )
     try:
