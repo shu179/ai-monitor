@@ -70,6 +70,7 @@ class CloudPlatformAutoSync:
         event_reconnect_jitter_ratio: float = 0.2,
         pull_state_delta: Callable[..., dict[str, Any]] | None = None,
         process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
+        retry_object_downloads: Callable[..., dict[str, Any]] | None = None,
         client_factory: Callable[[str], SurfacedCloudClient] | None = None,
         logger: Callable[[str], None] | None = None,
     ) -> None:
@@ -77,6 +78,7 @@ class CloudPlatformAutoSync:
         self._recover_upload_candidates = recover_upload_candidates
         self._pull_state_delta = pull_state_delta
         self._process_state_delta_inbox = process_state_delta_inbox
+        self._retry_object_downloads = retry_object_downloads
         self._session_store = session_store or CloudSessionStore()
         self._outbox = outbox or CloudOutbox()
         self._upload_retry_interval_seconds = max(5.0, float(upload_retry_interval_seconds or 20.0))
@@ -135,6 +137,7 @@ class CloudPlatformAutoSync:
             "last_state_delta_at": "",
             "last_state_delta_metrics": {},
             "last_state_delta_inbox_metrics": {},
+            "last_object_download_retry_metrics": {},
             "last_state_delta_error": "",
             "state_delta_backpressure_until": "",
             "state_delta_backpressure_retry_after_seconds": 0.0,
@@ -182,9 +185,11 @@ class CloudPlatformAutoSync:
         *,
         pull_state_delta: Callable[..., dict[str, Any]] | None = None,
         process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
+        retry_object_downloads: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self._pull_state_delta = pull_state_delta
         self._process_state_delta_inbox = process_state_delta_inbox
+        self._retry_object_downloads = retry_object_downloads
 
     def _update_status(self, **patch: Any) -> None:
         with self._lock:
@@ -646,17 +651,20 @@ class CloudPlatformAutoSync:
     def _invoke_state_delta_pipeline(self) -> dict[str, Any]:
         pull_handler = self._pull_state_delta
         process_handler = self._process_state_delta_inbox
+        retry_downloads_handler = self._retry_object_downloads
         backpressure_active = self._refresh_state_delta_backpressure_status()
         if not callable(pull_handler) and not callable(process_handler):
             result = {"ok": True, "message": "", "skipped": True}
             self._update_status(
                 last_state_delta_metrics={},
                 last_state_delta_inbox_metrics={},
+                last_object_download_retry_metrics={},
                 last_state_delta_error="",
             )
             return result
         pull_result: dict[str, Any] = {"ok": True, "message": "", "skipped": True}
         process_result: dict[str, Any] = {"ok": True, "message": "", "skipped": True}
+        retry_downloads_result: dict[str, Any] = {"ok": True, "message": "", "skipped": True}
         if callable(pull_handler) and not backpressure_active:
             try:
                 pull_result = _invoke_optional_payload_callback(
@@ -678,6 +686,14 @@ class CloudPlatformAutoSync:
                 )
             except Exception as exc:
                 process_result = {"ok": False, "message": f"state-delta inbox 处理失败：{exc}"}
+        if pull_result.get("ok") and process_result.get("ok") and callable(retry_downloads_handler):
+            try:
+                retry_downloads_result = _invoke_optional_payload_callback(
+                    retry_downloads_handler,
+                    {"limit": 20, "source": "auto_sync"},
+                )
+            except Exception as exc:
+                retry_downloads_result = {"ok": False, "message": f"对象下载恢复失败：{exc}"}
 
         ok = bool(pull_result.get("ok")) and bool(process_result.get("ok"))
         message = "" if ok else str(process_result.get("message") or pull_result.get("message") or "state-delta 自动下放失败")
@@ -685,6 +701,7 @@ class CloudPlatformAutoSync:
             last_state_delta_at=local_now().isoformat(timespec="seconds") if ok else self.get_status().get("last_state_delta_at", ""),
             last_state_delta_metrics=pull_metrics,
             last_state_delta_inbox_metrics=_state_delta_inbox_metrics(process_result),
+            last_object_download_retry_metrics=_object_download_retry_metrics(retry_downloads_result),
             last_state_delta_error=message,
         )
         return {
@@ -692,6 +709,7 @@ class CloudPlatformAutoSync:
             "message": message,
             "state_delta": pull_result,
             "state_delta_inbox": process_result,
+            "object_download_retry": retry_downloads_result,
         }
 
 
@@ -812,6 +830,19 @@ def _state_delta_inbox_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "failed": _safe_int(payload.get("failed")),
         "skipped_no_applier": _safe_int(payload.get("skipped_no_applier")),
         "streams": dict(payload.get("streams") if isinstance(payload.get("streams"), dict) else {}),
+    }
+
+
+def _object_download_retry_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    payload = result.get("object_download_retry") if isinstance(result.get("object_download_retry"), dict) else result
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "ok": bool(payload.get("ok", True)),
+        "attempted": _safe_int(payload.get("attempted")),
+        "recovered": _safe_int(payload.get("recovered")),
+        "failed": _safe_int(payload.get("failed")),
+        "skipped": _safe_int(payload.get("skipped")),
     }
 
 

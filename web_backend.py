@@ -2075,6 +2075,7 @@ class AppRuntime:
         self._cloud_platform_auto_sync.set_state_delta_handlers(
             pull_state_delta=self._cloud_runtime_support.pull_cloud_state_delta,
             process_state_delta_inbox=self._cloud_runtime_support.process_cloud_state_delta_inbox,
+            retry_object_downloads=self._cloud_runtime_support.retry_object_downloads,
         )
         self._cloud_command_transport_lock = threading.RLock()
         self._cloud_command_socket_path: Path | None = None
@@ -2112,6 +2113,7 @@ class AppRuntime:
             platform_auto_sync.set_state_delta_handlers(
                 pull_state_delta=support.pull_cloud_state_delta,
                 process_state_delta_inbox=support.process_cloud_state_delta_inbox,
+                retry_object_downloads=support.retry_object_downloads,
             )
         return support
 

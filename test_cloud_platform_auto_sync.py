@@ -161,12 +161,17 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
                     "streams": {"tasks": {"applied": 1}, "runs": {"applied": 1}},
                 }
 
+            def retry_downloads(payload):
+                calls.append(("retry_downloads", dict(payload or {})))
+                return {"ok": True, "attempted": 1, "recovered": 1, "failed": 0, "skipped": 0}
+
             manager = CloudPlatformAutoSync(
                 session_store=store,
                 outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
                 pull_tasks=lambda: {"ok": True},
                 pull_state_delta=pull_state_delta,
                 process_state_delta_inbox=process_inbox,
+                retry_object_downloads=retry_downloads,
                 event_stream_enabled=False,
                 logger=lambda _message: None,
             )
@@ -174,18 +179,21 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             manager.start()
             try:
                 deadline = time.time() + 2.0
-                while len(calls) < 2 and time.time() < deadline:
+                while len(calls) < 3 and time.time() < deadline:
                     time.sleep(0.05)
             finally:
                 manager.stop()
 
-            self.assertEqual([item[0] for item in calls], ["pull_delta", "process_inbox"])
+            self.assertEqual([item[0] for item in calls], ["pull_delta", "process_inbox", "retry_downloads"])
             self.assertEqual(calls[0][1]["source"], "auto_sync")
             self.assertEqual(calls[1][1]["limit"], 500)
+            self.assertEqual(calls[2][1]["limit"], 20)
+            self.assertEqual(calls[2][1]["source"], "auto_sync")
             status = manager.get_status()
             self.assertTrue(status["last_state_delta_at"])
             self.assertEqual(status["last_state_delta_metrics"]["changes"], 2)
             self.assertEqual(status["last_state_delta_inbox_metrics"]["applied"], 2)
+            self.assertEqual(status["last_object_download_retry_metrics"]["recovered"], 1)
             self.assertEqual(status["last_state_delta_error"], "")
 
     def test_outbox_enqueue_wakes_upload_without_retry_delay(self):
@@ -570,6 +578,60 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
 
             self.assertEqual(calls, ["pull", "state_delta", "process"])
             self.assertEqual(manager.get_status()["last_state_delta_inbox_metrics"]["applied"], 1)
+
+    def test_object_download_retry_failure_does_not_fail_state_delta_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CloudPlatformAutoSync(
+                session_store=CloudSessionStore(Path(tmpdir) / "session.json"),
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                pull_state_delta=lambda _payload=None: {"ok": True, "changes": 1},
+                process_state_delta_inbox=lambda _payload=None: {"ok": True, "applied": 1},
+                retry_object_downloads=lambda _payload=None: {
+                    "ok": False,
+                    "attempted": 1,
+                    "recovered": 0,
+                    "failed": 1,
+                    "skipped": 0,
+                    "message": "temporary download failure",
+                },
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            result = manager._invoke_state_delta_pipeline()  # noqa: SLF001
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["object_download_retry"]["ok"])
+            status = manager.get_status()
+            self.assertEqual(status["last_state_delta_error"], "")
+            self.assertEqual(status["last_state_delta_inbox_metrics"]["applied"], 1)
+            self.assertEqual(status["last_object_download_retry_metrics"]["failed"], 1)
+
+    def test_object_download_retry_exception_does_not_fail_state_delta_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            def retry_downloads(_payload=None):
+                raise RuntimeError("network still down")
+
+            manager = CloudPlatformAutoSync(
+                session_store=CloudSessionStore(Path(tmpdir) / "session.json"),
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                pull_state_delta=lambda _payload=None: {"ok": True, "changes": 1},
+                process_state_delta_inbox=lambda _payload=None: {"ok": True, "applied": 1},
+                retry_object_downloads=retry_downloads,
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            result = manager._invoke_state_delta_pipeline()  # noqa: SLF001
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["object_download_retry"]["ok"])
+            self.assertIn("对象下载恢复失败", result["object_download_retry"]["message"])
+            status = manager.get_status()
+            self.assertEqual(status["last_state_delta_error"], "")
+            self.assertEqual(status["last_object_download_retry_metrics"]["failed"], 0)
 
     def test_state_delta_backpressure_skips_remote_pull_but_processes_inbox(self):
         with tempfile.TemporaryDirectory() as tmpdir:
