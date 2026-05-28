@@ -1982,6 +1982,7 @@ def _cloud_sync_health_summary(
     backpressure_until = str(auto_sync.get("upload_backpressure_until") or "")
     object_download_retry_backpressure_until = str(auto_sync.get("object_download_retry_backpressure_until") or "")
     object_upload_retry_backpressure_until = str(auto_sync.get("object_upload_retry_backpressure_until") or "")
+    active_operation = str(auto_sync.get("active_operation") or "")
     last_error = str(auto_sync.get("last_error") or auto_sync.get("last_state_delta_error") or "")
     summary = {
         "logged_in": bool(
@@ -1991,6 +1992,14 @@ def _cloud_sync_health_summary(
         ),
         "auto_sync_running": bool(auto_sync.get("running")),
         "event_stream_connected": bool(auto_sync.get("event_stream_connected")),
+        "active_operation": active_operation,
+        "active_operation_detail": (
+            dict(auto_sync.get("active_operation_detail"))
+            if isinstance(auto_sync.get("active_operation_detail"), dict)
+            else {}
+        ),
+        "active_operation_started_at": str(auto_sync.get("active_operation_started_at") or ""),
+        "active_operation_elapsed_seconds": _safe_float(auto_sync.get("active_operation_elapsed_seconds"), 0.0),
         "upload_backpressure_active": bool(backpressure_until),
         "upload_backpressure_until": backpressure_until,
         "upload_backpressure_retry_after_seconds": _safe_float(
@@ -2146,6 +2155,14 @@ def _cloud_sync_action_summary(summary: dict[str, Any]) -> dict[str, Any]:
             throttle_bucket=str(summary.get("object_download_retry_backpressure_bucket") or ""),
         )
 
+    active_operation = str(summary.get("active_operation") or "")
+    if active_operation:
+        add_action(
+            active_operation,
+            "running",
+            0,
+        )
+
     outbox_wait_reason = str(summary.get("outbox_wait_reason") or "")
     if bool(summary.get("upload_backpressure_active")) and (
         _safe_int(summary.get("outbox_pending"), 0) + _safe_int(summary.get("outbox_failed"), 0) > 0
@@ -2196,9 +2213,12 @@ def _cloud_sync_action_summary(summary: dict[str, Any]) -> dict[str, Any]:
             summary.get("next_object_download_retry_after_seconds"),
         )
 
+    running_actions = [item for item in actions if str(item.get("reason") or "") == "running"]
     pending_actions = [item for item in actions if _safe_int(item.get("retry_after_seconds"), 0) > 0]
     ready_actions = [item for item in actions if _safe_int(item.get("retry_after_seconds"), 0) <= 0]
-    if ready_actions:
+    if running_actions:
+        next_action = running_actions[0]
+    elif ready_actions:
         next_action = min(ready_actions, key=lambda item: str(item.get("kind") or ""))
     elif pending_actions:
         next_action = min(pending_actions, key=lambda item: _safe_int(item.get("retry_after_seconds"), 0))

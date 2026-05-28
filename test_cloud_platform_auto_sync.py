@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 import tempfile
 import time
 import unittest
@@ -320,6 +321,48 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             self.assertEqual(status["last_object_upload_retry_metrics"]["failed"], 1)
             self.assertEqual(status["last_object_upload_retry_error"], "upload still unavailable")
             self.assertEqual(status["last_error"], "")
+
+    def test_active_operation_is_visible_until_callback_finishes(self):
+        manager = CloudPlatformAutoSync(
+            pull_tasks=lambda: {"ok": True},
+            event_stream_enabled=False,
+            logger=lambda _message: None,
+        )
+        started = threading.Event()
+        finish = threading.Event()
+        errors: list[str] = []
+
+        def callback():
+            started.set()
+            if not finish.wait(timeout=2.0):
+                errors.append("timeout")
+            return {"ok": True}
+
+        worker = threading.Thread(
+            target=lambda: manager._run_active_operation(  # noqa: SLF001
+                "retry_object_uploads",
+                callback,
+                detail={"ready_count": 2},
+            )
+        )
+        worker.start()
+        try:
+            self.assertTrue(started.wait(timeout=2.0))
+            status = manager.get_status()
+            self.assertEqual(status["active_operation"], "retry_object_uploads")
+            self.assertEqual(status["active_operation_detail"], {"ready_count": 2})
+            self.assertTrue(status["active_operation_started_at"])
+            self.assertGreaterEqual(status["active_operation_elapsed_seconds"], 0.0)
+        finally:
+            finish.set()
+            worker.join(timeout=2.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        status = manager.get_status()
+        self.assertEqual(status["active_operation"], "")
+        self.assertEqual(status["active_operation_detail"], {})
+        self.assertEqual(status["active_operation_elapsed_seconds"], 0.0)
 
     def test_object_upload_retry_backpressure_pauses_next_retry(self):
         with tempfile.TemporaryDirectory() as tmpdir:

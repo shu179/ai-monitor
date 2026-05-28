@@ -6,7 +6,7 @@ import random
 import threading
 import time
 from datetime import timedelta
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 from .cloud_client import CloudClientError, SurfacedCloudClient
 from .cloud_event_types import (
@@ -18,6 +18,8 @@ from .cloud_object_transfer_store import CloudObjectTransferStore
 from .cloud_run_sync import flush_cloud_outbox
 from .cloud_session_store import CloudSessionChangedError, CloudSessionStore, cloud_session_identity
 from .time_utils import local_now
+
+T = TypeVar("T")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -140,9 +142,15 @@ class CloudPlatformAutoSync:
         self._object_download_retry_backpressure_until_at = 0.0
         self._object_upload_retry_backpressure_until_at = 0.0
         self._state_delta_backpressure_until_at = 0.0
+        self._active_operation_started_at_monotonic = 0.0
+        self._active_operation_token = 0
         self._status: dict[str, Any] = {
             "running": False,
             "logged_in": False,
+            "active_operation": "",
+            "active_operation_detail": {},
+            "active_operation_started_at": "",
+            "active_operation_elapsed_seconds": 0.0,
             "outbox_pending": 0,
             "outbox_failed": 0,
             "outbox_upload_ready": 0,
@@ -229,7 +237,13 @@ class CloudPlatformAutoSync:
 
     def get_status(self) -> dict[str, Any]:
         with self._lock:
-            return dict(self._status)
+            status = dict(self._status)
+            if status.get("active_operation") and self._active_operation_started_at_monotonic > 0:
+                status["active_operation_elapsed_seconds"] = max(
+                    0.0,
+                    time.monotonic() - self._active_operation_started_at_monotonic,
+                )
+            return status
 
     def set_state_delta_handlers(
         self,
@@ -251,6 +265,49 @@ class CloudPlatformAutoSync:
     def _update_status(self, **patch: Any) -> None:
         with self._lock:
             self._status.update(patch)
+
+    def _begin_active_operation(self, operation: str, detail: dict[str, Any] | None = None) -> int:
+        started_monotonic = time.monotonic()
+        with self._lock:
+            self._active_operation_token += 1
+            token = self._active_operation_token
+            self._active_operation_started_at_monotonic = started_monotonic
+            self._status.update(
+                {
+                    "active_operation": str(operation or ""),
+                    "active_operation_detail": dict(detail or {}),
+                    "active_operation_started_at": local_now().isoformat(timespec="seconds"),
+                    "active_operation_elapsed_seconds": 0.0,
+                }
+            )
+            return token
+
+    def _finish_active_operation(self, token: int) -> None:
+        with self._lock:
+            if token != self._active_operation_token:
+                return
+            self._active_operation_started_at_monotonic = 0.0
+            self._status.update(
+                {
+                    "active_operation": "",
+                    "active_operation_detail": {},
+                    "active_operation_started_at": "",
+                    "active_operation_elapsed_seconds": 0.0,
+                }
+            )
+
+    def _run_active_operation(
+        self,
+        operation: str,
+        callback: Callable[[], T],
+        *,
+        detail: dict[str, Any] | None = None,
+    ) -> T:
+        token = self._begin_active_operation(operation, detail=detail)
+        try:
+            return callback()
+        finally:
+            self._finish_active_operation(token)
 
     def _log(self, message: str) -> None:
         try:
@@ -597,7 +654,11 @@ class CloudPlatformAutoSync:
                 if first_sync_for_login and has_upload_ready:
                     self._last_upload_started_at = now
                     try:
-                        upload_result = flush_cloud_outbox(outbox=active_outbox, limit=500)
+                        upload_result = self._run_active_operation(
+                            "upload_outbox",
+                            lambda: flush_cloud_outbox(outbox=active_outbox, limit=500),
+                            detail={"pending_count": pending_count, "upload_ready_count": upload_ready_count},
+                        )
                     except Exception as exc:
                         upload_result = {"ok": False, "message": f"运行数据恢复上传失败：{exc}", "metrics": {}}
                 elif has_pending_upload and has_upload_ready and not upload_backpressure_active and (
@@ -608,7 +669,11 @@ class CloudPlatformAutoSync:
                 ):
                     self._last_upload_started_at = now
                     try:
-                        upload_result = flush_cloud_outbox(outbox=active_outbox, limit=500)
+                        upload_result = self._run_active_operation(
+                            "upload_outbox",
+                            lambda: flush_cloud_outbox(outbox=active_outbox, limit=500),
+                            detail={"pending_count": pending_count, "upload_ready_count": upload_ready_count},
+                        )
                     except Exception as exc:
                         upload_result = {"ok": False, "message": f"运行数据自动上传失败：{exc}", "metrics": {}}
 
@@ -667,7 +732,14 @@ class CloudPlatformAutoSync:
                 ):
                     self._last_object_upload_retry_started_at = now
                     object_upload_retry_wake_requested = False
-                    object_upload_retry_result = self._invoke_object_upload_retry()
+                    object_upload_retry_result = self._run_active_operation(
+                        "retry_object_uploads",
+                        self._invoke_object_upload_retry,
+                        detail={
+                            "ready_count": object_upload_retry_ready_count,
+                            "waiting_count": object_upload_retry_waiting_count,
+                        },
+                    )
                     object_upload_retry_metrics = _object_upload_retry_metrics(object_upload_retry_result)
                     if object_upload_retry_result.get("ok"):
                         self._update_status(
@@ -720,7 +792,11 @@ class CloudPlatformAutoSync:
                 ):
                     self._last_object_download_retry_started_at = now
                     object_download_retry_wake_requested = False
-                    object_download_retry_result = self._invoke_object_download_retry()
+                    object_download_retry_result = self._run_active_operation(
+                        "retry_object_downloads",
+                        self._invoke_object_download_retry,
+                        detail={"ready_count": object_download_retry_ready_count},
+                    )
                     object_download_retry_metrics = _object_download_retry_metrics(object_download_retry_result)
                     if object_download_retry_result.get("ok"):
                         self._update_status(
@@ -751,7 +827,10 @@ class CloudPlatformAutoSync:
                 if first_sync_for_login or now - self._last_pull_started_at >= self._pull_interval_seconds:
                     self._last_pull_started_at = now
                     try:
-                        pull_result = self._invoke_pull_tasks(force=False)
+                        pull_result = self._run_active_operation(
+                            "pull_tasks",
+                            lambda: self._invoke_pull_tasks(force=False),
+                        )
                     except Exception as exc:
                         pull_result = {"ok": False, "message": f"云端任务自动拉取失败：{exc}", "summary": {}}
                     if pull_result.get("ok"):
@@ -761,7 +840,10 @@ class CloudPlatformAutoSync:
                             last_pull_metrics=pull_metrics,
                             last_pull_summary=_pull_summary(pull_metrics),
                         )
-                        state_delta_result = self._invoke_state_delta_pipeline()
+                        state_delta_result = self._run_active_operation(
+                            "state_delta_pipeline",
+                            self._invoke_state_delta_pipeline,
+                        )
                         if state_delta_result.get("ok"):
                             self._clear_error()
                         else:
@@ -924,7 +1006,11 @@ class CloudPlatformAutoSync:
             return False, exc.status_code == 401
 
     def _pull_now_from_event(self, event_name: str) -> None:
-        pull_result = self._invoke_pull_tasks(force=False)
+        pull_result = self._run_active_operation(
+            "pull_tasks",
+            lambda: self._invoke_pull_tasks(force=False),
+            detail={"source": "event_stream", "event_name": event_name},
+        )
         self._last_pull_started_at = time.monotonic()
         if pull_result.get("ok"):
             pull_metrics = _pull_metrics(pull_result)
@@ -933,7 +1019,11 @@ class CloudPlatformAutoSync:
                 last_pull_metrics=pull_metrics,
                 last_pull_summary=_pull_summary(pull_metrics),
             )
-            state_delta_result = self._invoke_state_delta_pipeline()
+            state_delta_result = self._run_active_operation(
+                "state_delta_pipeline",
+                self._invoke_state_delta_pipeline,
+                detail={"source": "event_stream", "event_name": event_name},
+            )
             if state_delta_result.get("ok"):
                 self._clear_error()
             else:

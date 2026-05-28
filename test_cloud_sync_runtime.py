@@ -1610,6 +1610,37 @@ def test_cloud_sync_health_summary_reports_idle_next_action_when_clear():
     assert summary["healthy"] is True
 
 
+def test_cloud_sync_health_summary_prioritizes_active_operation():
+    summary = _cloud_sync_health_summary(
+        session={
+            "base_url": "https://api.example.com",
+            "access_token": "access",
+            "refresh_token": "refresh",
+        },
+        auto_sync={
+            "running": True,
+            "active_operation": "upload_outbox",
+            "active_operation_detail": {"pending_count": 500},
+            "active_operation_started_at": "2026-05-28T10:00:00",
+            "active_operation_elapsed_seconds": 12.5,
+        },
+        outbox={"stats": {"pending": 500, "failed": 0, "dead_letter": 0, "upload_ready": 500}},
+        inbox={"by_status": {"pending": 0, "failed": 0, "applied": 0}},
+        agent_status={"total": 0},
+        content_state={"answers_total": 0, "assets_total": 0},
+    )
+
+    assert summary["active_operation"] == "upload_outbox"
+    assert summary["active_operation_detail"] == {"pending_count": 500}
+    assert summary["active_operation_started_at"] == "2026-05-28T10:00:00"
+    assert summary["active_operation_elapsed_seconds"] == 12.5
+    assert summary["next_sync_action"] == {
+        "kind": "upload_outbox",
+        "reason": "running",
+        "retry_after_seconds": 0,
+    }
+
+
 def test_app_cloud_runtime_support_sync_health_can_include_cloud_object_storage_report():
     owner = _support_owner()
     session_store = MagicMock()
