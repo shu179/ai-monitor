@@ -72,6 +72,7 @@ class CloudPlatformAutoSync:
         pull_state_delta: Callable[..., dict[str, Any]] | None = None,
         process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
         retry_object_downloads: Callable[..., dict[str, Any]] | None = None,
+        object_download_retry_status: Callable[..., dict[str, Any]] | None = None,
         retry_object_uploads: Callable[..., dict[str, Any]] | None = None,
         object_upload_retry_status: Callable[..., dict[str, Any]] | None = None,
         object_upload_retry_interval_seconds: float = 60.0,
@@ -83,6 +84,7 @@ class CloudPlatformAutoSync:
         self._pull_state_delta = pull_state_delta
         self._process_state_delta_inbox = process_state_delta_inbox
         self._retry_object_downloads = retry_object_downloads
+        self._object_download_retry_status = object_download_retry_status
         self._retry_object_uploads = retry_object_uploads
         self._object_upload_retry_status = object_upload_retry_status
         self._session_store = session_store or CloudSessionStore()
@@ -157,6 +159,10 @@ class CloudPlatformAutoSync:
             "last_state_delta_metrics": {},
             "last_state_delta_inbox_metrics": {},
             "last_object_download_retry_metrics": {},
+            "object_download_retry_ready_count": 0,
+            "object_download_retry_waiting_count": 0,
+            "object_download_retry_wait_reason": "",
+            "next_object_download_retry_after_seconds": 0,
             "object_download_retry_backpressure_until": "",
             "object_download_retry_backpressure_retry_after_seconds": 0.0,
             "object_download_retry_backpressure_queue_depth_hint": 0,
@@ -220,12 +226,14 @@ class CloudPlatformAutoSync:
         pull_state_delta: Callable[..., dict[str, Any]] | None = None,
         process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
         retry_object_downloads: Callable[..., dict[str, Any]] | None = None,
+        object_download_retry_status: Callable[..., dict[str, Any]] | None = None,
         retry_object_uploads: Callable[..., dict[str, Any]] | None = None,
         object_upload_retry_status: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self._pull_state_delta = pull_state_delta
         self._process_state_delta_inbox = process_state_delta_inbox
         self._retry_object_downloads = retry_object_downloads
+        self._object_download_retry_status = object_download_retry_status
         self._retry_object_uploads = retry_object_uploads
         self._object_upload_retry_status = object_upload_retry_status
 
@@ -514,6 +522,10 @@ class CloudPlatformAutoSync:
                         object_upload_retry_waiting_count=0,
                         object_upload_retry_wait_reason="not_logged_in",
                         next_object_upload_retry_after_seconds=0,
+                        object_download_retry_ready_count=0,
+                        object_download_retry_waiting_count=0,
+                        object_download_retry_wait_reason="not_logged_in",
+                        next_object_download_retry_after_seconds=0,
                     )
                     self._stop_event.wait(self._idle_interval_seconds)
                     continue
@@ -920,6 +932,21 @@ class CloudPlatformAutoSync:
             return {"ok": False, "available": False, "message": "对象上传恢复状态检查返回无效结果"}
         return result
 
+    def _invoke_object_download_retry_status(self) -> dict[str, Any]:
+        status_handler = self._object_download_retry_status
+        if not callable(status_handler):
+            return {"ok": True, "available": False}
+        try:
+            result = _invoke_optional_payload_callback(
+                status_handler,
+                {"source": "auto_sync"},
+            )
+        except Exception as exc:
+            return {"ok": False, "available": False, "message": f"对象下载恢复状态检查失败：{exc}"}
+        if not isinstance(result, dict):
+            return {"ok": False, "available": False, "message": "对象下载恢复状态检查返回无效结果"}
+        return result
+
     def _update_object_upload_retry_status_snapshot(self, status: dict[str, Any] | None) -> None:
         payload = status if isinstance(status, dict) else {}
         self._update_status(
@@ -929,12 +956,25 @@ class CloudPlatformAutoSync:
             next_object_upload_retry_after_seconds=_safe_int(payload.get("next_retry_after_seconds")),
         )
 
+    def _update_object_download_retry_status_snapshot(self, status: dict[str, Any] | None) -> None:
+        payload = status if isinstance(status, dict) else {}
+        self._update_status(
+            object_download_retry_ready_count=_safe_int(payload.get("retry_ready_count")),
+            object_download_retry_waiting_count=_safe_int(payload.get("retry_waiting_count")),
+            object_download_retry_wait_reason=str(payload.get("wait_reason") or ""),
+            next_object_download_retry_after_seconds=_safe_int(payload.get("next_retry_after_seconds")),
+        )
+
     def _invoke_state_delta_pipeline(self) -> dict[str, Any]:
         pull_handler = self._pull_state_delta
         process_handler = self._process_state_delta_inbox
         retry_downloads_handler = self._retry_object_downloads
         backpressure_active = self._refresh_state_delta_backpressure_status()
         download_retry_backpressure_active = self._refresh_object_download_retry_backpressure_status()
+        download_retry_status = self._invoke_object_download_retry_status()
+        download_retry_status_available = bool(download_retry_status.get("available"))
+        download_retry_ready_count = _safe_int(download_retry_status.get("retry_ready_count"))
+        self._update_object_download_retry_status_snapshot(download_retry_status)
         if not callable(pull_handler) and not callable(process_handler):
             result = {"ok": True, "message": "", "skipped": True}
             self._update_status(
@@ -973,6 +1013,7 @@ class CloudPlatformAutoSync:
             and process_result.get("ok")
             and callable(retry_downloads_handler)
             and not download_retry_backpressure_active
+            and (not download_retry_status_available or download_retry_ready_count > 0)
         ):
             try:
                 retry_downloads_result = _invoke_optional_payload_callback(
@@ -981,8 +1022,16 @@ class CloudPlatformAutoSync:
                 )
             except Exception as exc:
                 retry_downloads_result = {"ok": False, "message": f"对象下载恢复失败：{exc}"}
+            self._update_object_download_retry_status_snapshot(self._invoke_object_download_retry_status())
         elif pull_result.get("ok") and process_result.get("ok") and callable(retry_downloads_handler):
-            retry_downloads_result = {"ok": True, "message": "", "skipped": True, "backpressure_active": True}
+            retry_downloads_result = {
+                "ok": True,
+                "message": "",
+                "skipped": True,
+                "backpressure_active": bool(download_retry_backpressure_active),
+                "wait_reason": str(download_retry_status.get("wait_reason") or ""),
+                "next_retry_after_seconds": _safe_int(download_retry_status.get("next_retry_after_seconds")),
+            }
         download_retry_metrics = _object_download_retry_metrics(retry_downloads_result)
         if (
             not self._apply_object_download_retry_backpressure(download_retry_metrics, now=time.monotonic())

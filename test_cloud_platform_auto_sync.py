@@ -847,6 +847,110 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             self.assertTrue(status["object_download_retry_backpressure_until"])
             self.assertEqual(status["last_object_download_retry_metrics"]["backpressure_active"], True)
 
+    def test_object_download_retry_status_waits_until_due(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calls: list[str] = []
+            manager = CloudPlatformAutoSync(
+                session_store=CloudSessionStore(Path(tmpdir) / "session.json"),
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                pull_state_delta=lambda _payload=None: calls.append("state_delta") or {"ok": True, "changes": 1},
+                process_state_delta_inbox=lambda _payload=None: calls.append("process") or {"ok": True, "applied": 1},
+                retry_object_downloads=lambda _payload=None: calls.append("download_retry") or {
+                    "ok": True,
+                    "attempted": 1,
+                    "recovered": 1,
+                    "failed": 0,
+                    "skipped": 0,
+                },
+                object_download_retry_status=lambda _payload=None: {
+                    "ok": True,
+                    "available": True,
+                    "direction": "download",
+                    "retry_ready_count": 0,
+                    "retry_waiting_count": 1,
+                    "failed_count": 1,
+                    "next_retry_after_seconds": 8,
+                    "wait_reason": "waiting_retry_backoff",
+                },
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            result = manager._invoke_state_delta_pipeline()  # noqa: SLF001
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(calls, ["state_delta", "process"])
+            status = manager.get_status()
+            self.assertEqual(status["object_download_retry_ready_count"], 0)
+            self.assertEqual(status["object_download_retry_waiting_count"], 1)
+            self.assertEqual(status["object_download_retry_wait_reason"], "waiting_retry_backoff")
+            self.assertEqual(status["next_object_download_retry_after_seconds"], 8)
+
+    def test_object_download_retry_status_runs_when_ready(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calls: list[str] = []
+            statuses = [
+                {
+                    "ok": True,
+                    "available": True,
+                    "direction": "download",
+                    "retry_ready_count": 1,
+                    "retry_waiting_count": 0,
+                    "failed_count": 1,
+                    "next_retry_after_seconds": 0,
+                    "wait_reason": "ready",
+                },
+                {
+                    "ok": True,
+                    "available": True,
+                    "direction": "download",
+                    "retry_ready_count": 0,
+                    "retry_waiting_count": 0,
+                    "failed_count": 0,
+                    "next_retry_after_seconds": 0,
+                    "wait_reason": "idle",
+                },
+            ]
+
+            def retry_status(_payload=None):
+                return statuses.pop(0) if statuses else {
+                    "ok": True,
+                    "available": True,
+                    "direction": "download",
+                    "retry_ready_count": 0,
+                    "retry_waiting_count": 0,
+                    "failed_count": 0,
+                    "next_retry_after_seconds": 0,
+                    "wait_reason": "idle",
+                }
+
+            manager = CloudPlatformAutoSync(
+                session_store=CloudSessionStore(Path(tmpdir) / "session.json"),
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                pull_state_delta=lambda _payload=None: calls.append("state_delta") or {"ok": True, "changes": 1},
+                process_state_delta_inbox=lambda _payload=None: calls.append("process") or {"ok": True, "applied": 1},
+                retry_object_downloads=lambda _payload=None: calls.append("download_retry") or {
+                    "ok": True,
+                    "attempted": 1,
+                    "recovered": 1,
+                    "failed": 0,
+                    "skipped": 0,
+                },
+                object_download_retry_status=retry_status,
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            result = manager._invoke_state_delta_pipeline()  # noqa: SLF001
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(calls, ["state_delta", "process", "download_retry"])
+            status = manager.get_status()
+            self.assertEqual(status["last_object_download_retry_metrics"]["recovered"], 1)
+            self.assertEqual(status["object_download_retry_wait_reason"], "idle")
+
     def test_object_download_retry_exception_does_not_fail_state_delta_pipeline(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             def retry_downloads(_payload=None):

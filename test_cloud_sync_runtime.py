@@ -1440,6 +1440,10 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
         "object_download_retry_backpressure_retry_after_seconds": 6.0,
         "object_download_retry_backpressure_queue_depth_hint": 17,
         "object_download_retry_backpressure_bucket": "object_download",
+        "object_download_retry_ready_count": 0,
+        "object_download_retry_waiting_count": 1,
+        "object_download_retry_wait_reason": "waiting_retry_backoff",
+        "next_object_download_retry_after_seconds": 9,
         "object_upload_retry_backpressure_until": "2026-05-28T10:01:00",
         "object_upload_retry_backpressure_retry_after_seconds": 15.0,
         "object_upload_retry_backpressure_queue_depth_hint": 25,
@@ -1518,6 +1522,10 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     assert health["summary"]["object_download_retry_backpressure_retry_after_seconds"] == 6.0
     assert health["summary"]["object_download_retry_backpressure_queue_depth_hint"] == 17
     assert health["summary"]["object_download_retry_backpressure_bucket"] == "object_download"
+    assert health["summary"]["object_download_retry_ready_count"] == 0
+    assert health["summary"]["object_download_retry_waiting_count"] == 1
+    assert health["summary"]["object_download_retry_wait_reason"] == "waiting_retry_backoff"
+    assert health["summary"]["next_object_download_retry_after_seconds"] == 9
     assert health["summary"]["object_upload_retry_backpressure_active"] is True
     assert health["summary"]["object_upload_retry_backpressure_retry_after_seconds"] == 15.0
     assert health["summary"]["object_upload_retry_backpressure_queue_depth_hint"] == 25
@@ -1876,6 +1884,25 @@ def test_app_cloud_runtime_support_reports_object_upload_retry_status():
     assert result["ok"] is True
     assert result["available"] is True
     assert result["direction"] == "upload"
+    assert result["retry_ready_count"] == 0
+    assert result["retry_waiting_count"] == 1
+    assert result["wait_reason"] == "waiting_retry_backoff"
+    assert result["next_retry_after_seconds"] >= 7
+
+
+def test_app_cloud_runtime_support_reports_object_download_retry_status():
+    owner = _support_owner()
+    with tempfile.TemporaryDirectory() as tmp:
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        transfer_store.start_transfer(transfer_id="download-1", direction="download", object_id="object-1", sha256="a" * 64)
+        transfer_store.fail_transfer("download-1", "busy", retry_after_seconds=7.5)
+        support = AppCloudRuntimeSupport(owner=owner, object_transfer_store_factory=lambda: transfer_store)
+
+        result = support.object_download_retry_status({})
+
+    assert result["ok"] is True
+    assert result["available"] is True
+    assert result["direction"] == "download"
     assert result["retry_ready_count"] == 0
     assert result["retry_waiting_count"] == 1
     assert result["wait_reason"] == "waiting_retry_backoff"

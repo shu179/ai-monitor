@@ -2077,6 +2077,7 @@ class AppRuntime:
             pull_state_delta=self._cloud_runtime_support.pull_cloud_state_delta,
             process_state_delta_inbox=self._cloud_runtime_support.process_cloud_state_delta_inbox,
             retry_object_downloads=self._cloud_runtime_support.retry_object_downloads,
+            object_download_retry_status=self._cloud_runtime_support.object_download_retry_status,
             retry_object_uploads=self._cloud_runtime_support.retry_object_uploads,
             object_upload_retry_status=self._cloud_runtime_support.object_upload_retry_status,
         )
@@ -2125,6 +2126,7 @@ class AppRuntime:
                 pull_state_delta=support.pull_cloud_state_delta,
                 process_state_delta_inbox=support.process_cloud_state_delta_inbox,
                 retry_object_downloads=support.retry_object_downloads,
+                object_download_retry_status=support.object_download_retry_status,
                 retry_object_uploads=support.retry_object_uploads,
                 object_upload_retry_status=support.object_upload_retry_status,
             )

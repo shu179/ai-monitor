@@ -93,6 +93,7 @@ def create_local_cloud_sync_runtime(
     pull_state_delta: Callable[..., dict[str, Any]] | None = None,
     process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
     retry_object_downloads: Callable[..., dict[str, Any]] | None = None,
+    object_download_retry_status: Callable[..., dict[str, Any]] | None = None,
     retry_object_uploads: Callable[..., dict[str, Any]] | None = None,
     object_upload_retry_status: Callable[..., dict[str, Any]] | None = None,
 ) -> LocalCloudSyncRuntime:
@@ -112,6 +113,7 @@ def create_local_cloud_sync_runtime(
         pull_state_delta=pull_state_delta,
         process_state_delta_inbox=process_state_delta_inbox,
         retry_object_downloads=retry_object_downloads,
+        object_download_retry_status=object_download_retry_status,
         retry_object_uploads=retry_object_uploads,
         object_upload_retry_status=object_upload_retry_status,
         upload_burst_interval_seconds=_env_float("AIBRANDMONITOR_CLOUD_UPLOAD_BURST_INTERVAL_SECONDS", 1.0),
@@ -1011,6 +1013,18 @@ class AppCloudRuntimeSupport:
         request_payload = payload if isinstance(payload, dict) else {}
         status = self._object_transfer_store_factory().retry_status(
             direction="upload",
+            max_attempts=_safe_int(request_payload.get("max_attempts") or request_payload.get("maxAttempts"), 5),
+            stale_running_seconds=_safe_float(
+                request_payload.get("stale_running_seconds") or request_payload.get("staleRunningSeconds"),
+                600.0,
+            ),
+        )
+        return {"ok": True, "available": True, **status}
+
+    def object_download_retry_status(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        status = self._object_transfer_store_factory().retry_status(
+            direction="download",
             max_attempts=_safe_int(request_payload.get("max_attempts") or request_payload.get("maxAttempts"), 5),
             stale_running_seconds=_safe_float(
                 request_payload.get("stale_running_seconds") or request_payload.get("staleRunningSeconds"),
@@ -1996,6 +2010,13 @@ def _cloud_sync_health_summary(
         ),
         "object_download_retry_backpressure_bucket": str(
             auto_sync.get("object_download_retry_backpressure_bucket") or ""
+        ),
+        "object_download_retry_ready_count": _safe_int(auto_sync.get("object_download_retry_ready_count"), 0),
+        "object_download_retry_waiting_count": _safe_int(auto_sync.get("object_download_retry_waiting_count"), 0),
+        "object_download_retry_wait_reason": str(auto_sync.get("object_download_retry_wait_reason") or ""),
+        "next_object_download_retry_after_seconds": _safe_int(
+            auto_sync.get("next_object_download_retry_after_seconds"),
+            0,
         ),
         "object_upload_retry_backpressure_active": bool(object_upload_retry_backpressure_until),
         "object_upload_retry_backpressure_until": object_upload_retry_backpressure_until,
