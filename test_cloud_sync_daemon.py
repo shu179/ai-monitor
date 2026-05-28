@@ -210,6 +210,9 @@ class CloudSyncDaemonTests(unittest.TestCase):
         runtime._cloud_command_transport_last_recovery_completed_at = ""
         runtime._cloud_command_transport_last_recovery_result = ""
         runtime._cloud_command_transport_last_recovery_error = ""
+        runtime._cloud_command_transport_recovery_timer = None
+        runtime._cloud_command_transport_next_recovery_at = 0.0
+        runtime._cloud_command_transport_next_recovery_after = ""
         runtime._cloud_command_transport_recovery_interval_seconds = 30.0
         runtime._cloud_command_transport_mode = "in_process_direct"
         runtime._cloud_command_transport_error = "AF_UNIX unavailable"
@@ -247,6 +250,9 @@ class CloudSyncDaemonTests(unittest.TestCase):
         runtime._cloud_command_transport_last_recovery_completed_at = ""
         runtime._cloud_command_transport_last_recovery_result = "running"
         runtime._cloud_command_transport_last_recovery_error = ""
+        runtime._cloud_command_transport_recovery_timer = None
+        runtime._cloud_command_transport_next_recovery_at = time.monotonic() + 30
+        runtime._cloud_command_transport_next_recovery_after = "2026-05-28T12:00:30"
         runtime._cloud_command_transport_recovery_interval_seconds = 30.0
         runtime._cloud_command_transport_mode = "in_process_direct"
         runtime._cloud_command_transport_error = "timed out"
@@ -258,6 +264,35 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertEqual(status["next_transport_action"]["kind"], "recover_daemon")
         self.assertEqual(status["next_transport_action"]["reason"], "cooldown")
         self.assertGreater(status["next_transport_action"]["retry_after_seconds"], 0)
+
+    def test_app_runtime_cloud_command_transport_status_reports_scheduled_recovery(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_command_daemon = None
+        runtime._cloud_command_server = None
+        runtime._cloud_command_client = Mock()
+        runtime._cloud_command_socket_path = None
+        runtime._cloud_command_transport_recovery_thread = None
+        timer = Mock()
+        timer.is_alive.return_value = True
+        runtime._cloud_command_transport_recovery_timer = timer
+        runtime._cloud_command_transport_last_recovery_attempt_at = time.monotonic()
+        runtime._cloud_command_transport_last_recovery_attempt = "2026-05-28T12:00:00"
+        runtime._cloud_command_transport_last_recovery_reason = "timed out"
+        runtime._cloud_command_transport_last_recovery_completed_at = "2026-05-28T12:00:01"
+        runtime._cloud_command_transport_last_recovery_result = "failed"
+        runtime._cloud_command_transport_last_recovery_error = "socket busy"
+        runtime._cloud_command_transport_next_recovery_at = time.monotonic() + 30
+        runtime._cloud_command_transport_next_recovery_after = "2026-05-28T12:00:30"
+        runtime._cloud_command_transport_recovery_interval_seconds = 30.0
+        runtime._cloud_command_transport_mode = "in_process_direct"
+        runtime._cloud_command_transport_error = "socket busy"
+
+        status = AppRuntime._cloud_command_transport_status(runtime)
+
+        self.assertTrue(status["recovery_scheduled"])
+        self.assertEqual(status["transport_blockers"][0]["kind"], "daemon_recovery_scheduled")
+        self.assertEqual(status["next_transport_action"]["reason"], "scheduled")
+        self.assertEqual(status["next_recovery_after"], "2026-05-28T12:00:30")
 
     def test_app_runtime_cloud_runtime_command_falls_back_when_daemon_cannot_handle_command(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
@@ -332,6 +367,9 @@ class CloudSyncDaemonTests(unittest.TestCase):
         runtime._cloud_command_transport_last_recovery_completed_at = ""
         runtime._cloud_command_transport_last_recovery_result = ""
         runtime._cloud_command_transport_last_recovery_error = ""
+        runtime._cloud_command_transport_recovery_timer = None
+        runtime._cloud_command_transport_next_recovery_at = 0.0
+        runtime._cloud_command_transport_next_recovery_after = ""
         runtime._cloud_command_transport_recovery_interval_seconds = 30.0
         recovery_thread = Mock()
         recovery_thread.is_alive.return_value = True
@@ -347,7 +385,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertEqual(runtime._cloud_command_transport_last_recovery_error, "")
         self.assertNotEqual(runtime._cloud_command_transport_last_recovery_attempt, "")
 
-    def test_app_runtime_schedule_cloud_command_transport_recovery_obeys_cooldown(self) -> None:
+    def test_app_runtime_schedule_cloud_command_transport_recovery_skips_existing_timer(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         runtime._cloud_command_transport_lock = threading.RLock()
         runtime._cloud_command_daemon = None
@@ -362,16 +400,60 @@ class CloudSyncDaemonTests(unittest.TestCase):
         runtime._cloud_command_transport_last_recovery_completed_at = ""
         runtime._cloud_command_transport_last_recovery_result = ""
         runtime._cloud_command_transport_last_recovery_error = ""
+        timer = Mock()
+        timer.is_alive.return_value = True
+        runtime._cloud_command_transport_recovery_timer = timer
+        runtime._cloud_command_transport_next_recovery_at = 0.0
+        runtime._cloud_command_transport_next_recovery_after = ""
         runtime._cloud_command_transport_recovery_interval_seconds = 30.0
 
         with (
             patch("web_backend.time.monotonic", return_value=130.0),
+            patch("web_backend.threading.Timer") as timer_cls,
             patch("web_backend.threading.Thread") as thread_cls,
         ):
             scheduled = AppRuntime._schedule_cloud_command_transport_recovery(runtime, "timed out")
 
         self.assertFalse(scheduled)
+        timer_cls.assert_not_called()
         thread_cls.assert_not_called()
+
+    def test_app_runtime_schedule_cloud_command_transport_recovery_sets_timer_during_cooldown(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_command_transport_lock = threading.RLock()
+        runtime._cloud_command_daemon = None
+        runtime._cloud_command_server = None
+        runtime._cloud_command_client = Mock()
+        runtime._cloud_command_transport_mode = "in_process_direct"
+        runtime._cloud_command_transport_stop_requested = False
+        runtime._cloud_command_transport_recovery_thread = None
+        runtime._cloud_command_transport_recovery_timer = None
+        runtime._cloud_command_transport_last_recovery_attempt_at = 123.0
+        runtime._cloud_command_transport_last_recovery_attempt = "2026-05-28T12:00:00"
+        runtime._cloud_command_transport_last_recovery_reason = "timed out"
+        runtime._cloud_command_transport_last_recovery_completed_at = "2026-05-28T12:00:01"
+        runtime._cloud_command_transport_last_recovery_result = "failed"
+        runtime._cloud_command_transport_last_recovery_error = "socket busy"
+        runtime._cloud_command_transport_next_recovery_at = 0.0
+        runtime._cloud_command_transport_next_recovery_after = ""
+        runtime._cloud_command_transport_recovery_interval_seconds = 30.0
+        timer = Mock()
+        timer.is_alive.return_value = False
+
+        with (
+            patch("web_backend.time.monotonic", return_value=130.0),
+            patch("web_backend.threading.Timer", return_value=timer) as timer_cls,
+            patch("web_backend.threading.Thread") as thread_cls,
+        ):
+            scheduled = AppRuntime._schedule_cloud_command_transport_recovery(runtime, "socket busy")
+
+        self.assertTrue(scheduled)
+        timer_cls.assert_called_once()
+        timer.start.assert_called_once()
+        thread_cls.assert_not_called()
+        self.assertIs(runtime._cloud_command_transport_recovery_timer, timer)
+        self.assertGreater(runtime._cloud_command_transport_next_recovery_at, 0)
+        self.assertNotEqual(runtime._cloud_command_transport_next_recovery_after, "")
 
     def test_app_runtime_recover_cloud_command_transport_records_success(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
@@ -381,6 +463,9 @@ class CloudSyncDaemonTests(unittest.TestCase):
         runtime._cloud_command_transport_last_recovery_completed_at = ""
         runtime._cloud_command_transport_last_recovery_result = "running"
         runtime._cloud_command_transport_last_recovery_error = ""
+        runtime._cloud_command_transport_recovery_timer = None
+        runtime._cloud_command_transport_next_recovery_at = 0.0
+        runtime._cloud_command_transport_next_recovery_after = ""
 
         def start_transport() -> None:
             runtime._cloud_command_transport_mode = "child_daemon"
@@ -409,6 +494,9 @@ class CloudSyncDaemonTests(unittest.TestCase):
         runtime._cloud_command_transport_last_recovery_completed_at = ""
         runtime._cloud_command_transport_last_recovery_result = "running"
         runtime._cloud_command_transport_last_recovery_error = ""
+        runtime._cloud_command_transport_recovery_timer = None
+        runtime._cloud_command_transport_next_recovery_at = 0.0
+        runtime._cloud_command_transport_next_recovery_after = ""
 
         with (
             patch.object(runtime, "_start_cloud_command_transport", side_effect=RuntimeError("socket busy")),
@@ -417,6 +505,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
                 "_cloud_command_transport_status",
                 return_value={"responsive": False, "mode": "in_process_direct", "last_error": "socket busy"},
             ),
+            patch.object(runtime, "_schedule_cloud_command_transport_recovery", return_value=True) as schedule,
         ):
             AppRuntime._recover_cloud_command_transport_worker(runtime)
 
@@ -424,6 +513,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertEqual(runtime._cloud_command_transport_last_recovery_result, "failed")
         self.assertEqual(runtime._cloud_command_transport_last_recovery_error, "socket busy")
         self.assertNotEqual(runtime._cloud_command_transport_last_recovery_completed_at, "")
+        schedule.assert_called_once_with("socket busy", force=False)
 
     def test_app_runtime_cloud_runtime_command_skips_daemon_for_unsupported_command(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
