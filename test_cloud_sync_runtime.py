@@ -1748,6 +1748,14 @@ def test_app_cloud_runtime_support_sync_health_can_include_cloud_object_storage_
                     "disk": {"free_bytes": 9 * 1024 * 1024 * 1024},
                     "pressure": {"max_safe_upload_bytes": 256 * 1024 * 1024, "warnings": ["near_min_free"]},
                     "missing_files": [{"object_id": "missing-1"}],
+                    "temporary_total_bytes": 384,
+                    "temporary_files": [
+                        {"path": "/opt/surfaced/object-data/.tmp-active", "size_bytes": 128},
+                        {"path": "/opt/surfaced/object-data/.tmp-stale", "size_bytes": 256},
+                    ],
+                    "stale_temporary_files": [
+                        {"path": "/opt/surfaced/object-data/.tmp-stale", "size_bytes": 256}
+                    ],
                     "orphan_files": [{"path": "/opt/surfaced/object-data/orphan.bin"}],
                 },
                 "text": "Object storage doctor: status=warn",
@@ -1779,6 +1787,10 @@ def test_app_cloud_runtime_support_sync_health_can_include_cloud_object_storage_
     assert health["summary"]["cloud_object_storage_warning_count"] == 1
     assert health["summary"]["cloud_object_storage_missing_files"] == 1
     assert health["summary"]["cloud_object_storage_orphan_files"] == 1
+    assert health["summary"]["cloud_object_storage_temporary_files"] == 2
+    assert health["summary"]["cloud_object_storage_stale_temporary_files"] == 1
+    assert health["summary"]["cloud_object_storage_temporary_bytes"] == 384
+    assert health["summary"]["cloud_object_storage_stale_temporary_bytes"] == 256
     support._run_cloud_api_request.assert_called_once_with("admin_object_storage_report", {"includeCloudObjectStorage": True})
 
 

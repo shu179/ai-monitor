@@ -1833,6 +1833,14 @@ def _cloud_object_storage_summary(result: dict[str, Any] | None) -> dict[str, An
     report_body = report.get("report") if isinstance(report.get("report"), dict) else {}
     disk = report_body.get("disk") if isinstance(report_body.get("disk"), dict) else {}
     pressure = report_body.get("pressure") if isinstance(report_body.get("pressure"), dict) else {}
+    temporary_files = report_body.get("temporary_files", [])
+    stale_temporary_files = report_body.get("stale_temporary_files", [])
+    temporary_total_bytes = _safe_int(report_body.get("temporary_total_bytes"), 0)
+    stale_temporary_total_bytes = (
+        sum(_safe_int(item.get("size_bytes"), 0) for item in stale_temporary_files)
+        if isinstance(stale_temporary_files, list)
+        else 0
+    )
     return {
         "cloud_object_storage_checked": bool(payload),
         "cloud_object_storage_ok": bool(payload.get("ok")) if payload else False,
@@ -1848,6 +1856,12 @@ def _cloud_object_storage_summary(result: dict[str, Any] | None) -> dict[str, An
         "cloud_object_storage_orphan_files": len(report_body.get("orphan_files", []))
         if isinstance(report_body.get("orphan_files"), list)
         else 0,
+        "cloud_object_storage_temporary_files": len(temporary_files) if isinstance(temporary_files, list) else 0,
+        "cloud_object_storage_stale_temporary_files": len(stale_temporary_files)
+        if isinstance(stale_temporary_files, list)
+        else 0,
+        "cloud_object_storage_temporary_bytes": temporary_total_bytes,
+        "cloud_object_storage_stale_temporary_bytes": stale_temporary_total_bytes,
         "cloud_object_storage_message": str(payload.get("message") or ""),
     }
 
