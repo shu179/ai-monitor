@@ -64,6 +64,33 @@ class LoadSyncV2ScriptTests(unittest.TestCase):
             hashlib.sha256(body).hexdigest(),
         )
 
+    def test_acceptance_profiles_are_defined(self) -> None:
+        for profile in ("l1", "l2", "l3"):
+            self.assertIn(profile, load_sync_v2.PROFILE_DEFAULTS)
+            self.assertIn(profile, load_sync_v2.PROFILE_THRESHOLDS)
+
+    def test_evaluate_thresholds_passes_under_limit(self) -> None:
+        result = {"batches": {"count": 120, "p95_ms": 800}}
+        evaluation = load_sync_v2.evaluate_thresholds(result, {"batches_p95_ms": 1000})
+        self.assertTrue(evaluation["passed"])
+        self.assertEqual(evaluation["checks"][0]["actual_ms"], 800)
+
+    def test_evaluate_thresholds_fails_over_limit(self) -> None:
+        result = {"batches": {"count": 120, "p95_ms": 1500}}
+        evaluation = load_sync_v2.evaluate_thresholds(result, {"batches_p95_ms": 1000})
+        self.assertFalse(evaluation["passed"])
+
+    def test_evaluate_thresholds_treats_empty_section_as_not_applicable(self) -> None:
+        result = {"objects": {"count": 0, "p95_ms": 0}}
+        evaluation = load_sync_v2.evaluate_thresholds(result, {"objects_p95_ms": 500})
+        self.assertTrue(evaluation["passed"])
+
+    def test_evaluate_thresholds_fails_when_metric_missing(self) -> None:
+        # A populated section that reports 0 p95 is suspicious, not a free pass.
+        result = {"batches": {"count": 50, "p95_ms": 0}}
+        evaluation = load_sync_v2.evaluate_thresholds(result, {"batches_p95_ms": 1000})
+        self.assertFalse(evaluation["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

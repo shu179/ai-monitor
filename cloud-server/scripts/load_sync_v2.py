@@ -26,6 +26,52 @@ PROFILE_DEFAULTS = {
     "l3": {"tenants": 10, "events_per_tenant": 6000, "batch_size": 500, "concurrency": 10, "objects": 5, "object_bytes": 1024 * 1024 * 1024},
 }
 
+# Acceptance thresholds (milliseconds) checked with --assert-thresholds.
+# Only metrics the script measures directly are asserted. ``batches_p95_ms``
+# maps to the "metadata batch ACK p95 < 1s" target. The ``delta`` section here
+# measures end-to-end materialization wait (not single-call latency), so it is
+# reported but intentionally not asserted yet.
+PROFILE_THRESHOLDS = {
+    "dev": {},
+    "l1": {"batches_p95_ms": 1000},
+    "l2": {"batches_p95_ms": 1000},
+    "l3": {"batches_p95_ms": 1000},
+}
+
+_THRESHOLD_METRIC_MAP = {
+    "batches_p95_ms": ("batches", "p95_ms"),
+    "delta_p95_ms": ("delta", "p95_ms"),
+    "objects_p95_ms": ("objects", "p95_ms"),
+}
+
+
+def evaluate_thresholds(result: dict, thresholds: dict) -> dict:
+    """Compare measured p95s against a profile's acceptance thresholds.
+
+    Returns ``{"passed": bool, "checks": [...]}``. A section with ``count == 0``
+    (e.g. no objects sent) is treated as not-applicable rather than a failure;
+    a populated section whose p95 exceeds the limit fails the run.
+    """
+    checks: list[dict] = []
+    passed = True
+    for key, limit in sorted((thresholds or {}).items()):
+        section, field = _THRESHOLD_METRIC_MAP.get(key, (None, None))
+        if section is None:
+            continue
+        section_data = result.get(section) or {}
+        count = int(section_data.get("count") or 0)
+        actual = int(section_data.get(field) or 0)
+        if count == 0:
+            ok = True
+        else:
+            ok = 0 < actual <= int(limit)
+        if not ok:
+            passed = False
+        checks.append(
+            {"metric": key, "limit_ms": int(limit), "actual_ms": actual, "count": count, "ok": ok}
+        )
+    return {"passed": passed, "checks": checks}
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Cloud Sync v2 HTTP load profiles.")
@@ -40,6 +86,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
     parser.add_argument("--keep", action="store_true", help="Keep load-test workspaces for inspection.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    parser.add_argument(
+        "--assert-thresholds",
+        action="store_true",
+        help="Exit non-zero if measured p95 exceeds the profile's acceptance thresholds.",
+    )
     args = parser.parse_args(argv)
     marker = os.environ.get("SURFACED_CLOUD_ALLOW_LOAD", "").strip().lower()
     if marker not in {"1", "true", "yes"}:
@@ -76,10 +127,16 @@ def main(argv: list[str] | None = None) -> int:
             "delta": _summarize_metrics(delta_metrics),
             "queue": _summarize_queue(queue_report),
         }
+        threshold_eval = None
+        if args.assert_thresholds:
+            threshold_eval = evaluate_thresholds(result, PROFILE_THRESHOLDS.get(args.profile, {}))
+            result["thresholds"] = threshold_eval
         if args.json:
             print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         else:
             print(_format_result(result))
+        if threshold_eval is not None and not threshold_eval["passed"]:
+            return 1
         return 0
     finally:
         if workspace_ids and not args.keep:
@@ -371,6 +428,10 @@ def _format_result(result: dict) -> str:
         f"delta={result['delta']}",
         f"queue={result['queue']}",
     ]
+    thresholds = result.get("thresholds")
+    if thresholds is not None:
+        verdict = "PASS" if thresholds.get("passed") else "FAIL"
+        lines.append(f"thresholds={verdict} {thresholds.get('checks', [])}")
     return "\n".join(lines)
 
 

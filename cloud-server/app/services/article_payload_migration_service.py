@@ -42,6 +42,12 @@ ARTICLE_MIGRATION_CANDIDATE_KEYS = (
     "raw_content",
 )
 
+# Background backfill must yield to live traffic. These bound the adaptive
+# throttle the migration runner applies between batches.
+MIGRATION_DEFAULT_MAX_ACTIVE_BACKENDS = 20
+MIGRATION_MAX_BACKOFF_SECONDS = 30.0
+MIGRATION_SECONDS_PER_BACKEND_OVER_BUDGET = 1.0
+
 
 @dataclass(frozen=True)
 class ArticlePayloadText:
@@ -298,3 +304,45 @@ def build_article_payload_migration_report(db: Session) -> dict[str, Any]:
         "article_versions": versions,
         "object_backed_versions": objects,
     }
+
+
+def measure_active_backends(db: Session) -> int:
+    """Return how many other Postgres backends are currently executing.
+
+    Used by the article backfill runner to back off when live traffic is busy.
+    Degrades to 0 (no throttle) on engines without ``pg_stat_activity`` or on
+    any error, so the migration never crashes because of the probe itself.
+    """
+    try:
+        value = db.execute(
+            text(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE state = 'active' AND pid <> pg_backend_pid()"
+            )
+        ).scalar_one()
+    except Exception:  # pragma: no cover - defensive: sqlite/permission/etc.
+        return 0
+    return max(0, int(value or 0))
+
+
+def compute_throttle_delay(
+    active_backends: int,
+    *,
+    max_active: int = MIGRATION_DEFAULT_MAX_ACTIVE_BACKENDS,
+    max_backoff_seconds: float = MIGRATION_MAX_BACKOFF_SECONDS,
+    seconds_per_backend: float = MIGRATION_SECONDS_PER_BACKEND_OVER_BUDGET,
+) -> float:
+    """Map current DB load to a delay (seconds) before the next backfill batch.
+
+    At or below ``max_active`` the backfill runs full speed (delay 0). Above it
+    the delay grows linearly with how far over budget we are, capped at
+    ``max_backoff_seconds`` so a busy database simply pauses the backfill instead
+    of competing with live queries.
+    """
+    safe_max_active = max(1, int(max_active))
+    safe_active = max(0, int(active_backends))
+    if safe_active <= safe_max_active:
+        return 0.0
+    over = safe_active - safe_max_active
+    delay = float(over) * max(0.0, float(seconds_per_backend))
+    return min(delay, max(0.0, float(max_backoff_seconds)))
