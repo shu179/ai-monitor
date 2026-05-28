@@ -1794,6 +1794,98 @@ def test_app_cloud_runtime_support_sync_health_can_include_cloud_object_storage_
     support._run_cloud_api_request.assert_called_once_with("admin_object_storage_report", {"includeCloudObjectStorage": True})
 
 
+def test_app_cloud_runtime_support_sync_health_can_include_cloud_sync_queue_report():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.surfacedlab.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+    bound_outbox = MagicMock()
+    bound_outbox.diagnostics.return_value = {"stats": {"pending": 0, "failed": 0, "dead_letter": 0}}
+    outbox = MagicMock()
+    outbox.bind_to_session.return_value = bound_outbox
+    support = AppCloudRuntimeSupport(
+        owner=owner,
+        session_store_factory=lambda: session_store,
+        outbox_factory=lambda: outbox,
+        auto_sync_status_getter=lambda: {"running": True},
+        object_cache_factory=lambda: MagicMock(diagnostics=lambda: {}),
+        object_transfer_store_factory=lambda: MagicMock(diagnostics=lambda failed_limit=10: {}),
+    )
+    support._cloud_capabilities_cached = Mock(return_value={"ok": True, "cached": True, "limits": {}})
+    support._run_cloud_api_request = Mock(
+        return_value={
+            "ok": True,
+            "payload": {
+                "report": {
+                    "status": "warn",
+                    "counts": {
+                        "pending": 7,
+                        "in_progress": 2,
+                        "done": 40,
+                        "dead_letter": 1,
+                        "blocked": 3,
+                    },
+                    "worker_state": "stalled_no_active_worker",
+                    "expired_in_progress": 2,
+                    "oldest_pending_age_seconds": 120,
+                    "oldest_in_progress_age_seconds": 90,
+                    "shard_leases": {"active": 0, "expired": 8},
+                    "recent_done_latency_ms": {"completed": 5, "avg": 24, "max": 120},
+                },
+                "text": "Sync queue doctor: status=warn",
+            },
+            "message": "",
+        }
+    )
+
+    with (
+        patch("core.cloud_sync_runtime.CloudStateDeltaStore") as store_cls,
+        patch("core.cloud_sync_runtime.CloudStateDeltaInbox") as inbox_cls,
+        patch("core.cloud_sync_runtime.CloudAgentStatusStore") as agent_status_store_cls,
+        patch("core.cloud_sync_runtime.CloudContentStateStore") as content_state_store_cls,
+    ):
+        store_cls.return_value.diagnostics.return_value = {}
+        inbox_cls.return_value.diagnostics.return_value = {"by_status": {}}
+        agent_status_store_cls.return_value.diagnostics.return_value = {}
+        content_state_store_cls.return_value.diagnostics.return_value = {}
+
+        result = support.handle_command("cloud.sync_health", {"includeCloudSyncQueue": True})
+
+    health = result["sync_health"]
+    summary = health["summary"]
+    assert health["cloud_sync_queue"]["payload"]["report"]["status"] == "warn"
+    assert summary["cloud_sync_queue_checked"] is True
+    assert summary["cloud_sync_queue_ok"] is True
+    assert summary["cloud_sync_queue_status"] == "warn"
+    assert summary["cloud_sync_queue_worker_state"] == "stalled_no_active_worker"
+    assert summary["cloud_sync_queue_pending"] == 7
+    assert summary["cloud_sync_queue_in_progress"] == 2
+    assert summary["cloud_sync_queue_done"] == 40
+    assert summary["cloud_sync_queue_dead_letter"] == 1
+    assert summary["cloud_sync_queue_blocked"] == 3
+    assert summary["cloud_sync_queue_expired_in_progress"] == 2
+    assert summary["cloud_sync_queue_oldest_pending_age_seconds"] == 120
+    assert summary["cloud_sync_queue_oldest_in_progress_age_seconds"] == 90
+    assert summary["cloud_sync_queue_active_shards"] == 0
+    assert summary["cloud_sync_queue_expired_shards"] == 8
+    assert summary["cloud_sync_queue_recent_done_completed"] == 5
+    assert summary["cloud_sync_queue_recent_done_avg_ms"] == 24
+    assert summary["cloud_sync_queue_recent_done_max_ms"] == 120
+    assert summary["healthy"] is False
+    blocker_kinds = {item["kind"] for item in summary["sync_blockers"]}
+    assert {
+        "cloud_sync_queue_dead_letter",
+        "cloud_sync_queue_blocked",
+        "cloud_sync_queue_expired_in_progress",
+        "cloud_sync_queue_worker_stalled",
+    }.issubset(blocker_kinds)
+    support._run_cloud_api_request.assert_called_once_with("admin_sync_queue_report", {"includeCloudSyncQueue": True})
+
+
 def test_app_cloud_runtime_support_cache_object_downloads_to_file_cache():
     owner = _support_owner()
     data = b"downloaded object bytes"

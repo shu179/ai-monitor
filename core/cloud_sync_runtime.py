@@ -423,6 +423,10 @@ class AppCloudRuntimeSupport:
             request_payload.get("include_cloud_object_storage")
             or request_payload.get("includeCloudObjectStorage")
         )
+        include_cloud_sync_queue = bool(
+            request_payload.get("include_cloud_sync_queue")
+            or request_payload.get("includeCloudSyncQueue")
+        )
         session = self._session_store_factory().load()
         outbox = self._outbox_factory().bind_to_session(session).diagnostics(failed_limit=failed_limit)
         state_delta = CloudStateDeltaStore().diagnostics(session)
@@ -438,6 +442,11 @@ class AppCloudRuntimeSupport:
             if include_cloud_object_storage
             else None
         )
+        cloud_sync_queue = (
+            self._run_cloud_api_request("admin_sync_queue_report", request_payload)
+            if include_cloud_sync_queue
+            else None
+        )
         health = {
             "summary": _cloud_sync_health_summary(
                 session=session,
@@ -450,6 +459,7 @@ class AppCloudRuntimeSupport:
                 object_transfers=object_transfers,
                 capabilities=capabilities,
                 cloud_object_storage=cloud_object_storage,
+                cloud_sync_queue=cloud_sync_queue,
             ),
             "auto_sync": auto_sync,
             "capabilities": capabilities,
@@ -463,6 +473,8 @@ class AppCloudRuntimeSupport:
         }
         if cloud_object_storage is not None:
             health["cloud_object_storage"] = cloud_object_storage
+        if cloud_sync_queue is not None:
+            health["cloud_sync_queue"] = cloud_sync_queue
         return {
             "ok": True,
             "sync_health": health,
@@ -488,6 +500,8 @@ class AppCloudRuntimeSupport:
             return self._run_cloud_api_request("list_admin_article_classification_jobs", request_payload)
         if normalized in {"cloud.admin_object_storage_report", "admin_object_storage_report"}:
             return self._run_cloud_api_request("admin_object_storage_report", request_payload)
+        if normalized in {"cloud.admin_sync_queue_report", "admin_sync_queue_report"}:
+            return self._run_cloud_api_request("admin_sync_queue_report", request_payload)
         if normalized in {"cloud.resolve_admin_article_classification_job", "resolve_admin_article_classification_job"}:
             return self._run_cloud_api_request("resolve_admin_article_classification_job", request_payload)
         if normalized in {"cloud.ignore_admin_article_classification_job", "ignore_admin_article_classification_job"}:
@@ -1547,6 +1561,8 @@ class AppCloudRuntimeSupport:
                 return client.list_admin_users(token)
             if operation_name == "admin_object_storage_report":
                 return client.admin_object_storage_report(token)
+            if operation_name == "admin_sync_queue_report":
+                return client.admin_sync_queue_report(token)
             if operation_name == "list_admin_article_classification_jobs":
                 return client.list_admin_article_classification_jobs(
                     token,
@@ -1866,6 +1882,45 @@ def _cloud_object_storage_summary(result: dict[str, Any] | None) -> dict[str, An
     }
 
 
+def _cloud_sync_queue_summary(result: dict[str, Any] | None) -> dict[str, Any]:
+    payload = result if isinstance(result, dict) else {}
+    report = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    report_body = report.get("report") if isinstance(report.get("report"), dict) else {}
+    counts = report_body.get("counts") if isinstance(report_body.get("counts"), dict) else {}
+    leases = report_body.get("shard_leases") if isinstance(report_body.get("shard_leases"), dict) else {}
+    latency = (
+        report_body.get("recent_done_latency_ms")
+        if isinstance(report_body.get("recent_done_latency_ms"), dict)
+        else {}
+    )
+    return {
+        "cloud_sync_queue_checked": bool(payload),
+        "cloud_sync_queue_ok": bool(payload.get("ok")) if payload else False,
+        "cloud_sync_queue_status": str(report_body.get("status") or ""),
+        "cloud_sync_queue_worker_state": str(report_body.get("worker_state") or ""),
+        "cloud_sync_queue_pending": _safe_int(counts.get("pending"), 0),
+        "cloud_sync_queue_in_progress": _safe_int(counts.get("in_progress"), 0),
+        "cloud_sync_queue_done": _safe_int(counts.get("done"), 0),
+        "cloud_sync_queue_dead_letter": _safe_int(counts.get("dead_letter"), 0),
+        "cloud_sync_queue_blocked": _safe_int(counts.get("blocked"), 0),
+        "cloud_sync_queue_expired_in_progress": _safe_int(report_body.get("expired_in_progress"), 0),
+        "cloud_sync_queue_oldest_pending_age_seconds": _safe_int(
+            report_body.get("oldest_pending_age_seconds"),
+            0,
+        ),
+        "cloud_sync_queue_oldest_in_progress_age_seconds": _safe_int(
+            report_body.get("oldest_in_progress_age_seconds"),
+            0,
+        ),
+        "cloud_sync_queue_active_shards": _safe_int(leases.get("active"), 0),
+        "cloud_sync_queue_expired_shards": _safe_int(leases.get("expired"), 0),
+        "cloud_sync_queue_recent_done_completed": _safe_int(latency.get("completed"), 0),
+        "cloud_sync_queue_recent_done_avg_ms": _safe_int(latency.get("avg"), 0),
+        "cloud_sync_queue_recent_done_max_ms": _safe_int(latency.get("max"), 0),
+        "cloud_sync_queue_message": str(payload.get("message") or ""),
+    }
+
+
 def _merge_failure_backpressure(failures: list[dict[str, Any]]) -> dict[str, Any]:
     retry_after = 0.0
     queue_depth = 0
@@ -1964,6 +2019,7 @@ def _cloud_sync_health_summary(
     object_transfers: dict[str, Any] | None = None,
     capabilities: dict[str, Any] | None = None,
     cloud_object_storage: dict[str, Any] | None = None,
+    cloud_sync_queue: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     session_payload = session if isinstance(session, dict) else {}
     outbox_stats = outbox.get("stats") if isinstance(outbox.get("stats"), dict) else {}
@@ -2118,18 +2174,22 @@ def _cloud_sync_health_summary(
         "last_pull_at": str(auto_sync.get("last_pull_at") or ""),
         "last_state_delta_at": str(auto_sync.get("last_state_delta_at") or ""),
         "last_error": last_error,
-        "healthy": not any(
-            [
-                dead_letter > 0,
-                failed_inbox > 0,
-                bool(last_error),
-                bool(startup_recovery_error),
-            ]
-        ),
+        "healthy": not any([dead_letter > 0, failed_inbox > 0, bool(last_error), bool(startup_recovery_error)]),
     }
-    summary.update(_cloud_sync_action_summary(summary))
     summary.update(_cloud_capability_summary(capabilities))
     summary.update(_cloud_object_storage_summary(cloud_object_storage))
+    summary.update(_cloud_sync_queue_summary(cloud_sync_queue))
+    if bool(summary.get("cloud_sync_queue_checked")):
+        summary["healthy"] = bool(summary.get("healthy")) and not any(
+            [
+                _safe_int(summary.get("cloud_sync_queue_dead_letter"), 0) > 0,
+                _safe_int(summary.get("cloud_sync_queue_blocked"), 0) > 0,
+                _safe_int(summary.get("cloud_sync_queue_expired_in_progress"), 0) > 0,
+                str(summary.get("cloud_sync_queue_worker_state") or "")
+                in {"stalled_no_active_worker", "stalled_in_progress_no_active_worker"},
+            ]
+        )
+    summary.update(_cloud_sync_action_summary(summary))
     return summary
 
 
@@ -2163,6 +2223,31 @@ def _cloud_sync_action_summary(summary: dict[str, Any]) -> dict[str, Any]:
         add_blocker("outbox_dead_letter", "cloud outbox has dead-lettered events")
     if _safe_int(summary.get("inbox_failed"), 0) > 0:
         add_blocker("state_delta_inbox_failed", "state-delta inbox has failed items")
+    if _safe_int(summary.get("cloud_sync_queue_dead_letter"), 0) > 0:
+        add_blocker(
+            "cloud_sync_queue_dead_letter",
+            "cloud sync-v2 materialization queue has dead-lettered items",
+            dead_letter=_safe_int(summary.get("cloud_sync_queue_dead_letter"), 0),
+        )
+    if _safe_int(summary.get("cloud_sync_queue_blocked"), 0) > 0:
+        add_blocker(
+            "cloud_sync_queue_blocked",
+            "cloud sync-v2 materialization queue has entity chains blocked by dead letters",
+            blocked=_safe_int(summary.get("cloud_sync_queue_blocked"), 0),
+        )
+    if _safe_int(summary.get("cloud_sync_queue_expired_in_progress"), 0) > 0:
+        add_blocker(
+            "cloud_sync_queue_expired_in_progress",
+            "cloud sync-v2 materialization queue has expired worker leases",
+            expired_in_progress=_safe_int(summary.get("cloud_sync_queue_expired_in_progress"), 0),
+        )
+    cloud_worker_state = str(summary.get("cloud_sync_queue_worker_state") or "")
+    if cloud_worker_state in {"stalled_no_active_worker", "stalled_in_progress_no_active_worker"}:
+        add_blocker(
+            "cloud_sync_queue_worker_stalled",
+            "cloud sync-v2 queue has work but no active worker lease",
+            worker_state=cloud_worker_state,
+        )
     if bool(summary.get("last_startup_recovery_error")):
         add_blocker(
             "startup_recovery_failed",
