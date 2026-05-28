@@ -865,13 +865,18 @@ class AppCloudRuntimeSupport:
             return cached_result
 
         try:
-            ok, response_payload, message = self.cloud_request_with_refresh(operation)
+            ok, response_payload, message, backpressure = self.cloud_request_with_refresh(
+                operation,
+                include_error_metadata=True,
+            )
         except CloudObjectCacheError as exc:
             transfer_store.fail_transfer(transfer_id, str(exc))
             return {"ok": False, "message": str(exc)}
         if not ok:
             transfer_store.fail_transfer(transfer_id, message)
-            return {"ok": False, "message": message}
+            result = {"ok": False, "message": message}
+            result.update(_cloud_backpressure_fields(backpressure))
+            return result
         return {"ok": True, "cached": response_payload, "downloaded": True, "message": ""}
 
     def prune_cloud_object_cache(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -940,14 +945,14 @@ class AppCloudRuntimeSupport:
                 recovered += 1
                 continue
             failed += 1
-            failures.append(
-                {
-                    "transfer_id": str(item.get("transfer_id") or ""),
-                    "object_id": object_id,
-                    "message": str(result.get("message") or "download retry failed"),
-                }
-            )
-        return {
+            failure = {
+                "transfer_id": str(item.get("transfer_id") or ""),
+                "object_id": object_id,
+                "message": str(result.get("message") or "download retry failed"),
+            }
+            failure.update(_cloud_backpressure_fields(result))
+            failures.append(failure)
+        output = {
             "ok": failed == 0,
             "attempted": attempted,
             "recovered": recovered,
@@ -955,6 +960,8 @@ class AppCloudRuntimeSupport:
             "skipped": max(0, len(transfers) - attempted),
             "failures": failures[:10],
         }
+        output.update(_merge_failure_backpressure(failures))
+        return output
 
     def retry_object_uploads(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
