@@ -1332,6 +1332,10 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
         "upload_backpressure_retry_after_seconds": 8.5,
         "upload_backpressure_queue_depth_hint": 400,
         "upload_backpressure_bucket": "sync_metadata",
+        "object_download_retry_backpressure_until": "2026-05-28T10:00:30",
+        "object_download_retry_backpressure_retry_after_seconds": 6.0,
+        "object_download_retry_backpressure_queue_depth_hint": 17,
+        "object_download_retry_backpressure_bucket": "object_download",
         "object_upload_retry_backpressure_until": "2026-05-28T10:01:00",
         "object_upload_retry_backpressure_retry_after_seconds": 15.0,
         "object_upload_retry_backpressure_queue_depth_hint": 25,
@@ -1369,6 +1373,10 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     assert health["summary"]["logged_in"] is True
     assert health["summary"]["upload_backpressure_active"] is True
     assert health["summary"]["upload_backpressure_queue_depth_hint"] == 400
+    assert health["summary"]["object_download_retry_backpressure_active"] is True
+    assert health["summary"]["object_download_retry_backpressure_retry_after_seconds"] == 6.0
+    assert health["summary"]["object_download_retry_backpressure_queue_depth_hint"] == 17
+    assert health["summary"]["object_download_retry_backpressure_bucket"] == "object_download"
     assert health["summary"]["object_upload_retry_backpressure_active"] is True
     assert health["summary"]["object_upload_retry_backpressure_retry_after_seconds"] == 15.0
     assert health["summary"]["object_upload_retry_backpressure_queue_depth_hint"] == 25

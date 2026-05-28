@@ -123,6 +123,7 @@ class CloudPlatformAutoSync:
         self._last_error_log_at = 0.0
         self._last_transient_error_log_at = 0.0
         self._upload_backpressure_until_at = 0.0
+        self._object_download_retry_backpressure_until_at = 0.0
         self._object_upload_retry_backpressure_until_at = 0.0
         self._state_delta_backpressure_until_at = 0.0
         self._status: dict[str, Any] = {
@@ -147,6 +148,10 @@ class CloudPlatformAutoSync:
             "last_state_delta_metrics": {},
             "last_state_delta_inbox_metrics": {},
             "last_object_download_retry_metrics": {},
+            "object_download_retry_backpressure_until": "",
+            "object_download_retry_backpressure_retry_after_seconds": 0.0,
+            "object_download_retry_backpressure_queue_depth_hint": 0,
+            "object_download_retry_backpressure_bucket": "",
             "last_object_upload_retry_at": "",
             "last_object_upload_retry_metrics": {},
             "last_object_upload_retry_error": "",
@@ -387,6 +392,48 @@ class CloudPlatformAutoSync:
             object_upload_retry_backpressure_bucket="",
         )
 
+    def _refresh_object_download_retry_backpressure_status(self, now: float | None = None) -> bool:
+        current = time.monotonic() if now is None else float(now)
+        if self._object_download_retry_backpressure_until_at <= 0:
+            return False
+        remaining = self._object_download_retry_backpressure_until_at - current
+        if remaining <= 0:
+            self._clear_object_download_retry_backpressure()
+            return False
+        self._update_status(
+            object_download_retry_backpressure_until=(local_now() + timedelta(seconds=remaining)).isoformat(timespec="seconds"),
+        )
+        return True
+
+    def _apply_object_download_retry_backpressure(self, metrics: dict[str, Any], *, now: float | None = None) -> bool:
+        retry_after = _optional_positive_float(metrics.get("retry_after_seconds"))
+        if retry_after is None:
+            return False
+        current = time.monotonic() if now is None else float(now)
+        self._object_download_retry_backpressure_until_at = max(
+            self._object_download_retry_backpressure_until_at,
+            current + retry_after,
+        )
+        remaining = max(0.0, self._object_download_retry_backpressure_until_at - current)
+        queue_depth_hint = _optional_non_negative_int(metrics.get("queue_depth_hint"))
+        throttle_bucket = str(metrics.get("throttle_bucket") or "").strip()
+        self._update_status(
+            object_download_retry_backpressure_until=(local_now() + timedelta(seconds=remaining)).isoformat(timespec="seconds"),
+            object_download_retry_backpressure_retry_after_seconds=retry_after,
+            object_download_retry_backpressure_queue_depth_hint=queue_depth_hint if queue_depth_hint is not None else 0,
+            object_download_retry_backpressure_bucket=throttle_bucket,
+        )
+        return True
+
+    def _clear_object_download_retry_backpressure(self) -> None:
+        self._object_download_retry_backpressure_until_at = 0.0
+        self._update_status(
+            object_download_retry_backpressure_until="",
+            object_download_retry_backpressure_retry_after_seconds=0.0,
+            object_download_retry_backpressure_queue_depth_hint=0,
+            object_download_retry_backpressure_bucket="",
+        )
+
     def _finish_startup_recovery(
         self,
         recovery_result: dict[str, Any] | None,
@@ -452,6 +499,7 @@ class CloudPlatformAutoSync:
                     self._last_pull_started_at = 0.0
                     self._last_object_upload_retry_started_at = 0.0
                     self._clear_upload_backpressure()
+                    self._clear_object_download_retry_backpressure()
                     self._clear_object_upload_retry_backpressure()
                     self._update_status(
                         startup_recovery_running=True,
@@ -763,6 +811,7 @@ class CloudPlatformAutoSync:
         process_handler = self._process_state_delta_inbox
         retry_downloads_handler = self._retry_object_downloads
         backpressure_active = self._refresh_state_delta_backpressure_status()
+        download_retry_backpressure_active = self._refresh_object_download_retry_backpressure_status()
         if not callable(pull_handler) and not callable(process_handler):
             result = {"ok": True, "message": "", "skipped": True}
             self._update_status(
@@ -796,7 +845,12 @@ class CloudPlatformAutoSync:
                 )
             except Exception as exc:
                 process_result = {"ok": False, "message": f"state-delta inbox 处理失败：{exc}"}
-        if pull_result.get("ok") and process_result.get("ok") and callable(retry_downloads_handler):
+        if (
+            pull_result.get("ok")
+            and process_result.get("ok")
+            and callable(retry_downloads_handler)
+            and not download_retry_backpressure_active
+        ):
             try:
                 retry_downloads_result = _invoke_optional_payload_callback(
                     retry_downloads_handler,
@@ -804,6 +858,14 @@ class CloudPlatformAutoSync:
                 )
             except Exception as exc:
                 retry_downloads_result = {"ok": False, "message": f"对象下载恢复失败：{exc}"}
+        elif pull_result.get("ok") and process_result.get("ok") and callable(retry_downloads_handler):
+            retry_downloads_result = {"ok": True, "message": "", "skipped": True, "backpressure_active": True}
+        download_retry_metrics = _object_download_retry_metrics(retry_downloads_result)
+        if (
+            not self._apply_object_download_retry_backpressure(download_retry_metrics, now=time.monotonic())
+            and not download_retry_backpressure_active
+        ):
+            self._clear_object_download_retry_backpressure()
 
         ok = bool(pull_result.get("ok")) and bool(process_result.get("ok"))
         message = "" if ok else str(process_result.get("message") or pull_result.get("message") or "state-delta 自动下放失败")
@@ -811,7 +873,7 @@ class CloudPlatformAutoSync:
             last_state_delta_at=local_now().isoformat(timespec="seconds") if ok else self.get_status().get("last_state_delta_at", ""),
             last_state_delta_metrics=pull_metrics,
             last_state_delta_inbox_metrics=_state_delta_inbox_metrics(process_result),
-            last_object_download_retry_metrics=_object_download_retry_metrics(retry_downloads_result),
+            last_object_download_retry_metrics=download_retry_metrics,
             last_state_delta_error=message,
         )
         return {
@@ -953,6 +1015,7 @@ def _object_download_retry_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "recovered": _safe_int(payload.get("recovered")),
         "failed": _safe_int(payload.get("failed")),
         "skipped": _safe_int(payload.get("skipped")),
+        "backpressure_active": bool(payload.get("backpressure_active")),
         "retry_after_seconds": _safe_float(payload.get("retry_after_seconds") or payload.get("next_retry_after_seconds")),
         "queue_depth_hint": _safe_int(payload.get("queue_depth_hint")),
         "throttle_bucket": str(payload.get("throttle_bucket") or ""),

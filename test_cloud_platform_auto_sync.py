@@ -748,6 +748,43 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             self.assertEqual(status["last_state_delta_inbox_metrics"]["applied"], 1)
             self.assertEqual(status["last_object_download_retry_metrics"]["failed"], 1)
 
+    def test_object_download_retry_backpressure_skips_retry_but_processes_inbox(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calls: list[str] = []
+            manager = CloudPlatformAutoSync(
+                session_store=CloudSessionStore(Path(tmpdir) / "session.json"),
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                pull_state_delta=lambda _payload=None: calls.append("state_delta") or {"ok": True, "changes": 1},
+                process_state_delta_inbox=lambda _payload=None: calls.append("process") or {"ok": True, "applied": 1},
+                retry_object_downloads=lambda _payload=None: calls.append("download_retry") or {
+                    "ok": False,
+                    "attempted": 1,
+                    "recovered": 0,
+                    "failed": 1,
+                    "skipped": 0,
+                    "message": "object download busy",
+                    "retry_after_seconds": 0.6,
+                    "queue_depth_hint": 17,
+                    "throttle_bucket": "object_download",
+                },
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            first = manager._invoke_state_delta_pipeline()  # noqa: SLF001
+            second = manager._invoke_state_delta_pipeline()  # noqa: SLF001
+
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["ok"])
+            self.assertEqual(calls, ["state_delta", "process", "download_retry", "state_delta", "process"])
+            status = manager.get_status()
+            self.assertEqual(status["object_download_retry_backpressure_retry_after_seconds"], 0.6)
+            self.assertEqual(status["object_download_retry_backpressure_queue_depth_hint"], 17)
+            self.assertEqual(status["object_download_retry_backpressure_bucket"], "object_download")
+            self.assertTrue(status["object_download_retry_backpressure_until"])
+            self.assertEqual(status["last_object_download_retry_metrics"]["backpressure_active"], True)
+
     def test_object_download_retry_exception_does_not_fail_state_delta_pipeline(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             def retry_downloads(_payload=None):
