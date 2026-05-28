@@ -2191,21 +2191,8 @@ class AppRuntime:
     def _start_cloud_command_transport(self) -> None:
         state = self._cloud_command_transport_state()
         with state.lock:
-            state.stop_requested = False
-            recovery_thread = state.recovery_thread
-            if recovery_thread is threading.current_thread():
-                state.recovery_thread = None
-            if state.server is not None or state.daemon is not None:
-                return
             fallback_client = self._build_in_process_cloud_command_client()
-            state.client = fallback_client
-            state.socket_path = None
-            state.mode = "in_process_direct"
-            state.error = ""
-            state.error_type = ""
-            if not hasattr(socket, "AF_UNIX"):
-                state.error = "AF_UNIX unavailable"
-                state.error_type = "unsupported_platform"
+            if not state.prepare_start(fallback_client=fallback_client, af_unix_available=hasattr(socket, "AF_UNIX")):
                 return
             socket_path = self._build_cloud_command_socket_path()
             daemon = CloudSyncCommandDaemonProcess(
@@ -2220,16 +2207,10 @@ class AppRuntime:
                     daemon.stop()
                 except Exception:
                     pass
-                state.error = str(exc)
-                state.error_type = "start_failed"
+                state.record_start_failure(exc)
                 print(f"[CloudSyncDaemon] Child daemon unavailable, trying in-process socket server: {exc}")
             else:
-                state.socket_path = socket_path
-                state.daemon = daemon
-                state.client = client
-                state.mode = "child_daemon"
-                state.error = ""
-                state.error_type = ""
+                state.activate_child_daemon(socket_path=socket_path, daemon=daemon, client=client)
                 return
             server = UnixSocketCloudSyncCommandServer(
                 socket_path,
@@ -2243,16 +2224,10 @@ class AppRuntime:
                     server.stop()
                 except Exception:
                     pass
-                state.error = str(exc)
-                state.error_type = "start_failed"
+                state.record_start_failure(exc)
                 print(f"[CloudSyncDaemon] Unix socket transport unavailable, falling back in-process: {exc}")
                 return
-            state.socket_path = socket_path
-            state.server = server
-            state.client = client
-            state.mode = "in_process_socket"
-            state.error = ""
-            state.error_type = ""
+            state.activate_in_process_socket(socket_path=socket_path, server=server, client=client)
 
     def _degrade_cloud_command_transport(self, reason: str, *, error_type: str = "") -> None:
         """Switch future cloud commands back to the in-process handler."""
@@ -2262,15 +2237,11 @@ class AppRuntime:
         daemon = None
         server = None
         with state.lock:
-            daemon = state.daemon
-            server = state.server
-            state.daemon = None
-            state.server = None
-            state.socket_path = None
-            state.client = fallback_client
-            state.mode = "in_process_direct"
-            state.error = reason_text
-            state.error_type = str(error_type or "unknown").strip() or "unknown"
+            daemon, server = state.degrade_to_in_process(
+                fallback_client=fallback_client,
+                reason=reason_text,
+                error_type=error_type,
+            )
         if daemon is not None:
             try:
                 daemon.stop()
@@ -2305,12 +2276,12 @@ class AppRuntime:
         finally:
             state = self._cloud_command_transport_state()
             with state.lock:
-                state.last_recovery_completed_at = local_now().isoformat(timespec="seconds")
-                state.last_recovery_result = result
-                state.last_recovery_error = error
-                if state.recovery_thread is threading.current_thread():
-                    state.recovery_thread = None
-            if result == "failed" and not state.stop_requested:
+                stop_requested = state.record_recovery_completion(
+                    result=result,
+                    error=error,
+                    completed_at=local_now().isoformat(timespec="seconds"),
+                )
+            if result == "failed" and not stop_requested:
                 self._schedule_cloud_command_transport_recovery(
                     error or "cloud command transport recovery failed",
                     force=False,
@@ -2373,17 +2344,7 @@ class AppRuntime:
         daemon = None
         recovery_thread = None
         with state.lock:
-            server = state.server
-            daemon = state.daemon
-            recovery_thread = state.recovery_thread
-            state.clear_recovery_timer()
-            state.server = None
-            state.daemon = None
-            state.recovery_thread = None
-            state.client = None
-            state.socket_path = None
-            state.stop_requested = True
-            state.mode = "stopped"
+            server, daemon, recovery_thread = state.detach_for_stop()
         if daemon is not None:
             try:
                 daemon.stop()

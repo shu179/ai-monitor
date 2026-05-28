@@ -169,6 +169,85 @@ class CloudCommandTransportState:
             except Exception:
                 pass
 
+    def prepare_start(self, *, fallback_client: Any, af_unix_available: bool) -> bool:
+        self.stop_requested = False
+        if self.recovery_thread is threading.current_thread():
+            self.recovery_thread = None
+        if self.server is not None or self.daemon is not None:
+            return False
+        self.client = fallback_client
+        self.socket_path = None
+        self.mode = "in_process_direct"
+        self.error = ""
+        self.error_type = ""
+        if not af_unix_available:
+            self.error = "AF_UNIX unavailable"
+            self.error_type = "unsupported_platform"
+            return False
+        return True
+
+    def record_start_failure(self, exc: BaseException | str, *, error_type: str = "start_failed") -> None:
+        self.error = str(exc)
+        self.error_type = str(error_type or "start_failed").strip() or "start_failed"
+
+    def activate_child_daemon(self, *, socket_path: Path, daemon: Any, client: Any) -> None:
+        self.socket_path = socket_path
+        self.daemon = daemon
+        self.server = None
+        self.client = client
+        self.mode = "child_daemon"
+        self.error = ""
+        self.error_type = ""
+
+    def activate_in_process_socket(self, *, socket_path: Path, server: Any, client: Any) -> None:
+        self.socket_path = socket_path
+        self.server = server
+        self.daemon = None
+        self.client = client
+        self.mode = "in_process_socket"
+        self.error = ""
+        self.error_type = ""
+
+    def degrade_to_in_process(
+        self,
+        *,
+        fallback_client: Any,
+        reason: str,
+        error_type: str = "",
+    ) -> tuple[Any | None, Any | None]:
+        daemon = self.daemon
+        server = self.server
+        self.daemon = None
+        self.server = None
+        self.socket_path = None
+        self.client = fallback_client
+        self.mode = "in_process_direct"
+        self.error = str(reason or "云同步 daemon 不可用")
+        self.error_type = str(error_type or "unknown").strip() or "unknown"
+        return daemon, server
+
+    def detach_for_stop(self) -> tuple[Any | None, Any | None, threading.Thread | None]:
+        server = self.server
+        daemon = self.daemon
+        recovery_thread = self.recovery_thread
+        self.clear_recovery_timer()
+        self.server = None
+        self.daemon = None
+        self.recovery_thread = None
+        self.client = None
+        self.socket_path = None
+        self.stop_requested = True
+        self.mode = "stopped"
+        return server, daemon, recovery_thread
+
+    def record_recovery_completion(self, *, result: str, error: str, completed_at: str) -> bool:
+        self.last_recovery_completed_at = completed_at
+        self.last_recovery_result = str(result or "")
+        self.last_recovery_error = str(error or "")
+        if self.recovery_thread is threading.current_thread():
+            self.recovery_thread = None
+        return self.stop_requested
+
     def snapshot_status(
         self,
         *,
