@@ -1473,9 +1473,17 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
         outbox_factory=lambda: outbox,
         auto_sync_status_getter=lambda: auto_sync_status,
         request_client_factory=FakeClient,
-        object_cache_factory=lambda: MagicMock(diagnostics=lambda: {"objects": 4, "bytes": 12345}),
+        object_cache_factory=lambda: MagicMock(diagnostics=lambda: {"objects": 4, "bytes": 250, "max_cache_bytes": 1000}),
         object_transfer_store_factory=lambda: MagicMock(
-            diagnostics=lambda failed_limit=10: {"total": 3, "by_status": {"failed": 1, "running": 1}}
+            diagnostics=lambda failed_limit=10: {
+                "total": 5,
+                "retryable_count": 2,
+                "by_status": {"failed": 2, "running": 2, "completed": 1},
+                "by_direction": {
+                    "upload": {"failed": 1, "running": 1},
+                    "download": {"failed": 1, "running": 1},
+                },
+            }
         ),
     )
     support._run_cloud_api_request = Mock(wraps=support._run_cloud_api_request)
@@ -1515,11 +1523,18 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     assert health["summary"]["answers_cached"] == 7
     assert health["summary"]["assets_cached"] == 9
     assert health["summary"]["object_cache_objects"] == 4
-    assert health["summary"]["object_cache_bytes"] == 12345
-    assert health["summary"]["object_cache_max_bytes"] == 0
-    assert health["summary"]["object_transfers_total"] == 3
-    assert health["summary"]["object_transfers_failed"] == 1
-    assert health["summary"]["object_transfers_running"] == 1
+    assert health["summary"]["object_cache_bytes"] == 250
+    assert health["summary"]["object_cache_max_bytes"] == 1000
+    assert health["summary"]["object_cache_free_bytes"] == 750
+    assert health["summary"]["object_cache_usage_ratio"] == 0.25
+    assert health["summary"]["object_transfers_total"] == 5
+    assert health["summary"]["object_transfers_retryable"] == 2
+    assert health["summary"]["object_transfers_failed"] == 2
+    assert health["summary"]["object_transfers_running"] == 2
+    assert health["summary"]["object_upload_transfers_failed"] == 1
+    assert health["summary"]["object_upload_transfers_running"] == 1
+    assert health["summary"]["object_download_transfers_failed"] == 1
+    assert health["summary"]["object_download_transfers_running"] == 1
     assert health["summary"]["capabilities_ok"] is True
     assert health["summary"]["capabilities_cached"] is False
     assert health["summary"]["object_storage_backend"] == "local"

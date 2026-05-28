@@ -1924,6 +1924,21 @@ def _cloud_sync_health_summary(
     cache_payload = object_cache if isinstance(object_cache, dict) else {}
     transfers_payload = object_transfers if isinstance(object_transfers, dict) else {}
     transfer_by_status = transfers_payload.get("by_status") if isinstance(transfers_payload.get("by_status"), dict) else {}
+    transfer_by_direction = (
+        transfers_payload.get("by_direction") if isinstance(transfers_payload.get("by_direction"), dict) else {}
+    )
+    upload_transfers = transfer_by_direction.get("upload") if isinstance(transfer_by_direction.get("upload"), dict) else {}
+    download_transfers = (
+        transfer_by_direction.get("download") if isinstance(transfer_by_direction.get("download"), dict) else {}
+    )
+    object_cache_bytes = _safe_int(cache_payload.get("bytes"), 0)
+    object_cache_max_bytes = _safe_int(cache_payload.get("max_cache_bytes"), 0)
+    object_cache_free_bytes = max(0, object_cache_max_bytes - object_cache_bytes) if object_cache_max_bytes > 0 else 0
+    object_cache_usage_ratio = (
+        min(1.0, max(0.0, object_cache_bytes / object_cache_max_bytes))
+        if object_cache_max_bytes > 0
+        else 0.0
+    )
     backpressure_until = str(auto_sync.get("upload_backpressure_until") or "")
     object_download_retry_backpressure_until = str(auto_sync.get("object_download_retry_backpressure_until") or "")
     object_upload_retry_backpressure_until = str(auto_sync.get("object_upload_retry_backpressure_until") or "")
@@ -1985,11 +2000,18 @@ def _cloud_sync_health_summary(
         "answers_cached": _safe_int(content_state.get("answers_total"), 0),
         "assets_cached": _safe_int(content_state.get("assets_total"), 0),
         "object_cache_objects": _safe_int(cache_payload.get("objects"), 0),
-        "object_cache_bytes": _safe_int(cache_payload.get("bytes"), 0),
-        "object_cache_max_bytes": _safe_int(cache_payload.get("max_cache_bytes"), 0),
+        "object_cache_bytes": object_cache_bytes,
+        "object_cache_max_bytes": object_cache_max_bytes,
+        "object_cache_free_bytes": object_cache_free_bytes,
+        "object_cache_usage_ratio": object_cache_usage_ratio,
         "object_transfers_total": _safe_int(transfers_payload.get("total"), 0),
+        "object_transfers_retryable": _safe_int(transfers_payload.get("retryable_count"), 0),
         "object_transfers_failed": _safe_int(transfer_by_status.get("failed"), 0),
         "object_transfers_running": _safe_int(transfer_by_status.get("running"), 0),
+        "object_upload_transfers_failed": _safe_int(upload_transfers.get("failed"), 0),
+        "object_upload_transfers_running": _safe_int(upload_transfers.get("running"), 0),
+        "object_download_transfers_failed": _safe_int(download_transfers.get("failed"), 0),
+        "object_download_transfers_running": _safe_int(download_transfers.get("running"), 0),
         "last_upload_at": str(auto_sync.get("last_upload_at") or ""),
         "last_pull_at": str(auto_sync.get("last_pull_at") or ""),
         "last_state_delta_at": str(auto_sync.get("last_state_delta_at") or ""),
