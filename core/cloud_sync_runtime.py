@@ -194,6 +194,32 @@ class CloudCommandTransportState:
             socket_ping["error_type"] = str(ping_result.get("daemon_error_type") or "unknown")
         return socket_ping
 
+    def ensure_client(self, *, fallback_client: Any) -> Any:
+        client = self.client
+        if client is not None:
+            return client
+        self.client = fallback_client
+        self.mode = "in_process_direct"
+        self.error = ""
+        return fallback_client
+
+    def send_command_via_transport(
+        self,
+        client: Any,
+        command: str,
+        payload: dict[str, Any] | None,
+        *,
+        socket_client_factory: Callable[..., Any] | None = None,
+    ) -> dict[str, Any]:
+        socket_path = self.socket_path
+        factory = socket_client_factory or type(client)
+        if type(client).__name__ == "UnixSocketCloudSyncCommandClient" and socket_path:
+            client = factory(
+                socket_path,
+                timeout_seconds=self.command_timeout_seconds(command),
+            )
+        return client.send_command(command, payload)
+
     def clear_recovery_timer(self) -> None:
         timer = self.recovery_timer
         self.recovery_timer = None
@@ -404,6 +430,16 @@ class CloudCommandTransportState:
             "last_error": self.error,
             "last_error_type": self.error_type,
         }
+
+    def snapshot_status_with_action_summary(
+        self,
+        *,
+        ping_fn: Callable[[Path], dict[str, Any]] | None = None,
+        now_monotonic: Callable[[], float] = time.monotonic,
+    ) -> dict[str, Any]:
+        status = self.snapshot_status(ping_fn=ping_fn, now_monotonic=now_monotonic)
+        status.update(self.action_summary(status))
+        return status
 
     @staticmethod
     def action_summary(status: dict[str, Any]) -> dict[str, Any]:

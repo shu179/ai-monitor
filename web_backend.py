@@ -2135,26 +2135,18 @@ class AppRuntime:
 
     def _ensure_cloud_command_client(self) -> Any:
         state = self._cloud_command_transport_state()
-        client = state.client
-        if client is not None:
-            return client
-        client = self._build_in_process_cloud_command_client()
-        state.client = client
-        state.mode = "in_process_direct"
-        state.error = ""
-        return client
+        return state.ensure_client(fallback_client=self._build_in_process_cloud_command_client())
 
     def _cloud_command_timeout_seconds(self, command: str) -> float:
         return CloudCommandTransportState.command_timeout_seconds(command)
 
     def _send_cloud_command_via_transport(self, client: Any, command: str, payload: dict[str, Any] | None) -> dict[str, Any]:
-        socket_path = self._cloud_command_transport_state().socket_path
-        if type(client).__name__ == "UnixSocketCloudSyncCommandClient" and socket_path:
-            client = UnixSocketCloudSyncCommandClient(
-                socket_path,
-                timeout_seconds=self._cloud_command_timeout_seconds(command),
-            )
-        return client.send_command(command, payload)
+        return self._cloud_command_transport_state().send_command_via_transport(
+            client,
+            command,
+            payload,
+            socket_client_factory=UnixSocketCloudSyncCommandClient,
+        )
 
     def _start_cloud_command_transport(self) -> None:
         state = self._cloud_command_transport_state()
@@ -4465,12 +4457,7 @@ return changedCount
         def ping_socket(socket_path: Path) -> dict[str, Any]:
             return UnixSocketCloudSyncCommandClient(socket_path, timeout_seconds=0.25).send_command("cloud.daemon.ping")
 
-        status = state.snapshot_status(ping_fn=ping_socket)
-        status.update(CloudCommandTransportState.action_summary(status))
-        return status
-
-    def _cloud_command_transport_action_summary(self, status: dict[str, Any]) -> dict[str, Any]:
-        return CloudCommandTransportState.action_summary(status)
+        return state.snapshot_status_with_action_summary(ping_fn=ping_socket)
 
     def _cloud_runtime_payload_command(self, command: str, payload: dict[str, Any] | None = None) -> tuple[bool, Any, str]:
         result = self._cloud_runtime_command(command, payload)
