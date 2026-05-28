@@ -2084,6 +2084,12 @@ class AppRuntime:
         self._cloud_command_server: UnixSocketCloudSyncCommandServer | None = None
         self._cloud_command_daemon: CloudSyncCommandDaemonProcess | None = None
         self._cloud_command_client: Any | None = None
+        self._cloud_command_transport_recovery_thread: threading.Thread | None = None
+        self._cloud_command_transport_last_recovery_attempt_at = 0.0
+        self._cloud_command_transport_last_recovery_attempt = ""
+        self._cloud_command_transport_last_recovery_reason = ""
+        self._cloud_command_transport_recovery_interval_seconds = 30.0
+        self._cloud_command_transport_stop_requested = False
         self._cloud_command_transport_mode = "not_started"
         self._cloud_command_transport_error = ""
         self._isolate_ordinary_cloud_account_config(CloudSessionStore().load())
@@ -2147,6 +2153,10 @@ class AppRuntime:
             lock = threading.RLock()
             self._cloud_command_transport_lock = lock
         with lock:
+            self._cloud_command_transport_stop_requested = False
+            recovery_thread = getattr(self, "_cloud_command_transport_recovery_thread", None)
+            if recovery_thread is threading.current_thread():
+                self._cloud_command_transport_recovery_thread = None
             if getattr(self, "_cloud_command_server", None) is not None or getattr(self, "_cloud_command_daemon", None) is not None:
                 return
             fallback_client = self._build_in_process_cloud_command_client()
@@ -2230,6 +2240,58 @@ class AppRuntime:
             except Exception:
                 pass
 
+    def _recover_cloud_command_transport_worker(self) -> None:
+        try:
+            lock = getattr(self, "_cloud_command_transport_lock", None)
+            if lock is None:
+                lock = threading.RLock()
+                self._cloud_command_transport_lock = lock
+            with lock:
+                if bool(getattr(self, "_cloud_command_transport_stop_requested", False)):
+                    return
+            self._start_cloud_command_transport()
+        finally:
+            lock = getattr(self, "_cloud_command_transport_lock", None)
+            if lock is not None:
+                with lock:
+                    if getattr(self, "_cloud_command_transport_recovery_thread", None) is threading.current_thread():
+                        self._cloud_command_transport_recovery_thread = None
+
+    def _schedule_cloud_command_transport_recovery(self, reason: str, *, force: bool = False) -> bool:
+        lock = getattr(self, "_cloud_command_transport_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._cloud_command_transport_lock = lock
+        if not hasattr(socket, "AF_UNIX"):
+            return False
+        reason_text = str(reason or "cloud command transport recovery").strip() or "cloud command transport recovery"
+        now = time.monotonic()
+        with lock:
+            if bool(getattr(self, "_cloud_command_transport_stop_requested", False)):
+                return False
+            if getattr(self, "_cloud_command_daemon", None) is not None or getattr(self, "_cloud_command_server", None) is not None:
+                return False
+            if str(getattr(self, "_cloud_command_transport_mode", "") or "") != "in_process_direct":
+                return False
+            recovery_thread = getattr(self, "_cloud_command_transport_recovery_thread", None)
+            if recovery_thread is not None and callable(getattr(recovery_thread, "is_alive", None)) and recovery_thread.is_alive():
+                return False
+            interval = max(1.0, float(getattr(self, "_cloud_command_transport_recovery_interval_seconds", 30.0) or 30.0))
+            last_attempt_at = float(getattr(self, "_cloud_command_transport_last_recovery_attempt_at", 0.0) or 0.0)
+            if not force and last_attempt_at > 0 and now - last_attempt_at < interval:
+                return False
+            self._cloud_command_transport_last_recovery_attempt_at = now
+            self._cloud_command_transport_last_recovery_attempt = local_now().isoformat(timespec="seconds")
+            self._cloud_command_transport_last_recovery_reason = reason_text
+            recovery_thread = threading.Thread(
+                target=self._recover_cloud_command_transport_worker,
+                name="cloud-command-transport-recovery",
+                daemon=True,
+            )
+            self._cloud_command_transport_recovery_thread = recovery_thread
+        recovery_thread.start()
+        return True
+
     def _stop_cloud_command_transport(self) -> None:
         lock = getattr(self, "_cloud_command_transport_lock", None)
         if lock is None:
@@ -2237,13 +2299,17 @@ class AppRuntime:
             self._cloud_command_transport_lock = lock
         server = None
         daemon = None
+        recovery_thread = None
         with lock:
             server = getattr(self, "_cloud_command_server", None)
             daemon = getattr(self, "_cloud_command_daemon", None)
+            recovery_thread = getattr(self, "_cloud_command_transport_recovery_thread", None)
             self._cloud_command_server = None
             self._cloud_command_daemon = None
+            self._cloud_command_transport_recovery_thread = None
             self._cloud_command_client = None
             self._cloud_command_socket_path = None
+            self._cloud_command_transport_stop_requested = True
             self._cloud_command_transport_mode = "stopped"
         if daemon is not None:
             try:
@@ -2253,6 +2319,15 @@ class AppRuntime:
         if server is not None:
             try:
                 server.stop()
+            except Exception:
+                pass
+        if (
+            recovery_thread is not None
+            and recovery_thread is not threading.current_thread()
+            and callable(getattr(recovery_thread, "join", None))
+        ):
+            try:
+                recovery_thread.join(timeout=1.0)
             except Exception:
                 pass
 
@@ -4381,6 +4456,9 @@ return changedCount
         result = client.send_command(normalized, payload)
         if isinstance(result, dict) and bool(result.get("daemon_unavailable")):
             self._degrade_cloud_command_transport(str(result.get("message") or "云同步 daemon 不可用"))
+            self._schedule_cloud_command_transport_recovery(
+                str(result.get("message") or "云同步 daemon 不可用"),
+            )
             return self._ensure_cloud_runtime_support().handle_command(normalized, payload)
         if isinstance(result, dict) and bool(result.get("unsupported_by_daemon")):
             return self._ensure_cloud_runtime_support().handle_command(normalized, payload)
@@ -4414,7 +4492,13 @@ return changedCount
             else:
                 mode = "not_started"
         process = getattr(daemon, "process", None)
+        recovery_thread = getattr(self, "_cloud_command_transport_recovery_thread", None)
         daemon_process_alive = bool(callable(getattr(process, "is_alive", None)) and process.is_alive())
+        recovery_running = bool(
+            recovery_thread is not None
+            and callable(getattr(recovery_thread, "is_alive", None))
+            and recovery_thread.is_alive()
+        )
         socket_ping: dict[str, Any] = {
             "attempted": False,
             "ok": None,
@@ -4447,6 +4531,17 @@ return changedCount
             responsive = client is not None
         else:
             responsive = False
+        last_recovery_attempt_at = float(getattr(self, "_cloud_command_transport_last_recovery_attempt_at", 0.0) or 0.0)
+        recovery_interval_seconds = max(
+            1.0,
+            float(getattr(self, "_cloud_command_transport_recovery_interval_seconds", 30.0) or 30.0),
+        )
+        next_recovery_allowed_in_seconds = 0
+        if mode == "in_process_direct" and not recovery_running and last_recovery_attempt_at > 0:
+            next_recovery_allowed_in_seconds = max(
+                0,
+                int((recovery_interval_seconds - (time.monotonic() - last_recovery_attempt_at)) + 0.999),
+            )
         return {
             "mode": mode,
             "socket_path": str(socket_path or ""),
@@ -4456,6 +4551,10 @@ return changedCount
             "in_process_server_active": server is not None,
             "responsive": responsive,
             "socket_ping": socket_ping,
+            "recovery_running": recovery_running,
+            "last_recovery_attempt": str(getattr(self, "_cloud_command_transport_last_recovery_attempt", "") or ""),
+            "last_recovery_reason": str(getattr(self, "_cloud_command_transport_last_recovery_reason", "") or ""),
+            "next_recovery_allowed_in_seconds": next_recovery_allowed_in_seconds,
             "last_error": str(getattr(self, "_cloud_command_transport_error", "") or ""),
         }
 
