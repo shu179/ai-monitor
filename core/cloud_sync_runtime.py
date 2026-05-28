@@ -2082,6 +2082,133 @@ def _cloud_sync_health_summary(
             ]
         ),
     }
+    summary.update(_cloud_sync_action_summary(summary))
     summary.update(_cloud_capability_summary(capabilities))
     summary.update(_cloud_object_storage_summary(cloud_object_storage))
     return summary
+
+
+def _cloud_sync_action_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    blockers: list[dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
+
+    def add_blocker(kind: str, message: str, retry_after: Any = 0, **extra: Any) -> None:
+        payload = {
+            "kind": kind,
+            "message": message,
+            "retry_after_seconds": _safe_int(retry_after, 0),
+        }
+        payload.update({key: value for key, value in extra.items() if value not in (None, "")})
+        blockers.append(payload)
+
+    def add_action(kind: str, reason: str, retry_after: Any = 0) -> None:
+        actions.append(
+            {
+                "kind": kind,
+                "reason": reason,
+                "retry_after_seconds": _safe_int(retry_after, 0),
+            }
+        )
+
+    if not bool(summary.get("logged_in")):
+        add_blocker("not_logged_in", "cloud session is not logged in")
+    if not bool(summary.get("auto_sync_running")):
+        add_blocker("auto_sync_stopped", "cloud auto-sync is not running")
+    if _safe_int(summary.get("outbox_dead_letter"), 0) > 0:
+        add_blocker("outbox_dead_letter", "cloud outbox has dead-lettered events")
+    if _safe_int(summary.get("inbox_failed"), 0) > 0:
+        add_blocker("state_delta_inbox_failed", "state-delta inbox has failed items")
+    if bool(summary.get("last_error")):
+        add_blocker("last_error", str(summary.get("last_error") or "cloud sync reported an error"))
+
+    if bool(summary.get("upload_backpressure_active")):
+        add_blocker(
+            "upload_backpressure",
+            "metadata upload is throttled by the cloud",
+            summary.get("upload_backpressure_retry_after_seconds"),
+            queue_depth_hint=_safe_int(summary.get("upload_backpressure_queue_depth_hint"), 0),
+            throttle_bucket=str(summary.get("upload_backpressure_bucket") or ""),
+        )
+    if bool(summary.get("object_upload_retry_backpressure_active")):
+        add_blocker(
+            "object_upload_backpressure",
+            "object upload retry is throttled by the cloud",
+            summary.get("object_upload_retry_backpressure_retry_after_seconds"),
+            queue_depth_hint=_safe_int(summary.get("object_upload_retry_backpressure_queue_depth_hint"), 0),
+            throttle_bucket=str(summary.get("object_upload_retry_backpressure_bucket") or ""),
+        )
+    if bool(summary.get("object_download_retry_backpressure_active")):
+        add_blocker(
+            "object_download_backpressure",
+            "object download retry is throttled by the cloud",
+            summary.get("object_download_retry_backpressure_retry_after_seconds"),
+            queue_depth_hint=_safe_int(summary.get("object_download_retry_backpressure_queue_depth_hint"), 0),
+            throttle_bucket=str(summary.get("object_download_retry_backpressure_bucket") or ""),
+        )
+
+    outbox_wait_reason = str(summary.get("outbox_wait_reason") or "")
+    if bool(summary.get("upload_backpressure_active")) and (
+        _safe_int(summary.get("outbox_pending"), 0) + _safe_int(summary.get("outbox_failed"), 0) > 0
+    ):
+        add_action("upload_outbox", "server_backpressure", summary.get("upload_backpressure_retry_after_seconds"))
+    elif _safe_int(summary.get("outbox_upload_ready"), 0) > 0:
+        add_action("upload_outbox", "ready", 0)
+    elif _safe_int(summary.get("outbox_pending"), 0) + _safe_int(summary.get("outbox_failed"), 0) > 0:
+        add_action("upload_outbox", outbox_wait_reason or "waiting", summary.get("next_upload_attempt_after_seconds"))
+
+    object_upload_reason = str(summary.get("object_upload_retry_wait_reason") or "")
+    if bool(summary.get("object_upload_retry_backpressure_active")) and (
+        _safe_int(summary.get("object_upload_retry_ready_count"), 0)
+        + _safe_int(summary.get("object_upload_retry_waiting_count"), 0)
+        > 0
+    ):
+        add_action(
+            "retry_object_uploads",
+            "server_backpressure",
+            summary.get("object_upload_retry_backpressure_retry_after_seconds"),
+        )
+    elif _safe_int(summary.get("object_upload_retry_ready_count"), 0) > 0:
+        add_action("retry_object_uploads", "ready", 0)
+    elif _safe_int(summary.get("object_upload_retry_waiting_count"), 0) > 0:
+        add_action(
+            "retry_object_uploads",
+            object_upload_reason or "waiting_retry_backoff",
+            summary.get("next_object_upload_retry_after_seconds"),
+        )
+
+    object_download_reason = str(summary.get("object_download_retry_wait_reason") or "")
+    if bool(summary.get("object_download_retry_backpressure_active")) and (
+        _safe_int(summary.get("object_download_retry_ready_count"), 0)
+        + _safe_int(summary.get("object_download_retry_waiting_count"), 0)
+        > 0
+    ):
+        add_action(
+            "retry_object_downloads",
+            "server_backpressure",
+            summary.get("object_download_retry_backpressure_retry_after_seconds"),
+        )
+    elif _safe_int(summary.get("object_download_retry_ready_count"), 0) > 0:
+        add_action("retry_object_downloads", "ready", 0)
+    elif _safe_int(summary.get("object_download_retry_waiting_count"), 0) > 0:
+        add_action(
+            "retry_object_downloads",
+            object_download_reason or "waiting_retry_backoff",
+            summary.get("next_object_download_retry_after_seconds"),
+        )
+
+    pending_actions = [item for item in actions if _safe_int(item.get("retry_after_seconds"), 0) > 0]
+    ready_actions = [item for item in actions if _safe_int(item.get("retry_after_seconds"), 0) <= 0]
+    if ready_actions:
+        next_action = min(ready_actions, key=lambda item: str(item.get("kind") or ""))
+    elif pending_actions:
+        next_action = min(pending_actions, key=lambda item: _safe_int(item.get("retry_after_seconds"), 0))
+    elif blockers:
+        next_action = {"kind": "blocked", "reason": blockers[0]["kind"], "retry_after_seconds": blockers[0]["retry_after_seconds"]}
+    else:
+        next_action = {"kind": "idle", "reason": "idle", "retry_after_seconds": 0}
+
+    return {
+        "sync_blocked": bool(blockers),
+        "sync_blockers": blockers,
+        "next_sync_action": next_action,
+    }

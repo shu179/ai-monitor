@@ -19,6 +19,7 @@ from core.cloud_sync_runtime import (
     AppCloudRuntimeSupport,
     create_in_process_cloud_sync_command_client,
     create_local_cloud_sync_runtime,
+    _cloud_sync_health_summary,
 )
 
 
@@ -1540,6 +1541,18 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     assert health["summary"]["next_retry_after_seconds"] == 12
     assert health["summary"]["outbox_wait_reason"] == "waiting_retry_backoff"
     assert health["summary"]["next_upload_attempt_after_seconds"] == 12
+    assert health["summary"]["sync_blocked"] is True
+    blocker_kinds = {item["kind"] for item in health["summary"]["sync_blockers"]}
+    assert {
+        "upload_backpressure",
+        "object_download_backpressure",
+        "object_upload_backpressure",
+    }.issubset(blocker_kinds)
+    assert health["summary"]["next_sync_action"] == {
+        "kind": "retry_object_downloads",
+        "reason": "server_backpressure",
+        "retry_after_seconds": 6,
+    }
     assert health["summary"]["inbox_pending"] == 5
     assert health["summary"]["agent_status_total"] == 2
     assert health["summary"]["answers_cached"] == 7
@@ -1575,6 +1588,26 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     bound_outbox.diagnostics.assert_called_once_with(failed_limit=3)
     inbox_cls.return_value.diagnostics.assert_called_once_with(failed_limit=3)
     support._run_cloud_api_request.assert_not_called()
+
+
+def test_cloud_sync_health_summary_reports_idle_next_action_when_clear():
+    summary = _cloud_sync_health_summary(
+        session={
+            "base_url": "https://api.example.com",
+            "access_token": "access",
+            "refresh_token": "refresh",
+        },
+        auto_sync={"running": True},
+        outbox={"stats": {"pending": 0, "failed": 0, "dead_letter": 0, "upload_ready": 0}},
+        inbox={"by_status": {"pending": 0, "failed": 0, "applied": 0}},
+        agent_status={"total": 0},
+        content_state={"answers_total": 0, "assets_total": 0},
+    )
+
+    assert summary["sync_blocked"] is False
+    assert summary["sync_blockers"] == []
+    assert summary["next_sync_action"] == {"kind": "idle", "reason": "idle", "retry_after_seconds": 0}
+    assert summary["healthy"] is True
 
 
 def test_app_cloud_runtime_support_sync_health_can_include_cloud_object_storage_report():
