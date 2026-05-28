@@ -528,6 +528,14 @@ class SurfacedCloudClient:
         )
         return response if isinstance(response, dict) else {}
 
+    def admin_object_storage_report(self, access_token: str) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            "/api/v1/admin/ops/object-storage",
+            access_token=access_token,
+        )
+        return response if isinstance(response, dict) else {}
+
     def list_admin_article_classification_jobs(
         self,
         access_token: str,

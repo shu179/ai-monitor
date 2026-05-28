@@ -2120,6 +2120,30 @@ def test_app_cloud_runtime_support_command_lists_admin_users_via_cloud_request()
     assert result == {"ok": True, "payload": [{"id": 1, "username": "operator"}], "message": ""}
 
 
+def test_app_cloud_runtime_support_command_reads_admin_object_storage_report():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+
+    class FakeClient:
+        def admin_object_storage_report(self, _token: str):
+            return {
+                "report": {
+                    "status": "warn",
+                    "disk": {"free_bytes": 9 * 1024 * 1024 * 1024},
+                    "limits": {"object_storage_max_file_bytes": 512 * 1024 * 1024},
+                },
+                "text": "Object storage doctor: status=warn",
+            }
+
+    support.cloud_request_with_refresh = Mock(side_effect=lambda operation: (True, operation(FakeClient(), "access-token"), ""))
+
+    result = support.handle_command("cloud.admin_object_storage_report")
+
+    assert result["ok"] is True
+    assert result["payload"]["report"]["status"] == "warn"
+    assert result["payload"]["report"]["limits"]["object_storage_max_file_bytes"] == 512 * 1024 * 1024
+
+
 def test_app_cloud_runtime_support_daemon_handle_command_delegates_to_main_handler_when_needed():
     owner = _support_owner()
     support = AppCloudRuntimeSupport(owner=owner)

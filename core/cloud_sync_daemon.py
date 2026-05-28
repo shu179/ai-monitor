@@ -39,6 +39,7 @@ DAEMON_SUPPORTED_COMMANDS = frozenset(
         "cloud.state_delta_diagnostics",
         "cloud.process_state_delta_inbox",
         "cloud.list_admin_users",
+        "cloud.admin_object_storage_report",
         "cloud.list_admin_article_classification_jobs",
         "cloud.resolve_admin_article_classification_job",
         "cloud.ignore_admin_article_classification_job",

@@ -307,6 +307,17 @@ class CloudClientTests(unittest.TestCase):
         self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/admin/tasks/7/members/operator")
         self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
 
+    def test_admin_object_storage_report_uses_admin_ops_endpoint(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        result = client.admin_object_storage_report("access-token")
+
+        self.assertEqual(result["id"], 7)
+        self.assertEqual(session.calls[0]["method"], "GET")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/admin/ops/object-storage")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+
     def test_delete_admin_task_uses_delete(self):
         session = FakeSession()
         client = SurfacedCloudClient("https://api.example.com", session=session)

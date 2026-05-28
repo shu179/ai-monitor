@@ -469,6 +469,8 @@ class AppCloudRuntimeSupport:
             return self._run_cloud_api_request("list_admin_users", request_payload)
         if normalized in {"cloud.list_admin_article_classification_jobs", "list_admin_article_classification_jobs"}:
             return self._run_cloud_api_request("list_admin_article_classification_jobs", request_payload)
+        if normalized in {"cloud.admin_object_storage_report", "admin_object_storage_report"}:
+            return self._run_cloud_api_request("admin_object_storage_report", request_payload)
         if normalized in {"cloud.resolve_admin_article_classification_job", "resolve_admin_article_classification_job"}:
             return self._run_cloud_api_request("resolve_admin_article_classification_job", request_payload)
         if normalized in {"cloud.ignore_admin_article_classification_job", "ignore_admin_article_classification_job"}:
@@ -1477,6 +1479,8 @@ class AppCloudRuntimeSupport:
         def operation(client: Any, token: str) -> Any:
             if operation_name == "list_admin_users":
                 return client.list_admin_users(token)
+            if operation_name == "admin_object_storage_report":
+                return client.admin_object_storage_report(token)
             if operation_name == "list_admin_article_classification_jobs":
                 return client.list_admin_article_classification_jobs(
                     token,
