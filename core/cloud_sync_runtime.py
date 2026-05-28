@@ -194,6 +194,75 @@ class CloudCommandTransportState:
             "last_error_type": self.error_type,
         }
 
+    @staticmethod
+    def action_summary(status: dict[str, Any]) -> dict[str, Any]:
+        mode = str(status.get("mode") or "")
+        responsive = bool(status.get("responsive"))
+        recovery_running = bool(status.get("recovery_running"))
+        recovery_scheduled = bool(status.get("recovery_scheduled"))
+        next_recovery_allowed = int(status.get("next_recovery_allowed_in_seconds") or 0)
+        blockers: list[dict[str, Any]] = []
+
+        def add_blocker(kind: str, message: str, retry_after_seconds: int = 0) -> None:
+            blockers.append(
+                {
+                    "kind": kind,
+                    "message": message,
+                    "retry_after_seconds": max(0, int(retry_after_seconds or 0)),
+                }
+            )
+
+        if mode == "not_started":
+            add_blocker("transport_not_started", "cloud command transport has not started")
+        elif mode == "child_daemon" and not responsive:
+            add_blocker("daemon_unresponsive", "cloud sync daemon did not respond to ping")
+        elif mode == "in_process_direct":
+            if recovery_running:
+                add_blocker("daemon_recovery_running", "cloud sync daemon recovery is running")
+            elif recovery_scheduled:
+                add_blocker(
+                    "daemon_recovery_scheduled",
+                    "cloud sync daemon recovery is scheduled",
+                    next_recovery_allowed,
+                )
+            elif next_recovery_allowed > 0:
+                add_blocker(
+                    "daemon_recovery_cooldown",
+                    "cloud sync daemon recovery is waiting for cooldown",
+                    next_recovery_allowed,
+                )
+            else:
+                add_blocker("daemon_degraded", "cloud command transport is using in-process fallback")
+        elif not responsive:
+            add_blocker("transport_unresponsive", "cloud command transport is not responsive")
+
+        if not blockers:
+            next_action = {"kind": "none", "reason": "transport_healthy", "retry_after_seconds": 0}
+        elif recovery_running:
+            next_action = {"kind": "recover_daemon", "reason": "running", "retry_after_seconds": 0}
+        elif recovery_scheduled:
+            next_action = {
+                "kind": "recover_daemon",
+                "reason": "scheduled",
+                "retry_after_seconds": next_recovery_allowed,
+            }
+        elif next_recovery_allowed > 0:
+            next_action = {
+                "kind": "recover_daemon",
+                "reason": "cooldown",
+                "retry_after_seconds": next_recovery_allowed,
+            }
+        elif mode in {"in_process_direct", "child_daemon"}:
+            next_action = {"kind": "recover_daemon", "reason": blockers[0]["kind"], "retry_after_seconds": 0}
+        else:
+            next_action = {"kind": "start_transport", "reason": blockers[0]["kind"], "retry_after_seconds": 0}
+
+        return {
+            "transport_blocked": bool(blockers),
+            "transport_blockers": blockers,
+            "next_transport_action": next_action,
+        }
+
     def schedule_recovery_timer(
         self,
         *,

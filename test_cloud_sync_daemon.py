@@ -409,24 +409,12 @@ class CloudSyncDaemonTests(unittest.TestCase):
 
     def test_app_runtime_cloud_command_transport_status_reports_direct_fallback(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
-        runtime._cloud_command_daemon = None
-        runtime._cloud_command_server = None
-        runtime._cloud_command_client = Mock()
-        runtime._cloud_command_socket_path = None
-        runtime._cloud_command_transport_recovery_thread = None
-        runtime._cloud_command_transport_last_recovery_attempt_at = 0.0
-        runtime._cloud_command_transport_last_recovery_attempt = ""
-        runtime._cloud_command_transport_last_recovery_reason = ""
-        runtime._cloud_command_transport_last_recovery_completed_at = ""
-        runtime._cloud_command_transport_last_recovery_result = ""
-        runtime._cloud_command_transport_last_recovery_error = ""
-        runtime._cloud_command_transport_recovery_timer = None
-        runtime._cloud_command_transport_next_recovery_at = 0.0
-        runtime._cloud_command_transport_next_recovery_after = ""
-        runtime._cloud_command_transport_recovery_interval_seconds = 30.0
-        runtime._cloud_command_transport_mode = "in_process_direct"
-        runtime._cloud_command_transport_error = "AF_UNIX unavailable"
-        runtime._cloud_command_transport_error_type = "unsupported_platform"
+        runtime._cloud_command_transport = CloudCommandTransportState(
+            client=Mock(),
+            mode="in_process_direct",
+            error="AF_UNIX unavailable",
+            error_type="unsupported_platform",
+        )
 
         status = AppRuntime._cloud_command_transport_status(runtime)
 
@@ -451,24 +439,19 @@ class CloudSyncDaemonTests(unittest.TestCase):
 
     def test_app_runtime_cloud_command_transport_status_reports_recovery_cooldown(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
-        runtime._cloud_command_daemon = None
-        runtime._cloud_command_server = None
-        runtime._cloud_command_client = Mock()
-        runtime._cloud_command_socket_path = None
-        runtime._cloud_command_transport_recovery_thread = None
-        runtime._cloud_command_transport_last_recovery_attempt_at = time.monotonic()
-        runtime._cloud_command_transport_last_recovery_attempt = "2026-05-28T12:00:00"
-        runtime._cloud_command_transport_last_recovery_reason = "timed out"
-        runtime._cloud_command_transport_last_recovery_completed_at = ""
-        runtime._cloud_command_transport_last_recovery_result = "running"
-        runtime._cloud_command_transport_last_recovery_error = ""
-        runtime._cloud_command_transport_recovery_timer = None
-        runtime._cloud_command_transport_next_recovery_at = time.monotonic() + 30
-        runtime._cloud_command_transport_next_recovery_after = "2026-05-28T12:00:30"
-        runtime._cloud_command_transport_recovery_interval_seconds = 30.0
-        runtime._cloud_command_transport_mode = "in_process_direct"
-        runtime._cloud_command_transport_error = "timed out"
-        runtime._cloud_command_transport_error_type = "command_timeout"
+        runtime._cloud_command_transport = CloudCommandTransportState(
+            client=Mock(),
+            mode="in_process_direct",
+            last_recovery_attempt_at=time.monotonic(),
+            last_recovery_attempt="2026-05-28T12:00:00",
+            last_recovery_reason="timed out",
+            last_recovery_result="running",
+            next_recovery_at=time.monotonic() + 30,
+            next_recovery_after="2026-05-28T12:00:30",
+            recovery_interval_seconds=30.0,
+            error="timed out",
+            error_type="command_timeout",
+        )
 
         status = AppRuntime._cloud_command_transport_status(runtime)
 
@@ -480,26 +463,24 @@ class CloudSyncDaemonTests(unittest.TestCase):
 
     def test_app_runtime_cloud_command_transport_status_reports_scheduled_recovery(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
-        runtime._cloud_command_daemon = None
-        runtime._cloud_command_server = None
-        runtime._cloud_command_client = Mock()
-        runtime._cloud_command_socket_path = None
-        runtime._cloud_command_transport_recovery_thread = None
         timer = Mock()
         timer.is_alive.return_value = True
-        runtime._cloud_command_transport_recovery_timer = timer
-        runtime._cloud_command_transport_last_recovery_attempt_at = time.monotonic()
-        runtime._cloud_command_transport_last_recovery_attempt = "2026-05-28T12:00:00"
-        runtime._cloud_command_transport_last_recovery_reason = "timed out"
-        runtime._cloud_command_transport_last_recovery_completed_at = "2026-05-28T12:00:01"
-        runtime._cloud_command_transport_last_recovery_result = "failed"
-        runtime._cloud_command_transport_last_recovery_error = "socket busy"
-        runtime._cloud_command_transport_next_recovery_at = time.monotonic() + 30
-        runtime._cloud_command_transport_next_recovery_after = "2026-05-28T12:00:30"
-        runtime._cloud_command_transport_recovery_interval_seconds = 30.0
-        runtime._cloud_command_transport_mode = "in_process_direct"
-        runtime._cloud_command_transport_error = "socket busy"
-        runtime._cloud_command_transport_error_type = "connect_failed"
+        runtime._cloud_command_transport = CloudCommandTransportState(
+            client=Mock(),
+            mode="in_process_direct",
+            recovery_timer=timer,
+            last_recovery_attempt_at=time.monotonic(),
+            last_recovery_attempt="2026-05-28T12:00:00",
+            last_recovery_reason="timed out",
+            last_recovery_completed_at="2026-05-28T12:00:01",
+            last_recovery_result="failed",
+            last_recovery_error="socket busy",
+            next_recovery_at=time.monotonic() + 30,
+            next_recovery_after="2026-05-28T12:00:30",
+            recovery_interval_seconds=30.0,
+            error="socket busy",
+            error_type="connect_failed",
+        )
 
         status = AppRuntime._cloud_command_transport_status(runtime)
 
