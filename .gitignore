@@ -70,3 +70,12 @@ web-ui/node_modules/
 # OS
 .DS_Store
 Thumbs.db
+
+# 云端部署打包产物（可重新生成，不进版本库）
+*.tar.gz
+
+# 浏览器自动化 CLI 缓存
+.playwright-cli/
+
+# 运行时文件锁
+*.lock
