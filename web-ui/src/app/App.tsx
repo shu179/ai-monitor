@@ -73,7 +73,14 @@ const AccountContent = lazy(loadAccountContent);
 const ReleaseContent = lazy(loadReleaseContent);
 const ImageGenerationContent = lazy(loadImageGenerationContent);
 
-const preloadPageByTab: Record<string, () => Promise<unknown>> = {
+const PAGE_TABS = ["看板", "品牌", "发稿", "生图", "协作", "搜搜", "账号", "系统设置"] as const;
+type PageTab = typeof PAGE_TABS[number];
+
+function isPageTab(tab: string): tab is PageTab {
+  return (PAGE_TABS as readonly string[]).includes(tab);
+}
+
+const preloadPageByTab: Partial<Record<PageTab, () => Promise<unknown>>> = {
   看板: loadCenterContent,
   品牌: loadBrandsContent,
   发稿: loadReleaseContent,
@@ -88,6 +95,25 @@ function PageLoadingFallback() {
     <main className="flex min-w-0 flex-1 items-center justify-center bg-[#fcfdff] text-sm font-medium text-gray-400">
       正在加载页面…
     </main>
+  );
+}
+
+function PersistentPageSlot({
+  active,
+  children,
+}: {
+  active: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      aria-hidden={!active}
+      className={active ? "flex min-h-0 min-w-0 flex-1" : "hidden"}
+    >
+      <Suspense fallback={<PageLoadingFallback />}>
+        {children}
+      </Suspense>
+    </div>
   );
 }
 
@@ -169,7 +195,8 @@ export default function App() {
     offsetX: number;
     offsetY: number;
   } | null>(null);
-  const [activeTab, setActiveTab] = useState("看板");
+  const [activeTab, setActiveTab] = useState<PageTab>("看板");
+  const [mountedTabs, setMountedTabs] = useState<ReadonlySet<PageTab>>(() => new Set<PageTab>(["看板"]));
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [recognitionTestWindow, setRecognitionTestWindow] = useState<{
     open: boolean;
@@ -230,6 +257,7 @@ export default function App() {
     invalidateAccountScopedCaches();
     commitCloudAdminStatus(null);
     setBootstrap(createSecureBootstrap());
+    setMountedTabs(new Set<PageTab>(["看板"]));
     setRunMessage("");
     setRecognitionTestWindow((prev) => ({
       ...prev,
@@ -344,17 +372,27 @@ export default function App() {
   }, [applyCloudAuthStatusFromResult, isAuthChecked, isAuthenticated]);
 
   const handleTabChange = useCallback((tab: string) => {
-    preloadPageByTab[tab]?.();
-    if (tab === "品牌") {
+    const nextTab = isPageTab(tab) ? tab : "看板";
+    preloadPageByTab[nextTab]?.();
+    if (nextTab === "品牌") {
       warmTasksFullCache();
     }
     warmBootstrapCache();
-    setActiveTab(tab);
+    setMountedTabs((prev) => {
+      if (prev.has(nextTab)) {
+        return prev;
+      }
+      const next = new Set(prev);
+      next.add(nextTab);
+      return next;
+    });
+    setActiveTab(nextTab);
   }, []);
 
   const handleTabPreload = useCallback((tab: string) => {
-    preloadPageByTab[tab]?.();
-    if (tab === "品牌") {
+    const nextTab = isPageTab(tab) ? tab : "看板";
+    preloadPageByTab[nextTab]?.();
+    if (nextTab === "品牌") {
       warmTasksFullCache();
       return;
     }
@@ -693,8 +731,8 @@ export default function App() {
     if (!isAuthenticated) {
       return;
     }
-    setActiveTab("账号");
-  }, [isAuthenticated]);
+    handleTabChange("账号");
+  }, [handleTabChange, isAuthenticated]);
 
   const handleLogout = useCallback(async () => {
     beginAccountDataTransition();
@@ -1014,38 +1052,56 @@ export default function App() {
             avatar: isAuthenticated ? bootstrap.sidebar?.avatar : "",
           }}
         />
-        <Suspense fallback={<PageLoadingFallback />}>
-          {activeTab === "看板" ? (
+        {mountedTabs.has("看板") && (
+          <PersistentPageSlot active={activeTab === "看板"}>
             <CenterContent
               dashboard={bootstrap.dashboard}
               runMessage={runMessage}
               activeRegions={bootstrap.regionTags}
               onDataChanged={refreshBootstrap}
             />
-          ) : activeTab === "品牌" ? (
+          </PersistentPageSlot>
+        )}
+        {mountedTabs.has("品牌") && (
+          <PersistentPageSlot active={activeTab === "品牌"}>
             <BrandsContent
               currentDetectionMode={currentDetectionMode}
               cloudRole={cloudStatus?.user.role || ""}
               onSaveSuccess={showSaveSuccessToast}
               onRecognitionTestStart={handleRecognitionTestStart}
             />
-          ) : activeTab === "发稿" ? (
+          </PersistentPageSlot>
+        )}
+        {mountedTabs.has("发稿") && (
+          <PersistentPageSlot active={activeTab === "发稿"}>
             <ReleaseContent />
-          ) : activeTab === "生图" ? (
+          </PersistentPageSlot>
+        )}
+        {mountedTabs.has("生图") && (
+          <PersistentPageSlot active={activeTab === "生图"}>
             <ImageGenerationContent />
-          ) : activeTab === "协作" ? (
+          </PersistentPageSlot>
+        )}
+        {mountedTabs.has("协作") && (
+          <PersistentPageSlot active={activeTab === "协作"}>
             <UpcomingPanel
               icon={<UsersRound className="w-5 h-5 text-blue-600" />}
-              title={activeTab}
+              title="协作"
               subtitle="团队协同空间，任务、品牌、素材一处沉淀"
             />
-          ) : activeTab === "搜搜" ? (
+          </PersistentPageSlot>
+        )}
+        {mountedTabs.has("搜搜") && (
+          <PersistentPageSlot active={activeTab === "搜搜"}>
             <SearchContent
               availableModels={bootstrap.availableModels}
               bootstrap={bootstrap}
               onDataChanged={refreshBootstrap}
             />
-          ) : activeTab === "账号" ? (
+          </PersistentPageSlot>
+        )}
+        {mountedTabs.has("账号") && (
+          <PersistentPageSlot active={activeTab === "账号"}>
             <AccountContent
               isAuthenticated={isAuthenticated}
               cloudStatusSnapshot={cloudStatus}
@@ -1058,7 +1114,10 @@ export default function App() {
               onProfileSaved={refreshBootstrap}
               onLogout={handleLogout}
             />
-          ) : activeTab === "系统设置" ? (
+          </PersistentPageSlot>
+        )}
+        {mountedTabs.has("系统设置") && (
+          <PersistentPageSlot active={activeTab === "系统设置"}>
             <SettingsContent
               monitoring={bootstrap.monitoring}
               onMonitoringToggle={handleMonitoringToggle}
@@ -1068,14 +1127,8 @@ export default function App() {
               }}
               onLogout={handleLogout}
             />
-          ) : (
-            <CenterContent
-              dashboard={bootstrap.dashboard}
-              runMessage={runMessage}
-              onDataChanged={refreshBootstrap}
-            />
-          )}
-        </Suspense>
+          </PersistentPageSlot>
+        )}
         <RightSidebar
           detectionControlState={detectionControlState}
           detectionControlSwitching={detectionControlSwitching}

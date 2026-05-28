@@ -187,6 +187,9 @@ function formatArticleExportBrand(article: Article) {
 }
 
 const ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL = "未知";
+// 多关键词拼到同一格时用"空格中点空格"，避免与关键词内部的顿号、逗号混淆。
+// 与 Python 端 backend_lib/article_export.py 的 ARTICLE_EXPORT_KEYWORD_JOIN 保持一致。
+const ARTICLE_EXPORT_KEYWORD_JOIN = " · ";
 
 function formatArticleExportKeywords(article: Article) {
   const labels = (article.exportKeywords || [])
@@ -198,7 +201,7 @@ function formatArticleExportKeywords(article: Article) {
 function formatArticleExportKeywordCell(article: Article) {
   const cell = formatArticleExportKeywords(article)
     .filter(Boolean)
-    .join("、");
+    .join(ARTICLE_EXPORT_KEYWORD_JOIN);
   return cell || ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL;
 }
 

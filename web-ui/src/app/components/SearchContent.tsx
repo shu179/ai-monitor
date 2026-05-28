@@ -1,5 +1,17 @@
-import { useCallback, useEffect, useRef, useState, type ChangeEvent, type CSSProperties, type ReactElement } from "react";
-import { Bot, Send, ChevronDown, Plus, Mic, Image as ImageIcon, BarChart2, Target, Briefcase, Copy, RefreshCw, Square } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type CSSProperties, type ReactElement } from "react";
+import { Bot, Send, ChevronDown, Plus, Mic, Image as ImageIcon, BarChart2, Target, Briefcase, Copy, RefreshCw, Square, SquarePen, History, Trash2 } from "lucide-react";
+import {
+  formatRelativeTime as formatHistoryRelativeTime,
+  generateConversationId,
+  groupConversationsByTime,
+  loadConversations,
+  loadCurrentConversationId,
+  saveConversations,
+  saveCurrentConversationId,
+  summarizeConversationTitle,
+  type StoredConversation,
+  type StoredMessage,
+} from "../lib/searchChatHistory";
 import {
   createTask,
   fetchAssistantTools,
@@ -55,6 +67,13 @@ const CHAT_MODE_MARKERS = {
 } as const;
 
 const BRAND_RANK_CONFIRM_RE = /^确认\s*(.+?)\s*品牌排名\s*[。.!！]*$/;
+
+// Distance from the bottom (px) within which auto-follow during streaming
+// stays engaged. Tuned so a small overscroll bounce still counts as "at end".
+const SEARCH_CHAT_STICKY_THRESHOLD = 48;
+// Breathing room (px) left above the user bubble when a new turn anchors it
+// near the top of the chat viewport.
+const SEARCH_CHAT_ANCHOR_OFFSET = 24;
 
 const extractBrandRankBrand = (text: string) => {
   const match = text.trim().match(BRAND_RANK_CONFIRM_RE);
@@ -348,12 +367,30 @@ export function SearchContent({ availableModels, bootstrap, onDataChanged }: Sea
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [assistantTools, setAssistantTools] = useState<AssistantTool[]>([]);
   const [composerMode, setComposerMode] = useState<"default" | "brand_task" | "quick_todos">("default");
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  // Conversation history (persisted to localStorage via ../lib/searchChatHistory).
+  // `currentConversationId === null` means the user is on a fresh "new chat"
+  // slate — an id is minted lazily the first time we persist a non-empty
+  // conversation.
+  const [conversations, setConversations] = useState<StoredConversation[]>([]);
+  const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [isHydrated, setIsHydrated] = useState(false);
+  const historyButtonRef = useRef<HTMLButtonElement | null>(null);
+  const historyPopoverRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mascotRef = useRef<HTMLDivElement>(null);
   const resultRef = useRef<Record<string, { reply: string; thinking: string }>>({});
   const thinkingScrollRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const chatScrollContainerRef = useRef<HTMLDivElement | null>(null);
+  // Tracks the last user-message id we've anchored to the top of the
+  // viewport, so each new turn anchors exactly once instead of on every
+  // streaming token.
+  const anchoredTurnIdRef = useRef<string | null>(null);
+  // `true` only while the user is sitting at the bottom of the conversation.
+  // We auto-follow new tokens only when this is true — once they scroll up
+  // to read earlier context, the view stays put.
+  const stickToBottomRef = useRef(false);
   const streamAbortRef = useRef<AbortController | null>(null);
   const idleTimerRef = useRef<number | null>(null);
   const blinkTimerRef = useRef<number | null>(null);
@@ -573,13 +610,215 @@ export function SearchContent({ availableModels, bootstrap, onDataChanged }: Sea
     }
   }, [models, selectedModel, selectedModelKey]);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
+  const handleChatScroll = useCallback(() => {
+    const container = chatScrollContainerRef.current;
+    if (!container) return;
+    const distanceFromBottom =
+      container.scrollHeight - container.clientHeight - container.scrollTop;
+    stickToBottomRef.current = distanceFromBottom <= SEARCH_CHAT_STICKY_THRESHOLD;
+  }, []);
 
+  // Anchor on a new turn, otherwise follow the stream only when the user is
+  // already pinned to the bottom. Prior context stays visible until the user
+  // chooses to scroll past it.
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, isGenerating]);
+    const container = chatScrollContainerRef.current;
+    if (!container) return;
+
+    let latestUserMessage: Message | undefined;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].role === "user") {
+        latestUserMessage = messages[index];
+        break;
+      }
+    }
+    if (!latestUserMessage) return;
+
+    if (latestUserMessage.id !== anchoredTurnIdRef.current) {
+      anchoredTurnIdRef.current = latestUserMessage.id;
+      stickToBottomRef.current = false;
+      const node = container.querySelector<HTMLElement>(
+        `[data-search-chat-user-id="${latestUserMessage.id}"]`,
+      );
+      if (node) {
+        const frame = window.requestAnimationFrame(() => {
+          const containerRect = container.getBoundingClientRect();
+          const nodeRect = node.getBoundingClientRect();
+          const target =
+            container.scrollTop +
+            (nodeRect.top - containerRect.top) -
+            SEARCH_CHAT_ANCHOR_OFFSET;
+          container.scrollTop = Math.max(0, target);
+        });
+        return () => window.cancelAnimationFrame(frame);
+      }
+      return;
+    }
+
+    if (!stickToBottomRef.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      container.scrollTop = container.scrollHeight - container.clientHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [messages]);
+
+  // Hydrate persisted conversations + the active conversation on mount.
+  // Runs once; sets `isHydrated` so the persistence effect below stays inert
+  // until we know we wouldn't overwrite real data with empty initial state.
+  useEffect(() => {
+    const stored = loadConversations();
+    setConversations(stored);
+    const activeId = loadCurrentConversationId();
+    if (activeId) {
+      const active = stored.find((conv) => conv.id === activeId);
+      if (active) {
+        setCurrentConversationId(active.id);
+        setMessages(
+          active.messages.map((m) => ({
+            id: m.id,
+            role: m.role,
+            content: m.content,
+            thinking: m.thinking,
+            rawContent: m.rawContent,
+            rawThinking: m.rawThinking,
+          })),
+        );
+        anchoredTurnIdRef.current = null;
+      } else {
+        saveCurrentConversationId(null);
+      }
+    }
+    setIsHydrated(true);
+  }, []);
+
+  // Persist the active conversation whenever a turn completes. We skip
+  // mid-stream writes (partial replies aren't worth saving) and skip empty
+  // slates (avoids creating an empty "新对话" row on first mount).
+  useEffect(() => {
+    if (!isHydrated) return;
+    if (isGenerating) return;
+    if (messages.length === 0) return;
+
+    const id = currentConversationId ?? generateConversationId();
+    const now = Date.now();
+    const storedMessages: StoredMessage[] = messages.map((m) => ({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      thinking: m.thinking,
+      rawContent: m.rawContent,
+      rawThinking: m.rawThinking,
+    }));
+    const title = summarizeConversationTitle(storedMessages);
+
+    setConversations((prev) => {
+      const existing = prev.find((conv) => conv.id === id);
+      const createdAt = existing?.createdAt ?? now;
+      const updated: StoredConversation = {
+        id,
+        title,
+        messages: storedMessages,
+        createdAt,
+        updatedAt: now,
+      };
+      const next = [updated, ...prev.filter((conv) => conv.id !== id)];
+      saveConversations(next);
+      return next;
+    });
+
+    if (currentConversationId !== id) {
+      setCurrentConversationId(id);
+      saveCurrentConversationId(id);
+    }
+  }, [isHydrated, isGenerating, messages, currentConversationId]);
+
+  // Close the history popover when clicking outside of it.
+  useEffect(() => {
+    if (!historyOpen) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (historyPopoverRef.current?.contains(target)) return;
+      if (historyButtonRef.current?.contains(target)) return;
+      setHistoryOpen(false);
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [historyOpen]);
+
+  // Close on Escape — keeps keyboard parity with mature chat UIs.
+  useEffect(() => {
+    if (!historyOpen) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setHistoryOpen(false);
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [historyOpen]);
+
+  const handleStartNewChat = useCallback(() => {
+    streamAbortRef.current?.abort();
+    setMessages([]);
+    setCurrentConversationId(null);
+    saveCurrentConversationId(null);
+    anchoredTurnIdRef.current = null;
+    stickToBottomRef.current = false;
+    setHistoryOpen(false);
+  }, []);
+
+  const handleSelectConversation = useCallback(
+    (id: string) => {
+      setHistoryOpen(false);
+      if (id === currentConversationId) return;
+      const target = conversations.find((conv) => conv.id === id);
+      if (!target) return;
+      streamAbortRef.current?.abort();
+      setMessages(
+        target.messages.map((m) => ({
+          id: m.id,
+          role: m.role,
+          content: m.content,
+          thinking: m.thinking,
+          rawContent: m.rawContent,
+          rawThinking: m.rawThinking,
+        })),
+      );
+      setCurrentConversationId(target.id);
+      saveCurrentConversationId(target.id);
+      anchoredTurnIdRef.current = null;
+      stickToBottomRef.current = false;
+    },
+    [conversations, currentConversationId],
+  );
+
+  const handleDeleteConversation = useCallback(
+    (id: string) => {
+      setConversations((prev) => {
+        const next = prev.filter((conv) => conv.id !== id);
+        saveConversations(next);
+        return next;
+      });
+      if (id === currentConversationId) {
+        setMessages([]);
+        setCurrentConversationId(null);
+        saveCurrentConversationId(null);
+        anchoredTurnIdRef.current = null;
+        stickToBottomRef.current = false;
+      }
+    },
+    [currentConversationId],
+  );
+
+  const sortedConversations = useMemo(
+    () => [...conversations].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)),
+    [conversations],
+  );
+  const conversationGroups = useMemo(
+    () => groupConversationsByTime(sortedConversations),
+    [sortedConversations],
+  );
 
   useEffect(() => {
     const activeThinkingMessage = [...messages].reverse().find(
@@ -1582,16 +1821,128 @@ export function SearchContent({ availableModels, bootstrap, onDataChanged }: Sea
           }
         `}
       </style>
-      
+
+      {/* Conversation toolbar — absolutely positioned so it never displaces
+          the empty-state's vertical centering. Two icon-only buttons wrapped
+          in a hairline pill so they read as a single coherent control. */}
+      <div className="absolute right-5 top-3 z-20 flex items-center rounded-xl border border-gray-100 bg-white/80 backdrop-blur-sm shadow-[0_1px_4px_-1px_rgba(15,24,53,0.04)] xl:right-7">
+        <button
+          type="button"
+          onClick={handleStartNewChat}
+          aria-label="新建对话"
+          title="新建对话"
+          className="inline-flex h-8 w-9 items-center justify-center rounded-l-xl text-gray-500 transition-colors duration-150 hover:bg-gray-50 hover:text-gray-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-200"
+        >
+          <SquarePen className="h-[15px] w-[15px]" strokeWidth={1.75} />
+        </button>
+        <span className="h-4 w-px bg-gray-100" aria-hidden="true" />
+        <div className="relative">
+          <button
+            ref={historyButtonRef}
+            type="button"
+            onClick={() => setHistoryOpen((open) => !open)}
+            aria-label="历史对话"
+            aria-expanded={historyOpen}
+            aria-haspopup="menu"
+            title="历史对话"
+            className={`inline-flex h-8 w-9 items-center justify-center rounded-r-xl transition-colors duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-200 ${
+              historyOpen
+                ? "bg-gray-100/70 text-gray-900"
+                : "text-gray-500 hover:bg-gray-50 hover:text-gray-900"
+            }`}
+          >
+            <History className="h-[15px] w-[15px]" strokeWidth={1.75} />
+          </button>
+          {historyOpen && (
+            <div
+              ref={historyPopoverRef}
+              role="menu"
+              aria-label="历史对话"
+              className="absolute right-0 top-full mt-2 w-[300px] overflow-hidden rounded-xl border border-gray-100 bg-white shadow-[0_10px_28px_-10px_rgba(15,24,53,0.16)] py-1.5 z-30"
+            >
+              <div className="px-3.5 pt-2 pb-1.5 text-[11px] font-medium text-gray-500">
+                历史对话
+              </div>
+
+              <div className="max-h-[24rem] overflow-y-auto custom-scrollbar pb-1">
+                {sortedConversations.length === 0 ? (
+                  <div className="px-3.5 py-6 text-center text-[12px] text-gray-400">
+                    暂无历史对话
+                  </div>
+                ) : (
+                  conversationGroups.map((group) => (
+                    <div key={group.key} className="mb-0.5 last:mb-0">
+                      <div className="px-3.5 pt-2 pb-1 text-[10.5px] font-medium text-gray-400">
+                        {group.label}
+                      </div>
+                      <ul className="flex flex-col px-1.5">
+                        {group.items.map((conv) => {
+                          const isActive = conv.id === currentConversationId;
+                          return (
+                            <li key={conv.id}>
+                              <div
+                                role="menuitem"
+                                tabIndex={0}
+                                onClick={() => handleSelectConversation(conv.id)}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter" || event.key === " ") {
+                                    event.preventDefault();
+                                    handleSelectConversation(conv.id);
+                                  }
+                                }}
+                                className={`group flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 transition-colors duration-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-200 ${
+                                  isActive ? "bg-gray-100/70" : "hover:bg-gray-50"
+                                }`}
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div
+                                    className={`truncate text-[13px] leading-snug ${
+                                      isActive ? "font-medium text-gray-900" : "text-gray-700"
+                                    }`}
+                                  >
+                                    {conv.title || "新对话"}
+                                  </div>
+                                  <div className="mt-0.5 text-[11px] text-gray-400">
+                                    {formatHistoryRelativeTime(conv.updatedAt)}
+                                  </div>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    handleDeleteConversation(conv.id);
+                                  }}
+                                  aria-label="删除对话"
+                                  title="删除对话"
+                                  className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-gray-300 opacity-0 transition-opacity duration-100 hover:text-gray-600 group-hover:opacity-100 focus:opacity-100 focus:outline-none"
+                                >
+                                  <Trash2 className="h-[13px] w-[13px]" strokeWidth={1.75} />
+                                </button>
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
       {/* Scrollable Content Area */}
       <div
+        ref={chatScrollContainerRef}
+        onScroll={handleChatScroll}
         className="min-h-0 flex-1 overflow-y-auto w-full scrollbar-thin scrollbar-thumb-gray-200 relative z-0 pb-6"
       >
         
         {/* Refined Empty State */}
         {messages.length === 0 && (
           <div
-            className="flex flex-col items-center justify-center min-h-full px-8 py-6 pb-24 max-w-4xl mx-auto w-full animate-in fade-in duration-700"
+            className="flex flex-col items-center justify-center min-h-full px-8 pt-20 pb-6 max-w-4xl mx-auto w-full animate-in fade-in duration-700"
             onMouseMove={(event) => {
               if (hoveredSuggestion !== null) {
                 return;
@@ -1671,9 +2022,13 @@ export function SearchContent({ availableModels, bootstrap, onDataChanged }: Sea
 
         {/* Sophisticated Chat List */}
         {messages.length > 0 && (
-          <div className="max-w-4xl mx-auto w-full px-8 pt-10 pb-40 space-y-10">
+          <div className="max-w-4xl mx-auto w-full px-8 pt-14 pb-40 space-y-10">
             {messages.map(msg => (
-              <div key={msg.id} className={`flex gap-5 group ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
+              <div
+                key={msg.id}
+                data-search-chat-user-id={msg.role === 'user' ? msg.id : undefined}
+                className={`flex gap-5 group ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}
+              >
                 {/* Refined Avatar */}
                 {msg.role === 'bot' && (
                   <div className="w-8 h-8 flex items-center justify-center shrink-0 mt-1">
@@ -1806,7 +2161,7 @@ export function SearchContent({ availableModels, bootstrap, onDataChanged }: Sea
               </div>
             )}
             
-            <div ref={messagesEndRef} className="h-24" />
+            <div className="h-24" />
           </div>
         )}
       </div>

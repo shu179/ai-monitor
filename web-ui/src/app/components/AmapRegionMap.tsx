@@ -12,9 +12,11 @@ const AMAP_MIN_ZOOM_EPSILON = 0.03;
 const WHEEL_ZOOM_THRESHOLD = 40;
 const WHEEL_ZOOM_STEP = 0.35;
 const GEOCODE_CACHE_KEY = "dashboard.amap.regionGeocodeCache.v1";
+const VIEWPORT_CACHE_KEY = "dashboard.amap.viewportCache.v1";
 const AMAP_BRANDING_SELECTOR = ".amap-logo, .amap-copyright";
 const AMAP_VISUAL_STYLE = "amap://styles/whitesmoke";
 const AMAP_VISUAL_FEATURES = ["bg", "point", "road", "building"];
+const AMAP_STYLE_REAPPLY_DELAYS = [0, 80, 240, 600];
 
 type AmapRegionMapProps = {
   mapType: RegionMapType;
@@ -22,6 +24,12 @@ type AmapRegionMapProps = {
   className?: string;
   accentColor?: string;
   fallbackBorderClassName?: string;
+  viewStateKey?: string;
+};
+
+type StoredMapViewport = {
+  zoom: number;
+  center: [number, number];
 };
 
 type RenderNode = RegionMapNode & {
@@ -90,6 +98,95 @@ function writeGeocodeCache(cache: Record<string, { lng: number; lat: number }>) 
   }
 }
 
+function defaultViewportForMapType(mapType: RegionMapType): StoredMapViewport {
+  return mapType === "domestic"
+    ? { zoom: CHINA_OVERVIEW_ZOOM, center: CHINA_CENTER }
+    : { zoom: 1.45, center: [42, 24] };
+}
+
+function normalizeViewportKey(mapType: RegionMapType, viewStateKey?: string) {
+  return `${mapType}:${String(viewStateKey || "default").trim() || "default"}`;
+}
+
+function sanitizeStoredViewport(value: unknown): StoredMapViewport | null {
+  const source = value as Partial<StoredMapViewport> | null | undefined;
+  const zoom = Number(source?.zoom);
+  const center = Array.isArray(source?.center) ? source.center : [];
+  const lng = Number(center[0]);
+  const lat = Number(center[1]);
+  if (!Number.isFinite(zoom) || !Number.isFinite(lng) || !Number.isFinite(lat)) {
+    return null;
+  }
+  return {
+    zoom: Math.min(18, Math.max(AMAP_MIN_ZOOM, zoom)),
+    center: [lng, lat],
+  };
+}
+
+function readViewportCache(): Record<string, StoredMapViewport> {
+  try {
+    const raw = window.localStorage.getItem(VIEWPORT_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return {};
+    return Object.fromEntries(
+      Object.entries(parsed)
+        .map(([key, value]) => [key, sanitizeStoredViewport(value)] as const)
+        .filter((entry): entry is [string, StoredMapViewport] => Boolean(entry[1])),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function readStoredViewport(mapType: RegionMapType, viewStateKey?: string) {
+  return readViewportCache()[normalizeViewportKey(mapType, viewStateKey)] || null;
+}
+
+function writeStoredViewport(mapType: RegionMapType, viewStateKey: string | undefined, viewport: StoredMapViewport) {
+  try {
+    const cache = readViewportCache();
+    cache[normalizeViewportKey(mapType, viewStateKey)] = viewport;
+    window.localStorage.setItem(VIEWPORT_CACHE_KEY, JSON.stringify(cache));
+  } catch {
+    // Ignore persistence failures; the live map should still keep its in-memory view.
+  }
+}
+
+function readMapCenter(map: any): [number, number] | null {
+  const center = typeof map?.getCenter === "function" ? map.getCenter() : null;
+  if (!center) return null;
+  const lng = Number(typeof center.getLng === "function" ? center.getLng() : center.lng);
+  const lat = Number(typeof center.getLat === "function" ? center.getLat() : center.lat);
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) {
+    return null;
+  }
+  return [lng, lat];
+}
+
+function captureMapViewport(map: any): StoredMapViewport | null {
+  const zoom = Number(typeof map?.getZoom === "function" ? map.getZoom() : NaN);
+  const center = readMapCenter(map);
+  return sanitizeStoredViewport({ zoom, center });
+}
+
+function restoreMapViewport(map: any, viewport: StoredMapViewport) {
+  if (typeof map?.setZoomAndCenter === "function") {
+    map.setZoomAndCenter(viewport.zoom, viewport.center);
+  } else {
+    map?.setZoom?.(viewport.zoom);
+    map?.setCenter?.(viewport.center);
+  }
+}
+
+function rememberMapViewport(map: any, mapType: RegionMapType, viewStateKey?: string) {
+  const viewport = captureMapViewport(map);
+  if (viewport) {
+    writeStoredViewport(mapType, viewStateKey, viewport);
+  }
+  return viewport;
+}
+
 function hideAmapBranding(root: ParentNode = document) {
   root.querySelectorAll<HTMLElement>(AMAP_BRANDING_SELECTOR).forEach((element) => {
     element.style.setProperty("display", "none", "important");
@@ -101,6 +198,18 @@ function hideAmapBranding(root: ParentNode = document) {
 function applyAmapVisualStyle(map: any) {
   map?.setMapStyle?.(AMAP_VISUAL_STYLE);
   map?.setFeatures?.(AMAP_VISUAL_FEATURES);
+}
+
+function scheduleAmapVisualStyle(map: any) {
+  if (!map) {
+    return () => undefined;
+  }
+  const timers = AMAP_STYLE_REAPPLY_DELAYS.map((delay) => window.setTimeout(() => {
+    applyAmapVisualStyle(map);
+  }, delay));
+  return () => {
+    timers.forEach((timer) => window.clearTimeout(timer));
+  };
 }
 
 function buildFallbackNodes(mapType: RegionMapType, labels: string[]) {
@@ -125,12 +234,16 @@ export function AmapRegionMap({
   className = "",
   accentColor = "#2FB8E6",
   fallbackBorderClassName = "border border-gray-100/60",
+  viewStateKey,
 }: AmapRegionMapProps) {
   const mapRef = useRef<any>(null);
   const markerRef = useRef<any[]>([]);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const viewInitializedRef = useRef(false);
   const wheelDeltaRef = useRef(0);
+  const currentViewportRef = useRef<StoredMapViewport | null>(null);
+  const userViewportLockedRef = useRef(false);
+  const cancelStyleRetryRef = useRef<(() => void) | null>(null);
   const [loadState, setLoadState] = useState<"idle" | "ready" | "fallback">("idle");
   const [geocodedNodes, setGeocodedNodes] = useState<RegionMapNode[] | null>(null);
   const normalizedActiveRegions = useMemo(() => splitRegionTags(activeRegions), [activeRegions]);
@@ -166,9 +279,13 @@ export function AmapRegionMap({
         }
 
         if (!mapRef.current) {
+          const storedViewport = readStoredViewport(mapType, viewStateKey);
+          const initialViewport = storedViewport || defaultViewportForMapType(mapType);
+          currentViewportRef.current = initialViewport;
+          userViewportLockedRef.current = Boolean(storedViewport);
           mapRef.current = new AMap.Map(containerRef.current, {
-            zoom: mapType === "domestic" ? CHINA_OVERVIEW_ZOOM : 1.45,
-            center: mapType === "domestic" ? CHINA_CENTER : [42, 24],
+            zoom: initialViewport.zoom,
+            center: initialViewport.center,
             viewMode: "2D",
             mapStyle: AMAP_VISUAL_STYLE,
             features: AMAP_VISUAL_FEATURES,
@@ -187,7 +304,8 @@ export function AmapRegionMap({
           });
         }
 
-        applyAmapVisualStyle(mapRef.current);
+        cancelStyleRetryRef.current?.();
+        cancelStyleRetryRef.current = scheduleAmapVisualStyle(mapRef.current);
         setLoadState("ready");
         window.requestAnimationFrame(() => hideAmapBranding());
       })
@@ -200,13 +318,14 @@ export function AmapRegionMap({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [mapType, viewStateKey]);
 
   useEffect(() => {
     if (loadState !== "ready" || !mapRef.current) {
       return;
     }
-    applyAmapVisualStyle(mapRef.current);
+    cancelStyleRetryRef.current?.();
+    cancelStyleRetryRef.current = scheduleAmapVisualStyle(mapRef.current);
   }, [loadState]);
 
   useEffect(() => {
@@ -231,8 +350,10 @@ export function AmapRegionMap({
     });
 
     markerRef.current = markers;
+    cancelStyleRetryRef.current?.();
+    cancelStyleRetryRef.current = scheduleAmapVisualStyle(map);
 
-    if (mapType !== "domestic") {
+    if (mapType !== "domestic" && !userViewportLockedRef.current) {
       const fitMarkers = activeNodes.length ? markers.filter((_marker, index) => nodes[index].active) : markers;
       if (fitMarkers.length > 1) {
         map.setFitView(fitMarkers, false, [20, 20, 20, 20], 3.2);
@@ -299,13 +420,50 @@ export function AmapRegionMap({
 
   useEffect(() => {
     const map = mapRef.current;
-    if (loadState !== "ready" || mapType !== "domestic" || !map || viewInitializedRef.current) {
+    if (loadState !== "ready" || !map || viewInitializedRef.current) {
+      return;
+    }
+    if (mapType !== "domestic" && !userViewportLockedRef.current) {
       return;
     }
 
     viewInitializedRef.current = true;
-    map.setZoomAndCenter(CHINA_OVERVIEW_ZOOM, CHINA_CENTER);
-  }, [loadState, mapType]);
+    const viewport = currentViewportRef.current || readStoredViewport(mapType, viewStateKey) || defaultViewportForMapType(mapType);
+    currentViewportRef.current = viewport;
+    restoreMapViewport(map, viewport);
+    window.requestAnimationFrame(() => map.resize?.());
+  }, [loadState, mapType, viewStateKey]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (loadState !== "ready" || !map) {
+      return;
+    }
+
+    const handleUserViewportChange = () => {
+      currentViewportRef.current = rememberMapViewport(map, mapType, viewStateKey);
+      userViewportLockedRef.current = true;
+      cancelStyleRetryRef.current?.();
+      cancelStyleRetryRef.current = scheduleAmapVisualStyle(map);
+    };
+    const handleMapComplete = () => {
+      currentViewportRef.current = captureMapViewport(map) || currentViewportRef.current;
+      cancelStyleRetryRef.current?.();
+      cancelStyleRetryRef.current = scheduleAmapVisualStyle(map);
+    };
+
+    map.on?.("moveend", handleUserViewportChange);
+    map.on?.("zoomend", handleUserViewportChange);
+    map.on?.("dragend", handleUserViewportChange);
+    map.on?.("complete", handleMapComplete);
+
+    return () => {
+      map.off?.("moveend", handleUserViewportChange);
+      map.off?.("zoomend", handleUserViewportChange);
+      map.off?.("dragend", handleUserViewportChange);
+      map.off?.("complete", handleMapComplete);
+    };
+  }, [loadState, mapType, viewStateKey]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -342,13 +500,46 @@ export function AmapRegionMap({
       } else {
         map.setZoom(nextZoom);
       }
+      window.setTimeout(() => {
+        currentViewportRef.current = rememberMapViewport(map, mapType, viewStateKey);
+        userViewportLockedRef.current = true;
+        cancelStyleRetryRef.current?.();
+        cancelStyleRetryRef.current = scheduleAmapVisualStyle(map);
+      }, 0);
     };
 
     container.addEventListener("wheel", handleWheel, { passive: false, capture: true });
     return () => {
       container.removeEventListener("wheel", handleWheel, { capture: true });
     };
-  }, [loadState]);
+  }, [loadState, mapType, viewStateKey]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (loadState !== "ready" || !map || typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const restoreCurrentViewport = () => {
+      const viewport = currentViewportRef.current || readStoredViewport(mapType, viewStateKey);
+      map.resize?.();
+      cancelStyleRetryRef.current?.();
+      cancelStyleRetryRef.current = scheduleAmapVisualStyle(map);
+      if (viewport) {
+        restoreMapViewport(map, viewport);
+      }
+    };
+
+    const observer = new ResizeObserver(() => {
+      window.requestAnimationFrame(restoreCurrentViewport);
+    });
+    if (containerRef.current) {
+      observer.observe(containerRef.current);
+    }
+    return () => {
+      observer.disconnect();
+    };
+  }, [loadState, mapType, viewStateKey]);
 
   useEffect(() => {
     if (loadState !== "ready") {
@@ -372,9 +563,13 @@ export function AmapRegionMap({
     return () => {
       markerRef.current.forEach((marker) => marker.setMap?.(null));
       markerRef.current = [];
+      cancelStyleRetryRef.current?.();
+      cancelStyleRetryRef.current = null;
       mapRef.current?.destroy?.();
       mapRef.current = null;
       viewInitializedRef.current = false;
+      currentViewportRef.current = null;
+      userViewportLockedRef.current = false;
       hideAmapBranding();
     };
   }, []);

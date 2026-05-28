@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUpRight, ExternalLink, X } from "lucide-react";
 import { ChartArea } from "./Charts";
 import { FailedTasksModal } from "./FailedTasksModal";
@@ -644,12 +644,20 @@ function IndustryPieChart({ data }: { data?: { name: string; value: number }[] }
   );
 }
 
+// Pixel threshold below which the latest bar still counts as "in view".
+// Keeps auto-follow active when the user is essentially at the right edge.
+const MEDIA_CHART_STICKY_END_THRESHOLD = 24;
+
 function MediaBarChart({ data }: { data?: DashboardSnapshot["mediaStats"] }) {
   const [filter, setFilter] = useState<'all' | 'auth' | 'self'>('all');
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  // True while the most recent bar is in view. Set to false the moment the
+  // user scrolls away, so polling refreshes stop yanking the view back.
+  const stickToEndRef = useRef(true);
   const chartData = data && data.length ? data : FALLBACK_MEDIA_STATS;
   const displayData = chartData;
-  const chartMinWidth = Math.max(520, displayData.length * 34 + 48);
+  const dataLength = displayData.length;
+  const chartMinWidth = Math.max(520, dataLength * 34 + 48);
   const labeledData = useMemo(
     () => displayData.map((item, index) => ({
       ...item,
@@ -674,16 +682,36 @@ function MediaBarChart({ data }: { data?: DashboardSnapshot["mediaStats"] }) {
     yTicks.push(yAxisMax);
   }
 
-  useEffect(() => {
+  const scrollToEnd = useCallback(() => {
     const container = scrollContainerRef.current;
-    if (!container) {
-      return;
-    }
+    if (!container) return;
+    container.scrollLeft = Math.max(0, container.scrollWidth - container.clientWidth - 20);
+  }, []);
+
+  const handleScroll = useCallback(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    const distanceFromEnd = container.scrollWidth - container.clientWidth - container.scrollLeft;
+    stickToEndRef.current = distanceFromEnd <= MEDIA_CHART_STICKY_END_THRESHOLD;
+  }, []);
+
+  // Filter toggles are explicit user intent — always snap to the end and
+  // re-engage auto-follow afterwards.
+  useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
-      container.scrollLeft = Math.max(0, container.scrollWidth - container.clientWidth - 20);
+      scrollToEnd();
+      stickToEndRef.current = true;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [displayData, filter, chartMinWidth]);
+  }, [filter, scrollToEnd]);
+
+  // Data refreshes (polled every 5s) only auto-follow when the user is still
+  // pinned to the right edge. If they've scrolled left, leave the view alone.
+  useEffect(() => {
+    if (!stickToEndRef.current) return;
+    const frame = window.requestAnimationFrame(scrollToEnd);
+    return () => window.cancelAnimationFrame(frame);
+  }, [dataLength, chartMinWidth, scrollToEnd]);
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -721,7 +749,7 @@ function MediaBarChart({ data }: { data?: DashboardSnapshot["mediaStats"] }) {
               <div className="h-[22px]" />
           </div>
 
-          <div ref={scrollContainerRef} className="flex-1 overflow-x-auto overflow-y-hidden custom-scrollbar">
+          <div ref={scrollContainerRef} onScroll={handleScroll} className="flex-1 overflow-x-auto overflow-y-hidden custom-scrollbar">
             <div className="h-full" style={{ minWidth: chartMinWidth }}>
               <div className="h-[154px]">
                 <ResponsiveContainer width="100%" height="100%">
@@ -772,6 +800,7 @@ function OptimizationMap({ activeRegions = [] }: { activeRegions?: string[] }) {
         activeRegions={activeRegions}
         accentColor={DASHBOARD_CYAN}
         className="h-[176px] w-full rounded-[8px]"
+        viewStateKey="dashboard-region-map"
       />
     </div>
   );

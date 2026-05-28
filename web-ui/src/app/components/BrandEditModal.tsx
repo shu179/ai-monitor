@@ -1665,6 +1665,7 @@ function BrandOptimizationMap({ regions }: { regions: string }) {
         accentColor="var(--brand-cyan)"
         className="h-full w-full"
         fallbackBorderClassName="border-b border-gray-100"
+        viewStateKey="brand-edit-region-map"
       />
     </div>
   );
