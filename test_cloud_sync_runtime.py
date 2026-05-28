@@ -2117,6 +2117,59 @@ def test_app_cloud_runtime_support_retry_object_downloads_returns_backpressure_m
     assert result["failures"][0]["retry_after_seconds"] == 6.5
 
 
+def test_app_cloud_runtime_support_retry_object_downloads_persists_retry_after():
+    owner = _support_owner()
+    sha256 = hashlib.sha256(b"download me later").hexdigest()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+
+    class BusyClient:
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        def create_object_download(self, _token: str, object_id: str, *, trace_id: str = ""):
+            raise CloudClientError(
+                "object download busy",
+                status_code=429,
+                retry_after_seconds=6.5,
+                queue_depth_hint=17,
+                throttle_bucket="object_download",
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = CloudObjectCache(Path(tmp) / "cache")
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        transfer_store.start_transfer(
+            transfer_id="download-1",
+            direction="download",
+            object_id="object-1",
+            sha256=sha256,
+            size_bytes=17,
+            content_type="text/plain",
+        )
+        transfer_store.fail_transfer("download-1", "temporary", retry_after_seconds=0)
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            request_client_factory=BusyClient,
+            object_cache_factory=lambda: cache,
+            object_transfer_store_factory=lambda: transfer_store,
+        )
+
+        support.handle_command("cloud.retry_object_downloads", {"limit": 5})
+        status = transfer_store.retry_status(direction="download")
+
+    assert status["retry_ready_count"] == 0
+    assert status["retry_waiting_count"] == 1
+    assert status["wait_reason"] == "waiting_retry_backoff"
+    assert status["next_retry_after_seconds"] >= 6
+
+
 def test_app_cloud_runtime_support_retries_failed_object_uploads_when_source_matches():
     owner = _support_owner()
     body = b"retry upload bytes"

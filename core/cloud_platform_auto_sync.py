@@ -76,6 +76,7 @@ class CloudPlatformAutoSync:
         retry_object_uploads: Callable[..., dict[str, Any]] | None = None,
         object_upload_retry_status: Callable[..., dict[str, Any]] | None = None,
         object_upload_retry_interval_seconds: float = 60.0,
+        object_download_retry_interval_seconds: float = 60.0,
         client_factory: Callable[[str], SurfacedCloudClient] | None = None,
         logger: Callable[[str], None] | None = None,
     ) -> None:
@@ -103,6 +104,13 @@ class CloudPlatformAutoSync:
             5.0,
             _env_float("AIBRANDMONITOR_CLOUD_OBJECT_UPLOAD_RETRY_INTERVAL_SECONDS", object_upload_retry_interval_seconds),
         )
+        self._object_download_retry_interval_seconds = max(
+            5.0,
+            _env_float(
+                "AIBRANDMONITOR_CLOUD_OBJECT_DOWNLOAD_RETRY_INTERVAL_SECONDS",
+                object_download_retry_interval_seconds,
+            ),
+        )
         self._idle_interval_seconds = max(0.2, float(idle_interval_seconds or 1.0))
         self._event_stream_enabled = bool(event_stream_enabled)
         self._event_reconnect_seconds = max(1.0, float(event_reconnect_seconds or 5.0))
@@ -123,6 +131,7 @@ class CloudPlatformAutoSync:
         self._last_upload_started_at = 0.0
         self._last_pull_started_at = 0.0
         self._last_object_upload_retry_started_at = 0.0
+        self._last_object_download_retry_started_at = 0.0
         self._last_logged_in_key = ""
         self._last_error_log_text = ""
         self._last_error_log_at = 0.0
@@ -159,6 +168,8 @@ class CloudPlatformAutoSync:
             "last_state_delta_metrics": {},
             "last_state_delta_inbox_metrics": {},
             "last_object_download_retry_metrics": {},
+            "last_object_download_retry_at": "",
+            "last_object_download_retry_error": "",
             "object_download_retry_ready_count": 0,
             "object_download_retry_waiting_count": 0,
             "object_download_retry_wait_reason": "",
@@ -503,6 +514,7 @@ class CloudPlatformAutoSync:
         self._update_status(running=True)
         upload_wake_requested = False
         object_upload_retry_wake_requested = False
+        object_download_retry_wake_requested = False
         try:
             while not self._stop_event.is_set():
                 session = self._session_store.load()
@@ -538,6 +550,7 @@ class CloudPlatformAutoSync:
                     self._last_upload_started_at = 0.0
                     self._last_pull_started_at = 0.0
                     self._last_object_upload_retry_started_at = 0.0
+                    self._last_object_download_retry_started_at = 0.0
                     self._clear_upload_backpressure()
                     self._clear_object_download_retry_backpressure()
                     self._clear_object_upload_retry_backpressure()
@@ -674,6 +687,65 @@ class CloudPlatformAutoSync:
                         )
                     self._update_object_upload_retry_status_snapshot(self._invoke_object_upload_retry_status())
 
+                object_download_retry_result: dict[str, Any] | None = None
+                had_object_download_retry_backpressure = self._object_download_retry_backpressure_until_at > 0
+                object_download_retry_backpressure_active = self._refresh_object_download_retry_backpressure_status(now)
+                object_download_retry_backpressure_expired = (
+                    had_object_download_retry_backpressure and not object_download_retry_backpressure_active
+                )
+                object_download_retry_status = self._invoke_object_download_retry_status()
+                object_download_retry_status_available = bool(object_download_retry_status.get("available"))
+                object_download_retry_ready_count = _safe_int(object_download_retry_status.get("retry_ready_count"))
+                self._update_object_download_retry_status_snapshot(object_download_retry_status)
+                if (
+                    callable(self._retry_object_downloads)
+                    and not object_download_retry_backpressure_active
+                    and (
+                        (
+                            object_download_retry_status_available
+                            and object_download_retry_ready_count > 0
+                        )
+                        or (
+                            not object_download_retry_status_available
+                            and (
+                                object_download_retry_wake_requested
+                                or object_download_retry_backpressure_expired
+                                or (
+                                    self._last_object_download_retry_started_at > 0
+                                    and now - self._last_object_download_retry_started_at >= self._object_download_retry_interval_seconds
+                                )
+                            )
+                        )
+                    )
+                ):
+                    self._last_object_download_retry_started_at = now
+                    object_download_retry_wake_requested = False
+                    object_download_retry_result = self._invoke_object_download_retry()
+                    object_download_retry_metrics = _object_download_retry_metrics(object_download_retry_result)
+                    if object_download_retry_result.get("ok"):
+                        self._update_status(
+                            last_object_download_retry_at=local_now().isoformat(timespec="seconds"),
+                            last_object_download_retry_metrics=object_download_retry_metrics,
+                            last_object_download_retry_error="",
+                        )
+                        if not self._apply_object_download_retry_backpressure(
+                            object_download_retry_metrics,
+                            now=time.monotonic(),
+                        ):
+                            self._clear_object_download_retry_backpressure()
+                    else:
+                        self._apply_object_download_retry_backpressure(
+                            object_download_retry_metrics,
+                            now=time.monotonic(),
+                        )
+                        self._update_status(
+                            last_object_download_retry_metrics=object_download_retry_metrics,
+                            last_object_download_retry_error=str(
+                                object_download_retry_result.get("message") or "对象下载恢复失败"
+                            ),
+                        )
+                    self._update_object_download_retry_status_snapshot(self._invoke_object_download_retry_status())
+
                 pull_result: dict[str, Any] | None = None
                 state_delta_result: dict[str, Any] | None = None
                 if first_sync_for_login or now - self._last_pull_started_at >= self._pull_interval_seconds:
@@ -705,7 +777,9 @@ class CloudPlatformAutoSync:
                 if self._stop_event.wait(0.1):
                     break
                 upload_wake_requested = CloudOutbox.wait_for_change(self._idle_interval_seconds)
-                object_upload_retry_wake_requested = CloudObjectTransferStore.wait_for_change(0.0)
+                object_transfer_wake_requested = CloudObjectTransferStore.wait_for_change(0.0)
+                object_upload_retry_wake_requested = object_transfer_wake_requested
+                object_download_retry_wake_requested = object_transfer_wake_requested
         finally:
             self._update_status(running=False, event_stream_connected=False)
 
@@ -917,6 +991,18 @@ class CloudPlatformAutoSync:
         except Exception as exc:
             return {"ok": False, "message": f"对象上传恢复失败：{exc}"}
 
+    def _invoke_object_download_retry(self) -> dict[str, Any]:
+        retry_downloads_handler = self._retry_object_downloads
+        if not callable(retry_downloads_handler):
+            return {"ok": True, "message": "", "skipped": True}
+        try:
+            return _invoke_optional_payload_callback(
+                retry_downloads_handler,
+                {"limit": 20, "source": "auto_sync"},
+            )
+        except Exception as exc:
+            return {"ok": False, "message": f"对象下载恢复失败：{exc}"}
+
     def _invoke_object_upload_retry_status(self) -> dict[str, Any]:
         status_handler = self._object_upload_retry_status
         if not callable(status_handler):
@@ -1015,13 +1101,7 @@ class CloudPlatformAutoSync:
             and not download_retry_backpressure_active
             and (not download_retry_status_available or download_retry_ready_count > 0)
         ):
-            try:
-                retry_downloads_result = _invoke_optional_payload_callback(
-                    retry_downloads_handler,
-                    {"limit": 20, "source": "auto_sync"},
-                )
-            except Exception as exc:
-                retry_downloads_result = {"ok": False, "message": f"对象下载恢复失败：{exc}"}
+            retry_downloads_result = self._invoke_object_download_retry()
             self._update_object_download_retry_status_snapshot(self._invoke_object_download_retry_status())
         elif pull_result.get("ok") and process_result.get("ok") and callable(retry_downloads_handler):
             retry_downloads_result = {

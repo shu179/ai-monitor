@@ -983,7 +983,11 @@ class AppCloudRuntimeSupport:
             transfer_store.fail_transfer(transfer_id, str(exc))
             return {"ok": False, "message": str(exc)}
         if not ok:
-            transfer_store.fail_transfer(transfer_id, message)
+            transfer_store.fail_transfer(
+                transfer_id,
+                message,
+                retry_after_seconds=_safe_float((backpressure or {}).get("retry_after_seconds"), 0.0) or None,
+            )
             result = {"ok": False, "message": message}
             result.update(_cloud_backpressure_fields(backpressure))
             return result
@@ -2011,6 +2015,8 @@ def _cloud_sync_health_summary(
         "object_download_retry_backpressure_bucket": str(
             auto_sync.get("object_download_retry_backpressure_bucket") or ""
         ),
+        "last_object_download_retry_at": str(auto_sync.get("last_object_download_retry_at") or ""),
+        "last_object_download_retry_error": str(auto_sync.get("last_object_download_retry_error") or ""),
         "object_download_retry_ready_count": _safe_int(auto_sync.get("object_download_retry_ready_count"), 0),
         "object_download_retry_waiting_count": _safe_int(auto_sync.get("object_download_retry_waiting_count"), 0),
         "object_download_retry_wait_reason": str(auto_sync.get("object_download_retry_wait_reason") or ""),

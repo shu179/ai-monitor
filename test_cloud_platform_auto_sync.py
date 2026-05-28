@@ -437,6 +437,59 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
             self.assertEqual(status["object_upload_retry_ready_count"], 0)
             self.assertTrue(status["last_object_upload_retry_at"])
 
+    def test_object_download_retry_status_wakes_retry_when_backoff_expires(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.example.com",
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+                }
+            )
+            transfer_store = CloudObjectTransferStore(Path(tmpdir) / "transfers.sqlite3")
+            transfer_store.start_transfer(
+                transfer_id="download-1",
+                direction="download",
+                object_id="object-1",
+                sha256="a" * 64,
+            )
+            transfer_store.fail_transfer("download-1", "busy", retry_after_seconds=0.4)
+            calls: list[float] = []
+
+            def retry_downloads(_payload=None):
+                calls.append(time.monotonic())
+                transfer_store.finish_transfer("download-1", object_id="object-1", status="completed")
+                return {"ok": True, "attempted": 1, "recovered": 1, "failed": 0, "skipped": 0}
+
+            manager = CloudPlatformAutoSync(
+                session_store=store,
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                retry_object_downloads=retry_downloads,
+                object_download_retry_status=lambda _payload=None: {"ok": True, "available": True, **transfer_store.retry_status(direction="download")},
+                object_download_retry_interval_seconds=60,
+                pull_interval_seconds=3600,
+                idle_interval_seconds=0.2,
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            manager.start()
+            try:
+                deadline = time.time() + 2.0
+                while not calls and time.time() < deadline:
+                    time.sleep(0.05)
+            finally:
+                manager.stop()
+
+            self.assertEqual(len(calls), 1)
+            status = manager.get_status()
+            self.assertEqual(status["object_download_retry_wait_reason"], "idle")
+            self.assertEqual(status["object_download_retry_ready_count"], 0)
+            self.assertTrue(status["last_object_download_retry_at"])
+
     def test_upload_backpressure_pauses_flush_until_retry_after(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = CloudSessionStore(Path(tmpdir) / "session.json")
