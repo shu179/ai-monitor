@@ -2729,6 +2729,7 @@ def test_app_cloud_runtime_support_command_requeues_sync_queue_items():
                 "limit": kwargs["limit"],
                 "selected": 2,
                 "requeued": 0 if kwargs["dry_run"] else 2,
+                "batches_updated": 0 if kwargs["dry_run"] else 1,
                 "items": [],
             }
 

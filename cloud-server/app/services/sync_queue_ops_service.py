@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 REQUEUEABLE_STATUSES = ("blocked", "dead_letter")
+logger = logging.getLogger(__name__)
 
 
 def requeue_sync_queue_items(
@@ -45,7 +47,7 @@ def requeue_sync_queue_items(
     rows = db.execute(
         text(
             f"""
-            SELECT id, created_at, status, partition_key
+            SELECT id, created_at, batch_id, status, partition_key
             FROM sync_batch_items
             WHERE workspace_id = :workspace_id
               AND status = ANY(:statuses)
@@ -60,6 +62,7 @@ def requeue_sync_queue_items(
         {
             "id": int(row.id),
             "created_at": row.created_at.isoformat() if row.created_at else "",
+            "batch_id": str(row.batch_id or ""),
             "status": str(row.status or ""),
             "partition_key": str(row.partition_key or ""),
         }
@@ -74,6 +77,7 @@ def requeue_sync_queue_items(
             "limit": safe_limit,
             "selected": len(selected),
             "requeued": 0,
+            "batches_updated": 0,
             "items": selected,
         }
     values_sql = ", ".join(f"(:id_{idx}, :created_at_{idx})" for idx in range(len(rows)))
@@ -97,7 +101,20 @@ def requeue_sync_queue_items(
         ),
         update_params,
     )
+    batch_ids = sorted({str(row.batch_id or "") for row in rows if str(row.batch_id or "").strip()})
+    batches_updated = _mark_batches_requeued(db, batch_ids=batch_ids)
     db.commit()
+    logger.info(
+        "[CloudSyncQueueOps] requeue workspace_id=%s dry_run=%s statuses=%s partition_key=%s "
+        "selected=%s requeued=%s batches=%s",
+        safe_workspace_id,
+        False,
+        ",".join(safe_statuses),
+        safe_partition_key or "*",
+        len(selected),
+        int(result.rowcount or 0),
+        batches_updated,
+    )
     return {
         "dry_run": False,
         "workspace_id": safe_workspace_id,
@@ -106,5 +123,24 @@ def requeue_sync_queue_items(
         "limit": safe_limit,
         "selected": len(selected),
         "requeued": int(result.rowcount or 0),
+        "batches_updated": batches_updated,
         "items": selected,
     }
+
+
+def _mark_batches_requeued(db: Session, *, batch_ids: list[str]) -> int:
+    safe_ids = [str(item or "").strip() for item in batch_ids if str(item or "").strip()]
+    if not safe_ids:
+        return 0
+    result = db.execute(
+        text(
+            """
+            UPDATE sync_batches
+            SET status = 'accepted'
+            WHERE id = ANY(:batch_ids)
+              AND status IN ('completed_with_errors', 'done')
+            """
+        ),
+        {"batch_ids": safe_ids},
+    )
+    return int(result.rowcount or 0)

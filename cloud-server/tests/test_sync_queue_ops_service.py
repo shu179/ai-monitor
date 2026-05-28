@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from unittest.mock import MagicMock
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+os.environ.setdefault("SURFACED_CLOUD_SECRET_KEY", "test-secret-key-for-sync-queue-ops")
 
 from app.services.sync_queue_ops_service import requeue_sync_queue_items  # noqa: E402
 
@@ -21,6 +23,7 @@ class SyncQueueOpsServiceTests(unittest.TestCase):
             SimpleNamespace(
                 id=7,
                 created_at=datetime(2026, 5, 28, tzinfo=timezone.utc),
+                batch_id="batch-1",
                 status="blocked",
                 partition_key="3:article:abc",
             )
@@ -38,6 +41,7 @@ class SyncQueueOpsServiceTests(unittest.TestCase):
         self.assertTrue(result["dry_run"])
         self.assertEqual(result["selected"], 1)
         self.assertEqual(result["requeued"], 0)
+        self.assertEqual(result["items"][0]["batch_id"], "batch-1")
         self.assertEqual(result["items"][0]["status"], "blocked")
         sql = str(db.execute.call_args.args[0]).lower()
         params = db.execute.call_args.args[1]
@@ -54,18 +58,21 @@ class SyncQueueOpsServiceTests(unittest.TestCase):
             SimpleNamespace(
                 id=7,
                 created_at=selected_at,
+                batch_id="batch-1",
                 status="dead_letter",
                 partition_key="3:article:abc",
             )
         ]
         update_result = MagicMock(rowcount=1)
-        db.execute.side_effect = [select_result, update_result]
+        batch_update_result = MagicMock(rowcount=1)
+        db.execute.side_effect = [select_result, update_result, batch_update_result]
 
         result = requeue_sync_queue_items(db, workspace_id=3, statuses=["dead_letter"], limit=50, dry_run=False)
 
         self.assertFalse(result["dry_run"])
         self.assertEqual(result["selected"], 1)
         self.assertEqual(result["requeued"], 1)
+        self.assertEqual(result["batches_updated"], 1)
         update_sql = str(db.execute.call_args_list[1].args[0]).lower()
         update_params = db.execute.call_args_list[1].args[1]
         self.assertIn("set status = 'pending'", update_sql)
@@ -75,6 +82,11 @@ class SyncQueueOpsServiceTests(unittest.TestCase):
         self.assertIn("item.created_at = selected.created_at", update_sql)
         self.assertEqual(update_params["id_0"], 7)
         self.assertEqual(update_params["created_at_0"], selected_at)
+        batch_sql = str(db.execute.call_args_list[2].args[0]).lower()
+        batch_params = db.execute.call_args_list[2].args[1]
+        self.assertIn("update sync_batches", batch_sql)
+        self.assertIn("set status = 'accepted'", batch_sql)
+        self.assertEqual(batch_params["batch_ids"], ["batch-1"])
         db.commit.assert_called_once()
 
     def test_requeue_rejects_missing_workspace(self) -> None:

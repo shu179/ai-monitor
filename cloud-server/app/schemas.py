@@ -52,6 +52,7 @@ class CloudSyncQueueRequeueResponse(BaseModel):
     limit: int
     selected: int
     requeued: int
+    batches_updated: int = 0
     items: list[dict[str, Any]]
 
 
