@@ -99,6 +99,65 @@ class CloudCommandTransportState:
     error: str = ""
     error_type: str = ""
 
+    @staticmethod
+    def command_timeout_seconds(command: str) -> float:
+        normalized = str(command or "").strip()
+        if normalized in {
+            "cloud.status",
+            "cloud.current_status",
+            "cloud.status_from_session",
+            "cloud.validate_session",
+            "cloud.capabilities",
+            "cloud.outbox_diagnostics",
+            "cloud.sync_health",
+            "cloud.object_cache_diagnostics",
+            "cloud.object_transfer_diagnostics",
+            "cloud.object_transfer_retry_candidates",
+            "cloud.state_delta_diagnostics",
+        }:
+            return 5.0
+        if normalized in {
+            "cloud.flush_outbox",
+            "cloud.pull_state_delta",
+            "cloud.process_state_delta_inbox",
+            "cloud.retry_object_downloads",
+            "cloud.retry_object_uploads",
+            "cloud.prune_object_cache",
+            "cloud.cache_object",
+        }:
+            return 60.0
+        return 15.0
+
+    @staticmethod
+    def socket_ping_status(
+        socket_path: Path,
+        *,
+        ping_sender: Callable[[Path], dict[str, Any]],
+        now_monotonic: Callable[[], float] = time.monotonic,
+    ) -> dict[str, Any]:
+        socket_ping: dict[str, Any] = {
+            "attempted": True,
+            "ok": None,
+            "elapsed_ms": None,
+            "daemon": False,
+            "pid": None,
+            "message": "",
+            "error_type": "",
+        }
+        started_at = now_monotonic()
+        try:
+            ping_result = ping_sender(socket_path)
+        except Exception as exc:
+            ping_result = {"ok": False, "message": str(exc)}
+        socket_ping["elapsed_ms"] = int((now_monotonic() - started_at) * 1000)
+        socket_ping["ok"] = bool(ping_result.get("ok"))
+        socket_ping["daemon"] = bool(ping_result.get("daemon"))
+        socket_ping["pid"] = ping_result.get("pid") if isinstance(ping_result.get("pid"), int) else None
+        if not bool(socket_ping["ok"]):
+            socket_ping["message"] = str(ping_result.get("message") or "daemon ping failed")
+            socket_ping["error_type"] = str(ping_result.get("daemon_error_type") or "unknown")
+        return socket_ping
+
     def clear_recovery_timer(self) -> None:
         timer = self.recovery_timer
         self.recovery_timer = None
