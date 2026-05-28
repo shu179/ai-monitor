@@ -69,6 +69,9 @@ class LoadSyncV2ScriptTests(unittest.TestCase):
             self.assertIn(profile, load_sync_v2.PROFILE_DEFAULTS)
             self.assertIn(profile, load_sync_v2.PROFILE_THRESHOLDS)
 
+    def test_l3_object_size_matches_current_single_file_limit(self) -> None:
+        self.assertEqual(load_sync_v2.PROFILE_DEFAULTS["l3"]["object_bytes"], 512 * 1024 * 1024)
+
     def test_evaluate_thresholds_passes_under_limit(self) -> None:
         result = {"batches": {"count": 120, "p95_ms": 800}}
         evaluation = load_sync_v2.evaluate_thresholds(result, {"batches_p95_ms": 1000})

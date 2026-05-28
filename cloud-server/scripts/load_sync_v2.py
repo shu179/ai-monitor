@@ -23,7 +23,7 @@ PROFILE_DEFAULTS = {
     "dev": {"tenants": 1, "events_per_tenant": 100, "batch_size": 50, "concurrency": 2, "objects": 0, "object_bytes": 0},
     "l1": {"tenants": 10, "events_per_tenant": 6000, "batch_size": 500, "concurrency": 10, "objects": 0, "object_bytes": 0},
     "l2": {"tenants": 1, "events_per_tenant": 50000, "batch_size": 500, "concurrency": 8, "objects": 0, "object_bytes": 0},
-    "l3": {"tenants": 10, "events_per_tenant": 6000, "batch_size": 500, "concurrency": 10, "objects": 5, "object_bytes": 1024 * 1024 * 1024},
+    "l3": {"tenants": 10, "events_per_tenant": 6000, "batch_size": 500, "concurrency": 10, "objects": 5, "object_bytes": 512 * 1024 * 1024},
 }
 
 # Acceptance thresholds (milliseconds) checked with --assert-thresholds.
