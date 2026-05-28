@@ -907,6 +907,8 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
                     "reason": "transport_not_started",
                     "retry_after_seconds": 0,
                 },
+                "cloud_command_transport_last_recovery_result": "",
+                "cloud_command_transport_last_recovery_error": "",
                 "deep_blocked": True,
             },
         )

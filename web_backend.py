@@ -2090,6 +2090,9 @@ class AppRuntime:
         self._cloud_command_transport_last_recovery_attempt_at = 0.0
         self._cloud_command_transport_last_recovery_attempt = ""
         self._cloud_command_transport_last_recovery_reason = ""
+        self._cloud_command_transport_last_recovery_completed_at = ""
+        self._cloud_command_transport_last_recovery_result = ""
+        self._cloud_command_transport_last_recovery_error = ""
         self._cloud_command_transport_recovery_interval_seconds = 30.0
         self._cloud_command_transport_stop_requested = False
         self._cloud_command_transport_mode = "not_started"
@@ -2245,6 +2248,8 @@ class AppRuntime:
                 pass
 
     def _recover_cloud_command_transport_worker(self) -> None:
+        result = "failed"
+        error = ""
         try:
             lock = getattr(self, "_cloud_command_transport_lock", None)
             if lock is None:
@@ -2252,12 +2257,26 @@ class AppRuntime:
                 self._cloud_command_transport_lock = lock
             with lock:
                 if bool(getattr(self, "_cloud_command_transport_stop_requested", False)):
+                    result = "cancelled"
                     return
-            self._start_cloud_command_transport()
+            try:
+                self._start_cloud_command_transport()
+            except Exception as exc:
+                error = str(exc)
+            status = self._cloud_command_transport_status()
+            if bool(status.get("responsive")) and str(status.get("mode") or "") in {"child_daemon", "in_process_socket"}:
+                result = "recovered"
+                error = ""
+            else:
+                result = "failed"
+                error = error or str(status.get("last_error") or status.get("mode") or "cloud command transport recovery failed")
         finally:
             lock = getattr(self, "_cloud_command_transport_lock", None)
             if lock is not None:
                 with lock:
+                    self._cloud_command_transport_last_recovery_completed_at = local_now().isoformat(timespec="seconds")
+                    self._cloud_command_transport_last_recovery_result = result
+                    self._cloud_command_transport_last_recovery_error = error
                     if getattr(self, "_cloud_command_transport_recovery_thread", None) is threading.current_thread():
                         self._cloud_command_transport_recovery_thread = None
 
@@ -2287,6 +2306,9 @@ class AppRuntime:
             self._cloud_command_transport_last_recovery_attempt_at = now
             self._cloud_command_transport_last_recovery_attempt = local_now().isoformat(timespec="seconds")
             self._cloud_command_transport_last_recovery_reason = reason_text
+            self._cloud_command_transport_last_recovery_result = "running"
+            self._cloud_command_transport_last_recovery_error = ""
+            self._cloud_command_transport_last_recovery_completed_at = ""
             recovery_thread = threading.Thread(
                 target=self._recover_cloud_command_transport_worker,
                 name="cloud-command-transport-recovery",
@@ -4558,6 +4580,11 @@ return changedCount
             "recovery_running": recovery_running,
             "last_recovery_attempt": str(getattr(self, "_cloud_command_transport_last_recovery_attempt", "") or ""),
             "last_recovery_reason": str(getattr(self, "_cloud_command_transport_last_recovery_reason", "") or ""),
+            "last_recovery_completed_at": str(
+                getattr(self, "_cloud_command_transport_last_recovery_completed_at", "") or ""
+            ),
+            "last_recovery_result": str(getattr(self, "_cloud_command_transport_last_recovery_result", "") or ""),
+            "last_recovery_error": str(getattr(self, "_cloud_command_transport_last_recovery_error", "") or ""),
             "next_recovery_allowed_in_seconds": next_recovery_allowed_in_seconds,
             "last_error": str(getattr(self, "_cloud_command_transport_error", "") or ""),
         }
@@ -4650,6 +4677,12 @@ return changedCount
                 transport_status.get("next_transport_action")
                 if isinstance(transport_status.get("next_transport_action"), dict)
                 else {}
+            )
+            summary["cloud_command_transport_last_recovery_result"] = str(
+                transport_status.get("last_recovery_result") or ""
+            )
+            summary["cloud_command_transport_last_recovery_error"] = str(
+                transport_status.get("last_recovery_error") or ""
             )
             summary["deep_blocked"] = bool(summary.get("sync_blocked")) or bool(transport_status.get("transport_blocked"))
             sync_health["summary"] = summary
