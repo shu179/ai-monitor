@@ -638,7 +638,7 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
 
         self.assertEqual(sqlite_result, json_result)
 
-    def test_refresh_article_matches_preserves_deleted_task_classification(self) -> None:
+    def test_refresh_article_matches_drops_deleted_task_auto_classification(self) -> None:
         for backend in ("json", "sqlite"):
             with self.subTest(backend=backend):
                 self._configure_paths(f"legacy-deleted-article-label-{backend}")
@@ -651,6 +651,27 @@ class ArticleStoreSQLiteParityTests(unittest.TestCase):
                         "published_at": "2026-05-09",
                         "matched_tasks": ["已删除品牌"],
                         "match_reasons": {"已删除品牌": ["历史归类"]},
+                    }
+                ])
+
+                refreshed = article_store.refresh_article_matches({"tasks": []})
+
+                self.assertEqual(refreshed[0]["matched_tasks"], [])
+                self.assertEqual(refreshed[0]["match_reasons"], {})
+
+    def test_refresh_article_matches_preserves_manual_deleted_task_classification(self) -> None:
+        for backend in ("json", "sqlite"):
+            with self.subTest(backend=backend):
+                self._configure_paths(f"manual-deleted-article-label-{backend}")
+                os.environ[article_store.ARTICLE_STORE_BACKEND_ENV] = backend
+                article_store.bulk_upsert_articles([
+                    {
+                        "id": "article-deleted-manual-task",
+                        "url": "https://example.com/deleted-manual-task",
+                        "title": "历史品牌报道",
+                        "published_at": "2026-05-09",
+                        "matched_tasks": ["已删除品牌"],
+                        "match_reasons": {"已删除品牌": ["手动设置所属品牌"]},
                     }
                 ])
 

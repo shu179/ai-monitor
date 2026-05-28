@@ -91,7 +91,45 @@ def _normalize_keyword_import_candidate(value: Any) -> str:
     return text
 
 
+def _keyword_import_token_length(text: Any) -> int:
+    """统计中英文字符数（忽略空白和标点），用于判断片段是不是真正"成形的关键词"。"""
+    return len(re.findall(r"[一-鿿A-Za-z0-9]", str(text or "")))
+
+
+def _looks_like_compound_keyword_line(pieces: list[str]) -> bool:
+    """判断一行按"、""，"切出来的片段是不是「长尾主关键词 + 一串短卖点」混杂。
+
+    例如 "不飞粉的大地色眼影推荐，适合新手，日常通勤，自然百搭" 切出 4 段，
+    最长 11 个字、最短 4 个字，长度极不均匀——这显然是"主词 + 卖点"被一起粘进来了，
+    旧逻辑会把"适合新手"、"日常通勤"、"自然百搭"都当成独立关键词，让导出的"关键词大类"
+    出现一堆 3-4 字短词、并且让那些短词大量误命中其它品牌的文章。
+    """
+    if len(pieces) < 2:
+        return False
+    char_lens = [_keyword_import_token_length(piece) for piece in pieces]
+    return max(char_lens) >= 10 and min(char_lens) <= 5
+
+
+def _fallback_split_by_punctuation(text: str) -> list[str]:
+    """单 cell 整体作为关键词失败时（太长或被规范化拒绝），用顿号/逗号兜底切一下。"""
+    pieces = [piece.strip() for piece in re.split(r"[,，;；|｜、]+", text) if piece.strip()]
+    if not pieces:
+        return []
+    if _looks_like_compound_keyword_line(pieces):
+        return [max(pieces, key=_keyword_import_token_length)]
+    return pieces
+
+
 def _split_keyword_import_candidates(value: Any) -> list[str]:
+    """把一个 cell（或文本块）解析成关键词列表。
+
+    用户场景以"每个 cell 一个完整关键词"为主，所以默认行为是：
+      - 单 cell 不含换行 → 整体作为一个关键词，**不**按顿号/逗号再切，
+        避免把"干皮水润保湿、服帖不卡粉的粉底液推荐"这种本身就含顿号的长尾词切碎。
+      - cell 内含换行（常见于从 Word / 网页 / AI 输出粘贴进来带回车的脏数据）
+        → 按行处理，每行各自再走一次"整体当关键词"的判断。
+      - 整体超过 25 字或规范化拒绝 → 退回顿号切，并对"长尾 + 一串短卖点"模式只取最长那段。
+    """
     text = _stringify_table_cell(value)
     if not text:
         return []
@@ -102,10 +140,33 @@ def _split_keyword_import_candidates(value: Any) -> list[str]:
         text.strip(),
         flags=re.IGNORECASE,
     )
-    parts = re.split(r"[\n,，;；|｜、]+", text)
+
+    if "\n" not in text:
+        whole = _normalize_keyword_import_candidate(text)
+        if whole:
+            return [whole]
+        return [
+            candidate
+            for candidate in (
+                _normalize_keyword_import_candidate(part)
+                for part in _fallback_split_by_punctuation(text)
+            )
+            if candidate
+        ]
+
+    raw_parts: list[str] = []
+    for line in re.split(r"\n+", text):
+        stripped_line = line.strip()
+        if not stripped_line:
+            continue
+        whole_line = _normalize_keyword_import_candidate(stripped_line)
+        if whole_line:
+            raw_parts.append(stripped_line)
+            continue
+        raw_parts.extend(_fallback_split_by_punctuation(stripped_line))
     return [
         candidate
-        for candidate in (_normalize_keyword_import_candidate(part) for part in parts)
+        for candidate in (_normalize_keyword_import_candidate(part) for part in raw_parts)
         if candidate
     ]
 

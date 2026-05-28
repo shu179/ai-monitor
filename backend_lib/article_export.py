@@ -230,6 +230,10 @@ def _hydrate_article_export_urls(articles: list[dict[str, Any]]) -> list[dict[st
 
 
 ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL = "未知"
+# 多个关键词拼到同一格时，用 "空格 + 中点 + 空格" 作为分隔符。
+# 用户配置的关键词内部经常出现"、"或"，"，所以不能再用顿号拼，否则
+# "干皮水润保湿、服帖不卡粉的粉底液推荐" 会被误以为是一个含顿号的怪关键词。
+ARTICLE_EXPORT_KEYWORD_JOIN = " · "
 
 
 def _article_export_keyword_sort_key(label: str, keyword_order: dict[str, int]) -> tuple[int, str]:
@@ -269,7 +273,11 @@ def _article_export_items(
             cleaned_labels,
             key=lambda label: _article_export_keyword_sort_key(label, keyword_order),
         )
-        cell_value = "、".join(ordered_labels) if ordered_labels else ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL
+        cell_value = (
+            ARTICLE_EXPORT_KEYWORD_JOIN.join(ordered_labels)
+            if ordered_labels
+            else ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL
+        )
         items.append((cell_value, article))
 
     return items

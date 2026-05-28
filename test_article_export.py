@@ -165,7 +165,43 @@ def test_article_export_keyword_category_is_one_cell_not_row_grouping():
         show_keyword_category=True,
         config=config,
         task_name="品牌A",
-    ) == [("融资" + "、" + "新品", article)]
+    ) == [("融资 · 新品", article)]
+
+
+def test_article_export_keyword_category_joiner_isolates_keywords_with_inner_punctuation():
+    """关键词内部带顿号/逗号也不能和"多关键词拼接分隔符"混淆，
+    历史上拼接用"、"导致 '保湿、防脱' 看着像一个怪关键词；现在改成 ' · '。"""
+    config = {
+        "tasks": [
+            {
+                "name": "品牌A",
+                "brand": "品牌A",
+                "keywords": [
+                    {"keyword": "干皮水润保湿、服帖不卡粉的粉底液推荐"},
+                    {"keyword": "敏感肌可用"},
+                ],
+            }
+        ]
+    }
+    article = {
+        "id": "punctuation",
+        "title": "干皮水润保湿、服帖不卡粉的粉底液推荐 敏感肌可用",
+        "media_name": "示例媒体",
+        "media_type": "authority",
+        "published_at": "2024-01-01",
+        "matched_tasks": ["品牌A"],
+    }
+    items = _backend_article_export_items(
+        [article],
+        show_keyword_category=True,
+        config=config,
+        task_name="品牌A",
+    )
+    assert len(items) == 1
+    cell_value, _ = items[0]
+    assert " · " in cell_value
+    assert "干皮水润保湿、服帖不卡粉的粉底液推荐" in cell_value
+    assert "敏感肌可用" in cell_value
 
 
 def test_desktop_article_export_keyword_category_keeps_global_time_order():

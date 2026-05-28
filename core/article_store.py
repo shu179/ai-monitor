@@ -3049,6 +3049,66 @@ def _prune_cloud_articles_by_visible_task_ids_sqlite(
     }
 
 
+_MANUAL_CLASSIFICATION_REASON_HINTS = ("手动",)
+
+
+def _is_manual_classification_reason(reasons: list[str] | None) -> bool:
+    """归类原因里出现"手动"二字 → 这是用户在 UI 上显式归过来的，要永久保留。
+
+    `match_reasons[task]` 一般是 ["标题命中关键词「X」"] 这种由 analyze 自动生成的字符串；
+    用户手动归类时写入的是 "手动设置所属品牌"（见 backend_lib/article_service.py），
+    所以用"手动"前缀就足以区分自动 vs 手动两类来源。
+    """
+    if not reasons:
+        return False
+    for raw in reasons:
+        text = str(raw or "")
+        if any(hint in text for hint in _MANUAL_CLASSIFICATION_REASON_HINTS):
+            return True
+    return False
+
+
+def _merge_task_classifications_for_refresh(
+    *,
+    stored: list[str],
+    inferred: list[str],
+    inferred_reasons: dict[str, list[str]],
+    existing_reasons: dict[str, list[str]],
+) -> tuple[list[str], dict[str, list[str]]]:
+    """合并 stored 归类和 inferred 归类，用户预期是「config 是事实来源」：
+
+    - inferred 命中（当前 config 跑出来还在命中）→ 保留
+    - stored 里有但 inferred 不命中：
+        * 旧 reason 里出现"手动"二字 → 用户显式归过来的，永久保留
+        * 否则 → **不保留**——这条归类来自被删除的关键词或品牌，自动同步取消
+          归类即可，符合用户预期"删关键词/品牌就一起清掉归类，重新加回完全相同的再算回来"。
+    """
+    merged: list[str] = []
+    reasons: dict[str, list[str]] = {}
+
+    for task_name in inferred:
+        text = str(task_name or "").strip()
+        if not text or text in merged:
+            continue
+        merged.append(text)
+        reasons[text] = list(inferred_reasons.get(text) or [])
+
+    for task_name in stored:
+        text = str(task_name or "").strip()
+        if not text or text in merged:
+            continue
+        old_reasons = list(existing_reasons.get(text) or [])
+        if not _is_manual_classification_reason(old_reasons):
+            continue
+        merged.append(text)
+        reasons[text] = old_reasons
+
+    for task_name in merged:
+        if not reasons.get(task_name):
+            reasons[task_name] = ["保留历史归类"]
+    return merged, reasons
+
+
 def _refresh_article_matches_sqlite(config: dict) -> list:
     compiled_matcher = compile_article_matcher(config)
     config_signature = compiled_matcher.config_signature
@@ -3143,14 +3203,12 @@ def _refresh_article_matches_sqlite(config: dict) -> list:
                 if str(name or "").strip()
                 and str(name or "").strip() not in excluded_task_names
             }
-            merged = []
-            for task_name in stored + inferred:
-                if task_name and task_name not in merged:
-                    merged.append(task_name)
-            match_reasons = {
-                task_name: inferred_reasons.get(task_name) or ["保留历史归类"]
-                for task_name in merged
-            }
+            merged, match_reasons = _merge_task_classifications_for_refresh(
+                stored=stored,
+                inferred=inferred,
+                inferred_reasons=inferred_reasons,
+                existing_reasons=existing_reasons,
+            )
             unmatched_reason = "" if merged else str(analyzed.get("unmatched_reason", "") or "").strip()
             update_payload = {
                 "id": article.get("id"),
@@ -5971,14 +6029,12 @@ def refresh_article_matches(config: dict) -> list:
                 if str(name or "").strip()
                 and str(name or "").strip() not in excluded_task_names
             }
-            merged = []
-            for task_name in stored + inferred:
-                if task_name and task_name not in merged:
-                    merged.append(task_name)
-            match_reasons = {
-                task_name: inferred_reasons.get(task_name) or ["保留历史归类"]
-                for task_name in merged
-            }
+            merged, match_reasons = _merge_task_classifications_for_refresh(
+                stored=stored,
+                inferred=inferred,
+                inferred_reasons=inferred_reasons,
+                existing_reasons=existing_reasons,
+            )
             unmatched_reason = "" if merged else str(analyzed.get("unmatched_reason", "") or "").strip()
             if (
                 merged != list(article.get("matched_tasks") or [])
@@ -6223,14 +6279,12 @@ def _run_article_match_refresh_worker(config: dict, reason: str) -> None:
                     if str(name or "").strip()
                     and str(name or "").strip() not in excluded_task_names
                 }
-                merged = []
-                for task_name in stored + inferred:
-                    if task_name and task_name not in merged:
-                        merged.append(task_name)
-                match_reasons_map = {
-                    task_name: inferred_reasons.get(task_name) or ["保留历史归类"]
-                    for task_name in merged
-                }
+                merged, match_reasons_map = _merge_task_classifications_for_refresh(
+                    stored=stored,
+                    inferred=inferred,
+                    inferred_reasons=inferred_reasons,
+                    existing_reasons=existing_reasons,
+                )
                 unmatched_reason = "" if merged else str(analyzed_result.get("unmatched_reason", "") or "").strip()
                 update_payload = {
                     "id": article.get("id"),

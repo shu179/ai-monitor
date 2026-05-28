@@ -213,6 +213,8 @@ def _sort_articles_for_export(rows: list[dict]) -> list[dict]:
 
 
 ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL = "未知"
+# 多关键词同格拼接用"空格中点空格"，避免被关键词内部的顿号干扰，见 backend_lib/article_export.py。
+ARTICLE_EXPORT_KEYWORD_JOIN = " · "
 
 
 def _article_export_keyword_sort_key(label: str, keyword_order: dict[str, int]) -> tuple[int, str]:
@@ -238,7 +240,11 @@ def _article_export_items(
             if str(label or "").strip()
         ]
         labels.sort(key=lambda label: _article_export_keyword_sort_key(label, resolved_keyword_order))
-        cell_value = "、".join(labels) if labels else ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL
+        cell_value = (
+            ARTICLE_EXPORT_KEYWORD_JOIN.join(labels)
+            if labels
+            else ARTICLE_EXPORT_KEYWORD_UNKNOWN_LABEL
+        )
         items.append((cell_value, row))
 
     return items
