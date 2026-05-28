@@ -373,7 +373,7 @@ class CloudCommandTransportState:
             "error_type": "",
         }
         if mode == "child_daemon" and socket_path and ping_fn is not None:
-            socket_ping = ping_fn(socket_path)
+            socket_ping = self.socket_ping_status(socket_path, ping_sender=ping_fn, now_monotonic=now_monotonic)
         if mode == "child_daemon":
             responsive = bool(socket_ping.get("ok"))
         elif mode == "in_process_socket":

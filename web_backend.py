@@ -4463,12 +4463,7 @@ return changedCount
         state = self._cloud_command_transport_state()
 
         def ping_socket(socket_path: Path) -> dict[str, Any]:
-            return CloudCommandTransportState.socket_ping_status(
-                socket_path,
-                ping_sender=lambda path: UnixSocketCloudSyncCommandClient(path, timeout_seconds=0.25).send_command(
-                    "cloud.daemon.ping"
-                ),
-            )
+            return UnixSocketCloudSyncCommandClient(socket_path, timeout_seconds=0.25).send_command("cloud.daemon.ping")
 
         status = state.snapshot_status(ping_fn=ping_socket)
         status.update(CloudCommandTransportState.action_summary(status))
