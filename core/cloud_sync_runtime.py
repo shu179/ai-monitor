@@ -248,6 +248,41 @@ class CloudCommandTransportState:
             self.recovery_thread = None
         return self.stop_requested
 
+    def prepare_recovery_attempt(
+        self,
+        *,
+        reason: str,
+        force: bool,
+        now_monotonic: float,
+        now_text: str,
+    ) -> dict[str, Any]:
+        reason_text = str(reason or "cloud command transport recovery").strip() or "cloud command transport recovery"
+        if self.stop_requested:
+            return {"action": "skip"}
+        if self.daemon is not None or self.server is not None:
+            return {"action": "skip"}
+        if str(self.mode or "") != "in_process_direct":
+            return {"action": "skip"}
+        recovery_thread = self.recovery_thread
+        if recovery_thread is not None and callable(getattr(recovery_thread, "is_alive", None)) and recovery_thread.is_alive():
+            return {"action": "skip"}
+        interval = max(1.0, float(self.recovery_interval_seconds or 30.0))
+        last_attempt_at = float(self.last_recovery_attempt_at or 0.0)
+        if not force and last_attempt_at > 0 and now_monotonic - last_attempt_at < interval:
+            return {
+                "action": "timer",
+                "reason": reason_text,
+                "delay_seconds": max(0.0, interval - (now_monotonic - last_attempt_at)),
+            }
+        self.clear_recovery_timer()
+        self.last_recovery_attempt_at = now_monotonic
+        self.last_recovery_attempt = now_text
+        self.last_recovery_reason = reason_text
+        self.last_recovery_result = "running"
+        self.last_recovery_error = ""
+        self.last_recovery_completed_at = ""
+        return {"action": "start", "reason": reason_text}
+
     def snapshot_status(
         self,
         *,

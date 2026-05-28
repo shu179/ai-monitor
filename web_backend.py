@@ -2291,32 +2291,22 @@ class AppRuntime:
         state = self._cloud_command_transport_state()
         if not hasattr(socket, "AF_UNIX"):
             return False
-        reason_text = str(reason or "cloud command transport recovery").strip() or "cloud command transport recovery"
-        now = time.monotonic()
         with state.lock:
-            if state.stop_requested:
-                return False
-            if state.daemon is not None or state.server is not None:
-                return False
-            if str(state.mode or "") != "in_process_direct":
-                return False
-            recovery_thread = state.recovery_thread
-            if recovery_thread is not None and callable(getattr(recovery_thread, "is_alive", None)) and recovery_thread.is_alive():
-                return False
-            interval = max(1.0, float(state.recovery_interval_seconds or 30.0))
-            last_attempt_at = float(state.last_recovery_attempt_at or 0.0)
-            if not force and last_attempt_at > 0 and now - last_attempt_at < interval:
-                delay = max(0.0, interval - (now - last_attempt_at))
-                if self._schedule_cloud_command_transport_recovery_timer(reason_text, delay):
+            action = state.prepare_recovery_attempt(
+                reason=reason,
+                force=force,
+                now_monotonic=time.monotonic(),
+                now_text=local_now().isoformat(timespec="seconds"),
+            )
+            if action.get("action") == "timer":
+                if self._schedule_cloud_command_transport_recovery_timer(
+                    str(action.get("reason") or reason),
+                    float(action.get("delay_seconds") or 0.0),
+                ):
                     return True
                 return False
-            state.clear_recovery_timer()
-            state.last_recovery_attempt_at = now
-            state.last_recovery_attempt = local_now().isoformat(timespec="seconds")
-            state.last_recovery_reason = reason_text
-            state.last_recovery_result = "running"
-            state.last_recovery_error = ""
-            state.last_recovery_completed_at = ""
+            if action.get("action") != "start":
+                return False
             recovery_thread = threading.Thread(
                 target=self._recover_cloud_command_transport_worker,
                 name="cloud-command-transport-recovery",
