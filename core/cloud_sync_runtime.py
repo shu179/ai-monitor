@@ -790,7 +790,10 @@ class AppCloudRuntimeSupport:
         def operation(client: Any, token: str) -> Any:
             return client.capabilities(token)
 
-        ok, response_payload, message = self.cloud_request_with_refresh(operation)
+        try:
+            ok, response_payload, message = self.cloud_request_with_refresh(operation)
+        except Exception as exc:
+            ok, response_payload, message = False, None, str(exc)
         fetched_at = time.monotonic()
         if not ok:
             with self._cloud_capability_lock:
@@ -1058,6 +1061,7 @@ class AppCloudRuntimeSupport:
         skipped = 0
         failures: list[dict[str, Any]] = []
         transfer_store = self._object_transfer_store_factory()
+        capabilities: dict[str, Any] | None = None
         for item in transfers:
             transfer_id = str(item.get("transfer_id") or "").strip()
             path = Path(str(item.get("path") or "").strip())
@@ -1084,6 +1088,14 @@ class AppCloudRuntimeSupport:
                 message = "upload source changed since failed transfer"
                 transfer_store.fail_transfer(transfer_id, message)
                 failures.append({"transfer_id": transfer_id, "path": str(path), "message": message})
+                continue
+            if capabilities is None:
+                capabilities = self._cloud_capabilities_cached()
+            limit_message = _object_upload_limit_failure(actual_size, capabilities)
+            if limit_message:
+                failed += 1
+                transfer_store.fail_transfer(transfer_id, limit_message)
+                failures.append({"transfer_id": transfer_id, "path": str(path), "message": limit_message})
                 continue
             attempted += 1
 
@@ -1732,6 +1744,17 @@ def _cloud_capability_summary(capabilities: dict[str, Any] | None) -> dict[str, 
         "single_put_max_bytes": _safe_int(limits.get("single_put_max_bytes"), 0),
         "multipart_part_bytes": _safe_int(limits.get("multipart_part_bytes"), 0),
     }
+
+
+def _object_upload_limit_failure(size_bytes: int, capabilities: dict[str, Any] | None) -> str:
+    payload = capabilities if isinstance(capabilities, dict) else {}
+    if not bool(payload.get("ok")) and not bool(payload.get("stale")):
+        return ""
+    limits = payload.get("limits") if isinstance(payload.get("limits"), dict) else {}
+    max_file_bytes = _safe_int(limits.get("object_storage_max_file_bytes"), 0)
+    if max_file_bytes > 0 and int(size_bytes or 0) > max_file_bytes:
+        return f"object file exceeds cloud max file size ({size_bytes} > {max_file_bytes})"
+    return ""
 
 
 def _merge_failure_backpressure(failures: list[dict[str, Any]]) -> dict[str, Any]:

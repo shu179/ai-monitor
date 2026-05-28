@@ -1913,6 +1913,67 @@ def test_app_cloud_runtime_support_retries_failed_object_uploads_when_source_mat
     assert diagnostics["newest"][0]["object_id"] == "object-1"
 
 
+def test_app_cloud_runtime_support_skips_object_upload_retry_when_file_exceeds_cloud_limit():
+    owner = _support_owner()
+    body = b"too large for configured cloud limit"
+    sha256 = hashlib.sha256(body).hexdigest()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.example.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+
+    class FakeClient:
+        uploads = 0
+
+        def __init__(self, _base_url: str) -> None:
+            pass
+
+        def capabilities(self, _token: str):
+            return {
+                "capabilities": ["sync-v2", "object-v1"],
+                "limits": {"object_storage_max_file_bytes": len(body) - 1},
+                "ttl_seconds": {},
+                "object_storage_backend": "local",
+            }
+
+        def create_object_upload(self, _token: str, **_kwargs):
+            FakeClient.uploads += 1
+            raise AssertionError("oversized retry should not call create_object_upload")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "answer.txt"
+        source.write_bytes(body)
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        transfer_store.start_transfer(
+            transfer_id="upload-oversized",
+            direction="upload",
+            sha256=sha256,
+            size_bytes=len(body),
+            path=str(source),
+            content_type="text/plain",
+        )
+        transfer_store.fail_transfer("upload-oversized", "temporary")
+        support = AppCloudRuntimeSupport(
+            owner=owner,
+            session_store_factory=lambda: session_store,
+            request_client_factory=FakeClient,
+            object_transfer_store_factory=lambda: transfer_store,
+        )
+
+        result = support.handle_command("cloud.retry_object_uploads", {"limit": 5})
+        diagnostics = transfer_store.diagnostics()
+
+    assert result["ok"] is False
+    assert result["attempted"] == 0
+    assert result["failed"] == 1
+    assert "exceeds cloud max file size" in result["failures"][0]["message"]
+    assert "exceeds cloud max file size" in diagnostics["failed"][0]["last_error"]
+    assert FakeClient.uploads == 0
+
+
 def test_app_cloud_runtime_support_skips_object_upload_retry_when_source_changed():
     owner = _support_owner()
     original = b"original bytes"
