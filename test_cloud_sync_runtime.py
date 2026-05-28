@@ -1478,6 +1478,7 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
             diagnostics=lambda failed_limit=10: {"total": 3, "by_status": {"failed": 1, "running": 1}}
         ),
     )
+    support._run_cloud_api_request = Mock(wraps=support._run_cloud_api_request)
 
     with (
         patch("core.cloud_sync_runtime.CloudStateDeltaStore") as store_cls,
@@ -1529,12 +1530,79 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     assert health["summary"]["inline_blob_max_bytes"] == 32 * 1024
     assert health["summary"]["single_put_max_bytes"] == 5 * 1024 * 1024
     assert health["summary"]["multipart_part_bytes"] == 8 * 1024 * 1024
+    assert health["summary"]["cloud_object_storage_checked"] is False
     assert health["summary"]["healthy"] is True
     assert health["auto_sync"] == auto_sync_status
     assert health["capabilities"]["limits"]["object_storage_total_quota_bytes"] == 10 * 1024 * 1024 * 1024
     assert health["state_delta"] == {"cursors": {"tasks": 2}}
     bound_outbox.diagnostics.assert_called_once_with(failed_limit=3)
     inbox_cls.return_value.diagnostics.assert_called_once_with(failed_limit=3)
+    support._run_cloud_api_request.assert_not_called()
+
+
+def test_app_cloud_runtime_support_sync_health_can_include_cloud_object_storage_report():
+    owner = _support_owner()
+    session_store = MagicMock()
+    session_store.load.return_value = {
+        "base_url": "https://api.surfacedlab.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "user": {"id": 3, "workspace_id": 4},
+    }
+    bound_outbox = MagicMock()
+    bound_outbox.diagnostics.return_value = {"stats": {"pending": 0, "failed": 0, "dead_letter": 0}}
+    outbox = MagicMock()
+    outbox.bind_to_session.return_value = bound_outbox
+    support = AppCloudRuntimeSupport(
+        owner=owner,
+        session_store_factory=lambda: session_store,
+        outbox_factory=lambda: outbox,
+        auto_sync_status_getter=lambda: {"running": True},
+        object_cache_factory=lambda: MagicMock(diagnostics=lambda: {}),
+        object_transfer_store_factory=lambda: MagicMock(diagnostics=lambda failed_limit=10: {}),
+    )
+    support._cloud_capabilities_cached = Mock(return_value={"ok": True, "cached": True, "limits": {}})
+    support._run_cloud_api_request = Mock(
+        return_value={
+            "ok": True,
+            "payload": {
+                "report": {
+                    "status": "warn",
+                    "disk": {"free_bytes": 9 * 1024 * 1024 * 1024},
+                    "pressure": {"max_safe_upload_bytes": 256 * 1024 * 1024, "warnings": ["near_min_free"]},
+                    "missing_files": [{"object_id": "missing-1"}],
+                    "orphan_files": [{"path": "/opt/surfaced/object-data/orphan.bin"}],
+                },
+                "text": "Object storage doctor: status=warn",
+            },
+            "message": "",
+        }
+    )
+
+    with (
+        patch("core.cloud_sync_runtime.CloudStateDeltaStore") as store_cls,
+        patch("core.cloud_sync_runtime.CloudStateDeltaInbox") as inbox_cls,
+        patch("core.cloud_sync_runtime.CloudAgentStatusStore") as agent_status_store_cls,
+        patch("core.cloud_sync_runtime.CloudContentStateStore") as content_state_store_cls,
+    ):
+        store_cls.return_value.diagnostics.return_value = {}
+        inbox_cls.return_value.diagnostics.return_value = {"by_status": {}}
+        agent_status_store_cls.return_value.diagnostics.return_value = {}
+        content_state_store_cls.return_value.diagnostics.return_value = {}
+
+        result = support.handle_command("cloud.sync_health", {"includeCloudObjectStorage": True})
+
+    health = result["sync_health"]
+    assert health["cloud_object_storage"]["payload"]["report"]["status"] == "warn"
+    assert health["summary"]["cloud_object_storage_checked"] is True
+    assert health["summary"]["cloud_object_storage_ok"] is True
+    assert health["summary"]["cloud_object_storage_status"] == "warn"
+    assert health["summary"]["cloud_object_storage_disk_free_bytes"] == 9 * 1024 * 1024 * 1024
+    assert health["summary"]["cloud_object_storage_max_safe_upload_bytes"] == 256 * 1024 * 1024
+    assert health["summary"]["cloud_object_storage_warning_count"] == 1
+    assert health["summary"]["cloud_object_storage_missing_files"] == 1
+    assert health["summary"]["cloud_object_storage_orphan_files"] == 1
+    support._run_cloud_api_request.assert_called_once_with("admin_object_storage_report", {"includeCloudObjectStorage": True})
 
 
 def test_app_cloud_runtime_support_cache_object_downloads_to_file_cache():

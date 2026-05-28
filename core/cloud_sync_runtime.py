@@ -415,6 +415,10 @@ class AppCloudRuntimeSupport:
     def cloud_sync_health(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
         failed_limit = _safe_int(request_payload.get("failed_limit", request_payload.get("failedLimit", 10)), 10)
+        include_cloud_object_storage = bool(
+            request_payload.get("include_cloud_object_storage")
+            or request_payload.get("includeCloudObjectStorage")
+        )
         session = self._session_store_factory().load()
         outbox = self._outbox_factory().bind_to_session(session).diagnostics(failed_limit=failed_limit)
         state_delta = CloudStateDeltaStore().diagnostics(session)
@@ -425,30 +429,39 @@ class AppCloudRuntimeSupport:
         object_transfers = self._object_transfer_store_factory().diagnostics(failed_limit=failed_limit)
         auto_sync = self._safe_auto_sync_status()
         capabilities = self._cloud_capabilities_cached()
+        cloud_object_storage = (
+            self._run_cloud_api_request("admin_object_storage_report", request_payload)
+            if include_cloud_object_storage
+            else None
+        )
+        health = {
+            "summary": _cloud_sync_health_summary(
+                session=session,
+                auto_sync=auto_sync,
+                outbox=outbox,
+                inbox=inbox,
+                agent_status=agent_status,
+                content_state=content_state,
+                object_cache=object_cache,
+                object_transfers=object_transfers,
+                capabilities=capabilities,
+                cloud_object_storage=cloud_object_storage,
+            ),
+            "auto_sync": auto_sync,
+            "capabilities": capabilities,
+            "outbox": outbox,
+            "state_delta": state_delta,
+            "inbox": inbox,
+            "agent_status": agent_status,
+            "content_state": content_state,
+            "object_cache": object_cache,
+            "object_transfers": object_transfers,
+        }
+        if cloud_object_storage is not None:
+            health["cloud_object_storage"] = cloud_object_storage
         return {
             "ok": True,
-            "sync_health": {
-                "summary": _cloud_sync_health_summary(
-                    session=session,
-                    auto_sync=auto_sync,
-                    outbox=outbox,
-                    inbox=inbox,
-                    agent_status=agent_status,
-                    content_state=content_state,
-                    object_cache=object_cache,
-                    object_transfers=object_transfers,
-                    capabilities=capabilities,
-                ),
-                "auto_sync": auto_sync,
-                "capabilities": capabilities,
-                "outbox": outbox,
-                "state_delta": state_delta,
-                "inbox": inbox,
-                "agent_status": agent_status,
-                "content_state": content_state,
-                "object_cache": object_cache,
-                "object_transfers": object_transfers,
-            },
+            "sync_health": health,
         }
 
     def handle_command(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1761,6 +1774,31 @@ def _object_upload_limit_failure(size_bytes: int, capabilities: dict[str, Any] |
     return ""
 
 
+def _cloud_object_storage_summary(result: dict[str, Any] | None) -> dict[str, Any]:
+    payload = result if isinstance(result, dict) else {}
+    report = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    report_body = report.get("report") if isinstance(report.get("report"), dict) else {}
+    disk = report_body.get("disk") if isinstance(report_body.get("disk"), dict) else {}
+    pressure = report_body.get("pressure") if isinstance(report_body.get("pressure"), dict) else {}
+    return {
+        "cloud_object_storage_checked": bool(payload),
+        "cloud_object_storage_ok": bool(payload.get("ok")) if payload else False,
+        "cloud_object_storage_status": str(report_body.get("status") or ""),
+        "cloud_object_storage_disk_free_bytes": _safe_int(disk.get("free_bytes"), 0),
+        "cloud_object_storage_max_safe_upload_bytes": _safe_int(pressure.get("max_safe_upload_bytes"), 0),
+        "cloud_object_storage_warning_count": len(pressure.get("warnings", []))
+        if isinstance(pressure.get("warnings"), list)
+        else 0,
+        "cloud_object_storage_missing_files": len(report_body.get("missing_files", []))
+        if isinstance(report_body.get("missing_files"), list)
+        else 0,
+        "cloud_object_storage_orphan_files": len(report_body.get("orphan_files", []))
+        if isinstance(report_body.get("orphan_files"), list)
+        else 0,
+        "cloud_object_storage_message": str(payload.get("message") or ""),
+    }
+
+
 def _merge_failure_backpressure(failures: list[dict[str, Any]]) -> dict[str, Any]:
     retry_after = 0.0
     queue_depth = 0
@@ -1858,6 +1896,7 @@ def _cloud_sync_health_summary(
     object_cache: dict[str, Any] | None = None,
     object_transfers: dict[str, Any] | None = None,
     capabilities: dict[str, Any] | None = None,
+    cloud_object_storage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     session_payload = session if isinstance(session, dict) else {}
     outbox_stats = outbox.get("stats") if isinstance(outbox.get("stats"), dict) else {}
@@ -1951,4 +1990,5 @@ def _cloud_sync_health_summary(
         ),
     }
     summary.update(_cloud_capability_summary(capabilities))
+    summary.update(_cloud_object_storage_summary(cloud_object_storage))
     return summary
