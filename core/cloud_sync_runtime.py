@@ -1984,6 +1984,7 @@ def _cloud_sync_health_summary(
     object_upload_retry_backpressure_until = str(auto_sync.get("object_upload_retry_backpressure_until") or "")
     state_delta_backpressure_until = str(auto_sync.get("state_delta_backpressure_until") or "")
     active_operation = str(auto_sync.get("active_operation") or "")
+    startup_recovery_error = str(auto_sync.get("last_startup_recovery_error") or "")
     last_error = str(auto_sync.get("last_error") or auto_sync.get("last_state_delta_error") or "")
     summary = {
         "logged_in": bool(
@@ -2001,6 +2002,14 @@ def _cloud_sync_health_summary(
         ),
         "active_operation_started_at": str(auto_sync.get("active_operation_started_at") or ""),
         "active_operation_elapsed_seconds": _safe_float(auto_sync.get("active_operation_elapsed_seconds"), 0.0),
+        "startup_recovery_running": bool(auto_sync.get("startup_recovery_running")),
+        "last_startup_recovery_at": str(auto_sync.get("last_startup_recovery_at") or ""),
+        "last_startup_recovery_error": startup_recovery_error,
+        "last_startup_recovery_metrics": (
+            dict(auto_sync.get("last_startup_recovery_metrics"))
+            if isinstance(auto_sync.get("last_startup_recovery_metrics"), dict)
+            else {}
+        ),
         "upload_backpressure_active": bool(backpressure_until),
         "upload_backpressure_until": backpressure_until,
         "upload_backpressure_retry_after_seconds": _safe_float(
@@ -2100,6 +2109,7 @@ def _cloud_sync_health_summary(
                 dead_letter > 0,
                 failed_inbox > 0,
                 bool(last_error),
+                bool(startup_recovery_error),
             ]
         ),
     }
@@ -2139,6 +2149,11 @@ def _cloud_sync_action_summary(summary: dict[str, Any]) -> dict[str, Any]:
         add_blocker("outbox_dead_letter", "cloud outbox has dead-lettered events")
     if _safe_int(summary.get("inbox_failed"), 0) > 0:
         add_blocker("state_delta_inbox_failed", "state-delta inbox has failed items")
+    if bool(summary.get("last_startup_recovery_error")):
+        add_blocker(
+            "startup_recovery_failed",
+            str(summary.get("last_startup_recovery_error") or "cloud startup recovery failed"),
+        )
     if bool(summary.get("last_error")):
         add_blocker("last_error", str(summary.get("last_error") or "cloud sync reported an error"))
 
@@ -2179,6 +2194,12 @@ def _cloud_sync_action_summary(summary: dict[str, Any]) -> dict[str, Any]:
     if active_operation:
         add_action(
             active_operation,
+            "running",
+            0,
+        )
+    elif bool(summary.get("startup_recovery_running")):
+        add_action(
+            "startup_recovery",
             "running",
             0,
         )

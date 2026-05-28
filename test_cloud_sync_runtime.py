@@ -1680,6 +1680,43 @@ def test_cloud_sync_health_summary_reports_state_delta_backpressure():
     }
 
 
+def test_cloud_sync_health_summary_reports_startup_recovery_state():
+    summary = _cloud_sync_health_summary(
+        session={
+            "base_url": "https://api.example.com",
+            "access_token": "access",
+            "refresh_token": "refresh",
+        },
+        auto_sync={
+            "running": True,
+            "startup_recovery_running": True,
+            "last_startup_recovery_at": "2026-05-28T10:00:00",
+            "last_startup_recovery_error": "state-delta 下放失败",
+            "last_startup_recovery_metrics": {"state_delta": {"changes": 0}},
+        },
+        outbox={"stats": {"pending": 0, "failed": 0, "dead_letter": 0, "upload_ready": 0}},
+        inbox={"by_status": {"pending": 0, "failed": 0, "applied": 0}},
+        agent_status={"total": 0},
+        content_state={"answers_total": 0, "assets_total": 0},
+    )
+
+    assert summary["startup_recovery_running"] is True
+    assert summary["last_startup_recovery_at"] == "2026-05-28T10:00:00"
+    assert summary["last_startup_recovery_error"] == "state-delta 下放失败"
+    assert summary["last_startup_recovery_metrics"] == {"state_delta": {"changes": 0}}
+    assert {
+        "kind": "startup_recovery_failed",
+        "message": "state-delta 下放失败",
+        "retry_after_seconds": 0,
+    } in summary["sync_blockers"]
+    assert summary["next_sync_action"] == {
+        "kind": "startup_recovery",
+        "reason": "running",
+        "retry_after_seconds": 0,
+    }
+    assert summary["healthy"] is False
+
+
 def test_app_cloud_runtime_support_sync_health_can_include_cloud_object_storage_report():
     owner = _support_owner()
     session_store = MagicMock()
