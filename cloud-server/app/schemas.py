@@ -214,6 +214,7 @@ class CloudCapabilityResponse(BaseModel):
     capabilities: list[str]
     limits: dict[str, int]
     ttl_seconds: dict[str, int]
+    object_storage_backend: Literal["local", "s3"] = "local"
 
 
 class SyncBatchEventIn(SyncEventIn):

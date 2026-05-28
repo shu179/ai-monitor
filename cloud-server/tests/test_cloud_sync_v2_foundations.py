@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -9,6 +10,7 @@ from unittest.mock import MagicMock, patch
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+os.environ.setdefault("SURFACED_CLOUD_SECRET_KEY", "test-secret-key-for-sync-v2-foundations")
 
 from app.models import (  # noqa: E402
     AgentCommand,
@@ -129,7 +131,12 @@ class SyncV2ServiceTests(unittest.TestCase):
         self.assertIn("sync-v2", payload["capabilities"])
         self.assertEqual(payload["limits"]["inline_blob_max_bytes"], 32 * 1024)
         self.assertEqual(payload["limits"]["single_put_max_bytes"], 5 * 1024 * 1024)
+        self.assertEqual(payload["limits"]["object_storage_total_quota_bytes"], 10 * 1024 * 1024 * 1024)
+        self.assertEqual(payload["limits"]["object_storage_workspace_quota_bytes"], 5 * 1024 * 1024 * 1024)
+        self.assertEqual(payload["limits"]["object_storage_max_file_bytes"], 512 * 1024 * 1024)
+        self.assertEqual(payload["limits"]["object_storage_min_free_bytes"], 8 * 1024 * 1024 * 1024)
         self.assertEqual(payload["ttl_seconds"]["multipart_upload_session"], 24 * 60 * 60)
+        self.assertEqual(payload["object_storage_backend"], "local")
 
     def test_partition_key_prefers_entity_identity(self) -> None:
         event = SyncBatchEventIn(

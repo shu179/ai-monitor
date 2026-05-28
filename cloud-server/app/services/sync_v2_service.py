@@ -12,6 +12,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.models import (
     Article,
     ArticleReferenceEvent,
@@ -99,10 +100,29 @@ class SyncBackpressureError(RuntimeError):
 
 
 def cloud_capabilities() -> dict[str, Any]:
+    settings = get_settings()
+    limits = dict(LIMITS)
+    limits.update(
+        {
+            "object_storage_total_quota_bytes": int(settings.object_storage_total_quota_bytes or 0),
+            "object_storage_workspace_quota_bytes": int(settings.object_storage_workspace_quota_bytes or 0),
+            "object_storage_max_file_bytes": int(settings.object_storage_max_file_bytes or 0),
+            "object_storage_min_free_bytes": int(settings.object_storage_min_free_bytes or 0),
+        }
+    )
+    object_backend = (
+        "s3"
+        if str(settings.object_storage_endpoint_url or "").strip()
+        and str(settings.object_storage_bucket or "").strip()
+        and str(settings.object_storage_access_key_id or "").strip()
+        and str(settings.object_storage_secret_access_key or "").strip()
+        else "local"
+    )
     return {
         "capabilities": list(CAPABILITIES),
-        "limits": dict(LIMITS),
+        "limits": limits,
         "ttl_seconds": dict(TTL_SECONDS),
+        "object_storage_backend": object_backend,
     }
 
 
