@@ -72,6 +72,9 @@ class LoadSyncV2ScriptTests(unittest.TestCase):
     def test_l3_object_size_matches_current_single_file_limit(self) -> None:
         self.assertEqual(load_sync_v2.PROFILE_DEFAULTS["l3"]["object_bytes"], 512 * 1024 * 1024)
 
+    def test_l3_profile_includes_one_hundred_sse_connections(self) -> None:
+        self.assertEqual(load_sync_v2.PROFILE_DEFAULTS["l3"]["sse_connections"], 100)
+
     def test_evaluate_thresholds_passes_under_limit(self) -> None:
         result = {"batches": {"count": 120, "p95_ms": 800}}
         evaluation = load_sync_v2.evaluate_thresholds(result, {"batches_p95_ms": 1000})
@@ -103,6 +106,18 @@ class LoadSyncV2ScriptTests(unittest.TestCase):
 
         self.assertEqual(counts, {})
         sleep.assert_called_once_with(0.5)
+
+    def test_sse_summary_reports_connection_bytes_and_errors(self) -> None:
+        summary = load_sync_v2._summarize_sse_metrics([
+            {"elapsed_ms": 10, "status_code": 200, "accepted": 1, "error": "", "events": 1, "bytes": 20},
+            {"elapsed_ms": 20, "status_code": 500, "accepted": 0, "error": "boom", "events": 0, "bytes": 0},
+        ])
+
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(summary["accepted"], 1)
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["events"], 1)
+        self.assertEqual(summary["bytes"], 20)
 
 
 if __name__ == "__main__":

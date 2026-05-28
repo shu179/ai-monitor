@@ -28,6 +28,7 @@ def test_status_errors_on_missing_env_or_weak_secret() -> None:
         "weak_secrets": ["POSTGRES_PASSWORD"],
         "directories": {"object_storage": {"status": "ok"}, "backups": {"status": "ok"}},
         "compose": {"config_ok": True},
+        "postgres_observability": {"status": "ok"},
         "health": {"ok": True},
     }
 
@@ -41,6 +42,7 @@ def test_status_warns_when_health_is_down_but_config_is_safe() -> None:
         "weak_secrets": [],
         "directories": {"object_storage": {"status": "ok"}, "backups": {"status": "ok"}},
         "compose": {"config_ok": True},
+        "postgres_observability": {"status": "ok"},
         "health": {"ok": False},
     }
 
@@ -89,6 +91,13 @@ def test_format_report_contains_key_sections() -> None:
             },
         },
         "compose": {"available": True, "config_ok": True, "services": ["api", "worker"], "error": ""},
+        "postgres_observability": {
+            "checked": True,
+            "pg_stat_statements": True,
+            "slow_query_ms": 200,
+            "status": "ok",
+            "error": "",
+        },
         "health": {"url": "http://127.0.0.1:8080/health", "ok": False, "status_code": 0, "error": "offline"},
     }
 
@@ -99,6 +108,7 @@ def test_format_report_contains_key_sections() -> None:
     assert "object_storage_limits" in text
     assert "object_storage_capacity_errors=none" in text
     assert "compose=" in text
+    assert "postgres_observability=" in text
     assert "health url=" in text
 
 
@@ -155,3 +165,22 @@ def test_wal_archive_dir_accepts_postgres_owned_directory() -> None:
     assert report["status"] == "ok"
     assert report["writable"] is False
     assert report["postgres_owner_writable"] is True
+
+
+def test_parse_duration_ms_supports_postgres_units() -> None:
+    assert deploy_check._parse_duration_ms("200ms") == 200
+    assert deploy_check._parse_duration_ms("1s") == 1000
+    assert deploy_check._parse_duration_ms("250") == 250
+
+
+def test_postgres_observability_report_parses_ready_output() -> None:
+    result = SimpleNamespace(stdout="pg_stat_statements|200ms|t\n")
+    with (
+        patch("scripts.deploy_check.shutil.which", return_value="/usr/bin/docker"),
+        patch("scripts.deploy_check.subprocess.run", return_value=result),
+    ):
+        report = deploy_check._postgres_observability_report({"POSTGRES_USER": "surfaced", "POSTGRES_DB": "surfaced_cloud"})
+
+    assert report["status"] == "ok"
+    assert report["pg_stat_statements"] is True
+    assert report["slow_query_ms"] == 200

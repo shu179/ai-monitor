@@ -20,10 +20,10 @@ if str(ROOT) not in sys.path:
 
 
 PROFILE_DEFAULTS = {
-    "dev": {"tenants": 1, "events_per_tenant": 100, "batch_size": 50, "concurrency": 2, "objects": 0, "object_bytes": 0},
-    "l1": {"tenants": 10, "events_per_tenant": 6000, "batch_size": 500, "concurrency": 10, "objects": 0, "object_bytes": 0},
-    "l2": {"tenants": 1, "events_per_tenant": 50000, "batch_size": 500, "concurrency": 8, "objects": 0, "object_bytes": 0},
-    "l3": {"tenants": 10, "events_per_tenant": 6000, "batch_size": 500, "concurrency": 10, "objects": 5, "object_bytes": 512 * 1024 * 1024},
+    "dev": {"tenants": 1, "events_per_tenant": 100, "batch_size": 50, "concurrency": 2, "objects": 0, "object_bytes": 0, "sse_connections": 0, "sse_hold_seconds": 5},
+    "l1": {"tenants": 10, "events_per_tenant": 6000, "batch_size": 500, "concurrency": 10, "objects": 0, "object_bytes": 0, "sse_connections": 0, "sse_hold_seconds": 15},
+    "l2": {"tenants": 1, "events_per_tenant": 50000, "batch_size": 500, "concurrency": 8, "objects": 0, "object_bytes": 0, "sse_connections": 0, "sse_hold_seconds": 15},
+    "l3": {"tenants": 10, "events_per_tenant": 6000, "batch_size": 500, "concurrency": 10, "objects": 5, "object_bytes": 512 * 1024 * 1024, "sse_connections": 100, "sse_hold_seconds": 30},
 }
 
 # Acceptance thresholds (milliseconds) checked with --assert-thresholds.
@@ -83,6 +83,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--concurrency", type=int)
     parser.add_argument("--objects", type=int)
     parser.add_argument("--object-bytes", type=int)
+    parser.add_argument("--sse-connections", type=int)
+    parser.add_argument("--sse-hold-seconds", type=int)
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
     parser.add_argument("--keep", action="store_true", help="Keep load-test workspaces for inspection.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
@@ -113,9 +115,11 @@ def main(argv: list[str] | None = None) -> int:
             for tenant in tenants:
                 tenant["token"] = _login(client, email=tenant["email"], password=tenant["password"])
 
-        batch_metrics = _send_sync_batches(base_url=base_url, tenants=tenants, cfg=cfg)
-        object_metrics = _send_objects(base_url=base_url, tenants=tenants, cfg=cfg) if cfg["objects"] else []
-        delta_metrics = _wait_for_materialization(base_url=base_url, tenants=tenants, cfg=cfg, timeout_seconds=args.timeout_seconds)
+        with _SSELoadRunner(base_url=base_url, tenants=tenants, cfg=cfg) as sse_runner:
+            batch_metrics = _send_sync_batches(base_url=base_url, tenants=tenants, cfg=cfg)
+            object_metrics = _send_objects(base_url=base_url, tenants=tenants, cfg=cfg) if cfg["objects"] else []
+            delta_metrics = _wait_for_materialization(base_url=base_url, tenants=tenants, cfg=cfg, timeout_seconds=args.timeout_seconds)
+            sse_metrics = sse_runner.collect()
         queue_report = _load_queue_report()
 
         result = {
@@ -124,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
             "elapsed_seconds": round(time.monotonic() - started_at, 3),
             "batches": _summarize_metrics(batch_metrics),
             "objects": _summarize_metrics(object_metrics),
+            "sse": _summarize_sse_metrics(sse_metrics),
             "delta": _summarize_metrics(delta_metrics),
             "queue": _summarize_queue(queue_report),
         }
@@ -156,8 +161,10 @@ def _profile_config(args: argparse.Namespace) -> dict[str, int]:
         ("concurrency", "concurrency"),
         ("objects", "objects"),
         ("object_bytes", "object_bytes"),
+        ("sse_connections", "sse_connections"),
+        ("sse_hold_seconds", "sse_hold_seconds"),
     ]:
-        value = getattr(args, arg_name)
+        value = getattr(args, arg_name, None)
         if value is not None:
             cfg[key] = int(value)
     cfg["tenants"] = max(1, int(cfg["tenants"]))
@@ -166,6 +173,8 @@ def _profile_config(args: argparse.Namespace) -> dict[str, int]:
     cfg["concurrency"] = max(1, int(cfg["concurrency"]))
     cfg["objects"] = max(0, int(cfg["objects"]))
     cfg["object_bytes"] = max(0, int(cfg["object_bytes"]))
+    cfg["sse_connections"] = max(0, int(cfg["sse_connections"]))
+    cfg["sse_hold_seconds"] = max(1, int(cfg["sse_hold_seconds"]))
     return cfg
 
 
@@ -340,6 +349,83 @@ def _send_one_object(base_url: str, tenant: dict, object_bytes: int, index: int)
     return _metric(started_at, status_code=status_code, accepted=1)
 
 
+class _SSELoadRunner:
+    def __init__(self, *, base_url: str, tenants: list[dict], cfg: dict[str, int]) -> None:
+        self.base_url = base_url
+        self.tenants = tenants
+        self.cfg = cfg
+        self._executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._futures: list[concurrent.futures.Future] = []
+
+    def __enter__(self) -> "_SSELoadRunner":
+        connections = int(self.cfg.get("sse_connections") or 0)
+        if connections <= 0 or not self.tenants:
+            return self
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(connections, 200))
+        hold_seconds = int(self.cfg.get("sse_hold_seconds") or 30)
+        for idx in range(connections):
+            tenant = self.tenants[idx % len(self.tenants)]
+            self._futures.append(
+                self._executor.submit(
+                    _hold_one_sse_connection,
+                    self.base_url,
+                    tenant,
+                    idx,
+                    hold_seconds,
+                )
+            )
+        time.sleep(min(1.0, max(0.1, hold_seconds / 10)))
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self.collect()
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+
+    def collect(self) -> list[dict]:
+        if not self._futures:
+            return []
+        done, pending = concurrent.futures.wait(self._futures, timeout=int(self.cfg.get("sse_hold_seconds") or 30) + 10)
+        metrics: list[dict] = []
+        for future in done:
+            try:
+                metrics.append(future.result())
+            except Exception as exc:
+                metrics.append({"elapsed_ms": 0, "status_code": 0, "accepted": 0, "error": str(exc), "events": 0, "bytes": 0})
+        for future in pending:
+            future.cancel()
+            metrics.append({"elapsed_ms": 0, "status_code": 0, "accepted": 0, "error": "sse connection did not finish", "events": 0, "bytes": 0})
+        self._futures = []
+        return metrics
+
+
+def _hold_one_sse_connection(base_url: str, tenant: dict, index: int, hold_seconds: int) -> dict:
+    started_at = time.monotonic()
+    status_code = 0
+    bytes_seen = 0
+    try:
+        timeout = httpx.Timeout(connect=5.0, read=max(5.0, float(hold_seconds) + 5.0), write=5.0, pool=5.0)
+        with httpx.Client(base_url=base_url, timeout=timeout) as client:
+            with client.stream(
+                "GET",
+                "/api/v1/events/stream",
+                headers={"Authorization": f"Bearer {tenant['token']}", "X-Trace-Id": f"load-sse-{index}"},
+            ) as response:
+                status_code = int(response.status_code)
+                response.raise_for_status()
+                # Keep the connection open to exercise server-side SSE fanout.
+                time.sleep(max(1, int(hold_seconds)))
+                bytes_seen = int(response.num_bytes_downloaded)
+    except Exception as exc:
+        metric = _metric(started_at, status_code=status_code, error=str(exc))
+        metric.update({"events": 0, "bytes": bytes_seen})
+        return metric
+    metric = _metric(started_at, status_code=status_code, accepted=1)
+    metric.update({"events": 1 if bytes_seen > 0 else 0, "bytes": bytes_seen})
+    return metric
+
+
 def _deterministic_payload_sha256(*, size_bytes: int, index: int) -> str:
     import hashlib
 
@@ -436,6 +522,13 @@ def _summarize_metrics(metrics: list[dict]) -> dict:
     }
 
 
+def _summarize_sse_metrics(metrics: list[dict]) -> dict:
+    summary = _summarize_metrics(metrics)
+    summary["bytes"] = sum(int(item.get("bytes") or 0) for item in metrics)
+    summary["events"] = sum(int(item.get("events") or 0) for item in metrics)
+    return summary
+
+
 def _percentile(values: list[int], percentile: int) -> int:
     if not values:
         return 0
@@ -460,6 +553,7 @@ def _format_result(result: dict) -> str:
         f"config={result['config']}",
         f"batches={result['batches']}",
         f"objects={result['objects']}",
+        f"sse={result['sse']}",
         f"delta={result['delta']}",
         f"queue={result['queue']}",
     ]

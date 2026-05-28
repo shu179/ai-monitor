@@ -12,6 +12,9 @@ def test_docker_compose_mounts_object_and_backup_dirs() -> None:
     assert "/opt/surfaced/object-data:/opt/surfaced/object-data" in compose
     assert "/opt/surfaced/backups:/opt/surfaced/backups" in compose
     assert "/opt/surfaced/postgres-wal:/opt/surfaced/postgres-wal" in compose
+    assert "shared_preload_libraries=pg_stat_statements" in compose
+    assert "pg_stat_statements.track=all" in compose
+    assert "log_min_duration_statement=${SURFACED_CLOUD_PG_SLOW_QUERY_MS:-200}" in compose
     assert "archive_mode=on" in compose
     assert "archive_command=test -d /opt/surfaced/postgres-wal" in compose
     assert "cp %p /opt/surfaced/postgres-wal/%f" in compose
@@ -34,6 +37,7 @@ def test_env_example_documents_local_storage_and_backup_limits() -> None:
     assert "SURFACED_CLOUD_OBJECT_STORAGE_WORKSPACE_QUOTA_BYTES=5368709120" in env_example
     assert "SURFACED_CLOUD_OBJECT_STORAGE_MAX_FILE_BYTES=536870912" in env_example
     assert "SURFACED_CLOUD_OBJECT_STORAGE_MIN_FREE_BYTES=8589934592" in env_example
+    assert "SURFACED_CLOUD_PG_SLOW_QUERY_MS=200" in env_example
     assert "SURFACED_CLOUD_BACKUP_DIR=/opt/surfaced/backups" in env_example
     assert "SURFACED_CLOUD_PITR_WAL_ARCHIVE_DIR=/opt/surfaced/postgres-wal" in env_example
     assert "SURFACED_CLOUD_PITR_BASEBACKUP_RETAIN_DAYS=7" in env_example

@@ -80,6 +80,7 @@ def build_deploy_check_report(*, base_url: str = "http://127.0.0.1:8080") -> dic
         "wal_archive": _wal_archive_dir_report(wal_archive_dir),
     }
     compose = _compose_report()
+    postgres_observability = _postgres_observability_report(env_values)
     health = _health_report(base_url)
     checks = {
         "env_file_exists": env_path.exists(),
@@ -87,6 +88,7 @@ def build_deploy_check_report(*, base_url: str = "http://127.0.0.1:8080") -> dic
         "weak_secrets": weak_secrets,
         "directories": dirs,
         "compose": compose,
+        "postgres_observability": postgres_observability,
         "health": health,
     }
     status = _status(checks)
@@ -121,6 +123,15 @@ def format_deploy_check_report(report: dict) -> str:
         f"available={compose['available']} "
         f"config_ok={compose['config_ok']} "
         f"services={','.join(compose['services']) or 'unknown'}"
+    )
+    pg_obs = report.get("postgres_observability") or {}
+    lines.append(
+        "postgres_observability="
+        f"checked={pg_obs.get('checked', False)} "
+        f"pg_stat_statements={pg_obs.get('pg_stat_statements', False)} "
+        f"slow_query_ms={pg_obs.get('slow_query_ms', 0)} "
+        f"status={pg_obs.get('status', 'unknown')} "
+        f"error={pg_obs.get('error') or 'none'}"
     )
     health = report["health"]
     lines.append(f"health url={health['url']} ok={health['ok']} status_code={health['status_code']} error={health['error'] or 'none'}")
@@ -251,6 +262,74 @@ def _compose_report() -> dict:
     return {"available": available, "config_ok": config_ok, "services": services, "error": error}
 
 
+def _postgres_observability_report(env_values: dict[str, str] | None = None) -> dict:
+    if shutil.which("docker") is None:
+        return {"checked": False, "status": "warn", "pg_stat_statements": False, "slow_query_ms": 0, "error": "docker unavailable"}
+    try:
+        env_values = env_values or {}
+        db_user = str(env_values.get("POSTGRES_USER") or "surfaced")
+        db_name = str(env_values.get("POSTGRES_DB") or "surfaced_cloud")
+        result = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "exec",
+                "-T",
+                "postgres",
+                "psql",
+                "-U",
+                db_user,
+                "-d",
+                db_name,
+                "-tAc",
+                (
+                    "SELECT current_setting('shared_preload_libraries', true), "
+                    "current_setting('log_min_duration_statement', true), "
+                    "EXISTS(SELECT 1 FROM pg_extension WHERE extname='pg_stat_statements')"
+                ),
+            ],
+            cwd=str(ROOT),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        line = (result.stdout or "").strip().splitlines()[0]
+        libraries, slow_query, extension = (line.split("|") + ["", "", ""])[:3]
+        slow_query_ms = _parse_duration_ms(slow_query)
+        pg_stat_ready = "pg_stat_statements" in str(libraries or "") and str(extension).strip().lower() == "t"
+        status = "ok" if pg_stat_ready and slow_query_ms > 0 and slow_query_ms <= 200 else "warn"
+        return {
+            "checked": True,
+            "status": status,
+            "pg_stat_statements": pg_stat_ready,
+            "slow_query_ms": slow_query_ms,
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "checked": False,
+            "status": "warn",
+            "pg_stat_statements": False,
+            "slow_query_ms": 0,
+            "error": str(exc),
+        }
+
+
+def _parse_duration_ms(value: str) -> int:
+    text = str(value or "").strip().lower()
+    if not text:
+        return 0
+    try:
+        if text.endswith("ms"):
+            return int(float(text[:-2]))
+        if text.endswith("s"):
+            return int(float(text[:-1]) * 1000)
+        return int(float(text))
+    except Exception:
+        return 0
+
+
 def _health_report(base_url: str) -> dict:
     url = str(base_url or "").rstrip("/") + "/health"
     try:
@@ -275,6 +354,8 @@ def _status(checks: dict) -> str:
     if any(item["status"] == "error" for item in checks["directories"].values()):
         return "error"
     if not checks["compose"]["config_ok"]:
+        return "warn"
+    if checks.get("postgres_observability", {}).get("status") == "warn":
         return "warn"
     if not checks["health"]["ok"]:
         return "warn"
