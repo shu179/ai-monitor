@@ -2100,6 +2100,7 @@ class AppRuntime:
         self._cloud_command_transport_stop_requested = False
         self._cloud_command_transport_mode = "not_started"
         self._cloud_command_transport_error = ""
+        self._cloud_command_transport_error_type = ""
         self._isolate_ordinary_cloud_account_config(CloudSessionStore().load())
 
     def _build_cloud_runtime_support(self) -> AppCloudRuntimeSupport:
@@ -2174,8 +2175,10 @@ class AppRuntime:
             self._cloud_command_socket_path = None
             self._cloud_command_transport_mode = "in_process_direct"
             self._cloud_command_transport_error = ""
+            self._cloud_command_transport_error_type = ""
             if not hasattr(socket, "AF_UNIX"):
                 self._cloud_command_transport_error = "AF_UNIX unavailable"
+                self._cloud_command_transport_error_type = "unsupported_platform"
                 return
             socket_path = self._build_cloud_command_socket_path()
             daemon = CloudSyncCommandDaemonProcess(
@@ -2191,6 +2194,7 @@ class AppRuntime:
                 except Exception:
                     pass
                 self._cloud_command_transport_error = str(exc)
+                self._cloud_command_transport_error_type = "start_failed"
                 print(f"[CloudSyncDaemon] Child daemon unavailable, trying in-process socket server: {exc}")
             else:
                 self._cloud_command_socket_path = socket_path
@@ -2198,6 +2202,7 @@ class AppRuntime:
                 self._cloud_command_client = client
                 self._cloud_command_transport_mode = "child_daemon"
                 self._cloud_command_transport_error = ""
+                self._cloud_command_transport_error_type = ""
                 return
             server = UnixSocketCloudSyncCommandServer(
                 socket_path,
@@ -2212,6 +2217,7 @@ class AppRuntime:
                 except Exception:
                     pass
                 self._cloud_command_transport_error = str(exc)
+                self._cloud_command_transport_error_type = "start_failed"
                 print(f"[CloudSyncDaemon] Unix socket transport unavailable, falling back in-process: {exc}")
                 return
             self._cloud_command_socket_path = socket_path
@@ -2219,8 +2225,9 @@ class AppRuntime:
             self._cloud_command_client = client
             self._cloud_command_transport_mode = "in_process_socket"
             self._cloud_command_transport_error = ""
+            self._cloud_command_transport_error_type = ""
 
-    def _degrade_cloud_command_transport(self, reason: str) -> None:
+    def _degrade_cloud_command_transport(self, reason: str, *, error_type: str = "") -> None:
         """Switch future cloud commands back to the in-process handler."""
         fallback_client = self._build_in_process_cloud_command_client()
         lock = getattr(self, "_cloud_command_transport_lock", None)
@@ -2239,6 +2246,7 @@ class AppRuntime:
             self._cloud_command_client = fallback_client
             self._cloud_command_transport_mode = "in_process_direct"
             self._cloud_command_transport_error = reason_text
+            self._cloud_command_transport_error_type = str(error_type or "unknown").strip() or "unknown"
         if daemon is not None:
             try:
                 daemon.stop()
@@ -4534,7 +4542,8 @@ return changedCount
         client = self._ensure_cloud_command_client()
         result = client.send_command(normalized, payload)
         if isinstance(result, dict) and bool(result.get("daemon_unavailable")):
-            self._degrade_cloud_command_transport(str(result.get("message") or "云同步 daemon 不可用"))
+            error_type = str(result.get("daemon_error_type") or "unknown")
+            self._degrade_cloud_command_transport(str(result.get("message") or "云同步 daemon 不可用"), error_type=error_type)
             self._schedule_cloud_command_transport_recovery(
                 str(result.get("message") or "云同步 daemon 不可用"),
             )
@@ -4591,6 +4600,7 @@ return changedCount
             "daemon": False,
             "pid": None,
             "message": "",
+            "error_type": "",
         }
         if mode == "child_daemon" and socket_path:
             socket_ping["attempted"] = True
@@ -4608,6 +4618,7 @@ return changedCount
             socket_ping["pid"] = ping_result.get("pid") if isinstance(ping_result.get("pid"), int) else None
             if not bool(socket_ping["ok"]):
                 socket_ping["message"] = str(ping_result.get("message") or "daemon ping failed")
+                socket_ping["error_type"] = str(ping_result.get("daemon_error_type") or "unknown")
         if mode == "child_daemon":
             responsive = bool(socket_ping.get("ok"))
         elif mode == "in_process_socket":
@@ -4651,6 +4662,7 @@ return changedCount
             "next_recovery_after": str(getattr(self, "_cloud_command_transport_next_recovery_after", "") or ""),
             "next_recovery_allowed_in_seconds": next_recovery_allowed_in_seconds,
             "last_error": str(getattr(self, "_cloud_command_transport_error", "") or ""),
+            "last_error_type": str(getattr(self, "_cloud_command_transport_error_type", "") or ""),
         }
         status.update(self._cloud_command_transport_action_summary(status))
         return status
@@ -4761,6 +4773,7 @@ return changedCount
             summary["cloud_command_transport_last_recovery_error"] = str(
                 transport_status.get("last_recovery_error") or ""
             )
+            summary["cloud_command_transport_last_error_type"] = str(transport_status.get("last_error_type") or "")
             summary["deep_blocked"] = bool(summary.get("sync_blocked")) or bool(transport_status.get("transport_blocked"))
             sync_health["summary"] = summary
             result = dict(result)

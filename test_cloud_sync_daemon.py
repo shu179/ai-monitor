@@ -285,6 +285,32 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertTrue(status["socket_ping"]["daemon"])
         self.assertEqual(status["socket_ping"]["pid"], 1234)
 
+    def test_app_runtime_cloud_command_transport_status_reports_ping_error_type(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        process = Mock()
+        process.is_alive.return_value = True
+        runtime._cloud_command_daemon = Mock(process=process)
+        runtime._cloud_command_server = None
+        runtime._cloud_command_client = Mock()
+        runtime._cloud_command_socket_path = Path("/tmp/cloud-sync.sock")
+        runtime._cloud_command_transport_mode = "child_daemon"
+        runtime._cloud_command_transport_error = ""
+        runtime._cloud_command_transport_error_type = ""
+        ping_client = Mock()
+        ping_client.send_command.return_value = {
+            "ok": False,
+            "daemon_unavailable": True,
+            "daemon_error_type": "command_timeout",
+            "message": "云同步 daemon 不可用: timed out",
+        }
+
+        with patch("web_backend.UnixSocketCloudSyncCommandClient", return_value=ping_client):
+            status = AppRuntime._cloud_command_transport_status(runtime)
+
+        self.assertFalse(status["responsive"])
+        self.assertEqual(status["socket_ping"]["error_type"], "command_timeout")
+        self.assertIn("timed out", status["socket_ping"]["message"])
+
     def test_app_runtime_cloud_command_transport_status_reports_direct_fallback(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         runtime._cloud_command_daemon = None
@@ -304,6 +330,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         runtime._cloud_command_transport_recovery_interval_seconds = 30.0
         runtime._cloud_command_transport_mode = "in_process_direct"
         runtime._cloud_command_transport_error = "AF_UNIX unavailable"
+        runtime._cloud_command_transport_error_type = "unsupported_platform"
 
         status = AppRuntime._cloud_command_transport_status(runtime)
 
@@ -318,6 +345,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertEqual(status["last_recovery_reason"], "")
         self.assertEqual(status["next_recovery_allowed_in_seconds"], 0)
         self.assertEqual(status["last_error"], "AF_UNIX unavailable")
+        self.assertEqual(status["last_error_type"], "unsupported_platform")
         self.assertTrue(status["transport_blocked"])
         self.assertEqual(status["transport_blockers"][0]["kind"], "daemon_degraded")
         self.assertEqual(
@@ -344,6 +372,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         runtime._cloud_command_transport_recovery_interval_seconds = 30.0
         runtime._cloud_command_transport_mode = "in_process_direct"
         runtime._cloud_command_transport_error = "timed out"
+        runtime._cloud_command_transport_error_type = "command_timeout"
 
         status = AppRuntime._cloud_command_transport_status(runtime)
 
@@ -374,6 +403,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         runtime._cloud_command_transport_recovery_interval_seconds = 30.0
         runtime._cloud_command_transport_mode = "in_process_direct"
         runtime._cloud_command_transport_error = "socket busy"
+        runtime._cloud_command_transport_error_type = "connect_failed"
 
         status = AppRuntime._cloud_command_transport_status(runtime)
 
@@ -411,6 +441,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
                 return_value={
                     "ok": False,
                     "daemon_unavailable": True,
+                    "daemon_error_type": "command_timeout",
                     "message": "云同步 daemon 不可用: timed out",
                 }
             )
@@ -437,6 +468,7 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertIsNone(runtime._cloud_command_socket_path)
         self.assertEqual(runtime._cloud_command_transport_mode, "in_process_direct")
         self.assertIn("timed out", runtime._cloud_command_transport_error)
+        self.assertEqual(runtime._cloud_command_transport_error_type, "command_timeout")
         schedule_recovery.assert_called_once()
         support.handle_command.assert_called_once_with("cloud.flush_outbox", None)
 

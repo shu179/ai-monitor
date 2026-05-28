@@ -909,6 +909,7 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
                 },
                 "cloud_command_transport_last_recovery_result": "",
                 "cloud_command_transport_last_recovery_error": "",
+                "cloud_command_transport_last_error_type": "",
                 "deep_blocked": True,
             },
         )
