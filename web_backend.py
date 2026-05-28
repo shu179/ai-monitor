@@ -4414,13 +4414,48 @@ return changedCount
             else:
                 mode = "not_started"
         process = getattr(daemon, "process", None)
+        daemon_process_alive = bool(callable(getattr(process, "is_alive", None)) and process.is_alive())
+        socket_ping: dict[str, Any] = {
+            "attempted": False,
+            "ok": None,
+            "elapsed_ms": None,
+            "daemon": False,
+            "pid": None,
+            "message": "",
+        }
+        if mode == "child_daemon" and socket_path:
+            socket_ping["attempted"] = True
+            started_at = time.monotonic()
+            ping_result: dict[str, Any]
+            try:
+                ping_result = UnixSocketCloudSyncCommandClient(socket_path, timeout_seconds=0.25).send_command(
+                    "cloud.daemon.ping"
+                )
+            except Exception as exc:
+                ping_result = {"ok": False, "message": str(exc)}
+            socket_ping["elapsed_ms"] = int((time.monotonic() - started_at) * 1000)
+            socket_ping["ok"] = bool(ping_result.get("ok"))
+            socket_ping["daemon"] = bool(ping_result.get("daemon"))
+            socket_ping["pid"] = ping_result.get("pid") if isinstance(ping_result.get("pid"), int) else None
+            if not bool(socket_ping["ok"]):
+                socket_ping["message"] = str(ping_result.get("message") or "daemon ping failed")
+        if mode == "child_daemon":
+            responsive = bool(socket_ping.get("ok"))
+        elif mode == "in_process_socket":
+            responsive = server is not None and client is not None
+        elif mode == "in_process_direct":
+            responsive = client is not None
+        else:
+            responsive = False
         return {
             "mode": mode,
             "socket_path": str(socket_path or ""),
             "client_active": client is not None,
             "daemon_active": daemon is not None,
-            "daemon_process_alive": bool(callable(getattr(process, "is_alive", None)) and process.is_alive()),
+            "daemon_process_alive": daemon_process_alive,
             "in_process_server_active": server is not None,
+            "responsive": responsive,
+            "socket_ping": socket_ping,
             "last_error": str(getattr(self, "_cloud_command_transport_error", "") or ""),
         }
 

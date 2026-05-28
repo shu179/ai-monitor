@@ -168,7 +168,33 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertTrue(status["client_active"])
         self.assertTrue(status["daemon_active"])
         self.assertTrue(status["daemon_process_alive"])
+        self.assertFalse(status["responsive"])
+        self.assertFalse(status["socket_ping"]["ok"])
         self.assertEqual(status["socket_path"], "/tmp/cloud-sync.sock")
+
+    def test_app_runtime_cloud_command_transport_status_pings_child_daemon(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        process = Mock()
+        process.is_alive.return_value = True
+        runtime._cloud_command_daemon = Mock(process=process)
+        runtime._cloud_command_server = None
+        runtime._cloud_command_client = Mock()
+        runtime._cloud_command_socket_path = Path("/tmp/cloud-sync.sock")
+        runtime._cloud_command_transport_mode = "child_daemon"
+        runtime._cloud_command_transport_error = ""
+        ping_client = Mock()
+        ping_client.send_command.return_value = {"ok": True, "daemon": True, "pid": 1234}
+
+        with patch("web_backend.UnixSocketCloudSyncCommandClient", return_value=ping_client) as client_cls:
+            status = AppRuntime._cloud_command_transport_status(runtime)
+
+        client_cls.assert_called_once_with(Path("/tmp/cloud-sync.sock"), timeout_seconds=0.25)
+        ping_client.send_command.assert_called_once_with("cloud.daemon.ping")
+        self.assertTrue(status["responsive"])
+        self.assertTrue(status["socket_ping"]["attempted"])
+        self.assertTrue(status["socket_ping"]["ok"])
+        self.assertTrue(status["socket_ping"]["daemon"])
+        self.assertEqual(status["socket_ping"]["pid"], 1234)
 
     def test_app_runtime_cloud_command_transport_status_reports_direct_fallback(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
@@ -185,6 +211,8 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertTrue(status["client_active"])
         self.assertFalse(status["daemon_active"])
         self.assertFalse(status["daemon_process_alive"])
+        self.assertTrue(status["responsive"])
+        self.assertFalse(status["socket_ping"]["attempted"])
         self.assertEqual(status["last_error"], "AF_UNIX unavailable")
 
     def test_app_runtime_cloud_runtime_command_falls_back_when_daemon_cannot_handle_command(self) -> None:
