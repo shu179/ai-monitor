@@ -880,6 +880,7 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
             {"ok": True, "cloud": {"loggedIn": True}},
             {"ok": True, "outbox": {"stats": {"failed": 1}}},
             {"ok": True, "sync_health": {"summary": {"outbox_pending": 2}}},
+            {"ok": True, "sync_health": {"summary": {"cloud_object_storage_checked": True}}},
             {"ok": True, "state_delta": {"cursors": {"tasks": 2}}},
             {"ok": True, "cloud": {"loggedIn": True, "savedAt": "now"}},
             {"ok": True, "cloud": {"loggedIn": False}},
@@ -893,6 +894,10 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         self.assertEqual(runtime.get_cloud_status(), {"ok": True, "cloud": {"loggedIn": True}})
         self.assertEqual(runtime.get_cloud_outbox_diagnostics(), {"ok": True, "outbox": {"stats": {"failed": 1}}})
         self.assertEqual(runtime.get_cloud_sync_health(), {"ok": True, "sync_health": {"summary": {"outbox_pending": 2}}})
+        self.assertEqual(
+            runtime.get_cloud_sync_health_deep(),
+            {"ok": True, "sync_health": {"summary": {"cloud_object_storage_checked": True}}},
+        )
         self.assertEqual(runtime.get_cloud_state_delta_diagnostics(), {"ok": True, "state_delta": {"cursors": {"tasks": 2}}})
         self.assertEqual(runtime._current_cloud_status(), {"ok": True, "cloud": {"loggedIn": True, "savedAt": "now"}})  # noqa: SLF001
         self.assertEqual(runtime._cloud_status_from_session({"access_token": "token"}), {"ok": True, "cloud": {"loggedIn": False}})  # noqa: SLF001
@@ -911,6 +916,7 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
                 unittest.mock.call("cloud.status"),
                 unittest.mock.call("cloud.outbox_diagnostics"),
                 unittest.mock.call("cloud.sync_health"),
+                unittest.mock.call("cloud.sync_health", {"includeCloudObjectStorage": True}),
                 unittest.mock.call("cloud.state_delta_diagnostics"),
                 unittest.mock.call("cloud.current_status"),
                 unittest.mock.call("cloud.status_from_session", {"session": {"access_token": "token"}}),
