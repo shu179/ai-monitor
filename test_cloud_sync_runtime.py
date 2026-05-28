@@ -2712,6 +2712,61 @@ def test_app_cloud_runtime_support_command_reads_admin_object_storage_report():
     assert result["payload"]["report"]["limits"]["object_storage_max_file_bytes"] == 512 * 1024 * 1024
 
 
+def test_app_cloud_runtime_support_command_requeues_sync_queue_items():
+    owner = _support_owner()
+    support = AppCloudRuntimeSupport(owner=owner)
+
+    class FakeClient:
+        calls = []
+
+        def admin_requeue_sync_queue(self, _token: str, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "dry_run": kwargs["dry_run"],
+                "workspace_id": kwargs["workspace_id"],
+                "statuses": kwargs["statuses"],
+                "partition_key": kwargs["partition_key"],
+                "limit": kwargs["limit"],
+                "selected": 2,
+                "requeued": 0 if kwargs["dry_run"] else 2,
+                "items": [],
+            }
+
+    fake_client = FakeClient()
+    support.cloud_request_with_refresh = Mock(side_effect=lambda operation: (True, operation(fake_client, "access-token"), ""))
+
+    result = support.handle_command(
+        "cloud.requeue_sync_queue",
+        {
+            "workspaceId": 7,
+            "statuses": ["blocked"],
+            "partitionKey": "7:article:abc",
+            "limit": 50,
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["payload"]["dry_run"] is True
+    assert result["payload"]["selected"] == 2
+    assert result["payload"]["requeued"] == 0
+    assert FakeClient.calls[-1] == {
+        "workspace_id": 7,
+        "statuses": ["blocked"],
+        "partition_key": "7:article:abc",
+        "limit": 50,
+        "dry_run": True,
+    }
+
+    result = support.handle_command(
+        "cloud.requeue_sync_queue",
+        {"workspace_id": 7, "statuses": ["dead_letter"], "dryRun": False},
+    )
+
+    assert result["payload"]["dry_run"] is False
+    assert result["payload"]["requeued"] == 2
+    assert FakeClient.calls[-1]["dry_run"] is False
+
+
 def test_app_cloud_runtime_support_daemon_handle_command_delegates_to_main_handler_when_needed():
     owner = _support_owner()
     support = AppCloudRuntimeSupport(owner=owner)

@@ -643,6 +643,30 @@ class SurfacedCloudClient:
         )
         return response if isinstance(response, dict) else {}
 
+    def admin_requeue_sync_queue(
+        self,
+        access_token: str,
+        *,
+        workspace_id: int,
+        statuses: list[str] | None = None,
+        partition_key: str = "",
+        limit: int = 100,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            "/api/v1/admin/ops/sync-queue/requeue",
+            access_token=access_token,
+            json_body={
+                "workspace_id": int(workspace_id or 0),
+                "statuses": [str(item) for item in (statuses or ["blocked", "dead_letter"]) if str(item or "").strip()],
+                "partition_key": str(partition_key or "").strip() or None,
+                "limit": max(1, min(int(limit or 100), 1000)),
+                "dry_run": bool(dry_run),
+            },
+        )
+        return response if isinstance(response, dict) else {}
+
     def list_admin_article_classification_jobs(
         self,
         access_token: str,

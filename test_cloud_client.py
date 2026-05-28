@@ -344,6 +344,34 @@ class CloudClientTests(unittest.TestCase):
         self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/admin/ops/sync-queue")
         self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
 
+    def test_admin_requeue_sync_queue_posts_bounded_payload(self):
+        session = FakeSession()
+        client = SurfacedCloudClient("https://api.example.com", session=session)
+
+        result = client.admin_requeue_sync_queue(
+            "access-token",
+            workspace_id=7,
+            statuses=["blocked"],
+            partition_key="7:article:abc",
+            limit=50,
+            dry_run=False,
+        )
+
+        self.assertEqual(result["id"], 7)
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://api.example.com/api/v1/admin/ops/sync-queue/requeue")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer access-token")
+        self.assertEqual(
+            session.calls[0]["json"],
+            {
+                "workspace_id": 7,
+                "statuses": ["blocked"],
+                "partition_key": "7:article:abc",
+                "limit": 50,
+                "dry_run": False,
+            },
+        )
+
     def test_delete_admin_task_uses_delete(self):
         session = FakeSession()
         client = SurfacedCloudClient("https://api.example.com", session=session)

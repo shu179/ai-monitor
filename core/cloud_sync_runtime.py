@@ -502,6 +502,8 @@ class AppCloudRuntimeSupport:
             return self._run_cloud_api_request("admin_object_storage_report", request_payload)
         if normalized in {"cloud.admin_sync_queue_report", "admin_sync_queue_report"}:
             return self._run_cloud_api_request("admin_sync_queue_report", request_payload)
+        if normalized in {"cloud.requeue_sync_queue", "requeue_sync_queue"}:
+            return self._run_cloud_api_request("requeue_sync_queue", request_payload)
         if normalized in {"cloud.resolve_admin_article_classification_job", "resolve_admin_article_classification_job"}:
             return self._run_cloud_api_request("resolve_admin_article_classification_job", request_payload)
         if normalized in {"cloud.ignore_admin_article_classification_job", "ignore_admin_article_classification_job"}:
@@ -1563,6 +1565,21 @@ class AppCloudRuntimeSupport:
                 return client.admin_object_storage_report(token)
             if operation_name == "admin_sync_queue_report":
                 return client.admin_sync_queue_report(token)
+            if operation_name == "requeue_sync_queue":
+                statuses_payload = payload.get("statuses")
+                statuses = (
+                    [str(item) for item in statuses_payload if str(item or "").strip()]
+                    if isinstance(statuses_payload, list)
+                    else None
+                )
+                return client.admin_requeue_sync_queue(
+                    token,
+                    workspace_id=_safe_int(payload.get("workspace_id") or payload.get("workspaceId"), 0),
+                    statuses=statuses,
+                    partition_key=str(payload.get("partition_key") or payload.get("partitionKey") or "").strip(),
+                    limit=_safe_int(payload.get("limit"), 100),
+                    dry_run=not (payload.get("dry_run") is False or payload.get("dryRun") is False),
+                )
             if operation_name == "list_admin_article_classification_jobs":
                 return client.list_admin_article_classification_jobs(
                     token,
