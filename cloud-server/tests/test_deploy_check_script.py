@@ -177,10 +177,29 @@ def test_postgres_observability_report_parses_ready_output() -> None:
     result = SimpleNamespace(stdout="pg_stat_statements|200ms|t\n")
     with (
         patch("scripts.deploy_check.shutil.which", return_value="/usr/bin/docker"),
-        patch("scripts.deploy_check.subprocess.run", return_value=result),
+        patch("scripts.deploy_check._run_docker_compose_exec", return_value=result),
     ):
         report = deploy_check._postgres_observability_report({"POSTGRES_USER": "surfaced", "POSTGRES_DB": "surfaced_cloud"})
 
     assert report["status"] == "ok"
     assert report["pg_stat_statements"] is True
     assert report["slow_query_ms"] == 200
+
+
+def test_docker_compose_exec_falls_back_to_sudo_docker() -> None:
+    failures = [RuntimeError("permission denied")]
+    success = SimpleNamespace(stdout="ok")
+
+    def fake_run(command, **_kwargs):
+        if command[:1] == ["docker"]:
+            raise failures[0]
+        return success
+
+    with (
+        patch("scripts.deploy_check.shutil.which", return_value="/usr/bin/tool"),
+        patch("scripts.deploy_check.subprocess.run", side_effect=fake_run) as run,
+    ):
+        result = deploy_check._run_docker_compose_exec(["postgres", "true"])
+
+    assert result is success
+    assert run.call_args_list[1].args[0][:3] == ["sudo", "-n", "docker"]

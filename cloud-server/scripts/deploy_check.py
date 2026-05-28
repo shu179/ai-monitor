@@ -269,12 +269,8 @@ def _postgres_observability_report(env_values: dict[str, str] | None = None) -> 
         env_values = env_values or {}
         db_user = str(env_values.get("POSTGRES_USER") or "surfaced")
         db_name = str(env_values.get("POSTGRES_DB") or "surfaced_cloud")
-        result = subprocess.run(
+        result = _run_docker_compose_exec(
             [
-                "docker",
-                "compose",
-                "exec",
-                "-T",
                 "postgres",
                 "psql",
                 "-U",
@@ -287,12 +283,7 @@ def _postgres_observability_report(env_values: dict[str, str] | None = None) -> 
                     "current_setting('log_min_duration_statement', true), "
                     "EXISTS(SELECT 1 FROM pg_extension WHERE extname='pg_stat_statements')"
                 ),
-            ],
-            cwd=str(ROOT),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
+            ]
         )
         line = (result.stdout or "").strip().splitlines()[0]
         libraries, slow_query, extension = (line.split("|") + ["", "", ""])[:3]
@@ -314,6 +305,29 @@ def _postgres_observability_report(env_values: dict[str, str] | None = None) -> 
             "slow_query_ms": 0,
             "error": str(exc),
         }
+
+
+def _run_docker_compose_exec(args: list[str]) -> subprocess.CompletedProcess[str]:
+    last_error: Exception | None = None
+    prefixes = [["docker"], ["sudo", "-n", "docker"]]
+    for prefix in prefixes:
+        if shutil.which(prefix[0]) is None:
+            continue
+        command = [*prefix, "compose", "exec", "-T", *args]
+        try:
+            return subprocess.run(
+                command,
+                cwd=str(ROOT),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("docker unavailable")
 
 
 def _parse_duration_ms(value: str) -> int:
