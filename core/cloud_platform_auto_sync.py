@@ -14,6 +14,7 @@ from .cloud_event_types import (
     PULL_TRIGGER_EVENT_NAMES,
 )
 from .cloud_outbox import CloudOutbox
+from .cloud_object_transfer_store import CloudObjectTransferStore
 from .cloud_run_sync import flush_cloud_outbox
 from .cloud_session_store import CloudSessionChangedError, CloudSessionStore, cloud_session_identity
 from .time_utils import local_now
@@ -72,6 +73,7 @@ class CloudPlatformAutoSync:
         process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
         retry_object_downloads: Callable[..., dict[str, Any]] | None = None,
         retry_object_uploads: Callable[..., dict[str, Any]] | None = None,
+        object_upload_retry_status: Callable[..., dict[str, Any]] | None = None,
         object_upload_retry_interval_seconds: float = 60.0,
         client_factory: Callable[[str], SurfacedCloudClient] | None = None,
         logger: Callable[[str], None] | None = None,
@@ -82,6 +84,7 @@ class CloudPlatformAutoSync:
         self._process_state_delta_inbox = process_state_delta_inbox
         self._retry_object_downloads = retry_object_downloads
         self._retry_object_uploads = retry_object_uploads
+        self._object_upload_retry_status = object_upload_retry_status
         self._session_store = session_store or CloudSessionStore()
         self._outbox = outbox or CloudOutbox()
         self._upload_retry_interval_seconds = max(5.0, float(upload_retry_interval_seconds or 20.0))
@@ -161,6 +164,10 @@ class CloudPlatformAutoSync:
             "last_object_upload_retry_at": "",
             "last_object_upload_retry_metrics": {},
             "last_object_upload_retry_error": "",
+            "object_upload_retry_ready_count": 0,
+            "object_upload_retry_waiting_count": 0,
+            "object_upload_retry_wait_reason": "",
+            "next_object_upload_retry_after_seconds": 0,
             "object_upload_retry_backpressure_until": "",
             "object_upload_retry_backpressure_retry_after_seconds": 0.0,
             "object_upload_retry_backpressure_queue_depth_hint": 0,
@@ -214,11 +221,13 @@ class CloudPlatformAutoSync:
         process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
         retry_object_downloads: Callable[..., dict[str, Any]] | None = None,
         retry_object_uploads: Callable[..., dict[str, Any]] | None = None,
+        object_upload_retry_status: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self._pull_state_delta = pull_state_delta
         self._process_state_delta_inbox = process_state_delta_inbox
         self._retry_object_downloads = retry_object_downloads
         self._retry_object_uploads = retry_object_uploads
+        self._object_upload_retry_status = object_upload_retry_status
 
     def _update_status(self, **patch: Any) -> None:
         with self._lock:
@@ -485,6 +494,7 @@ class CloudPlatformAutoSync:
     def _loop(self) -> None:
         self._update_status(running=True)
         upload_wake_requested = False
+        object_upload_retry_wake_requested = False
         try:
             while not self._stop_event.is_set():
                 session = self._session_store.load()
@@ -500,6 +510,10 @@ class CloudPlatformAutoSync:
                         outbox_next_retry_after_seconds=0,
                         outbox_wait_reason="not_logged_in",
                         next_upload_attempt_after_seconds=0,
+                        object_upload_retry_ready_count=0,
+                        object_upload_retry_waiting_count=0,
+                        object_upload_retry_wait_reason="not_logged_in",
+                        next_object_upload_retry_after_seconds=0,
                     )
                     self._stop_event.wait(self._idle_interval_seconds)
                     continue
@@ -597,17 +611,37 @@ class CloudPlatformAutoSync:
                 object_upload_retry_backpressure_expired = (
                     had_object_upload_retry_backpressure and not object_upload_retry_backpressure_active
                 )
+                object_upload_retry_status = self._invoke_object_upload_retry_status()
+                object_upload_retry_status_available = bool(object_upload_retry_status.get("available"))
+                object_upload_retry_ready_count = _safe_int(object_upload_retry_status.get("retry_ready_count"))
+                object_upload_retry_waiting_count = _safe_int(object_upload_retry_status.get("retry_waiting_count"))
+                object_upload_retry_wait_reason = str(object_upload_retry_status.get("wait_reason") or "")
+                next_object_upload_retry_after_seconds = _safe_int(
+                    object_upload_retry_status.get("next_retry_after_seconds")
+                )
+                self._update_object_upload_retry_status_snapshot(object_upload_retry_status)
                 if (
                     callable(self._retry_object_uploads)
                     and not object_upload_retry_backpressure_active
                     and (
-                        first_sync_for_login
-                        or object_upload_retry_backpressure_expired
-                        or self._last_object_upload_retry_started_at <= 0
-                        or now - self._last_object_upload_retry_started_at >= self._object_upload_retry_interval_seconds
+                        (
+                            object_upload_retry_status_available
+                            and object_upload_retry_ready_count > 0
+                        )
+                        or (
+                            not object_upload_retry_status_available
+                            and (
+                                first_sync_for_login
+                                or object_upload_retry_wake_requested
+                                or object_upload_retry_backpressure_expired
+                                or self._last_object_upload_retry_started_at <= 0
+                                or now - self._last_object_upload_retry_started_at >= self._object_upload_retry_interval_seconds
+                            )
+                        )
                     )
                 ):
                     self._last_object_upload_retry_started_at = now
+                    object_upload_retry_wake_requested = False
                     object_upload_retry_result = self._invoke_object_upload_retry()
                     object_upload_retry_metrics = _object_upload_retry_metrics(object_upload_retry_result)
                     if object_upload_retry_result.get("ok"):
@@ -626,6 +660,7 @@ class CloudPlatformAutoSync:
                                 object_upload_retry_result.get("message") or "对象上传恢复失败"
                             ),
                         )
+                    self._update_object_upload_retry_status_snapshot(self._invoke_object_upload_retry_status())
 
                 pull_result: dict[str, Any] | None = None
                 state_delta_result: dict[str, Any] | None = None
@@ -658,6 +693,7 @@ class CloudPlatformAutoSync:
                 if self._stop_event.wait(0.1):
                     break
                 upload_wake_requested = CloudOutbox.wait_for_change(self._idle_interval_seconds)
+                object_upload_retry_wake_requested = CloudObjectTransferStore.wait_for_change(0.0)
         finally:
             self._update_status(running=False, event_stream_connected=False)
 
@@ -868,6 +904,30 @@ class CloudPlatformAutoSync:
             )
         except Exception as exc:
             return {"ok": False, "message": f"对象上传恢复失败：{exc}"}
+
+    def _invoke_object_upload_retry_status(self) -> dict[str, Any]:
+        status_handler = self._object_upload_retry_status
+        if not callable(status_handler):
+            return {"ok": True, "available": False}
+        try:
+            result = _invoke_optional_payload_callback(
+                status_handler,
+                {"source": "auto_sync"},
+            )
+        except Exception as exc:
+            return {"ok": False, "available": False, "message": f"对象上传恢复状态检查失败：{exc}"}
+        if not isinstance(result, dict):
+            return {"ok": False, "available": False, "message": "对象上传恢复状态检查返回无效结果"}
+        return result
+
+    def _update_object_upload_retry_status_snapshot(self, status: dict[str, Any] | None) -> None:
+        payload = status if isinstance(status, dict) else {}
+        self._update_status(
+            object_upload_retry_ready_count=_safe_int(payload.get("retry_ready_count")),
+            object_upload_retry_waiting_count=_safe_int(payload.get("retry_waiting_count")),
+            object_upload_retry_wait_reason=str(payload.get("wait_reason") or ""),
+            next_object_upload_retry_after_seconds=_safe_int(payload.get("next_retry_after_seconds")),
+        )
 
     def _invoke_state_delta_pipeline(self) -> dict[str, Any]:
         pull_handler = self._pull_state_delta

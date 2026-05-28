@@ -94,6 +94,7 @@ def create_local_cloud_sync_runtime(
     process_state_delta_inbox: Callable[..., dict[str, Any]] | None = None,
     retry_object_downloads: Callable[..., dict[str, Any]] | None = None,
     retry_object_uploads: Callable[..., dict[str, Any]] | None = None,
+    object_upload_retry_status: Callable[..., dict[str, Any]] | None = None,
 ) -> LocalCloudSyncRuntime:
     manager = CloudSyncManager(
         config_getter=config_getter,
@@ -112,6 +113,7 @@ def create_local_cloud_sync_runtime(
         process_state_delta_inbox=process_state_delta_inbox,
         retry_object_downloads=retry_object_downloads,
         retry_object_uploads=retry_object_uploads,
+        object_upload_retry_status=object_upload_retry_status,
         upload_burst_interval_seconds=_env_float("AIBRANDMONITOR_CLOUD_UPLOAD_BURST_INTERVAL_SECONDS", 1.0),
         upload_burst_pending_threshold=_env_int("AIBRANDMONITOR_CLOUD_UPLOAD_BURST_PENDING_THRESHOLD", 100),
         logger=logger,
@@ -1005,6 +1007,18 @@ class AppCloudRuntimeSupport:
         )
         return {"ok": True, "retryable_transfers": transfers, "count": len(transfers)}
 
+    def object_upload_retry_status(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload if isinstance(payload, dict) else {}
+        status = self._object_transfer_store_factory().retry_status(
+            direction="upload",
+            max_attempts=_safe_int(request_payload.get("max_attempts") or request_payload.get("maxAttempts"), 5),
+            stale_running_seconds=_safe_float(
+                request_payload.get("stale_running_seconds") or request_payload.get("staleRunningSeconds"),
+                600.0,
+            ),
+        )
+        return {"ok": True, "available": True, **status}
+
     def retry_object_downloads(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload if isinstance(payload, dict) else {}
         limit = _safe_int(request_payload.get("limit"), 10)
@@ -1146,7 +1160,11 @@ class AppCloudRuntimeSupport:
             except Exception as exc:
                 failed += 1
                 failure_message = str(exc or "upload retry failed")
-                transfer_store.fail_transfer(transfer_id, failure_message)
+                transfer_store.fail_transfer(
+                    transfer_id,
+                    failure_message,
+                    retry_after_seconds=getattr(exc, "retry_after_seconds", None),
+                )
                 failures.append({"transfer_id": transfer_id, "path": str(path), "message": failure_message})
                 continue
             if ok and isinstance(response_payload, dict) and bool(response_payload.get("ok")):
@@ -1155,7 +1173,11 @@ class AppCloudRuntimeSupport:
             failed += 1
             response_dict = response_payload if isinstance(response_payload, dict) else {}
             failure_message = str(message or response_dict.get("message") or "upload retry failed")
-            transfer_store.fail_transfer(transfer_id, failure_message)
+            transfer_store.fail_transfer(
+                transfer_id,
+                failure_message,
+                retry_after_seconds=_safe_float((backpressure or {}).get("retry_after_seconds"), 0.0) or None,
+            )
             failure = {"transfer_id": transfer_id, "path": str(path), "message": failure_message}
             failure.update(_cloud_backpressure_fields(backpressure))
             failures.append(failure)

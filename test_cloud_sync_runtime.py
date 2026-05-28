@@ -45,6 +45,7 @@ def test_create_local_cloud_sync_runtime_wires_burst_env(monkeypatch):
             process_state_delta_inbox=lambda _payload=None: {"ok": True},
             retry_object_downloads=lambda _payload=None: {"ok": True},
             retry_object_uploads=lambda _payload=None: {"ok": True},
+            object_upload_retry_status=lambda _payload=None: {"ok": True, "available": True, "retry_ready_count": 0},
             logger=lambda _message: None,
         )
 
@@ -56,6 +57,7 @@ def test_create_local_cloud_sync_runtime_wires_burst_env(monkeypatch):
     assert callable(auto_sync_cls.call_args.kwargs["process_state_delta_inbox"])
     assert callable(auto_sync_cls.call_args.kwargs["retry_object_downloads"])
     assert callable(auto_sync_cls.call_args.kwargs["retry_object_uploads"])
+    assert callable(auto_sync_cls.call_args.kwargs["object_upload_retry_status"])
 
 
 def test_create_in_process_cloud_sync_command_client_wraps_handler():
@@ -1840,7 +1842,7 @@ def test_app_cloud_runtime_support_lists_object_transfer_retry_candidates():
     with tempfile.TemporaryDirectory() as tmp:
         transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
         transfer_store.start_transfer(transfer_id="download-1", direction="download", object_id="object-1")
-        transfer_store.fail_transfer("download-1", "temporary")
+        transfer_store.fail_transfer("download-1", "temporary", retry_after_seconds=0)
         support = AppCloudRuntimeSupport(owner=owner, object_transfer_store_factory=lambda: transfer_store)
 
         result = support.handle_command(
@@ -1851,6 +1853,25 @@ def test_app_cloud_runtime_support_lists_object_transfer_retry_candidates():
     assert result["ok"] is True
     assert result["count"] == 1
     assert result["retryable_transfers"][0]["transfer_id"] == "download-1"
+
+
+def test_app_cloud_runtime_support_reports_object_upload_retry_status():
+    owner = _support_owner()
+    with tempfile.TemporaryDirectory() as tmp:
+        transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
+        transfer_store.start_transfer(transfer_id="upload-1", direction="upload", sha256="a" * 64)
+        transfer_store.fail_transfer("upload-1", "busy", retry_after_seconds=7.5)
+        support = AppCloudRuntimeSupport(owner=owner, object_transfer_store_factory=lambda: transfer_store)
+
+        result = support.object_upload_retry_status({})
+
+    assert result["ok"] is True
+    assert result["available"] is True
+    assert result["direction"] == "upload"
+    assert result["retry_ready_count"] == 0
+    assert result["retry_waiting_count"] == 1
+    assert result["wait_reason"] == "waiting_retry_backoff"
+    assert result["next_retry_after_seconds"] >= 7
 
 
 def test_app_cloud_runtime_support_retries_failed_object_downloads():
@@ -1894,7 +1915,7 @@ def test_app_cloud_runtime_support_retries_failed_object_downloads():
             size_bytes=len(data),
             content_type="text/plain",
         )
-        transfer_store.fail_transfer("download-1", "temporary")
+        transfer_store.fail_transfer("download-1", "temporary", retry_after_seconds=0)
         support = AppCloudRuntimeSupport(
             owner=owner,
             session_store_factory=lambda: session_store,
@@ -1961,7 +1982,7 @@ def test_app_cloud_runtime_support_retries_failed_zstd_object_downloads_with_tra
             content_type="text/plain",
             compression="zstd",
         )
-        transfer_store.fail_transfer("download-zstd-1", "temporary")
+        transfer_store.fail_transfer("download-zstd-1", "temporary", retry_after_seconds=0)
         support = AppCloudRuntimeSupport(
             owner=owner,
             session_store_factory=lambda: session_store,
@@ -1988,7 +2009,7 @@ def test_app_cloud_runtime_support_retry_object_downloads_skips_uploads():
     with tempfile.TemporaryDirectory() as tmp:
         transfer_store = CloudObjectTransferStore(Path(tmp) / "transfers.sqlite3")
         transfer_store.start_transfer(transfer_id="upload-1", direction="upload", sha256="a" * 64)
-        transfer_store.fail_transfer("upload-1", "temporary")
+        transfer_store.fail_transfer("upload-1", "temporary", retry_after_seconds=0)
         client_factory = MagicMock()
         support = AppCloudRuntimeSupport(
             owner=owner,
@@ -2041,7 +2062,7 @@ def test_app_cloud_runtime_support_retry_object_downloads_returns_backpressure_m
             size_bytes=17,
             content_type="text/plain",
         )
-        transfer_store.fail_transfer("download-1", "temporary")
+        transfer_store.fail_transfer("download-1", "temporary", retry_after_seconds=0)
         support = AppCloudRuntimeSupport(
             owner=owner,
             session_store_factory=lambda: session_store,
@@ -2110,7 +2131,7 @@ def test_app_cloud_runtime_support_retries_failed_object_uploads_when_source_mat
             path=str(source),
             content_type="text/plain",
         )
-        transfer_store.fail_transfer("upload-1", "temporary")
+        transfer_store.fail_transfer("upload-1", "temporary", retry_after_seconds=0)
         support = AppCloudRuntimeSupport(
             owner=owner,
             session_store_factory=lambda: session_store,
@@ -2170,7 +2191,7 @@ def test_app_cloud_runtime_support_skips_object_upload_retry_when_file_exceeds_c
             path=str(source),
             content_type="text/plain",
         )
-        transfer_store.fail_transfer("upload-oversized", "temporary")
+        transfer_store.fail_transfer("upload-oversized", "temporary", retry_after_seconds=0)
         support = AppCloudRuntimeSupport(
             owner=owner,
             session_store_factory=lambda: session_store,
@@ -2205,7 +2226,7 @@ def test_app_cloud_runtime_support_skips_object_upload_retry_when_source_changed
             path=str(source),
             content_type="text/plain",
         )
-        transfer_store.fail_transfer("upload-1", "temporary")
+        transfer_store.fail_transfer("upload-1", "temporary", retry_after_seconds=0)
         client_factory = MagicMock()
         support = AppCloudRuntimeSupport(
             owner=owner,
@@ -2260,7 +2281,7 @@ def test_app_cloud_runtime_support_retry_object_uploads_returns_backpressure_met
             path=str(source),
             content_type="text/plain",
         )
-        transfer_store.fail_transfer("upload-1", "temporary")
+        transfer_store.fail_transfer("upload-1", "temporary", retry_after_seconds=0)
         support = AppCloudRuntimeSupport(
             owner=owner,
             session_store_factory=lambda: session_store,

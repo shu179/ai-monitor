@@ -11,6 +11,7 @@ import requests
 from core.cloud_client import _format_request_exception
 from core.cloud_outbox import CloudOutbox
 from core.cloud_client import CloudClientError
+from core.cloud_object_transfer_store import CloudObjectTransferStore
 from core.cloud_platform_auto_sync import CloudPlatformAutoSync
 from core.cloud_session_store import CloudSessionStore
 
@@ -380,6 +381,61 @@ class CloudPlatformAutoSyncTests(unittest.TestCase):
 
             self.assertGreaterEqual(len(calls), 2)
             self.assertEqual(manager.get_status()["object_upload_retry_backpressure_until"], "")
+
+    def test_object_upload_retry_status_wakes_retry_when_backoff_expires(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CloudSessionStore(Path(tmpdir) / "session.json")
+            store.save(
+                {
+                    "base_url": "https://api.example.com",
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "user": {"id": 2, "workspace_id": 1, "role": "operator"},
+                }
+            )
+            transfer_store = CloudObjectTransferStore(Path(tmpdir) / "transfers.sqlite3")
+            transfer_store.start_transfer(
+                transfer_id="upload-1",
+                direction="upload",
+                sha256="a" * 64,
+                size_bytes=12,
+                path=str(Path(tmpdir) / "file.bin"),
+                content_type="application/octet-stream",
+            )
+            transfer_store.fail_transfer("upload-1", "busy", retry_after_seconds=0.4)
+            calls: list[float] = []
+
+            def retry_uploads(_payload=None):
+                calls.append(time.monotonic())
+                transfer_store.finish_transfer("upload-1", status="completed")
+                return {"ok": True, "attempted": 1, "recovered": 1, "failed": 0, "skipped": 0}
+
+            manager = CloudPlatformAutoSync(
+                session_store=store,
+                outbox=CloudOutbox(Path(tmpdir) / "outbox.json"),
+                pull_tasks=lambda: {"ok": True},
+                retry_object_uploads=retry_uploads,
+                object_upload_retry_status=lambda _payload=None: {"ok": True, "available": True, **transfer_store.retry_status(direction="upload")},
+                object_upload_retry_interval_seconds=60,
+                pull_interval_seconds=3600,
+                idle_interval_seconds=0.2,
+                event_stream_enabled=False,
+                logger=lambda _message: None,
+            )
+
+            manager.start()
+            try:
+                deadline = time.time() + 2.0
+                while not calls and time.time() < deadline:
+                    time.sleep(0.05)
+            finally:
+                manager.stop()
+
+            self.assertEqual(len(calls), 1)
+            status = manager.get_status()
+            self.assertEqual(status["object_upload_retry_wait_reason"], "idle")
+            self.assertEqual(status["object_upload_retry_ready_count"], 0)
+            self.assertTrue(status["last_object_upload_retry_at"])
 
     def test_upload_backpressure_pauses_flush_until_retry_after(self):
         with tempfile.TemporaryDirectory() as tmpdir:

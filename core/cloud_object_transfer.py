@@ -72,7 +72,11 @@ def upload_cloud_object_file(
         )
     except Exception as exc:
         if store is not None:
-            store.fail_transfer(transfer_id, str(exc))
+            store.fail_transfer(
+                transfer_id,
+                str(exc),
+                retry_after_seconds=getattr(exc, "retry_after_seconds", None),
+            )
         raise
 
 
