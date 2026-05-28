@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from app.models import ObjectManifest
 from app.services.object_storage_diagnostics import build_object_storage_report, format_object_storage_report
+from app.services.sync_v2_service import TTL_SECONDS
 
 
 class ObjectStorageDiagnosticsTests(unittest.TestCase):
@@ -134,6 +136,45 @@ class ObjectStorageDiagnosticsTests(unittest.TestCase):
         text = format_object_storage_report(report)
         self.assertIn("pressure=", text)
         self.assertIn("quota_used=", text)
+
+    def test_report_does_not_treat_fresh_temp_upload_as_orphan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_upload = Path(tmp) / "7/aa/bb/a.tmp-uploading"
+            temp_upload.parent.mkdir(parents=True)
+            temp_upload.write_bytes(b"uploading")
+            db = _db_with_manifests([])
+
+            with patch("app.services.object_storage_diagnostics.get_settings", return_value=_settings(tmp)):
+                report = build_object_storage_report(db)
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["orphan_files"], [])
+        self.assertEqual(len(report["temporary_files"]), 1)
+        self.assertEqual(report["temporary_total_bytes"], 9)
+        self.assertEqual(report["stale_temporary_files"], [])
+
+    def test_report_warns_about_stale_temp_uploads_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_upload = Path(tmp) / "7/aa/bb/a.tmp-stale"
+            temp_upload.parent.mkdir(parents=True)
+            temp_upload.write_bytes(b"stale")
+            old = 100_000
+            os.utime(temp_upload, (old, old))
+            db = _db_with_manifests([])
+
+            with (
+                patch("app.services.object_storage_diagnostics.get_settings", return_value=_settings(tmp)),
+                patch("app.services.object_storage_diagnostics.time.time", return_value=old + TTL_SECONDS["multipart_upload_session"] + 1),
+            ):
+                report = build_object_storage_report(db)
+
+        self.assertEqual(report["status"], "warn")
+        self.assertEqual(report["orphan_files"], [])
+        self.assertEqual(len(report["temporary_files"]), 1)
+        self.assertEqual(len(report["stale_temporary_files"]), 1)
+        text = format_object_storage_report(report)
+        self.assertIn("temporary_files:", text)
+        self.assertIn("stale_temporary_files:", text)
 
 
 def _db_with_manifests(manifests: list[ObjectManifest]):

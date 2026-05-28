@@ -47,6 +47,26 @@ class CloudMaintenanceServiceTests(unittest.TestCase):
             self.assertFalse(orphan.exists())
             db.commit.assert_called_once()
 
+    def test_execute_deletes_only_stale_temporary_upload_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh = Path(tmp) / "7/aa/bb/a.tmp-fresh"
+            stale = Path(tmp) / "7/aa/bb/a.tmp-stale"
+            fresh.parent.mkdir(parents=True)
+            fresh.write_bytes(b"fresh")
+            stale.write_bytes(b"stale")
+            old = 100_000
+            os.utime(stale, (old, old))
+            db = _db(expired_session_ids=[], parts_count=0, dead_letters=0, change_rows=0)
+
+            with patch("app.services.object_storage_diagnostics.time.time", return_value=old + 24 * 60 * 60 + 1):
+                result = run_cloud_maintenance(db, dry_run=False, settings=_settings(tmp))
+
+            self.assertEqual(result["orphan_files"], {"files": 0, "bytes": 0})
+            self.assertEqual(result["temporary_files"], {"files": 1, "bytes": 5})
+            self.assertTrue(fresh.exists())
+            self.assertFalse(stale.exists())
+            db.commit.assert_called_once()
+
     def test_execute_deletes_expired_soft_deleted_object_after_rechecking_ref_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sha = "d" * 64

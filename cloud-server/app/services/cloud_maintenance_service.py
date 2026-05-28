@@ -39,7 +39,13 @@ def run_cloud_maintenance(
     dead_letters = _cleanup_expired_dead_letters(db, now=now, dry_run=dry_run)
     change_logs = _cleanup_expired_change_log(db, now=now, dry_run=dry_run)
     soft_deleted_objects = _cleanup_soft_deleted_objects(db, now=now, settings=resolved_settings, dry_run=dry_run)
-    orphan_files = _cleanup_orphan_local_files(db, settings=resolved_settings, dry_run=dry_run)
+    object_storage_report = build_object_storage_report(db, settings=resolved_settings)
+    orphan_files = _cleanup_orphan_local_files(settings=resolved_settings, dry_run=dry_run, report=object_storage_report)
+    temporary_files = _cleanup_stale_temporary_local_files(
+        settings=resolved_settings,
+        dry_run=dry_run,
+        report=object_storage_report,
+    )
     if not dry_run:
         db.commit()
     result = {
@@ -49,11 +55,12 @@ def run_cloud_maintenance(
         "change_log": change_logs,
         "soft_deleted_objects": soft_deleted_objects,
         "orphan_files": orphan_files,
+        "temporary_files": temporary_files,
     }
     logger.info(
         "[CloudMaintenance] dry_run=%s expired_upload_sessions=%s upload_parts=%s "
         "dead_letters=%s change_log_rows=%s soft_deleted_objects=%s soft_deleted_bytes=%s "
-        "orphan_files=%s orphan_bytes=%s",
+        "orphan_files=%s orphan_bytes=%s stale_temporary_files=%s stale_temporary_bytes=%s",
         bool(dry_run),
         expired_uploads["sessions"],
         expired_uploads["parts"],
@@ -63,6 +70,8 @@ def run_cloud_maintenance(
         soft_deleted_objects["bytes"],
         orphan_files["files"],
         orphan_files["bytes"],
+        temporary_files["files"],
+        temporary_files["bytes"],
     )
     return result
 
@@ -190,12 +199,30 @@ def _cleanup_soft_deleted_objects(
     return {"objects": deleted_objects, "bytes": deleted_bytes}
 
 
-def _cleanup_orphan_local_files(db: Session, *, settings: Settings, dry_run: bool) -> dict[str, int]:
-    report = build_object_storage_report(db, settings=settings)
+def _cleanup_orphan_local_files(*, settings: Settings, dry_run: bool, report: dict[str, Any]) -> dict[str, int]:
     deleted_files = 0
     deleted_bytes = 0
     root = Path(str(settings.object_storage_local_dir or "/opt/surfaced/object-data")).resolve()
     for item in report.get("orphan_files", []):
+        path = Path(str(item.get("path") or "")).resolve()
+        if root not in path.parents and path != root:
+            continue
+        size_bytes = int(item.get("size_bytes") or 0)
+        if not dry_run:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        deleted_files += 1
+        deleted_bytes += size_bytes
+    return {"files": deleted_files, "bytes": deleted_bytes}
+
+
+def _cleanup_stale_temporary_local_files(*, settings: Settings, dry_run: bool, report: dict[str, Any]) -> dict[str, int]:
+    deleted_files = 0
+    deleted_bytes = 0
+    root = Path(str(settings.object_storage_local_dir or "/opt/surfaced/object-data")).resolve()
+    for item in report.get("stale_temporary_files", []):
         path = Path(str(item.get("path") or "")).resolve()
         if root not in path.parents and path != root:
             continue

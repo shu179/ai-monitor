@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import shutil
 import tempfile
 from pathlib import Path
@@ -15,6 +16,9 @@ from app.services.object_storage_service import (
     OBJECT_MANIFEST_STATUS_DELETING,
     local_object_path,
 )
+from app.services.sync_v2_service import TTL_SECONDS
+
+TEMP_OBJECT_FILE_STALE_AFTER_SECONDS = int(TTL_SECONDS["multipart_upload_session"])
 
 
 def build_object_storage_report(db: Session, *, settings: Settings | None = None) -> dict[str, Any]:
@@ -27,6 +31,11 @@ def build_object_storage_report(db: Session, *, settings: Settings | None = None
     active_manifests = _active_manifest_rows(db)
     manifest_total = sum(int(row["storage_size_bytes"]) for row in active_manifests)
     workspace_usage = _workspace_usage(db)
+    temporary_files, stale_temporary_files = _temporary_files(
+        root,
+        stale_after_seconds=TEMP_OBJECT_FILE_STALE_AFTER_SECONDS,
+    )
+    temporary_total = sum(int(item.get("size_bytes") or 0) for item in temporary_files)
     missing_files, manifest_paths = _missing_files(active_manifests, settings=resolved_settings)
     orphan_files = _orphan_files(root, manifest_paths)
     limits = {
@@ -51,11 +60,13 @@ def build_object_storage_report(db: Session, *, settings: Settings | None = None
         disk_free_bytes=int(usage.free),
         local_size_bytes=local_size,
         manifest_total_bytes=manifest_total,
+        temporary_total_bytes=temporary_total,
         limits=limits,
         capacity_error_count=len(capacity_errors),
         warning_count=len(pressure["warnings"]),
         missing_count=len(missing_files),
         orphan_count=len(orphan_files),
+        stale_temporary_count=len(stale_temporary_files),
     )
     return {
         "status": status,
@@ -71,9 +82,12 @@ def build_object_storage_report(db: Session, *, settings: Settings | None = None
         "pressure": pressure,
         "local_size_bytes": local_size,
         "manifest_total_bytes": manifest_total,
+        "temporary_total_bytes": temporary_total,
         "manifest_count": len(active_manifests),
         "workspace_usage": workspace_usage,
         "missing_files": missing_files,
+        "temporary_files": temporary_files,
+        "stale_temporary_files": stale_temporary_files,
         "orphan_files": orphan_files,
     }
 
@@ -134,6 +148,32 @@ def format_object_storage_report(report: dict[str, Any]) -> str:
             lines.append(f"  ... {len(report['missing_files']) - 20} more")
     else:
         lines.append("missing_files: none")
+    if report.get("temporary_files"):
+        lines.append("temporary_files:")
+        for item in report["temporary_files"][:20]:
+            lines.append(
+                "  "
+                f"bytes={_format_bytes(item['size_bytes'])} "
+                f"age={int(item.get('age_seconds') or 0)}s "
+                f"path={item['path']}"
+            )
+        if len(report["temporary_files"]) > 20:
+            lines.append(f"  ... {len(report['temporary_files']) - 20} more")
+    else:
+        lines.append("temporary_files: none")
+    if report.get("stale_temporary_files"):
+        lines.append("stale_temporary_files:")
+        for item in report["stale_temporary_files"][:20]:
+            lines.append(
+                "  "
+                f"bytes={_format_bytes(item['size_bytes'])} "
+                f"age={int(item.get('age_seconds') or 0)}s "
+                f"path={item['path']}"
+            )
+        if len(report["stale_temporary_files"]) > 20:
+            lines.append(f"  ... {len(report['stale_temporary_files']) - 20} more")
+    else:
+        lines.append("stale_temporary_files: none")
     if report["orphan_files"]:
         lines.append("orphan_files:")
         for item in report["orphan_files"][:20]:
@@ -211,11 +251,44 @@ def _orphan_files(root: Path, manifest_paths: set[Path]) -> list[dict[str, Any]]
         if not path.is_file():
             continue
         resolved = path.resolve()
+        if _is_temporary_object_file(resolved):
+            continue
         if resolved in manifest_paths:
             continue
         out.append({"path": str(resolved), "size_bytes": int(path.stat().st_size)})
     out.sort(key=lambda item: str(item["path"]))
     return out
+
+
+def _temporary_files(root: Path, *, stale_after_seconds: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    temporary: list[dict[str, Any]] = []
+    stale: list[dict[str, Any]] = []
+    if not root.exists():
+        return temporary, stale
+    now = time.time()
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        if not _is_temporary_object_file(resolved):
+            continue
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        age_seconds = max(0, int(now - stat.st_mtime))
+        item = {"path": str(resolved), "size_bytes": int(stat.st_size), "age_seconds": age_seconds}
+        temporary.append(item)
+        if age_seconds >= int(stale_after_seconds):
+            stale.append(item)
+    temporary.sort(key=lambda item: str(item["path"]))
+    stale.sort(key=lambda item: str(item["path"]))
+    return temporary, stale
+
+
+def _is_temporary_object_file(path: Path) -> bool:
+    name = str(path.name or "")
+    return ".tmp-" in name or name.startswith(".object-storage-doctor-")
 
 
 def _directory_size(root: Path) -> int:
@@ -239,6 +312,8 @@ def _status(
     warning_count: int,
     missing_count: int,
     orphan_count: int,
+    temporary_total_bytes: int,
+    stale_temporary_count: int,
 ) -> str:
     if not writable:
         return "error"
@@ -250,7 +325,10 @@ def _status(
         return "error"
     if int(limits["total_quota_bytes"]) > 0 and local_size_bytes > int(limits["total_quota_bytes"]):
         return "error"
-    if orphan_count or local_size_bytes != manifest_total_bytes:
+    reconciled_size = max(0, int(local_size_bytes) - int(temporary_total_bytes or 0))
+    if orphan_count or reconciled_size != manifest_total_bytes:
+        return "warn"
+    if stale_temporary_count:
         return "warn"
     if warning_count:
         return "warn"
