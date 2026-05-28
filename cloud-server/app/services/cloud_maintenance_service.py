@@ -16,6 +16,7 @@ from app.services.object_storage_service import (
     OBJECT_MANIFEST_STATUS_DELETING,
     local_object_path,
 )
+from app.services.partition_service import drop_aged_partitions, ensure_future_partitions
 from app.services.sync_v2_service import TTL_SECONDS
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ def run_cloud_maintenance(
         dry_run=dry_run,
         report=object_storage_report,
     )
+    partitions = _maintain_partitions(db, now=now, dry_run=dry_run)
     if not dry_run:
         db.commit()
     result = {
@@ -56,6 +58,7 @@ def run_cloud_maintenance(
         "soft_deleted_objects": soft_deleted_objects,
         "orphan_files": orphan_files,
         "temporary_files": temporary_files,
+        "partitions": partitions,
     }
     logger.info(
         "[CloudMaintenance] dry_run=%s expired_upload_sessions=%s upload_parts=%s "
@@ -74,6 +77,30 @@ def run_cloud_maintenance(
         temporary_files["bytes"],
     )
     return result
+
+
+def _maintain_partitions(db: Session, *, now: datetime, dry_run: bool) -> dict[str, Any]:
+    """Keep monthly partitions ahead of time and drop aged change-log months.
+
+    Skipped in dry-run mode (it creates/drops tables). ``ensure_future_partitions``
+    only creates conflict-free future months; the change-log DROP complements the
+    row-level DELETE backstop that still covers the default partition's backlog.
+    """
+    if dry_run:
+        return {"created": {}, "dropped": []}
+    try:
+        created = ensure_future_partitions(db, months_ahead=3, now=now)
+        change_log_cutoff = now - timedelta(seconds=int(TTL_SECONDS["change_log_retention"]))
+        dropped = drop_aged_partitions(db, parent="workspace_change_log", cutoff=change_log_cutoff)
+    except Exception as exc:
+        # Housekeeping must never abort the cleanup commit; per-create savepoints
+        # already absorb expected default-overlap errors, so anything reaching
+        # here is unexpected. Log and report it without failing the run.
+        logger.warning("[CloudMaintenance] partition maintenance skipped: %s", exc)
+        return {"created": {}, "dropped": [], "error": str(exc)}
+    if any(created.values()) or dropped:
+        logger.info("[CloudMaintenance] partitions created=%s dropped=%s", created, dropped)
+    return {"created": created, "dropped": dropped}
 
 
 def _cleanup_expired_upload_sessions(db: Session, *, now: datetime, dry_run: bool) -> dict[str, int]:
