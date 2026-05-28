@@ -27,6 +27,7 @@ from app.schemas import (
 )
 from app.services.object_storage_service import (
     ObjectStorageError,
+    ObjectStorageQuotaExceeded,
     complete_object_upload,
     create_object_download,
     create_object_upload,
@@ -137,7 +138,7 @@ def object_upload_create(
             )
         )
     except ObjectStorageError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise _object_storage_http_exception(exc) from exc
 
 
 @router.post("/objects/uploads/{session_id}/parts:presign", response_model=ObjectPartsPresignResponse)
@@ -157,7 +158,7 @@ def object_upload_parts_presign(
             )
         )
     except ObjectStorageError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise _object_storage_http_exception(exc) from exc
 
 
 @router.post("/objects/uploads/{session_id}/parts", response_model=ObjectPartCompleteResponse)
@@ -180,7 +181,7 @@ def object_upload_part_complete(
             )
         )
     except ObjectStorageError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise _object_storage_http_exception(exc) from exc
 
 
 @router.post("/objects/uploads/{session_id}:complete", response_model=ObjectUploadCompleteResponse)
@@ -201,7 +202,7 @@ def object_upload_complete(
             )
         )
     except ObjectStorageError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise _object_storage_http_exception(exc) from exc
 
 
 @router.post("/objects/{object_id}:download", response_model=ObjectDownloadResponse)
@@ -209,7 +210,7 @@ def object_download(object_id: str, current_user: CurrentUser, db: DbSession) ->
     try:
         return ObjectDownloadResponse(**create_object_download(db, current_user, object_id=object_id))
     except ObjectStorageError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise _object_storage_http_exception(exc) from exc
 
 
 @router.put("/objects/uploads/{session_id}/content", response_model=ObjectUploadCompleteResponse)
@@ -229,7 +230,7 @@ async def object_upload_content(
             )
         )
     except ObjectStorageError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise _object_storage_http_exception(exc) from exc
 
 
 @router.get("/objects/{object_id}/content")
@@ -246,5 +247,25 @@ def object_download_content(object_id: str, current_user: CurrentUser, db: DbSes
     try:
         path = read_local_object(manifest)
     except ObjectStorageError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise _object_storage_http_exception(exc) from exc
     return FileResponse(path, media_type=str(manifest.content_type), filename=str(manifest.sha256))
+
+
+def _object_storage_http_exception(exc: ObjectStorageError) -> HTTPException:
+    if isinstance(exc, ObjectStorageQuotaExceeded):
+        headers = throttle_headers(
+            retry_after_seconds=exc.retry_after_seconds,
+            queue_depth_hint=exc.queue_depth_hint,
+            throttle_bucket=exc.throttle_bucket,
+        )
+        return HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "message": str(exc),
+                "retry_after_seconds": exc.retry_after_seconds,
+                "queue_depth_hint": exc.queue_depth_hint,
+                "throttle_bucket": exc.throttle_bucket,
+            },
+            headers=headers,
+        )
+    return HTTPException(status_code=exc.status_code, detail=str(exc))

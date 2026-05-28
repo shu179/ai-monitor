@@ -315,6 +315,20 @@ class ObjectUploadFlowTests(unittest.TestCase):
                 _enforce_local_disk_headroom(1, settings=settings)
         self.assertTrue(any("reason=disk_headroom_exceeded" in line for line in logs.output))
 
+    def test_local_disk_headroom_rejection_carries_backpressure_metadata(self) -> None:
+        from app.services.object_storage_service import _enforce_local_disk_headroom
+
+        settings = _settings_with_local_dir("/tmp/object-data")
+        settings.object_storage_min_free_bytes = 999_999_999_999_999
+
+        with self.assertRaises(ObjectStorageQuotaExceeded) as caught:
+            _enforce_local_disk_headroom(1, settings=settings)
+
+        exc = caught.exception
+        self.assertEqual(exc.retry_after_seconds, 60)
+        self.assertEqual(exc.throttle_bucket, "object_upload")
+        self.assertGreater(exc.queue_depth_hint, 0)
+
     def test_local_upload_rechecks_headroom_while_streaming_and_cleans_tmp(self) -> None:
         from app.models import ObjectUploadSession
 

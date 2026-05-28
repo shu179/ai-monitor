@@ -72,6 +72,19 @@ class ObjectStorageNotFound(ObjectStorageError):
 class ObjectStorageQuotaExceeded(ObjectStorageError):
     status_code = 429
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: int = 60,
+        queue_depth_hint: int = 0,
+        throttle_bucket: str = "object_upload",
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = max(1, int(retry_after_seconds or 60))
+        self.queue_depth_hint = max(0, int(queue_depth_hint or 0))
+        self.throttle_bucket = str(throttle_bucket or "object_upload").strip() or "object_upload"
+
 
 def create_object_upload(
     db: Session,
@@ -994,7 +1007,35 @@ def _reject_upload(reason: str, **fields: Any) -> None:
         "total_quota_exceeded": "server object storage quota exceeded",
         "workspace_quota_exceeded": "workspace object storage quota exceeded",
     }
-    raise ObjectStorageQuotaExceeded(messages.get(reason, reason))
+    raise ObjectStorageQuotaExceeded(
+        messages.get(reason, reason),
+        retry_after_seconds=_object_upload_retry_after_seconds(reason),
+        queue_depth_hint=_object_upload_pressure_hint(reason, fields),
+    )
+
+
+def _object_upload_retry_after_seconds(reason: str) -> int:
+    if reason == "max_file_exceeded":
+        return 3600
+    return 60
+
+
+def _object_upload_pressure_hint(reason: str, fields: dict[str, Any]) -> int:
+    try:
+        incoming_size = int(fields.get("incoming_size") or 0)
+        limit_bytes = int(fields.get("limit_bytes") or 0)
+        used_bytes = int(fields.get("used_bytes") or 0)
+        free_bytes = int(fields.get("free_bytes") or 0)
+        min_free_bytes = int(fields.get("min_free_bytes") or 0)
+    except Exception:
+        return 0
+    if reason == "disk_headroom_exceeded":
+        return max(0, min_free_bytes - max(0, free_bytes - incoming_size))
+    if reason in {"total_quota_exceeded", "workspace_quota_exceeded"}:
+        return max(0, used_bytes + incoming_size - limit_bytes)
+    if reason == "max_file_exceeded":
+        return max(0, incoming_size - limit_bytes)
+    return 0
 
 
 def _is_local_upload_session(upload_session: ObjectUploadSession) -> bool:
