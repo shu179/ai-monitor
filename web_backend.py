@@ -4546,7 +4546,7 @@ return changedCount
                 0,
                 int((recovery_interval_seconds - (time.monotonic() - last_recovery_attempt_at)) + 0.999),
             )
-        return {
+        status = {
             "mode": mode,
             "socket_path": str(socket_path or ""),
             "client_active": client is not None,
@@ -4560,6 +4560,63 @@ return changedCount
             "last_recovery_reason": str(getattr(self, "_cloud_command_transport_last_recovery_reason", "") or ""),
             "next_recovery_allowed_in_seconds": next_recovery_allowed_in_seconds,
             "last_error": str(getattr(self, "_cloud_command_transport_error", "") or ""),
+        }
+        status.update(self._cloud_command_transport_action_summary(status))
+        return status
+
+    def _cloud_command_transport_action_summary(self, status: dict[str, Any]) -> dict[str, Any]:
+        mode = str(status.get("mode") or "")
+        responsive = bool(status.get("responsive"))
+        recovery_running = bool(status.get("recovery_running"))
+        next_recovery_allowed = int(status.get("next_recovery_allowed_in_seconds") or 0)
+        blockers: list[dict[str, Any]] = []
+
+        def add_blocker(kind: str, message: str, retry_after_seconds: int = 0) -> None:
+            blockers.append(
+                {
+                    "kind": kind,
+                    "message": message,
+                    "retry_after_seconds": max(0, int(retry_after_seconds or 0)),
+                }
+            )
+
+        if mode == "not_started":
+            add_blocker("transport_not_started", "cloud command transport has not started")
+        elif mode == "child_daemon" and not responsive:
+            add_blocker("daemon_unresponsive", "cloud sync daemon did not respond to ping")
+        elif mode == "in_process_direct":
+            if recovery_running:
+                add_blocker("daemon_recovery_running", "cloud sync daemon recovery is running")
+            elif next_recovery_allowed > 0:
+                add_blocker(
+                    "daemon_recovery_cooldown",
+                    "cloud sync daemon recovery is waiting for cooldown",
+                    next_recovery_allowed,
+                )
+            else:
+                add_blocker("daemon_degraded", "cloud command transport is using in-process fallback")
+        elif not responsive:
+            add_blocker("transport_unresponsive", "cloud command transport is not responsive")
+
+        if not blockers:
+            next_action = {"kind": "none", "reason": "transport_healthy", "retry_after_seconds": 0}
+        elif recovery_running:
+            next_action = {"kind": "recover_daemon", "reason": "running", "retry_after_seconds": 0}
+        elif next_recovery_allowed > 0:
+            next_action = {
+                "kind": "recover_daemon",
+                "reason": "cooldown",
+                "retry_after_seconds": next_recovery_allowed,
+            }
+        elif mode in {"in_process_direct", "child_daemon"}:
+            next_action = {"kind": "recover_daemon", "reason": blockers[0]["kind"], "retry_after_seconds": 0}
+        else:
+            next_action = {"kind": "start_transport", "reason": blockers[0]["kind"], "retry_after_seconds": 0}
+
+        return {
+            "transport_blocked": bool(blockers),
+            "transport_blockers": blockers,
+            "next_transport_action": next_action,
         }
 
     def _cloud_runtime_payload_command(self, command: str, payload: dict[str, Any] | None = None) -> tuple[bool, Any, str]:
@@ -4584,7 +4641,18 @@ return changedCount
         result = self._cloud_runtime_command("cloud.sync_health", {"includeCloudObjectStorage": True})
         if isinstance(result, dict) and isinstance(result.get("sync_health"), dict):
             sync_health = dict(result["sync_health"])
-            sync_health["cloud_command_transport"] = self._cloud_command_transport_status()
+            transport_status = self._cloud_command_transport_status()
+            sync_health["cloud_command_transport"] = transport_status
+            summary = dict(sync_health.get("summary") if isinstance(sync_health.get("summary"), dict) else {})
+            summary["cloud_command_transport_blocked"] = bool(transport_status.get("transport_blocked"))
+            summary["cloud_command_transport_mode"] = str(transport_status.get("mode") or "")
+            summary["cloud_command_transport_next_action"] = dict(
+                transport_status.get("next_transport_action")
+                if isinstance(transport_status.get("next_transport_action"), dict)
+                else {}
+            )
+            summary["deep_blocked"] = bool(summary.get("sync_blocked")) or bool(transport_status.get("transport_blocked"))
+            sync_health["summary"] = summary
             result = dict(result)
             result["sync_health"] = sync_health
         return result

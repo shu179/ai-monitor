@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -223,6 +224,34 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertEqual(status["last_recovery_reason"], "")
         self.assertEqual(status["next_recovery_allowed_in_seconds"], 0)
         self.assertEqual(status["last_error"], "AF_UNIX unavailable")
+        self.assertTrue(status["transport_blocked"])
+        self.assertEqual(status["transport_blockers"][0]["kind"], "daemon_degraded")
+        self.assertEqual(
+            status["next_transport_action"],
+            {"kind": "recover_daemon", "reason": "daemon_degraded", "retry_after_seconds": 0},
+        )
+
+    def test_app_runtime_cloud_command_transport_status_reports_recovery_cooldown(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_command_daemon = None
+        runtime._cloud_command_server = None
+        runtime._cloud_command_client = Mock()
+        runtime._cloud_command_socket_path = None
+        runtime._cloud_command_transport_recovery_thread = None
+        runtime._cloud_command_transport_last_recovery_attempt_at = time.monotonic()
+        runtime._cloud_command_transport_last_recovery_attempt = "2026-05-28T12:00:00"
+        runtime._cloud_command_transport_last_recovery_reason = "timed out"
+        runtime._cloud_command_transport_recovery_interval_seconds = 30.0
+        runtime._cloud_command_transport_mode = "in_process_direct"
+        runtime._cloud_command_transport_error = "timed out"
+
+        status = AppRuntime._cloud_command_transport_status(runtime)
+
+        self.assertTrue(status["transport_blocked"])
+        self.assertEqual(status["transport_blockers"][0]["kind"], "daemon_recovery_cooldown")
+        self.assertEqual(status["next_transport_action"]["kind"], "recover_daemon")
+        self.assertEqual(status["next_transport_action"]["reason"], "cooldown")
+        self.assertGreater(status["next_transport_action"]["retry_after_seconds"], 0)
 
     def test_app_runtime_cloud_runtime_command_falls_back_when_daemon_cannot_handle_command(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)

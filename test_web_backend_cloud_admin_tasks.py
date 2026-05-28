@@ -896,8 +896,22 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         self.assertEqual(runtime.get_cloud_sync_health(), {"ok": True, "sync_health": {"summary": {"outbox_pending": 2}}})
         deep_health = runtime.get_cloud_sync_health_deep()
         self.assertTrue(deep_health["ok"])
-        self.assertEqual(deep_health["sync_health"]["summary"], {"cloud_object_storage_checked": True})
+        self.assertEqual(
+            deep_health["sync_health"]["summary"],
+            {
+                "cloud_object_storage_checked": True,
+                "cloud_command_transport_blocked": True,
+                "cloud_command_transport_mode": "not_started",
+                "cloud_command_transport_next_action": {
+                    "kind": "start_transport",
+                    "reason": "transport_not_started",
+                    "retry_after_seconds": 0,
+                },
+                "deep_blocked": True,
+            },
+        )
         self.assertEqual(deep_health["sync_health"]["cloud_command_transport"]["mode"], "not_started")
+        self.assertTrue(deep_health["sync_health"]["cloud_command_transport"]["transport_blocked"])
         self.assertEqual(runtime.get_cloud_state_delta_diagnostics(), {"ok": True, "state_delta": {"cursors": {"tasks": 2}}})
         self.assertEqual(runtime._current_cloud_status(), {"ok": True, "cloud": {"loggedIn": True, "savedAt": "now"}})  # noqa: SLF001
         self.assertEqual(runtime._cloud_status_from_session({"access_token": "token"}), {"ok": True, "cloud": {"loggedIn": False}})  # noqa: SLF001
