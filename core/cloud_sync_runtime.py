@@ -1722,6 +1722,7 @@ def _cloud_sync_health_summary(
     transfers_payload = object_transfers if isinstance(object_transfers, dict) else {}
     transfer_by_status = transfers_payload.get("by_status") if isinstance(transfers_payload.get("by_status"), dict) else {}
     backpressure_until = str(auto_sync.get("upload_backpressure_until") or "")
+    object_upload_retry_backpressure_until = str(auto_sync.get("object_upload_retry_backpressure_until") or "")
     last_error = str(auto_sync.get("last_error") or auto_sync.get("last_state_delta_error") or "")
     return {
         "logged_in": bool(
@@ -1742,6 +1743,19 @@ def _cloud_sync_health_summary(
             0,
         ),
         "upload_backpressure_bucket": str(auto_sync.get("upload_backpressure_bucket") or ""),
+        "object_upload_retry_backpressure_active": bool(object_upload_retry_backpressure_until),
+        "object_upload_retry_backpressure_until": object_upload_retry_backpressure_until,
+        "object_upload_retry_backpressure_retry_after_seconds": _safe_float(
+            auto_sync.get("object_upload_retry_backpressure_retry_after_seconds"),
+            0.0,
+        ),
+        "object_upload_retry_backpressure_queue_depth_hint": _safe_int(
+            auto_sync.get("object_upload_retry_backpressure_queue_depth_hint"),
+            0,
+        ),
+        "object_upload_retry_backpressure_bucket": str(
+            auto_sync.get("object_upload_retry_backpressure_bucket") or ""
+        ),
         "outbox_pending": pending_outbox,
         "outbox_failed": failed_outbox,
         "outbox_dead_letter": dead_letter,

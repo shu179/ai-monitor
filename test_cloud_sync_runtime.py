@@ -1332,6 +1332,10 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
         "upload_backpressure_retry_after_seconds": 8.5,
         "upload_backpressure_queue_depth_hint": 400,
         "upload_backpressure_bucket": "sync_metadata",
+        "object_upload_retry_backpressure_until": "2026-05-28T10:01:00",
+        "object_upload_retry_backpressure_retry_after_seconds": 15.0,
+        "object_upload_retry_backpressure_queue_depth_hint": 25,
+        "object_upload_retry_backpressure_bucket": "object_upload",
         "last_upload_at": "2026-05-28T09:59:00",
         "last_pull_at": "2026-05-28T09:59:03",
         "last_state_delta_at": "2026-05-28T09:59:04",
@@ -1365,6 +1369,10 @@ def test_app_cloud_runtime_support_command_returns_sync_health_snapshot():
     assert health["summary"]["logged_in"] is True
     assert health["summary"]["upload_backpressure_active"] is True
     assert health["summary"]["upload_backpressure_queue_depth_hint"] == 400
+    assert health["summary"]["object_upload_retry_backpressure_active"] is True
+    assert health["summary"]["object_upload_retry_backpressure_retry_after_seconds"] == 15.0
+    assert health["summary"]["object_upload_retry_backpressure_queue_depth_hint"] == 25
+    assert health["summary"]["object_upload_retry_backpressure_bucket"] == "object_upload"
     assert health["summary"]["outbox_pending"] == 2
     assert health["summary"]["outbox_failed"] == 1
     assert health["summary"]["outbox_upload_ready"] == 3
