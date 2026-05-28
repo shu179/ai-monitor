@@ -894,10 +894,10 @@ class WebBackendCloudAdminTaskTests(unittest.TestCase):
         self.assertEqual(runtime.get_cloud_status(), {"ok": True, "cloud": {"loggedIn": True}})
         self.assertEqual(runtime.get_cloud_outbox_diagnostics(), {"ok": True, "outbox": {"stats": {"failed": 1}}})
         self.assertEqual(runtime.get_cloud_sync_health(), {"ok": True, "sync_health": {"summary": {"outbox_pending": 2}}})
-        self.assertEqual(
-            runtime.get_cloud_sync_health_deep(),
-            {"ok": True, "sync_health": {"summary": {"cloud_object_storage_checked": True}}},
-        )
+        deep_health = runtime.get_cloud_sync_health_deep()
+        self.assertTrue(deep_health["ok"])
+        self.assertEqual(deep_health["sync_health"]["summary"], {"cloud_object_storage_checked": True})
+        self.assertEqual(deep_health["sync_health"]["cloud_command_transport"]["mode"], "not_started")
         self.assertEqual(runtime.get_cloud_state_delta_diagnostics(), {"ok": True, "state_delta": {"cursors": {"tasks": 2}}})
         self.assertEqual(runtime._current_cloud_status(), {"ok": True, "cloud": {"loggedIn": True, "savedAt": "now"}})  # noqa: SLF001
         self.assertEqual(runtime._cloud_status_from_session({"access_token": "token"}), {"ok": True, "cloud": {"loggedIn": False}})  # noqa: SLF001

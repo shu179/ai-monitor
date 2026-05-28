@@ -150,6 +150,43 @@ class CloudSyncDaemonTests(unittest.TestCase):
         self.assertIsNone(runtime._cloud_command_daemon)
         self.assertIsNone(runtime._cloud_command_socket_path)
 
+    def test_app_runtime_cloud_command_transport_status_reports_child_daemon(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        process = Mock()
+        process.is_alive.return_value = True
+        daemon = Mock(process=process)
+        runtime._cloud_command_daemon = daemon
+        runtime._cloud_command_server = None
+        runtime._cloud_command_client = Mock()
+        runtime._cloud_command_socket_path = Path("/tmp/cloud-sync.sock")
+        runtime._cloud_command_transport_mode = "child_daemon"
+        runtime._cloud_command_transport_error = ""
+
+        status = AppRuntime._cloud_command_transport_status(runtime)
+
+        self.assertEqual(status["mode"], "child_daemon")
+        self.assertTrue(status["client_active"])
+        self.assertTrue(status["daemon_active"])
+        self.assertTrue(status["daemon_process_alive"])
+        self.assertEqual(status["socket_path"], "/tmp/cloud-sync.sock")
+
+    def test_app_runtime_cloud_command_transport_status_reports_direct_fallback(self) -> None:
+        runtime = AppRuntime.__new__(AppRuntime)
+        runtime._cloud_command_daemon = None
+        runtime._cloud_command_server = None
+        runtime._cloud_command_client = Mock()
+        runtime._cloud_command_socket_path = None
+        runtime._cloud_command_transport_mode = "in_process_direct"
+        runtime._cloud_command_transport_error = "AF_UNIX unavailable"
+
+        status = AppRuntime._cloud_command_transport_status(runtime)
+
+        self.assertEqual(status["mode"], "in_process_direct")
+        self.assertTrue(status["client_active"])
+        self.assertFalse(status["daemon_active"])
+        self.assertFalse(status["daemon_process_alive"])
+        self.assertEqual(status["last_error"], "AF_UNIX unavailable")
+
     def test_app_runtime_cloud_runtime_command_falls_back_when_daemon_cannot_handle_command(self) -> None:
         runtime = AppRuntime.__new__(AppRuntime)
         runtime._cloud_command_transport_lock = threading.RLock()
